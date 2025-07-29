@@ -17,16 +17,16 @@ class MyCustomAgent(Agent):
         seed = int(time.time() * 1000000) + hash(self.game_id) % 1000000
         random.seed(seed)
 
-        # --- Exploration Memory ---
-        # This now programmatically gets all actions except RESET.
+        # --- Agent Memory ---
+        # Phase 1: Action Exploration
         self.actions_to_test = [a for a in GameAction if a is not GameAction.RESET]
-        
-        # A dictionary to store the results of our tests.
         self.action_results = {}
-        # A place to store the grid state before we take an action.
         self.grid_before_action = None
-        # A way to remember the last action we tried.
         self.last_action_tested = None
+
+        # Phase 2: Discovery
+        self.game_type = "unknown"  # Can be 'unknown', 'avatar', or 'static'
+        self.avatar_info = {}       # To store avatar color, size, etc. if found
 
     @property
     def name(self) -> str:
@@ -45,55 +45,86 @@ class MyCustomAgent(Agent):
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
-        """Choose action via an exploration phase, then a solving phase."""
+        """Determines game type, then chooses an action."""
         # --- Phase 0: Handle Game Reset ---
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
             return GameAction.RESET
 
-        # --- Phase 1: Check the result of our LAST action ---
+        # --- Universal: Analyze the result of the previous action ---
         if self.grid_before_action is not None and self.last_action_tested is not None:
-            new_grid = np.array(latest_frame.frame) # Change this line
-            did_grid_change = not np.array_equal(self.grid_before_action, new_grid)
+            grid_after = np.array(latest_frame.frame)
+            grid_before = self.grid_before_action
+
+            # 1. Record if the action had an effect
+            did_grid_change = not np.array_equal(grid_before, grid_after)
             self.action_results[self.last_action_tested.name] = did_grid_change
-            self.grid_before_action = None
 
-        # --- Phase 2: Decide Mode (Explore or Solve) ---
+            # 2. If in Discovery Phase, analyze the type of change
+            if self.game_type == "unknown" and self.last_action_tested.is_simple() and did_grid_change:
+                # Convert to 2D to find changed pixels
+                before_2d = grid_before.sum(axis=2)
+                after_2d = grid_after.sum(axis=2)
+
+                # Find where pixels appeared and disappeared
+                disappeared_mask = (before_2d > 0) & (after_2d == 0)
+                appeared_mask = (before_2d == 0) & (after_2d > 0)
+                
+                # Heuristic for finding an avatar: a small, equal number of pixels moved.
+                if np.sum(disappeared_mask) == np.sum(appeared_mask) and 0 < np.sum(appeared_mask) < 25:
+                    self.game_type = "avatar"
+                    # We would add more logic here to store avatar color, shape, etc.
+                else:
+                    self.game_type = "static"
+
+            self.grid_before_action = None # Clear the stored grid
+
+        # --- Action Selection based on current phase ---
+
+        # Phase 1: Still exploring actions?
         if len(self.actions_to_test) > 0:
-            # --- EXPLORATION MODE ---
             action = self.actions_to_test.pop(0)
-
-            self.grid_before_action = np.array(latest_frame.frame) # And this line
+            self.grid_before_action = np.array(latest_frame.frame)
             self.last_action_tested = action
             action.reasoning = f"Exploring: Testing action '{action.name}'."
             return action
-        else:
-            # --- SOLVING MODE ---
-            # Exploration is complete! We can now use our knowledge.
-            grid_3d = np.array(latest_frame.frame)
 
-            # Convert the 3D color grid to a 2D grid.
-            # We do this by summing the color channels (the 3rd dimension, axis=2).
-            # Black pixels (0,0,0) will have a sum of 0. Colored pixels will have a sum > 0.
-            grid_2d = grid_3d.sum(axis=2)
-            
-            # Now find coordinates on our new 2D grid.
-            object_coordinates = np.argwhere(grid_2d > 0)
-
-            if len(object_coordinates) > 0:
-                y, x = object_coordinates[0]
-                action = GameAction.CLICK
-                action.set_data({"x": int(x), "y": int(y)})
-                action.reasoning = f"Solving: Exploration done. Found object at ({x}, {y})."
+        # Phase 2: Ready to discover game type?
+        elif self.game_type == "unknown":
+            effective_simple = [GameAction[name] for name, changed in self.action_results.items() if changed and GameAction[name].is_simple()]
+            if effective_simple:
+                # Trigger the discovery by taking the first simple, effective action
+                action = effective_simple[0]
+                self.grid_before_action = np.array(latest_frame.frame)
+                self.last_action_tested = action
+                action.reasoning = "Discovery: Triggering analysis with a simple move."
+                return action
             else:
-                # If there are no objects, let's try a default non-CLICK action.
-                # We'll use the first action we found during exploration that caused a change.
-                effective_actions = [name for name, changed in self.action_results.items() if changed]
-                if effective_actions:
-                    action = GameAction[effective_actions[0]]
-                    action.reasoning = f"Solving: No objects to click. Using first effective action: {action.name}"
-                else:
-                    # If no actions did anything, we are likely stuck.
-                    action = GameAction.RESET
-                    action.reasoning = "Solving: No objects and no effective actions found. Resetting."
+                # No simple actions had any effect, must be a static game
+                self.game_type = "static"
 
+        # Phase 3: Solving Mode (now informed by game type)
+        if self.game_type == "avatar":
+            action = GameAction.RESET # Placeholder for future avatar logic
+            action.reasoning = "Solving: Game type is AVATAR. (Logic not implemented yet)."
             return action
+        
+        elif self.game_type == "static":
+            # Fallback to our old find-and-click logic for static games
+            grid_2d = np.array(latest_frame.frame).sum(axis=2)
+            object_coords = np.argwhere(grid_2d > 0)
+            if len(object_coords) > 0:
+                y, x = object_coords[0]
+                complex_actions = [GameAction[name] for name, changed in self.action_results.items() if changed and GameAction[name].is_complex()]
+                if complex_actions:
+                    action = complex_actions[0]
+                    action.set_data({"x": int(x), "y": int(y)})
+                    action.reasoning = f"Solving: STATIC game. Trying complex action on object at ({x},{y})."
+                else:
+                    action = GameAction.RESET
+                    action.reasoning = "Solving: STATIC game but no effective complex actions found."
+            else:
+                action = GameAction.RESET
+                action.reasoning = "Solving: STATIC game but grid is empty."
+            return action
+            
+        return GameAction.RESET # Default fallback
