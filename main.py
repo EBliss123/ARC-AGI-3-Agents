@@ -186,8 +186,6 @@ def main() -> None:
     signal.signal(signal.SIGINT, partial(cleanup, swarm))  # handler for Ctrl+C
 
     agent_thread.join()
-
-
 if __name__ == "__main__":
     os.environ["TESTING"] = "False"
     main()
