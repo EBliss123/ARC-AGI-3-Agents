@@ -23,10 +23,12 @@ class MyCustomAgent(Agent):
         self.action_results = {}
         self.grid_before_action = None
         self.last_action_tested = None
+        self.score_before_action = None
 
         # Phase 2: Discovery
         self.game_type = "unknown"  # Can be 'unknown', 'avatar', or 'static'
         self.avatar_info = {}       # To store avatar color, size, etc. if found
+        self.action_effects = {}
 
     @property
     def name(self) -> str:
@@ -45,8 +47,8 @@ class MyCustomAgent(Agent):
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
-        """Determines game type, then chooses an action."""
-        # --- Phase 0: Handle Game Reset ---
+        """Determines game type, then chooses an action with a 'no reset' policy."""
+        # --- Phase 0: Handle Game Reset (This is the only mandatory reset) ---
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
             return GameAction.RESET
 
@@ -54,77 +56,94 @@ class MyCustomAgent(Agent):
         if self.grid_before_action is not None and self.last_action_tested is not None:
             grid_after = np.array(latest_frame.frame)
             grid_before = self.grid_before_action
+            score_after = latest_frame.score
+            score_before = self.score_before_action
 
-            # 1. Record if the action had an effect
             did_grid_change = not np.array_equal(grid_before, grid_after)
-            self.action_results[self.last_action_tested.name] = did_grid_change
+            did_score_change = score_after != score_before
+            did_anything_change = did_grid_change or did_score_change
+            
+            self.action_results[self.last_action_tested.name] = did_anything_change
 
-            # 2. If in Discovery Phase, analyze the type of change
             if self.game_type == "unknown" and self.last_action_tested.is_simple() and did_grid_change:
-                # Convert to 2D to find changed pixels
                 before_2d = grid_before.sum(axis=2)
                 after_2d = grid_after.sum(axis=2)
-
-                # Find where pixels appeared and disappeared
                 disappeared_mask = (before_2d > 0) & (after_2d == 0)
                 appeared_mask = (before_2d == 0) & (after_2d > 0)
                 
-                # Heuristic for finding an avatar: a small, equal number of pixels moved.
                 if np.sum(disappeared_mask) == np.sum(appeared_mask) and 0 < np.sum(appeared_mask) < 25:
                     self.game_type = "avatar"
-                    # We would add more logic here to store avatar color, shape, etc.
+                    appeared_coords = np.argwhere(appeared_mask)
+                    disappeared_coords = np.argwhere(disappeared_mask)
+                    pos_before = disappeared_coords.mean(axis=0)
+                    pos_after = appeared_coords.mean(axis=0)
+                    dy = round(pos_after[0] - pos_before[0])
+                    dx = round(pos_after[1] - pos_before[1])
+                    self.action_effects[self.last_action_tested.name] = {"dy": dy, "dx": dx}
+                    self.avatar_info['position'] = pos_after
+                    self.avatar_info['size'] = len(appeared_coords)
                 else:
                     self.game_type = "static"
 
-            self.grid_before_action = None # Clear the stored grid
+            self.grid_before_action = None
 
         # --- Action Selection based on current phase ---
 
-        # Phase 1: Still exploring actions?
         if len(self.actions_to_test) > 0:
             action = self.actions_to_test.pop(0)
             self.grid_before_action = np.array(latest_frame.frame)
+            self.score_before_action = latest_frame.score
             self.last_action_tested = action
             action.reasoning = f"Exploring: Testing action '{action.name}'."
             return action
 
-        # Phase 2: Ready to discover game type?
         elif self.game_type == "unknown":
             effective_simple = [GameAction[name] for name, changed in self.action_results.items() if changed and GameAction[name].is_simple()]
             if effective_simple:
-                # Trigger the discovery by taking the first simple, effective action
                 action = effective_simple[0]
                 self.grid_before_action = np.array(latest_frame.frame)
+                self.score_before_action = latest_frame.score
                 self.last_action_tested = action
                 action.reasoning = "Discovery: Triggering analysis with a simple move."
                 return action
             else:
-                # No simple actions had any effect, must be a static game
                 self.game_type = "static"
 
-        # Phase 3: Solving Mode (now informed by game type)
+        # --- Phase 3: Solving Mode ---
         if self.game_type == "avatar":
-            action = GameAction.RESET # Placeholder for future avatar logic
-            action.reasoning = "Solving: Game type is AVATAR. (Logic not implemented yet)."
+            known_move_actions = list(self.action_effects.keys())
+            if known_move_actions:
+                action_name = random.choice(known_move_actions)
+                action = GameAction[action_name]
+                action.reasoning = f"Solving (Avatar): Randomly exploring with action {action.name}."
+            else:
+                # This is now the ONLY reset condition during avatar solving
+                action = GameAction.RESET
+                action.reasoning = "Solving (Avatar): STUCK! No known move actions."
             return action
         
         elif self.game_type == "static":
-            # Fallback to our old find-and-click logic for static games
+            effective_simple = [GameAction[name] for name, changed in self.action_results.items() if changed and GameAction[name].is_simple()]
+            effective_complex = [GameAction[name] for name, changed in self.action_results.items() if changed and GameAction[name].is_complex()]
+
             grid_2d = np.array(latest_frame.frame).sum(axis=2)
             object_coords = np.argwhere(grid_2d > 0)
-            if len(object_coords) > 0:
+
+            if len(object_coords) > 0 and effective_complex:
+                # Primary strategy: use a complex action on an object
                 y, x = object_coords[0]
-                complex_actions = [GameAction[name] for name, changed in self.action_results.items() if changed and GameAction[name].is_complex()]
-                if complex_actions:
-                    action = complex_actions[0]
-                    action.set_data({"x": int(x), "y": int(y)})
-                    action.reasoning = f"Solving: STATIC game. Trying complex action on object at ({x},{y})."
-                else:
-                    action = GameAction.RESET
-                    action.reasoning = "Solving: STATIC game but no effective complex actions found."
+                action = effective_complex[0]
+                action.set_data({"x": int(x), "y": int(y)})
+                action.reasoning = f"Solving (Static): Trying complex action on object at ({x},{y})."
+            elif effective_simple:
+                # Fallback strategy: No object or no complex action, try a simple one
+                action = effective_simple[0]
+                action.reasoning = "Solving (Static): No object/complex action. Trying a simple effective action."
             else:
+                # Last resort: No effective actions of any kind were ever found.
                 action = GameAction.RESET
-                action.reasoning = "Solving: STATIC game but grid is empty."
+                action.reasoning = "Solving (Static): STUCK! No effective actions known."
             return action
             
-        return GameAction.RESET # Default fallback
+        # This fallback should now rarely, if ever, be reached.
+        return GameAction.RESET
