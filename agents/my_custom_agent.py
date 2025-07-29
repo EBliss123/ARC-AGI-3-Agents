@@ -18,13 +18,9 @@ class MyCustomAgent(Agent):
         random.seed(seed)
 
         # --- Exploration Memory ---
-        # A list of simple actions we want to test.
-        self.actions_to_test = [
-            GameAction.UP,
-            GameAction.DOWN,
-            GameAction.LEFT,
-            GameAction.RIGHT,
-        ]
+        # This now programmatically gets all actions except RESET.
+        self.actions_to_test = [a for a in GameAction if a is not GameAction.RESET]
+        
         # A dictionary to store the results of our tests.
         self.action_results = {}
         # A place to store the grid state before we take an action.
@@ -52,40 +48,36 @@ class MyCustomAgent(Agent):
         """Choose action via an exploration phase, then a solving phase."""
         # --- Phase 0: Handle Game Reset ---
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
-            # If the game is over, we'll want to reset the exploration state too,
-            # but we'll handle that logic later. For now, just reset the game.
             return GameAction.RESET
 
         # --- Phase 1: Check the result of our LAST action ---
-        # If we have a grid saved from the last turn, let's see if our action changed it.
         if self.grid_before_action is not None and self.last_action_tested is not None:
-            new_grid = np.array(latest_frame.grid)
-            # np.array_equal checks if two arrays are identical.
+            new_grid = np.array(latest_frame.frame) # Change this line
             did_grid_change = not np.array_equal(self.grid_before_action, new_grid)
-            # Store the result in our memory.
             self.action_results[self.last_action_tested.name] = did_grid_change
-            # Clear the stored grid so we don't re-check this next turn.
             self.grid_before_action = None
 
         # --- Phase 2: Decide Mode (Explore or Solve) ---
         if len(self.actions_to_test) > 0:
             # --- EXPLORATION MODE ---
-            # If we still have actions to test, let's test one.
-            action = self.actions_to_test.pop(0)  # Get the next action from the front of the list.
+            action = self.actions_to_test.pop(0)
 
-            # Store the current grid and the action we're about to take.
-            self.grid_before_action = np.array(latest_frame.grid)
+            self.grid_before_action = np.array(latest_frame.frame) # And this line
             self.last_action_tested = action
             action.reasoning = f"Exploring: Testing action '{action.name}'."
             return action
         else:
             # --- SOLVING MODE ---
             # Exploration is complete! We can now use our knowledge.
-            # For now, we'll just use our old "find and click" logic.
-            # In the future, we could use the self.action_results data here.
+            grid_3d = np.array(latest_frame.frame)
 
-            grid = np.array(latest_frame.grid)
-            object_coordinates = np.argwhere(grid > 0)
+            # Convert the 3D color grid to a 2D grid.
+            # We do this by summing the color channels (the 3rd dimension, axis=2).
+            # Black pixels (0,0,0) will have a sum of 0. Colored pixels will have a sum > 0.
+            grid_2d = grid_3d.sum(axis=2)
+            
+            # Now find coordinates on our new 2D grid.
+            object_coordinates = np.argwhere(grid_2d > 0)
 
             if len(object_coordinates) > 0:
                 y, x = object_coordinates[0]
@@ -93,7 +85,15 @@ class MyCustomAgent(Agent):
                 action.set_data({"x": int(x), "y": int(y)})
                 action.reasoning = f"Solving: Exploration done. Found object at ({x}, {y})."
             else:
-                action = GameAction.UP
-                action.reasoning = "Solving: Exploration done. Grid is empty, moving UP."
+                # If there are no objects, let's try a default non-CLICK action.
+                # We'll use the first action we found during exploration that caused a change.
+                effective_actions = [name for name, changed in self.action_results.items() if changed]
+                if effective_actions:
+                    action = GameAction[effective_actions[0]]
+                    action.reasoning = f"Solving: No objects to click. Using first effective action: {action.name}"
+                else:
+                    # If no actions did anything, we are likely stuck.
+                    action = GameAction.RESET
+                    action.reasoning = "Solving: No objects and no effective actions found. Resetting."
 
             return action
