@@ -20,7 +20,7 @@ import requests
 
 from agents import AVAILABLE_AGENTS, Swarm
 from agents.tracing import initialize as init_agentops
-from agents.my_first_agent import MyFirstAgent # Add this line to import your agent class
+from agents.my_custom_agent import MyCustomAgent 
 
 logger = logging.getLogger()
 
