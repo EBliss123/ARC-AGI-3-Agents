@@ -14,6 +14,7 @@ import threading
 from functools import partial
 from types import FrameType
 from typing import Optional
+from agents.my_custom_agent import MyCustomAgent
 
 import requests
 

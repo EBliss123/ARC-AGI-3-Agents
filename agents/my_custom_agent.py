@@ -1,5 +1,6 @@
 import random
 import time
+import numpy as np
 from typing import Any
 
 from .agent import Agent
