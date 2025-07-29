@@ -20,6 +20,7 @@ import requests
 
 from agents import AVAILABLE_AGENTS, Swarm
 from agents.tracing import initialize as init_agentops
+from agents.my_first_agent import MyFirstAgent # Add this line to import your agent class
 
 logger = logging.getLogger()
 
@@ -186,8 +187,6 @@ def main() -> None:
     signal.signal(signal.SIGINT, partial(cleanup, swarm))  # handler for Ctrl+C
 
     agent_thread.join()
-
-
 if __name__ == "__main__":
     os.environ["TESTING"] = "False"
     main()
