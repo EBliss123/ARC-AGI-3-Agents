@@ -27,8 +27,10 @@ class RuleEngine:
     pass
 
 class MyCustomAgent(Agent):
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
         """Initializes the agent and its components."""
+        super().__init__(*args, **kwargs)
+
         self.turn_count = 0
         self.phase = "discovery" # Phases: discovery, mapping, rule_testing, solving
 
@@ -42,7 +44,7 @@ class MyCustomAgent(Agent):
         self.initial_objects = None
         self.last_grid = None
 
-    def step(self, obs, reward, done, info):
+    def choose_action(self, obs, reward, done, info):
         """The main method called by the game on each turn."""
         grid = obs['grid']
 
@@ -59,3 +61,6 @@ class MyCustomAgent(Agent):
         # For now, we will take no action and just observe.
         # Action 0 is a no-op action.
         return 0
+    
+    def is_done(self, obs, done) -> bool:
+        return done
