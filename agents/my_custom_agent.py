@@ -28,7 +28,16 @@ class WorldMapper:
 
 class RuleEngine:
     """Formulates and tests hypotheses about game rules."""
-    pass
+    def __init__(self):
+        # The agent's memory of what happened after each action
+        # Format: { action_id: [list of changes seen on turn_1, list of changes seen on turn_2, ...]}
+        self.observations = defaultdict(list)
+
+    def record_observation(self, action_id, changes):
+        """Records the observed changes for a given action."""
+        if changes: # Only record if something actually happened
+            self.observations[action_id].append(changes)
+            logging.info(f"RuleEngine: Logged {len(changes)} changes for action {action_id}.")
 
 class MyCustomAgent(Agent):
     def __init__(self, *args, **kwargs):
@@ -37,20 +46,68 @@ class MyCustomAgent(Agent):
         
         # Long-term components
         self.observer = GameObserver()
-        # ... (other components can be added here later) ...
+        self.rule_engine = RuleEngine()
+        self.world_mapper = WorldMapper()
+        self.action_controller = ActionController()
 
         # Episode-specific state
         self.phase = "discovery"
         self.last_grid = np.array([])
         self.last_action_taken = 0
-        
+
         # State for discovery phases
         self.actions_to_test = [1, 2, 3, 4, 5]
         self.discovered_actions = []
         self.initial_objects = None
         self.click_targets = []
         self.click_discovery_prepared = False
+        self.player_identified = False
+        self.last_player_pos = None
 
+    def _analyze_grid_changes(self, grid, latest_frame):
+        """Compares the last grid with the current one to find all changes."""
+        changes = []
+
+        def get_center(coords):
+            if not coords: return None
+            sum_x = sum(x for y, x in coords)
+            sum_y = sum(y for y, x in coords)
+            count = len(coords)
+            return (int(round(sum_y / count)), int(round(sum_x / count)))
+
+        last_objects = self.observer.analyze_grid(self.last_grid)
+        current_objects = self.observer.analyze_grid(latest_frame.frame)
+
+        last_obj_set = {(color, frozenset(coords)) for color, coords in last_objects.items()}
+        current_obj_set = {(color, frozenset(coords)) for color, coords in current_objects.items()}
+
+        disappeared = list(last_obj_set - current_obj_set)
+        appeared = list(current_obj_set - last_obj_set)
+
+        # Use a copy of the lists to safely remove items as we pair them
+        unmatched_appeared = appeared[:]
+
+        # Look for objects that moved
+        for d_color, d_coords in disappeared:
+            best_match = None
+            for a_color, a_coords in unmatched_appeared:
+                d_center = get_center(d_coords)
+                a_center = get_center(a_coords)
+                distance = abs(d_center[0] - a_center[0]) + abs(d_center[1] - a_center[1])
+
+                if 0.5 < distance < 1.5:
+                    changes.append({'type': 'MOVE', 'from_color': d_color, 'to_color': a_color, 'distance': distance})
+                    best_match = (a_color, a_coords)
+                    break # Found a clear move, stop looking for this disappeared object
+
+            if best_match:
+                unmatched_appeared.remove(best_match)
+
+        # Any remaining items likely changed in place (color, shape, etc.)
+        for a_color, a_coords in unmatched_appeared:
+            changes.append({'type': 'OTHER_CHANGE', 'new_obj': (a_color, a_coords)})
+
+        return changes
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         """Decide if the agent is done playing."""
@@ -82,6 +139,11 @@ class MyCustomAgent(Agent):
             logging.info(f"--- Change detected! Action {self.last_action_taken} was effective. ---")
             if self.last_action_taken not in self.discovered_actions:
                 self.discovered_actions.append(self.last_action_taken)
+
+            # Analyze all changes and log them in the RuleEngine
+            changes = self._analyze_grid_changes(grid, latest_frame)
+            self.rule_engine.record_observation(self.last_action_taken, changes)
+
 
         action_num = 0
         action_data = None
