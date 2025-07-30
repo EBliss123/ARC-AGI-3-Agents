@@ -48,6 +48,7 @@ class MyCustomAgent(Agent):
         self.discovered_actions = []
         self.initial_objects = None
         self.click_targets = []
+        self.click_discovery_prepared = False
 
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
@@ -81,7 +82,7 @@ class MyCustomAgent(Agent):
             if self.last_action_taken not in self.discovered_actions:
                 self.discovered_actions.append(self.last_action_taken)
 
-        action_num = 0  # Default to no-op
+        action_num = 0
         action_data = None
         reasoning = f"Phase: {self.phase}"
 
@@ -95,22 +96,23 @@ class MyCustomAgent(Agent):
                 self.phase = "click_discovery"
 
         if self.phase == "click_discovery":
-            if not self.click_targets:
+            # Prepare the list of targets ONCE.
+            if not self.click_discovery_prepared:
                 targets = []
                 background_color = (0, 0, 0)
+                if self.initial_objects:
+                    for color, coords_list in self.initial_objects.items():
+                        if color == background_color:
+                            continue
+                        sum_x = sum(x for y, x in coords_list)
+                        sum_y = sum(y for y, x in coords_list)
+                        count = len(coords_list)
+                        center_x = int(round(sum_x / count))
+                        center_y = int(round(sum_y / count))
+                        targets.append((center_y, center_x))
 
-                for color, coords_list in self.initial_objects.items():
-                    if color == background_color:
-                        continue
-
-                    sum_x = sum(x for y, x in coords_list)
-                    sum_y = sum(y for y, x in coords_list)
-                    count = len(coords_list)
-                    center_x = int(round(sum_x / count))
-                    center_y = int(round(sum_y / count))
-                    targets.append((center_y, center_x))
-                
                 self.click_targets = targets
+                self.click_discovery_prepared = True # Set the flag so this doesn't run again
                 logging.info(f"--- Phase 2: Prepared {len(self.click_targets)} object centers to click. ---")
 
             if self.click_targets:
@@ -127,8 +129,8 @@ class MyCustomAgent(Agent):
         if action_data:
             action_obj.set_data(action_data)
         action_obj.reasoning = reasoning
-        
+
         self.last_grid = np.copy(grid)
         self.last_action_taken = action_num
-        
+
         return action_obj
