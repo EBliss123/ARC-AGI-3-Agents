@@ -61,59 +61,72 @@ class MyCustomAgent(Agent):
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """Choose which action the Agent should take."""
 
-        # --- On the very first turn, RESET to get the GUID and initial state ---
+        # --- Turn 0: RESET is always the first action ---
         if self.action_counter == 0:
             logging.info("--- Turn 0: Resetting the environment. ---")
-            self.last_grid = np.copy(latest_frame.frame)
-            # Analyze the initial grid to find all objects to click later
-            self.initial_objects = self.observer.analyze_grid(latest_frame.frame)
             self.last_action_taken = 0
             return GameAction.from_id(0)
 
+        # --- Post-Reset Logic (from Turn 1 onwards) ---
         grid = latest_frame.frame
 
-        # --- Analyze the result of the LAST turn ---
+        # On Turn 1, analyze the TRUE initial grid state (after RESET)
+        if self.action_counter == 1:
+            self.initial_objects = self.observer.analyze_grid(grid)
+            logging.info(f"--- Turn 1: Initial analysis complete. Found {len(self.initial_objects)} colored object groups. ---")
+
+        # Analyze the result of the LAST turn
         if not np.array_equal(grid, self.last_grid):
             logging.info(f"--- Change detected! Action {self.last_action_taken} was effective. ---")
-            # We can build more complex rule logic here later
             if self.last_action_taken not in self.discovered_actions:
                 self.discovered_actions.append(self.last_action_taken)
 
         action_num = 0  # Default to no-op
         action_data = None
+        reasoning = f"Phase: {self.phase}"
 
-        # --- Agent Logic: Decide action based on current phase ---
+        # --- Phase-Based Action Selection ---
         if self.phase == "discovery":
             if self.actions_to_test:
                 action_num = self.actions_to_test.pop(0)
-                logging.info(f"--- Phase 1: Testing simple action {action_num} ---")
+                reasoning += f". Testing simple action {action_num}."
             else:
                 logging.info("--- Phase 1 Complete. Moving to Click Discovery. ---")
                 self.phase = "click_discovery"
 
         if self.phase == "click_discovery":
-            # First time in this phase? Prepare the list of click targets.
             if not self.click_targets:
-                all_coords = []
+                targets = []
+                background_color = (0, 0, 0)
+
                 for color, coords_list in self.initial_objects.items():
-                    all_coords.extend(coords_list)
-                self.click_targets = all_coords
-                logging.info(f"--- Phase 2: Prepared {len(self.click_targets)} coordinates to click. ---")
+                    if color == background_color:
+                        continue
+
+                    sum_x = sum(x for y, x in coords_list)
+                    sum_y = sum(y for y, x in coords_list)
+                    count = len(coords_list)
+                    center_x = int(round(sum_x / count))
+                    center_y = int(round(sum_y / count))
+                    targets.append((center_y, center_x))
+                
+                self.click_targets = targets
+                logging.info(f"--- Phase 2: Prepared {len(self.click_targets)} object centers to click. ---")
 
             if self.click_targets:
                 action_num = 6 # Click Action
                 y, x = self.click_targets.pop(0)
                 action_data = {'x': x, 'y': y}
-                logging.info(f"--- Phase 2: Testing click at (x={x}, y={y}) ---")
+                reasoning += f". Testing click at (x={x}, y={y})."
             else:
-                logging.info("--- Phase 2 Complete. All objects clicked. Moving to Mapping. ---")
+                logging.info("--- Phase 2 Complete. Moving to Mapping. ---")
                 self.phase = "mapping"
 
         # --- Create and return the final action object ---
         action_obj = GameAction.from_id(action_num)
         if action_data:
             action_obj.set_data(action_data)
-        action_obj.reasoning = f"Phase: {self.phase}. Action: {action_num}."
+        action_obj.reasoning = reasoning
         
         self.last_grid = np.copy(grid)
         self.last_action_taken = action_num
