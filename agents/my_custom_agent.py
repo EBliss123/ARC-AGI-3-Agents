@@ -61,10 +61,20 @@ class MyCustomAgent(Agent):
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """Choose which action the Agent should take."""
+
+        # On the very first turn, the agent MUST reset the environment.
+        # The RESET action is ID 0. This will provide the guid for future actions.
+        if self.action_counter == 0:
+            logging.info("--- Turn 0: Resetting the environment to get GUID. ---")
+            self.last_grid = np.copy(latest_frame.frame)
+            self.last_action_taken = 0
+            return GameAction.from_id(0)
+
+        # On all subsequent turns, proceed with the agent's logic.
         grid = latest_frame.frame
 
         # --- Analyze the result of the LAST turn ---
-        if self.action_counter > 0 and not np.array_equal(grid, self.last_grid):
+        if not np.array_equal(grid, self.last_grid):
             logging.info(f"--- Change detected! Action {self.last_action_taken} is effective. ---")
             if self.last_action_taken not in self.discovered_actions:
                 self.discovered_actions.append(self.last_action_taken)
