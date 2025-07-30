@@ -4,7 +4,7 @@ from collections import defaultdict
 
 # Imports from the game framework's files
 from .agent import Agent
-from .structs import FrameData, GameAction, GameState
+from .structs import FrameData, GameAction, GameState, ComplexAction
 
 class GameObserver:
     """Analyzes the game grid to identify objects and changes."""
@@ -36,64 +36,85 @@ class MyCustomAgent(Agent):
         
         # Long-term components
         self.observer = GameObserver()
-        self.controller = ActionController()
-        self.mapper = WorldMapper()
-        self.engine = RuleEngine()
+        # ... (other components can be added here later) ...
 
         # Episode-specific state
-        self.turn_count = 0
         self.phase = "discovery"
         self.last_grid = np.array([])
+        self.last_action_taken = 0
+        
+        # State for discovery phases
         self.actions_to_test = [1, 2, 3, 4, 5]
         self.discovered_actions = []
-        self.last_action_taken = 0
+        self.initial_objects = None
+        self.click_targets = []
+
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         """Decide if the agent is done playing."""
-        # The framework does a pre-check. We must return False to start the game.
         if self.action_counter == 0:
             return False
-
+        
         current_state = latest_frame.state
-
-        # The game is finished if the state is WIN or GAME_OVER.
         return current_state == GameState.WIN or current_state == GameState.GAME_OVER
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """Choose which action the Agent should take."""
 
-        # On the very first turn, the agent MUST reset the environment.
-        # The RESET action is ID 0. This will provide the guid for future actions.
+        # --- On the very first turn, RESET to get the GUID and initial state ---
         if self.action_counter == 0:
-            logging.info("--- Turn 0: Resetting the environment to get GUID. ---")
+            logging.info("--- Turn 0: Resetting the environment. ---")
             self.last_grid = np.copy(latest_frame.frame)
+            # Analyze the initial grid to find all objects to click later
+            self.initial_objects = self.observer.analyze_grid(latest_frame.frame)
             self.last_action_taken = 0
             return GameAction.from_id(0)
 
-        # On all subsequent turns, proceed with the agent's logic.
         grid = latest_frame.frame
 
         # --- Analyze the result of the LAST turn ---
         if not np.array_equal(grid, self.last_grid):
-            logging.info(f"--- Change detected! Action {self.last_action_taken} is effective. ---")
+            logging.info(f"--- Change detected! Action {self.last_action_taken} was effective. ---")
+            # We can build more complex rule logic here later
             if self.last_action_taken not in self.discovered_actions:
                 self.discovered_actions.append(self.last_action_taken)
 
-        # --- Decide the CURRENT action's number ---
         action_num = 0  # Default to no-op
+        action_data = None
+
+        # --- Agent Logic: Decide action based on current phase ---
         if self.phase == "discovery":
             if self.actions_to_test:
                 action_num = self.actions_to_test.pop(0)
-                logging.info(f"--- Turn {self.action_counter}: Testing action {action_num} ---")
+                logging.info(f"--- Phase 1: Testing simple action {action_num} ---")
             else:
-                logging.info(f"--- Simple action discovery complete. Discovered actions: {self.discovered_actions} ---")
+                logging.info("--- Phase 1 Complete. Moving to Click Discovery. ---")
+                self.phase = "click_discovery"
+
+        if self.phase == "click_discovery":
+            # First time in this phase? Prepare the list of click targets.
+            if not self.click_targets:
+                all_coords = []
+                for color, coords_list in self.initial_objects.items():
+                    all_coords.extend(coords_list)
+                self.click_targets = all_coords
+                logging.info(f"--- Phase 2: Prepared {len(self.click_targets)} coordinates to click. ---")
+
+            if self.click_targets:
+                action_num = 6 # Click Action
+                y, x = self.click_targets.pop(0)
+                action_data = {'x': x, 'y': y}
+                logging.info(f"--- Phase 2: Testing click at (x={x}, y={y}) ---")
+            else:
+                logging.info("--- Phase 2 Complete. All objects clicked. Moving to Mapping. ---")
                 self.phase = "mapping"
 
-        # --- Create the action object using the official GameAction class ---
+        # --- Create and return the final action object ---
         action_obj = GameAction.from_id(action_num)
-        action_obj.reasoning = f"Phase: {self.phase}. Taking action {action_num}."
+        if action_data:
+            action_obj.set_data(action_data)
+        action_obj.reasoning = f"Phase: {self.phase}. Action: {action_num}."
         
-        # --- Update state for the next turn ---
         self.last_grid = np.copy(grid)
         self.last_action_taken = action_num
         
