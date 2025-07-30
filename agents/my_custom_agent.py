@@ -1,5 +1,6 @@
 import numpy as np
 import logging
+import random
 from collections import defaultdict
 
 # Imports from the game framework's files
@@ -95,8 +96,7 @@ class MyCustomAgent(Agent):
                 logging.info("--- Phase 1 Complete. Moving to Click Discovery. ---")
                 self.phase = "click_discovery"
 
-        if self.phase == "click_discovery":
-            # Prepare the list of targets ONCE.
+        elif self.phase == "click_discovery":
             if not self.click_discovery_prepared:
                 targets = []
                 background_color = (0, 0, 0)
@@ -112,17 +112,29 @@ class MyCustomAgent(Agent):
                         targets.append((center_y, center_x))
 
                 self.click_targets = targets
-                self.click_discovery_prepared = True # Set the flag so this doesn't run again
+                self.click_discovery_prepared = True
                 logging.info(f"--- Phase 2: Prepared {len(self.click_targets)} object centers to click. ---")
 
             if self.click_targets:
-                action_num = 6 # Click Action
+                action_num = 6
                 y, x = self.click_targets.pop(0)
                 action_data = {'x': x, 'y': y}
                 reasoning += f". Testing click at (x={x}, y={y})."
             else:
                 logging.info("--- Phase 2 Complete. Moving to Mapping. ---")
                 self.phase = "mapping"
+
+        elif self.phase == "mapping":
+            reasoning += ". Exploring the map."
+            # Filter out RESET (action 0) and CLICK (action 6) from the list of actions to use for exploring.
+            exploring_actions = [a for a in self.discovered_actions if a not in [0, 6]]
+
+            if exploring_actions:
+                action_num = random.choice(exploring_actions)
+            else:
+                logging.warning("No effective movement actions found to explore with.")
+                action_num = 0
+
 
         # --- Create and return the final action object ---
         action_obj = GameAction.from_id(action_num)
