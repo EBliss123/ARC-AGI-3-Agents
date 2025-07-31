@@ -1,5 +1,6 @@
 # ARC-AGI-3 Main Script
 import random
+import copy
 from .agent import Agent
 from .structs import FrameData, GameAction, GameState
 
@@ -28,6 +29,8 @@ class AGI3(Agent):
         self.previous_frame = None
         self.changed_pixels = []
         self.static_pixels = []
+        self.debug_counter = 0
+
 
         print(f"Custom AGI initialized for game: {self.game_id}")
 
@@ -35,17 +38,6 @@ class AGI3(Agent):
         """Decide if the agent is done playing."""
         # The agent stops this attempt if it wins the level.
         return latest_frame.state is GameState.WIN
-    
-    def print_grid(self, grid, title=""):
-        """Helper function to print a grid for debugging."""
-        print(f"--- {title} ---")
-        if not grid or not grid[0]:
-            print(" (empty)")
-            return
-        for row in grid:
-            # Replace 0 with '.' for clarity, convert others to string
-            row_str = [str(p) if p != 0 else '.' for p in row]
-            print(" ".join(row_str))
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
@@ -55,12 +47,6 @@ class AGI3(Agent):
         
         # 1. Perception: Create a structured model from the raw grid data.
         self.perceive(latest_frame)
-
-        # --- ADD THESE LINES FOR DEBUGGING ---
-        self.print_grid(self.static_pixels, "Static Pixels")
-        self.print_grid(self.changed_pixels, "Changed Pixels")
-        print("="*30) # Add a separator for readability
-# ------------------------------------
 
         # 2. Object Segmentation: Identify all objects on the grid.
         self.segment_objects(latest_frame)
@@ -83,44 +69,53 @@ class AGI3(Agent):
         Compares the current frame with the previous one to detect changes."""
         current_frame = latest_frame.frame
 
-        # The frame can be empty on the initial NOT_PLAYED state. Do nothing.
         if not current_frame:
             return
 
-        # On the first real frame, we can't do a comparison yet, so just store it.
         if self.previous_frame is None:
-            self.previous_frame = tuple(list(row) for row in current_frame)
+            self.previous_frame = copy.deepcopy(current_frame)
             return
 
-        # Get dimensions of both frames to check for changes in grid size.
         current_height = len(current_frame)
         current_width = len(current_frame[0])
         prev_height = len(self.previous_frame)
         prev_width = len(self.previous_frame[0])
 
-        # If dimensions have changed, we can't do a direct comparison.
-        # We'll assume everything changed and reset for the next frame.
         if current_height != prev_height or current_width != prev_width:
-            self.changed_pixels = [list(row) for row in current_frame]
-            self.static_pixels = []  # Or an empty grid of the new size
-            self.previous_frame = tuple(list(row) for row in current_frame)
+            print("--- Frame dimensions changed! ---")
+            self.previous_frame = copy.deepcopy(current_frame)
             return
 
-        # If we get here, dimensions are the same. Proceed with comparison.
-        self.changed_pixels = [[0 for _ in range(current_width)] for _ in range(current_height)]
-        self.static_pixels = [[0 for _ in range(current_width)] for _ in range(current_height)]
-
+        # --- Log Changes ---
+        print("--- Pixel Changes This Step ---")
+        changes_found = False
         for r in range(current_height):
             for c in range(current_width):
-                if self.previous_frame[r][c] == current_frame[r][c]:
-                    # If the pixel is the same, record it in static_pixels.
-                    self.static_pixels[r][c] = current_frame[r][c]
-                else:
-                    # If the pixel changed, record its new value in changed_pixels.
-                    self.changed_pixels[r][c] = current_frame[r][c]
+                old_pixel_data = self.previous_frame[r][c]
+                new_pixel_data = current_frame[r][c]
+                
+                # Check if the lists at this coordinate are different.
+                if old_pixel_data != new_pixel_data:
+                    changes_found = True
+                    print(f"  - Changes found at coordinate ({r},{c}):")
+                    
+                    # Now, log every single difference inside the lists.
+                    if len(old_pixel_data) == len(new_pixel_data):
+                        for i in range(len(old_pixel_data)):
+                            if old_pixel_data[i] != new_pixel_data[i]:
+                                old_val = old_pixel_data[i]
+                                new_val = new_pixel_data[i]
+                                print(f"    - Index {i}: Changed from {old_val} to {new_val}")
+                    else:
+                        print(f"    - Data lists changed length.")
 
-        # Save the current frame for the next frame's comparison.
-        self.previous_frame = tuple(list(row) for row in current_frame)
+        if not changes_found:
+            print("  - No pixel changes detected.")
+        
+        print("="*30)
+
+        # Save a deep copy for the next comparison.
+        self.previous_frame = copy.deepcopy(current_frame)
 
     def segment_objects(self, latest_frame: FrameData):
         """Scans the grid to find and define all objects."""
