@@ -18,6 +18,22 @@ class VC33_Game:
     """Environment for the VC33 game."""
     pass
 
+class GameObject:
+    """A blueprint for storing all attributes of a found object."""
+    def __init__(self, obj_id, color, pixels):
+        self.id = obj_id
+        self.color = color
+        self.pixels = set(pixels)
+        self.size = len(self.pixels)
+        
+        # Find the top-left corner to define position
+        min_x = min(p[0] for p in self.pixels)
+        min_y = min(p[1] for p in self.pixels)
+        self.position = (min_x, min_y)
+
+    def __repr__(self):
+        return f"GameObject(id={self.id}, color={self.color}, size={self.size}, pos={self.position})"
+
 # --- Core AGI Logic ---
 
 class AGI3(Agent):
@@ -26,6 +42,7 @@ class AGI3(Agent):
         super().__init__(*args, **kwargs)
         # Custom agent initializations can go here.
         print(f"Custom AGI initialized for game: {self.game_id}")
+        self.objects = []
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         """Decide if the agent is done playing."""
@@ -64,8 +81,58 @@ class AGI3(Agent):
 
     def segment_objects(self, latest_frame: FrameData):
         """Scans the grid to find and define all objects."""
-        # Identify objects from the grid here.
-        pass
+        grid = latest_frame.frame  # Use .frame instead of .grid
+
+        # Add a check to handle cases where the frame is empty
+        if not grid:
+            self.objects = []
+            return
+
+        height = len(grid)
+        width = len(grid[0])
+        self.objects = []
+        visited = set()
+        object_id_counter = 0
+
+        for y in range(height):
+            for x in range(width):
+                if (x, y) in visited or grid[y][x] == 0:
+                    continue
+
+                object_pixels = self._flood_fill_search(grid, x, y, visited)
+
+                if object_pixels:
+                    color = grid[y][x]
+                    new_object = GameObject(object_id_counter, color, object_pixels)
+                    self.objects.append(new_object)
+                    object_id_counter += 1
+
+        if self.objects:
+            print(f"Found {len(self.objects)} objects: {self.objects}")
+
+    def _flood_fill_search(self, grid, start_x, start_y, visited):
+        """Performs a search to find all connected pixels of the same color."""
+        pixels = []
+        target_color = grid[start_y][start_x]
+        q = [(start_x, start_y)] # A queue for our search
+        visited.add((start_x, start_y))
+
+        while q:
+            x, y = q.pop(0)
+            pixels.append((x, y))
+
+            # Check all four neighbors (up, down, left, right)
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = x + dx, y + dy
+
+                # Ensure the neighbor is within the grid and part of the same object
+                if 0 <= nx < len(grid[0]) and 0 <= ny < len(grid) and \
+                (nx, ny) not in visited and grid[ny][nx] == target_color:
+
+                    visited.add((nx, ny))
+                    q.append((nx, ny))
+
+        return pixels
 
     def discover_actions(self):
         """Tries actions and logs the changes they cause."""
