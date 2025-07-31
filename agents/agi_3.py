@@ -35,6 +35,17 @@ class AGI3(Agent):
         """Decide if the agent is done playing."""
         # The agent stops this attempt if it wins the level.
         return latest_frame.state is GameState.WIN
+    
+    def print_grid(self, grid, title=""):
+        """Helper function to print a grid for debugging."""
+        print(f"--- {title} ---")
+        if not grid or not grid[0]:
+            print(" (empty)")
+            return
+        for row in grid:
+            # Replace 0 with '.' for clarity, convert others to string
+            row_str = [str(p) if p != 0 else '.' for p in row]
+            print(" ".join(row_str))
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
@@ -44,6 +55,12 @@ class AGI3(Agent):
         
         # 1. Perception: Create a structured model from the raw grid data.
         self.perceive(latest_frame)
+
+        # --- ADD THESE LINES FOR DEBUGGING ---
+        self.print_grid(self.static_pixels, "Static Pixels")
+        self.print_grid(self.changed_pixels, "Changed Pixels")
+        print("="*30) # Add a separator for readability
+# ------------------------------------
 
         # 2. Object Segmentation: Identify all objects on the grid.
         self.segment_objects(latest_frame)
