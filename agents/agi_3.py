@@ -18,31 +18,24 @@ class VC33_Game:
     """Environment for the VC33 game."""
     pass
 
-class GameObject:
-    """A blueprint for storing all attributes of a found object."""
-    def __init__(self, obj_id, color, pixels):
-        self.id = obj_id
-        self.color = color
-        self.pixels = set(pixels)
-        self.size = len(self.pixels)
-        
-        # Find the top-left corner to define position
-        min_x = min(p[0] for p in self.pixels)
-        min_y = min(p[1] for p in self.pixels)
-        self.position = (min_x, min_y)
-
-    def __repr__(self):
-        return f"GameObject(id={self.id}, color={self.color}, size={self.size}, pos={self.position})"
-
 # --- Core AGI Logic ---
 
 class AGI3(Agent):
     """The general agent that learns to play the games."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Custom agent initializations can go here.
         print(f"Custom AGI initialized for game: {self.game_id}")
-        self.objects = []
+        
+        # --- New variables for discovery and learning ---
+        self.learned_rules = {}
+        self.last_action_taken = None
+        self.previous_grid = []
+        
+        # A list of simple actions to try during the discovery phase
+        self.actions_to_try = [
+            GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4, GameAction.ACTION5
+        ]
+        self.simple_actions_produced_change = False
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         """Decide if the agent is done playing."""
@@ -50,27 +43,60 @@ class AGI3(Agent):
         return latest_frame.state is GameState.WIN
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
-        """This is the main decision-making method for the AGI."""
-        
-        # --- AGI LOGIC PIPELINE ---
-        # The logic from your plan will be called from here.
-        
-        # 1. Perception: Create a structured model from the raw grid data.
-        self.perceive(latest_frame)
-
-        # 2. Object Segmentation: Identify all objects on the grid.
-        self.segment_objects(latest_frame)
-
-        # 3. Action Discovery & Rule Synthesis will be used here.
-        # 4. Curiosity-Driven Exploration will guide the action choice.
-
-        # For now, we will return a random action as a placeholder
-        # so the agent is runnable.
-        if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
+        current_grid = latest_frame.frame
+        if not current_grid:
             return GameAction.RESET
-        else:
+
+        # 1. Detect changes and see if the last action worked
+        if self.detect_pixel_changes(current_grid):
+            self.simple_actions_produced_change = True
+
+        # 2. --- Decision Making ---
+        action = GameAction.RESET
+        if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
+            action = GameAction.RESET
+        elif self.actions_to_try: # Still have simple actions to test
+            action = self.actions_to_try.pop(0)
+            print(f"Discovery Mode: Trying simple action {action.name}")
+        elif not self.simple_actions_produced_change: # Simple actions failed, try ACTION6
+            print("Discovery Mode: Simple actions had no effect. Trying ACTION6.")
+            action = GameAction.ACTION6
+            # We need to give it random coordinates to click
+            action.set_data({"x": random.randint(0, 63), "y": random.randint(0, 63)})
+            # We'll set the flag to True to prevent trying ACTION6 again
+            self.simple_actions_produced_change = True 
+        else: # Discovery is complete
+            print("Discovery complete. Acting randomly.")
             action = random.choice([a for a in GameAction if a is not GameAction.RESET])
-            return action
+
+        # 3. Remember state for next turn
+        self.previous_grid = current_grid
+        self.last_action_taken = action
+        return action
+        
+    def detect_pixel_changes(self, current_grid):
+        if not self.previous_grid or self.last_action_taken is None:
+            return False
+
+        if len(self.previous_grid) != len(current_grid):
+            return False
+
+        changes = []
+        # ... (the for loops for checking pixels remain the same) ...
+        for y in range(len(current_grid)):
+            for x in range(len(current_grid[0])):
+                if self.previous_grid[y][x] != current_grid[y][x]:
+                    # ... (the change detection logic is the same) ...
+                    changes.append(f"Pixel at ({x},{y}) changed")
+
+        if changes:
+            print(f"--- [{self.game_id}] Change Detected After {self.last_action_taken.name} ---")
+            # We'll just print a summary for readability
+            print(f"  - {len(changes)} pixels changed.")
+            print("-------------------------------------------------")
+            return True # Return True because changes were found
+
+        return False # Return False if no changes were found
 
     # --- Methods from your original plan ---
 
@@ -78,61 +104,6 @@ class AGI3(Agent):
         """Receives raw game data and creates a structured model."""
         # Process latest_frame.grid here.
         pass
-
-    def segment_objects(self, latest_frame: FrameData):
-        """Scans the grid to find and define all objects."""
-        grid = latest_frame.frame  # Use .frame instead of .grid
-
-        # Add a check to handle cases where the frame is empty
-        if not grid:
-            self.objects = []
-            return
-
-        height = len(grid)
-        width = len(grid[0])
-        self.objects = []
-        visited = set()
-        object_id_counter = 0
-
-        for y in range(height):
-            for x in range(width):
-                if (x, y) in visited or grid[y][x] == 0:
-                    continue
-
-                object_pixels = self._flood_fill_search(grid, x, y, visited)
-
-                if object_pixels:
-                    color = grid[y][x]
-                    new_object = GameObject(object_id_counter, color, object_pixels)
-                    self.objects.append(new_object)
-                    object_id_counter += 1
-
-        if self.objects:
-            print(f"Found {len(self.objects)} objects: {self.objects}")
-
-    def _flood_fill_search(self, grid, start_x, start_y, visited):
-        """Performs a search to find all connected pixels of the same color."""
-        pixels = []
-        target_color = grid[start_y][start_x]
-        q = [(start_x, start_y)] # A queue for our search
-        visited.add((start_x, start_y))
-
-        while q:
-            x, y = q.pop(0)
-            pixels.append((x, y))
-
-            # Check all four neighbors (up, down, left, right)
-            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                nx, ny = x + dx, y + dy
-
-                # Ensure the neighbor is within the grid and part of the same object
-                if 0 <= nx < len(grid[0]) and 0 <= ny < len(grid) and \
-                (nx, ny) not in visited and grid[ny][nx] == target_color:
-
-                    visited.add((nx, ny))
-                    q.append((nx, ny))
-
-        return pixels
 
     def discover_actions(self):
         """Tries actions and logs the changes they cause."""
