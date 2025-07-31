@@ -14,11 +14,13 @@ import threading
 from functools import partial
 from types import FrameType
 from typing import Optional
+from agents.my_custom_agent import MyCustomAgent
 
 import requests
 
 from agents import AVAILABLE_AGENTS, Swarm
 from agents.tracing import initialize as init_agentops
+from agents.my_custom_agent import MyCustomAgent 
 
 logger = logging.getLogger()
 
@@ -194,8 +196,6 @@ def main() -> None:
     except Exception as e:
         logger.error(f"Unexpected error in main thread: {e}")
         cleanup(swarm, None, None)
-
-
 if __name__ == "__main__":
     os.environ["TESTING"] = "False"
     main()
