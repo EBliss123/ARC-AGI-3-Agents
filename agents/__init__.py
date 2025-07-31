@@ -11,6 +11,7 @@ from .templates.random_agent import Random
 from .templates.reasoning_agent import ReasoningAgent
 from .templates.smolagents import SmolCodingAgent, SmolVisionAgent
 from .my_custom_agent import MyCustomAgent
+from .agi_3 import AGI3
 
 load_dotenv()
 
