@@ -24,18 +24,12 @@ class AGI3(Agent):
     """The general agent that learns to play the games."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Custom agent initializations can go here.
+        self.previous_frame = None
+        self.changed_pixels = []
+        self.static_pixels = []
+
         print(f"Custom AGI initialized for game: {self.game_id}")
-        
-        # --- New variables for discovery and learning ---
-        self.learned_rules = {}
-        self.last_action_taken = None
-        self.previous_grid = []
-        
-        # A list of simple actions to try during the discovery phase
-        self.actions_to_try = [
-            GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4, GameAction.ACTION5
-        ]
-        self.simple_actions_produced_change = False
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         """Decide if the agent is done playing."""
@@ -43,66 +37,77 @@ class AGI3(Agent):
         return latest_frame.state is GameState.WIN
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
-        current_grid = latest_frame.frame
-        if not current_grid:
-            return GameAction.RESET
-
-        # 1. Detect changes and see if the last action worked
-        if self.detect_pixel_changes(current_grid):
-            self.simple_actions_produced_change = True
-
-        # 2. --- Decision Making ---
-        action = GameAction.RESET
-        if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
-            action = GameAction.RESET
-        elif self.actions_to_try: # Still have simple actions to test
-            action = self.actions_to_try.pop(0)
-            print(f"Discovery Mode: Trying simple action {action.name}")
-        elif not self.simple_actions_produced_change: # Simple actions failed, try ACTION6
-            print("Discovery Mode: Simple actions had no effect. Trying ACTION6.")
-            action = GameAction.ACTION6
-            # We need to give it random coordinates to click
-            action.set_data({"x": random.randint(0, 63), "y": random.randint(0, 63)})
-            # We'll set the flag to True to prevent trying ACTION6 again
-            self.simple_actions_produced_change = True 
-        else: # Discovery is complete
-            print("Discovery complete. Acting randomly.")
-            action = random.choice([a for a in GameAction if a is not GameAction.RESET])
-
-        # 3. Remember state for next turn
-        self.previous_grid = current_grid
-        self.last_action_taken = action
-        return action
+        """This is the main decision-making method for the AGI."""
         
-    def detect_pixel_changes(self, current_grid):
-        if not self.previous_grid or self.last_action_taken is None:
-            return False
+        # --- AGI LOGIC PIPELINE ---
+        # The logic from your plan will be called from here.
+        
+        # 1. Perception: Create a structured model from the raw grid data.
+        self.perceive(latest_frame)
 
-        if len(self.previous_grid) != len(current_grid):
-            return False
+        # 2. Object Segmentation: Identify all objects on the grid.
+        self.segment_objects(latest_frame)
 
-        changes = []
-        # ... (the for loops for checking pixels remain the same) ...
-        for y in range(len(current_grid)):
-            for x in range(len(current_grid[0])):
-                if self.previous_grid[y][x] != current_grid[y][x]:
-                    # ... (the change detection logic is the same) ...
-                    changes.append(f"Pixel at ({x},{y}) changed")
+        # 3. Action Discovery & Rule Synthesis will be used here.
+        # 4. Curiosity-Driven Exploration will guide the action choice.
 
-        if changes:
-            print(f"--- [{self.game_id}] Change Detected After {self.last_action_taken.name} ---")
-            # We'll just print a summary for readability
-            print(f"  - {len(changes)} pixels changed.")
-            print("-------------------------------------------------")
-            return True # Return True because changes were found
-
-        return False # Return False if no changes were found
+        # For now, we will return a random action as a placeholder
+        # so the agent is runnable.
+        if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
+            return GameAction.RESET
+        else:
+            action = random.choice([a for a in GameAction if a is not GameAction.RESET])
+            return action
 
     # --- Methods from your original plan ---
 
     def perceive(self, latest_frame: FrameData):
-        """Receives raw game data and creates a structured model."""
-        # Process latest_frame.grid here.
+        """Receives raw game data and creates a structured model.
+        Compares the current frame with the previous one to detect changes."""
+        current_frame = latest_frame.frame
+
+        # The frame can be empty on the initial NOT_PLAYED state. Do nothing.
+        if not current_frame:
+            return
+
+        # On the first real frame, we can't do a comparison yet, so just store it.
+        if self.previous_frame is None:
+            self.previous_frame = tuple(list(row) for row in current_frame)
+            return
+
+        # Get dimensions of both frames to check for changes in grid size.
+        current_height = len(current_frame)
+        current_width = len(current_frame[0])
+        prev_height = len(self.previous_frame)
+        prev_width = len(self.previous_frame[0])
+
+        # If dimensions have changed, we can't do a direct comparison.
+        # We'll assume everything changed and reset for the next frame.
+        if current_height != prev_height or current_width != prev_width:
+            self.changed_pixels = [list(row) for row in current_frame]
+            self.static_pixels = []  # Or an empty grid of the new size
+            self.previous_frame = tuple(list(row) for row in current_frame)
+            return
+
+        # If we get here, dimensions are the same. Proceed with comparison.
+        self.changed_pixels = [[0 for _ in range(current_width)] for _ in range(current_height)]
+        self.static_pixels = [[0 for _ in range(current_width)] for _ in range(current_height)]
+
+        for r in range(current_height):
+            for c in range(current_width):
+                if self.previous_frame[r][c] == current_frame[r][c]:
+                    # If the pixel is the same, record it in static_pixels.
+                    self.static_pixels[r][c] = current_frame[r][c]
+                else:
+                    # If the pixel changed, record its new value in changed_pixels.
+                    self.changed_pixels[r][c] = current_frame[r][c]
+
+        # Save the current frame for the next frame's comparison.
+        self.previous_frame = tuple(list(row) for row in current_frame)
+
+    def segment_objects(self, latest_frame: FrameData):
+        """Scans the grid to find and define all objects."""
+        # Identify objects from the grid here.
         pass
 
     def discover_actions(self):
