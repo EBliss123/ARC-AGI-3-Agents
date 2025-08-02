@@ -36,15 +36,46 @@ class AGI3(Agent):
         self.changed_pixels = []
         self.static_pixels = []
         self.debug_counter = 0
+
+        # --- State Management ---
         self.agent_state = AgentState.DISCOVERY
         self.discovery_runs = 0
         self.last_action = None
         self.discovered_actions = set()
-        self.all_actions = [a for a in GameAction if a is not GameAction.RESET]
-        self.actions_to_try = self.all_actions.copy()
 
+        # --- Generic Action Groups ---
+        # Get all possible actions, excluding RESET, to create generic groups.
+        all_discoverable_actions = [a for a in GameAction if a is not GameAction.RESET]
+        
+        # Group 1-5 are primary; 6 is secondary.
+        self.primary_actions = all_discoverable_actions[:5]
+        
+        # Safely get the 6th action if it exists.
+        if len(all_discoverable_actions) > 5:
+            self.secondary_actions = [all_discoverable_actions[5]]
+        else:
+            self.secondary_actions = []
+
+        # --- Discovery Phase Tracking ---
+        self.actions_to_try = self.primary_actions.copy()
+        self.discovery_sub_phase = 'PRIMARY' # Can be 'PRIMARY' or 'SECONDARY'
+        self.discovered_in_current_run = False
 
         print(f"Custom AGI initialized for game: {self.game_id}")
+
+    def _end_discovery_run(self):
+        """Helper method to finalize a discovery run and set up for the next."""
+        self.discovery_runs += 1
+        print(f"--- Discovery Run {self.discovery_runs} Complete ---")
+
+        if self.discovery_runs >= 3:
+            print("--- All discovery runs complete. Switching to RANDOM_ACTION state. ---")
+            self.agent_state = AgentState.RANDOM_ACTION
+        else:
+            # Reset for the next full run, starting with primary actions
+            self.actions_to_try = self.primary_actions.copy()
+            self.discovery_sub_phase = 'PRIMARY'
+            self.discovered_in_current_run = False
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         """Decide if the agent is done playing."""
@@ -53,58 +84,54 @@ class AGI3(Agent):
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
-        
-        # --- AGI LOGIC PIPELINE ---
-        
-        # 1. Perception: Check for changes from the last action. 
         changes_found, change_descriptions = self.perceive(latest_frame)
 
-        # If the last action caused a change, add it to our set of useful actions.
         if changes_found and self.last_action:
             print(f"Action {self.last_action.name} caused changes. Storing it.")
             for description in change_descriptions:
                 print(description)
             self.discovered_actions.add(self.last_action)
+            self.discovered_in_current_run = True
 
-        # Handle game state resets.
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
             print("--- New Attempt: Resetting Agent State to DISCOVERY ---")
             self.agent_state = AgentState.DISCOVERY
             self.discovery_runs = 0
-            self.actions_to_try = self.all_actions.copy()
+            self.actions_to_try = self.primary_actions.copy()
             self.last_action = None
+            self.discovery_sub_phase = 'PRIMARY'
+            self.discovered_in_current_run = False
             return GameAction.RESET
 
         # --- State-Based Action Selection ---
-        
-        # 2. Action Discovery: Systematically try all actions for 3 runs. 
         if self.agent_state == AgentState.DISCOVERY:
             if not self.actions_to_try:
-                self.discovery_runs += 1
-                print(f"--- Discovery Run {self.discovery_runs} Complete ---")
-                if self.discovery_runs >= 3:
-                    print("--- All discovery runs complete. Switching to RANDOM_ACTION state. ---")
-                    self.agent_state = AgentState.RANDOM_ACTION
-                else:
-                    # Start the next run
-                    self.actions_to_try = self.all_actions.copy()
-
-            if self.agent_state == AgentState.DISCOVERY:
-                print(f"Discovery Run {self.discovery_runs + 1}: Trying actions.")
+                # We've run out of actions in the current sub-phase.
+                if self.discovery_sub_phase == 'PRIMARY':
+                    if self.discovered_in_current_run or not self.secondary_actions:
+                        # End the run if we found something or if there are no secondary actions.
+                        self._end_discovery_run()
+                    else:
+                        # If nothing was found, try secondary actions next.
+                        print("--- Primary actions yielded no results. Trying secondary actions. ---")
+                        self.discovery_sub_phase = 'SECONDARY'
+                        self.actions_to_try = self.secondary_actions.copy()
+                else: # We just finished the SECONDARY phase
+                    self._end_discovery_run()
+            
+            # If we are still in discovery, take the next action.
+            if self.agent_state == AgentState.DISCOVERY and self.actions_to_try:
                 action = self.actions_to_try.pop(0)
                 self.last_action = action
                 return action
 
-        # 3. Curiosity-Driven Action: Use discovered actions.
-        # This part runs after discovery is complete.
+        # --- Curiosity-Driven Action: Use discovered actions ---
         if self.discovered_actions:
-            # [cite_start]Prioritize actions that led to new grid states. [cite: 44]
-            print(f"Choosing from {len(self.discovered_actions)} discovered actions.")
             action = random.choice(list(self.discovered_actions))
         else:
-            # Fallback if no actions caused any change after 3 runs.
-            print("No discovered actions. Choosing from all possible actions.")
-            action = random.choice(self.all_actions)
+            # Fallback if discovery yields nothing
+            all_possible_actions = self.primary_actions + self.secondary_actions
+            action = random.choice(all_possible_actions)
         
         self.last_action = action
         return action
