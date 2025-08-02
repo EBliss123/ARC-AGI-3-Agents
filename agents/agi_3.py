@@ -36,6 +36,7 @@ class AGI3(Agent):
         self.changed_pixels = []
         self.static_pixels = []
         self.debug_counter = 0
+        self.visited_grids = set() # Stores previously seen grid states
 
         # --- State Management ---
         self.agent_state = AgentState.DISCOVERY
@@ -61,6 +62,7 @@ class AGI3(Agent):
         self.actions_to_try = self.primary_actions.copy()
         self.discovery_sub_phase = 'PRIMARY' # Can be 'PRIMARY' or 'SECONDARY'
         self.discovered_in_current_run = False
+        self.level_knowledge_is_learned = False
 
         print(f"Custom AGI initialized for game: {self.game_id}")
 
@@ -72,6 +74,7 @@ class AGI3(Agent):
         if self.discovery_runs >= 3:
             print("--- All discovery runs complete. Switching to RANDOM_ACTION state. ---")
             self.agent_state = AgentState.RANDOM_ACTION
+            self.level_knowledge_is_learned = True
         else:
             # Reset for the next full run, starting with primary actions
             self.actions_to_try = self.primary_actions.copy()
@@ -85,17 +88,25 @@ class AGI3(Agent):
     
     def _reset_for_new_attempt(self):
         """Resets the agent's state for a new life or attempt."""
-        print("--- New Attempt: Resetting Agent State to DISCOVERY ---")
-        self.agent_state = AgentState.DISCOVERY
-        self.discovery_runs = 0
-        self.actions_to_try = self.primary_actions.copy()
-        self.last_action = None
         self.previous_frame = None
-        self.discovery_sub_phase = 'PRIMARY'
-        self.discovered_in_current_run = False
+        self.last_action = None
+
+        if self.level_knowledge_is_learned:
+            print("--- New Life: Knowledge retained. Resuming with random actions. ---")
+            self.agent_state = AgentState.RANDOM_ACTION
+        else:
+            print("--- New Attempt: Resetting Agent State to DISCOVERY ---")
+            self.agent_state = AgentState.DISCOVERY
+            self.discovery_runs = 0
+            self.actions_to_try = self.primary_actions.copy()
+            self.discovery_sub_phase = 'PRIMARY'
+            self.discovered_in_current_run = False
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
+        grid_tuple = tuple(map(tuple, latest_frame.frame))
+        grid_tuple = tuple(tuple(tuple(p) for p in row) for row in latest_frame.frame)
+        self.visited_grids.add(grid_tuple)
         changes_found, change_descriptions = self.perceive(latest_frame)
 
         # If perceive detected a dimension change, treat it as a reset event.
@@ -130,6 +141,9 @@ class AGI3(Agent):
 
         # Handle resets from the official game state.
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
+            # If the whole game is new/over, reset everything, including level knowledge.
+            if latest_frame.state == GameState.NOT_PLAYED:
+                self.level_knowledge_is_learned = False
             self._reset_for_new_attempt()
             return GameAction.RESET
 
@@ -151,10 +165,24 @@ class AGI3(Agent):
                 self.last_action = action
                 return action
 
+        # --- 4. Curiosity-Driven Action or Fallback ---
         # If discovery is over, we are in the RANDOM_ACTION state.
         if self.action_effects:
-            action = random.choice(list(self.action_effects.keys()))
+            # Try to find an action that leads to a new grid state
+            best_action = None
+            for action in self.action_effects.keys():
+                # This is a placeholder for predicting the next state.
+                # A true implementation would simulate the action's effect.
+                # For now, we'll just pick a random known action.
+                pass # More advanced logic will go here.
+            
+            # If no curious move is found, pick a random known action.
+            if best_action is None:
+                best_action = random.choice(list(self.action_effects.keys()))
+            
+            action = best_action
         else:
+            # Fallback if discovery yielded nothing
             all_possible_actions = self.primary_actions + self.secondary_actions
             if all_possible_actions:
                 action = random.choice(all_possible_actions)
