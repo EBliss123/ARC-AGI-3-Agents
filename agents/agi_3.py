@@ -42,6 +42,7 @@ class AGI3(Agent):
         self.discovery_runs = 0
         self.last_action = None
         self.action_effects = {} # Will store actions and all their resulting changes
+        self.action_failures = {}
 
         # --- Generic Action Groups ---
         # Get all possible actions, excluding RESET, to create generic groups.
@@ -84,21 +85,43 @@ class AGI3(Agent):
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
+        # --- 1. Perception ---
+        # First, see what happened as a result of the last action.
         changes_found, change_descriptions = self.perceive(latest_frame)
 
-        if changes_found and self.last_action:
-            # Store the complete list of changes for the action
-            self.action_effects[self.last_action] = change_descriptions
-            self.discovered_in_current_run = True
+        # --- 2. Process Last Action's Result ---
+        # Next, process that outcome based on the agent's state.
+        if self.last_action:
+            if self.agent_state == AgentState.DISCOVERY and changes_found:
+                # SUCCESS during DISCOVERY: A new rule is found.
+                self.action_effects[self.last_action] = change_descriptions
+                self.discovered_in_current_run = True
+                
+                print(f"Action {self.last_action.name} caused {len(change_descriptions)} changes. Storing success.")
+                for description in change_descriptions[:10]:
+                    print(description)
+                if len(change_descriptions) > 10:
+                    print("  - ...and more.")
 
-            # Print a summary of the changes to the log
-            print(f"Action {self.last_action.name} caused {len(change_descriptions)} changes. Storing.")
-            for description in change_descriptions[:10]: # Print up to 10 changes
-                print(description)
-            if len(change_descriptions) > 10:
-                print("  - ...and more.")
+            elif self.agent_state == AgentState.RANDOM_ACTION:
+                if changes_found:
+                    # SUCCESS during RANDOM_ACTION: A known action worked as expected.
+                    print(f"Known action {self.last_action.name} succeeded, causing {len(change_descriptions)} changes.")
+                    for description in change_descriptions[:10]:
+                        print(description)
+                    if len(change_descriptions) > 10:
+                        print("  - ...and more.")
+                else:
+                    # FAILURE during RANDOM_ACTION: A known action failed. Log the context.
+                    print(f"Known action {self.last_action.name} had no effect. Storing failure context.")
+                    context = copy.deepcopy(self.previous_frame)
+                    if self.last_action not in self.action_failures:
+                        self.action_failures[self.last_action] = []
+                    self.action_failures[self.last_action].append(context)
 
+        # --- 3. Handle Game State Resets ---
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
+            # (This block remains unchanged)
             print("--- New Attempt: Resetting Agent State to DISCOVERY ---")
             self.agent_state = AgentState.DISCOVERY
             self.discovery_runs = 0
@@ -108,39 +131,35 @@ class AGI3(Agent):
             self.discovered_in_current_run = False
             return GameAction.RESET
 
-        # --- State-Based Action Selection ---
+        # --- 4. Choose a New Action to Take ---
+        # Finally, decide what to do in this new turn.
         if self.agent_state == AgentState.DISCOVERY:
+            # (This block remains unchanged)
             if not self.actions_to_try:
-                # We've run out of actions in the current sub-phase.
                 if self.discovery_sub_phase == 'PRIMARY':
                     if self.discovered_in_current_run or not self.secondary_actions:
-                        # End the run if we found something or if there are no secondary actions.
                         self._end_discovery_run()
                     else:
-                        # If nothing was found, try secondary actions next.
                         print("--- Primary actions yielded no results. Trying secondary actions. ---")
                         self.discovery_sub_phase = 'SECONDARY'
                         self.actions_to_try = self.secondary_actions.copy()
-                else: # We just finished the SECONDARY phase
+                else:
                     self._end_discovery_run()
             
-            # If we are still in discovery, take the next action.
             if self.agent_state == AgentState.DISCOVERY and self.actions_to_try:
                 action = self.actions_to_try.pop(0)
                 self.last_action = action
                 return action
 
-        # --- Curiosity-Driven Action: Use discovered actions ---
+        # If discovery is over, we are in the RANDOM_ACTION state.
         if self.action_effects:
-            # Choose a random action from the ones we know have an effect
             action = random.choice(list(self.action_effects.keys()))
         else:
-            # Fallback if discovery yields nothing
             all_possible_actions = self.primary_actions + self.secondary_actions
             if all_possible_actions:
                 action = random.choice(all_possible_actions)
             else:
-                action = GameAction.NOOP # A final fallback if no actions are possible
+                action = GameAction.NOOP
         
         self.last_action = action
         return action
