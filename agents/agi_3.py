@@ -104,9 +104,28 @@ class AGI3(Agent):
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
-        grid_tuple = tuple(map(tuple, latest_frame.frame))
+        # Convert the current grid to a hashable format for memory storage.
         grid_tuple = tuple(tuple(tuple(p) for p in row) for row in latest_frame.frame)
-        self.visited_grids.add(grid_tuple)
+
+        # Check if this grid state is new before adding it to memory.
+        if grid_tuple not in self.visited_grids:
+            print(f"🔎 New grid state discovered! Total unique states seen: {len(self.visited_grids) + 1}")
+            self.visited_grids.add(grid_tuple)
+        
+        # --- 1. Check for Win/Loss State First (Highest Priority) ---
+        if latest_frame.state is GameState.WIN:
+            print("🏆 Level Solved! Awaiting next level. 🏆")
+            # We don't reset here, just wait for the new level to load.
+            return GameAction.NOOP # Do nothing until the next level starts
+        
+        if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
+            # If the whole game is new/over, reset everything.
+            if latest_frame.state == GameState.NOT_PLAYED:
+                self.level_knowledge_is_learned = False
+            self._reset_for_new_attempt()
+            return GameAction.RESET
+
+        # --- 2. Perception & Consequence of Last Action ---
         changes_found, change_descriptions = self.perceive(latest_frame)
 
         # If perceive detected a dimension change, treat it as a reset event.
@@ -139,15 +158,7 @@ class AGI3(Agent):
                         self.action_failures[self.last_action] = []
                     self.action_failures[self.last_action].append(context)
 
-        # Handle resets from the official game state.
-        if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
-            # If the whole game is new/over, reset everything, including level knowledge.
-            if latest_frame.state == GameState.NOT_PLAYED:
-                self.level_knowledge_is_learned = False
-            self._reset_for_new_attempt()
-            return GameAction.RESET
-
-        # Choose a new action to take.
+        # --- 3. Choose a New Action to Take ---
         if self.agent_state == AgentState.DISCOVERY:
             if not self.actions_to_try:
                 if self.discovery_sub_phase == 'PRIMARY':
@@ -165,24 +176,10 @@ class AGI3(Agent):
                 self.last_action = action
                 return action
 
-        # --- 4. Curiosity-Driven Action or Fallback ---
         # If discovery is over, we are in the RANDOM_ACTION state.
         if self.action_effects:
-            # Try to find an action that leads to a new grid state
-            best_action = None
-            for action in self.action_effects.keys():
-                # This is a placeholder for predicting the next state.
-                # A true implementation would simulate the action's effect.
-                # For now, we'll just pick a random known action.
-                pass # More advanced logic will go here.
-            
-            # If no curious move is found, pick a random known action.
-            if best_action is None:
-                best_action = random.choice(list(self.action_effects.keys()))
-            
-            action = best_action
+            action = random.choice(list(self.action_effects.keys()))
         else:
-            # Fallback if discovery yielded nothing
             all_possible_actions = self.primary_actions + self.secondary_actions
             if all_possible_actions:
                 action = random.choice(all_possible_actions)
