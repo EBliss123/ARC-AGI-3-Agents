@@ -41,7 +41,7 @@ class AGI3(Agent):
         self.agent_state = AgentState.DISCOVERY
         self.discovery_runs = 0
         self.last_action = None
-        self.discovered_actions = set()
+        self.action_effects = {} # Will store actions and all their resulting changes
 
         # --- Generic Action Groups ---
         # Get all possible actions, excluding RESET, to create generic groups.
@@ -87,11 +87,16 @@ class AGI3(Agent):
         changes_found, change_descriptions = self.perceive(latest_frame)
 
         if changes_found and self.last_action:
-            print(f"Action {self.last_action.name} caused changes. Storing it.")
-            for description in change_descriptions:
-                print(description)
-            self.discovered_actions.add(self.last_action)
+            # Store the complete list of changes for the action
+            self.action_effects[self.last_action] = change_descriptions
             self.discovered_in_current_run = True
+
+            # Print a summary of the changes to the log
+            print(f"Action {self.last_action.name} caused {len(change_descriptions)} changes. Storing.")
+            for description in change_descriptions[:10]: # Print up to 10 changes
+                print(description)
+            if len(change_descriptions) > 10:
+                print("  - ...and more.")
 
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
             print("--- New Attempt: Resetting Agent State to DISCOVERY ---")
@@ -126,12 +131,16 @@ class AGI3(Agent):
                 return action
 
         # --- Curiosity-Driven Action: Use discovered actions ---
-        if self.discovered_actions:
-            action = random.choice(list(self.discovered_actions))
+        if self.action_effects:
+            # Choose a random action from the ones we know have an effect
+            action = random.choice(list(self.action_effects.keys()))
         else:
             # Fallback if discovery yields nothing
             all_possible_actions = self.primary_actions + self.secondary_actions
-            action = random.choice(all_possible_actions)
+            if all_possible_actions:
+                action = random.choice(all_possible_actions)
+            else:
+                action = GameAction.NOOP # A final fallback if no actions are possible
         
         self.last_action = action
         return action
@@ -163,9 +172,6 @@ class AGI3(Agent):
         # Find and describe pixel changes with index-level detail
         for r in range(current_height):
             for c in range(current_width):
-                # We can stop collecting descriptions if we have enough, to keep logs clean
-                if len(change_descriptions) > 10:
-                    break
 
                 old_pixel_data = self.previous_frame[r][c]
                 new_pixel_data = current_frame[r][c]
@@ -178,16 +184,11 @@ class AGI3(Agent):
                     if len(old_pixel_data) == len(new_pixel_data):
                         for i in range(len(old_pixel_data)):
                             if old_pixel_data[i] != new_pixel_data[i]:
-                                if len(change_descriptions) > 10:
-                                    change_descriptions.append("    - ...and more.")
-                                    break
                                 old_val = old_pixel_data[i]
                                 new_val = new_pixel_data[i]
                                 change_descriptions.append(f"    - Index {i}: From {old_val} to {new_val}")
                     else:
                         change_descriptions.append(f"    - Data lists changed length.")
-            if len(change_descriptions) > 10:
-                break
 
         # Save a deep copy for the next comparison
         self.previous_frame = copy.deepcopy(current_frame)
