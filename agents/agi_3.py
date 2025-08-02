@@ -82,21 +82,32 @@ class AGI3(Agent):
         """Decide if the agent is done playing."""
         # The agent stops this attempt if it wins the level.
         return latest_frame.state is GameState.WIN
+    
+    def _reset_for_new_attempt(self):
+        """Resets the agent's state for a new life or attempt."""
+        print("--- New Attempt: Resetting Agent State to DISCOVERY ---")
+        self.agent_state = AgentState.DISCOVERY
+        self.discovery_runs = 0
+        self.actions_to_try = self.primary_actions.copy()
+        self.last_action = None
+        self.previous_frame = None
+        self.discovery_sub_phase = 'PRIMARY'
+        self.discovered_in_current_run = False
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
-        # --- 1. Perception ---
-        # First, see what happened as a result of the last action.
         changes_found, change_descriptions = self.perceive(latest_frame)
 
-        # --- 2. Process Last Action's Result ---
-        # Next, process that outcome based on the agent's state.
+        # If perceive detected a dimension change, treat it as a reset event.
+        if changes_found and change_descriptions == ["Frame dimensions changed"]:
+            self._reset_for_new_attempt()
+            return GameAction.RESET
+
+        # Process the result of the last action.
         if self.last_action:
             if self.agent_state == AgentState.DISCOVERY and changes_found:
-                # SUCCESS during DISCOVERY: A new rule is found.
                 self.action_effects[self.last_action] = change_descriptions
                 self.discovered_in_current_run = True
-                
                 print(f"Action {self.last_action.name} caused {len(change_descriptions)} changes. Storing success.")
                 for description in change_descriptions[:10]:
                     print(description)
@@ -105,36 +116,25 @@ class AGI3(Agent):
 
             elif self.agent_state == AgentState.RANDOM_ACTION:
                 if changes_found:
-                    # SUCCESS during RANDOM_ACTION: A known action worked as expected.
                     print(f"Known action {self.last_action.name} succeeded, causing {len(change_descriptions)} changes.")
                     for description in change_descriptions[:10]:
                         print(description)
                     if len(change_descriptions) > 10:
                         print("  - ...and more.")
                 else:
-                    # FAILURE during RANDOM_ACTION: A known action failed. Log the context.
                     print(f"Known action {self.last_action.name} had no effect. Storing failure context.")
                     context = copy.deepcopy(self.previous_frame)
                     if self.last_action not in self.action_failures:
                         self.action_failures[self.last_action] = []
                     self.action_failures[self.last_action].append(context)
 
-        # --- 3. Handle Game State Resets ---
+        # Handle resets from the official game state.
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
-            # (This block remains unchanged)
-            print("--- New Attempt: Resetting Agent State to DISCOVERY ---")
-            self.agent_state = AgentState.DISCOVERY
-            self.discovery_runs = 0
-            self.actions_to_try = self.primary_actions.copy()
-            self.last_action = None
-            self.discovery_sub_phase = 'PRIMARY'
-            self.discovered_in_current_run = False
+            self._reset_for_new_attempt()
             return GameAction.RESET
 
-        # --- 4. Choose a New Action to Take ---
-        # Finally, decide what to do in this new turn.
+        # Choose a new action to take.
         if self.agent_state == AgentState.DISCOVERY:
-            # (This block remains unchanged)
             if not self.actions_to_try:
                 if self.discovery_sub_phase == 'PRIMARY':
                     if self.discovered_in_current_run or not self.secondary_actions:
@@ -143,7 +143,7 @@ class AGI3(Agent):
                         print("--- Primary actions yielded no results. Trying secondary actions. ---")
                         self.discovery_sub_phase = 'SECONDARY'
                         self.actions_to_try = self.secondary_actions.copy()
-                else:
+                else: 
                     self._end_discovery_run()
             
             if self.agent_state == AgentState.DISCOVERY and self.actions_to_try:
