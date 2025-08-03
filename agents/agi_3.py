@@ -44,6 +44,7 @@ class AGI3(Agent):
         self.last_action = None
         self.action_effects = {} # Will store actions and all their resulting changes
         self.action_failures = {}
+        self.ineffective_actions = [] # Tracks actions that had no effect since the last success
 
         # --- Generic Action Groups ---
         # Get all possible actions, excluding RESET, to create generic groups.
@@ -135,24 +136,31 @@ class AGI3(Agent):
 
         # Process the result of the last action.
         if self.last_action:
-            if self.agent_state == AgentState.DISCOVERY and changes_found:
-                self.action_effects[self.last_action] = change_descriptions
-                self.discovered_in_current_run = True
-                print(f"Action {self.last_action.name} caused {len(change_descriptions)} changes. Storing success.")
+            if changes_found:
+                # --- Action SUCCEEDED (caused a change) ---
+                was_cleared = len(self.ineffective_actions) > 0
+                self.ineffective_actions.clear()
+                clear_message = " Clearing ineffective actions list." if was_cleared else ""
+
+                if self.agent_state == AgentState.DISCOVERY:
+                    self.action_effects[self.last_action] = change_descriptions
+                    self.discovered_in_current_run = True
+                    print(f"Action {self.last_action.name} caused {len(change_descriptions)} changes. Storing success.{clear_message}")
+                else: # RANDOM_ACTION state
+                    print(f"Known action {self.last_action.name} succeeded, causing {len(change_descriptions)} changes.{clear_message}")
+
                 for description in change_descriptions[:10]:
                     print(description)
                 if len(change_descriptions) > 10:
                     print("  - ...and more.")
 
-            elif self.agent_state == AgentState.RANDOM_ACTION:
-                if changes_found:
-                    print(f"Known action {self.last_action.name} succeeded, causing {len(change_descriptions)} changes.")
-                    for description in change_descriptions[:10]:
-                        print(description)
-                    if len(change_descriptions) > 10:
-                        print("  - ...and more.")
-                else:
-                    print(f"Known action {self.last_action.name} had no effect. Storing failure context.")
+            else:
+                # --- Action FAILED (caused no change) ---
+                if self.last_action not in self.ineffective_actions:
+                    self.ineffective_actions.append(self.last_action)
+
+                if self.agent_state == AgentState.RANDOM_ACTION:
+                    print(f"Known action {self.last_action.name} had no effect. Storing failure context. Ineffective actions: {[a.name for a in self.ineffective_actions]}")
                     context = copy.deepcopy(self.previous_frame)
                     if self.last_action not in self.action_failures:
                         self.action_failures[self.last_action] = []
@@ -178,14 +186,34 @@ class AGI3(Agent):
 
         # If discovery is over, we are in the RANDOM_ACTION state.
         if self.action_effects:
-            action = random.choice(list(self.action_effects.keys()))
+            known_actions = list(self.action_effects.keys())
+            
+            # Filter out any actions that have recently been ineffective.
+            candidate_actions = [a for a in known_actions if a not in self.ineffective_actions]
+            
+            # If no candidates are left, all known actions have failed. Reset and try again.
+            if not candidate_actions and known_actions:
+                print("--- All known actions are ineffective. Resetting list and trying again. ---")
+                self.ineffective_actions.clear()
+                candidate_actions = known_actions # Use the full list for this one attempt
+
+            # Choose from the available, effective actions.
+            if candidate_actions:
+                action = random.choice(candidate_actions)
+            else:
+                # Fallback if there are no known_actions at all.
+                all_possible_actions = self.primary_actions + self.secondary_actions
+                if all_possible_actions:
+                    action = random.choice(all_possible_actions)
+                else:
+                    action = GameAction.NOOP
         else:
             all_possible_actions = self.primary_actions + self.secondary_actions
             if all_possible_actions:
                 action = random.choice(all_possible_actions)
             else:
                 action = GameAction.NOOP
-        
+
         self.last_action = action
         return action
 
