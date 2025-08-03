@@ -45,6 +45,8 @@ class AGI3(Agent):
         self.action_effects = {} # Will store actions and all their resulting changes
         self.action_failures = {}
         self.ineffective_actions = [] # Tracks actions that had no effect since the last success
+        self.level_start_frame = None
+        self.level_start_score = 0
 
         # --- Generic Action Groups ---
         # Get all possible actions, excluding RESET, to create generic groups.
@@ -105,6 +107,12 @@ class AGI3(Agent):
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
+        # --- 1. Store initial level state if not already set ---
+        if self.level_start_frame is None:
+            print("--- New Level Detected (Initial Frame). Storing start state. ---")
+            self.level_start_frame = copy.deepcopy(latest_frame.frame)
+            self.level_start_score = latest_frame.score
+        
         # Convert the current grid to a hashable format for memory storage.
         grid_tuple = tuple(tuple(tuple(p) for p in row) for row in latest_frame.frame)
 
@@ -129,10 +137,26 @@ class AGI3(Agent):
         # --- 2. Perception & Consequence of Last Action ---
         changes_found, change_descriptions = self.perceive(latest_frame)
 
-        # If perceive detected a dimension change, treat it as a reset event.
+        # --- Special Handling for Dimension Changes (New Level or Lost Life) ---
         if changes_found and change_descriptions == ["Frame dimensions changed"]:
-            self._reset_for_new_attempt()
-            return GameAction.RESET
+            new_grid = latest_frame.frame
+            new_score = latest_frame.score
+
+            # A new level is detected if the grid changes AND the score increases[cite: 42].
+            is_new_level = (new_grid != self.level_start_frame and new_score > self.level_start_score)
+
+            if is_new_level:
+                print(f"--- New Level Detected! Score increased to {new_score}. ---")
+                # Update the baseline for the new level
+                self.level_start_frame = copy.deepcopy(new_grid)
+                self.level_start_score = new_score
+                # Attribute success to the last action and describe it as a level advance.
+                change_descriptions = [f"Advanced to a new level with score {new_score}."]
+            else:
+                # If the state matches the start of the level, it's a lost life[cite: 41].
+                print("--- Lost a Life (Frame reset to level start). Resetting attempt. ---")
+                self._reset_for_new_attempt()
+                return GameAction.RESET
 
         # Process the result of the last action.
         if self.last_action:
@@ -237,7 +261,7 @@ class AGI3(Agent):
         current_height, current_width = len(current_frame), len(current_frame[0])
         prev_height, prev_width = len(self.previous_frame), len(self.previous_frame[0])
         if current_height != prev_height or current_width != prev_width:
-            print("--- Frame dimensions changed! ---")
+            print("--- Frame dimensions changed! Analyzing... ---")
             self.previous_frame = copy.deepcopy(current_frame)
             return True, ["Frame dimensions changed"]
 
