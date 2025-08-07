@@ -81,10 +81,21 @@ class Agent(ABC):
         ):
             action = self.choose_action(self.frames, self.frames[-1])
             if frame := self.take_action(action):
+                # Store the score from before the latest action
+                previous_score = self.score
+
                 self.append_frame(frame)
                 logger.info(
                     f"{self.game_id} - {action.name}: count {self.action_counter}, score {frame.score}, avg fps {self.fps})"
                 )
+
+                # If the new score is higher, reset the action counter
+                if frame.score > previous_score:
+                    logger.info(
+                        f"Score increased to {frame.score}. Resetting action counter."
+                    )
+                    self.action_counter = 0
+
             self.action_counter += 1
 
         self.cleanup()
