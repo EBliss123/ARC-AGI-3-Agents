@@ -47,6 +47,7 @@ class AGI3(Agent):
         self.ineffective_actions = [] # Tracks actions that had no effect since the last success
         self.level_start_frame = None
         self.level_start_score = 0
+        self.state_action_map = {} # Maps (grid_state, action) -> resulting_grid_state
 
         # --- Generic Action Groups ---
         # Get all possible actions, excluding RESET, to create generic groups.
@@ -125,7 +126,7 @@ class AGI3(Agent):
         if latest_frame.state is GameState.WIN:
             print("🏆 Level Solved! Awaiting next level. 🏆")
             # We don't reset here, just wait for the new level to load.
-            return GameAction.NOOP # Do nothing until the next level starts
+            return self.last_action if self.last_action else GameAction.ACTION1
         
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
             # If the whole game is new/over, reset everything.
@@ -160,6 +161,15 @@ class AGI3(Agent):
 
         # Process the result of the last action.
         if self.last_action:
+            # NEW: Record the state transition for our map
+            if self.previous_frame:
+                previous_grid_tuple = tuple(tuple(tuple(p) for p in row) for row in self.previous_frame)
+                if previous_grid_tuple not in self.state_action_map:
+                    self.state_action_map[previous_grid_tuple] = {}
+                if self.last_action not in self.state_action_map[previous_grid_tuple]:
+                    self.state_action_map[previous_grid_tuple][self.last_action] = grid_tuple
+                    print(f"🗺️ Mapped transition: From state {hash(previous_grid_tuple)} via {self.last_action.name} to state {hash(grid_tuple)}.")
+            
             if changes_found:
                 # --- Action SUCCEEDED (caused a change) ---
                 was_cleared = len(self.ineffective_actions) > 0
@@ -208,35 +218,37 @@ class AGI3(Agent):
                 self.last_action = action
                 return action
 
-        # If discovery is over, we are in the RANDOM_ACTION state.
+        # If discovery is over, use curiosity-driven exploration
+        action = GameAction.ACTION1 # Default failsafe action
         if self.action_effects:
             known_actions = list(self.action_effects.keys())
+            actions_taken_from_here = self.state_action_map.get(grid_tuple, {})
             
-            # Filter out any actions that have recently been ineffective.
-            candidate_actions = [a for a in known_actions if a not in self.ineffective_actions]
-            
-            # If no candidates are left, all known actions have failed. Reset and try again.
-            if not candidate_actions and known_actions:
-                print("--- All known actions are ineffective. Resetting list and trying again. ---")
-                self.ineffective_actions.clear()
-                candidate_actions = known_actions # Use the full list for this one attempt
+            # Prioritize actions not yet taken from this specific grid
+            untried_actions = [a for a in known_actions if a not in actions_taken_from_here]
+            candidate_actions = [a for a in untried_actions if a not in self.ineffective_actions]
 
-            # Choose from the available, effective actions.
             if candidate_actions:
+                print(f"🧭 Prioritizing untried actions: {[a.name for a in candidate_actions]}")
                 action = random.choice(candidate_actions)
             else:
-                # Fallback if there are no known_actions at all.
-                all_possible_actions = self.primary_actions + self.secondary_actions
-                if all_possible_actions:
-                    action = random.choice(all_possible_actions)
-                else:
-                    action = GameAction.NOOP
+                # Fallback to choosing from any known, effective action
+                print("🔂 No novel actions to try from this state. Falling back to known effective actions.")
+                effective_actions = [a for a in known_actions if a not in self.ineffective_actions]
+                
+                # If all known actions become ineffective, reset the list to escape getting stuck
+                if not effective_actions and known_actions:
+                    print("--- All known actions are ineffective. Resetting list and trying again. ---")
+                    self.ineffective_actions.clear()
+                    effective_actions = known_actions
+                
+                if effective_actions:
+                    action = random.choice(effective_actions)
         else:
+            # Fallback if no actions are known to have effects yet
             all_possible_actions = self.primary_actions + self.secondary_actions
             if all_possible_actions:
                 action = random.choice(all_possible_actions)
-            else:
-                action = GameAction.NOOP
 
         self.last_action = action
         return action
