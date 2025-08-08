@@ -47,6 +47,9 @@ class AGI3(Agent):
         self.ineffective_actions = [] # Tracks actions that had no effect since the last success
         self.level_start_frame = None
         self.level_start_score = 0
+        self.resource_indicator_candidates = {}
+        self.confirmed_resource_indicator = None
+        self.RESOURCE_CONFIDENCE_THRESHOLD = 3 # Actions in a row to confirm
 
         # --- Generic Action Groups ---
         # Get all possible actions, excluding RESET, to create generic groups.
@@ -137,7 +140,7 @@ class AGI3(Agent):
             return GameAction.RESET
 
         # --- 2. Perception & Consequence of Last Action ---
-        changes_found, change_descriptions = self.perceive(latest_frame)
+        changes_found, change_descriptions, structured_changes = self.perceive(latest_frame)
 
         # --- Special Handling for Dimension Changes (New Level or Lost Life) ---
         if changes_found and change_descriptions == ["Frame dimensions changed"]:
@@ -183,6 +186,8 @@ class AGI3(Agent):
                     print(description)
                 if len(change_descriptions) > 10:
                     print("  - ...and more.")
+
+                self._update_resource_indicator_tracking(structured_changes, self.last_action)
 
             else:
                 # --- Action FAILED (caused no change) ---
@@ -249,19 +254,20 @@ class AGI3(Agent):
 
     # --- Methods from your original plan ---
 
-    def perceive(self, latest_frame: FrameData) -> tuple[bool, list[str]]:
+    def perceive(self, latest_frame: FrameData) -> tuple[bool, list[str], list]:
         """Compares the current frame with the previous one to detect changes.
-        Returns a tuple: (bool_if_changes_found, list_of_change_descriptions)."""
+        Returns a tuple: (bool_if_changes_found, list_of_descriptions, structured_changes_list)."""
         current_frame = latest_frame.frame
         changes_found = False
         change_descriptions = []
+        structured_changes = []
 
         if not current_frame:
-            return False, []
+            return False, [], []
 
         if self.previous_frame is None:
             self.previous_frame = copy.deepcopy(current_frame)
-            return False, []
+            return False, [], []
 
         # Check for dimension changes first
         current_height, current_width = len(current_frame), len(current_frame[0])
@@ -269,7 +275,7 @@ class AGI3(Agent):
         if current_height != prev_height or current_width != prev_width:
             print("--- Frame dimensions changed! Analyzing... ---")
             self.previous_frame = copy.deepcopy(current_frame)
-            return True, ["Frame dimensions changed"]
+            return True, ["Frame dimensions changed"], []
 
         # Find and describe pixel changes with index-level detail
         for r in range(current_height):
@@ -282,6 +288,7 @@ class AGI3(Agent):
                     changes_found = True
                     change_descriptions.append(f"  - Changes at coordinate ({r},{c}):")
 
+                    pixel_level_changes = []
                     # Log every single difference inside the pixel's data list
                     if len(old_pixel_data) == len(new_pixel_data):
                         for i in range(len(old_pixel_data)):
@@ -289,13 +296,91 @@ class AGI3(Agent):
                                 old_val = old_pixel_data[i]
                                 new_val = new_pixel_data[i]
                                 change_descriptions.append(f"    - Index {i}: From {old_val} to {new_val}")
+                                pixel_level_changes.append({'index': i, 'from': old_val, 'to': new_val})
                     else:
                         change_descriptions.append(f"    - Data lists changed length.")
+                    
+                    if pixel_level_changes:
+                        structured_changes.append({'coord': (r, c), 'changes': pixel_level_changes})
 
         # Save a deep copy for the next comparison
         self.previous_frame = copy.deepcopy(current_frame)
 
-        return changes_found, change_descriptions
+        return changes_found, change_descriptions, structured_changes
+
+    def _update_resource_indicator_tracking(self, structured_changes: list, action: GameAction):
+        """Analyzes changes to find a resource indicator, which depletes on any action."""
+        if self.confirmed_resource_indicator or not action:
+            return
+
+        changed_coords = {change['coord'] for change in structured_changes}
+
+        # 1. Prune candidates that were expected to change but didn't.
+        # Any existing candidate that did NOT change on this turn is inconsistent.
+        keys_to_remove = []
+        for coord in self.resource_indicator_candidates:
+            if coord not in changed_coords:
+                print(f"📉 Candidate at {coord} was inconsistent (did not change), removing.")
+                keys_to_remove.append(coord)
+        
+        for key in keys_to_remove:
+            del self.resource_indicator_candidates[key]
+
+        # 2. Check all changes for potential indicator patterns
+        for change in structured_changes:
+            coord = change['coord']
+            # This pattern requires a single, distinct index change within the coordinate
+            if len(change['changes']) != 1:
+                continue
+            
+            detail = change['changes'][0]
+            current_index, old_val, new_val = detail['index'], detail['from'], detail['to']
+
+            if not isinstance(new_val, (int, float)) or not isinstance(old_val, (int, float)):
+                continue
+
+            value_direction = 'inc' if new_val > old_val else 'dec'
+
+            if coord in self.resource_indicator_candidates:
+                # --- Update Existing Candidate ---
+                candidate = self.resource_indicator_candidates[coord]
+                
+                # Check for consistency in value change direction (action no longer matters)
+                if candidate['value_direction'] == value_direction:
+                    index_direction = 'inc' if current_index > candidate['last_index'] else 'dec'
+
+                    # On the 2nd hit, establish the index direction
+                    if candidate.get('index_direction') is None:
+                        candidate['index_direction'] = index_direction
+                        candidate['confidence'] += 1
+                    # On subsequent hits, ensure the index direction is also consistent
+                    elif candidate['index_direction'] == index_direction:
+                        candidate['confidence'] += 1
+                    else:
+                        # Index direction changed, this is not a consistent indicator
+                        del self.resource_indicator_candidates[coord]
+                        continue
+                    
+                    candidate['last_index'] = current_index
+                    print(f"📈 Resource candidate {coord} confidence is now {candidate['confidence']}.")
+
+                    if candidate['confidence'] >= self.RESOURCE_CONFIDENCE_THRESHOLD:
+                        self.confirmed_resource_indicator = {'coord': coord, **candidate}
+                        print(f"✅ Confirmed resource indicator at coordinate {coord}!")
+                        self.resource_indicator_candidates.clear()
+                        return
+                else:
+                    # Value direction was inconsistent, remove
+                    del self.resource_indicator_candidates[coord]
+            else:
+                # --- Add New Candidate ---
+                self.resource_indicator_candidates[coord] = {
+                    'confidence': 1,
+                    'last_index': current_index,
+                    'value_direction': value_direction,
+                    'index_direction': None # Will be determined on the next consistent change
+                }
+                print(f"🤔 New resource candidate found at coordinate {coord}.")
 
     def segment_objects(self, latest_frame: FrameData):
         """Scans the grid to find and define all objects."""
