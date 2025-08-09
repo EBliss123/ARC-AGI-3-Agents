@@ -343,10 +343,10 @@ class AGI3(Agent):
                     else:
                         # For novel changes, also create human-readable descriptions for logging.
                         novel_changes_found = True
-                        novel_change_descriptions.append(f"  - Changes at coordinate ({r},{c}):")
+                        novel_change_descriptions.append(f"  - Changes at row {c}:")
                         if len(old_pixel_data) == len(new_pixel_data):
                              for change in pixel_level_changes:
-                                 novel_change_descriptions.append(f"    - Index {change['index']}: From {change['from']} to {change['to']}")
+                                 novel_change_descriptions.append(f"    - Pixel {change['index']}: From {change['from']} to {change['to']}")
                         else:
                             novel_change_descriptions.append(f"    - Data lists changed length.")
 
@@ -365,7 +365,7 @@ class AGI3(Agent):
         keys_to_remove = []
         for coord in self.resource_indicator_candidates:
             if coord not in changed_coords:
-                print(f"📉 Candidate at {coord} was inconsistent (did not change), removing.")
+                print(f"📉 Candidate at row {coord[1]} was inconsistent (did not change), removing.")
                 keys_to_remove.append(coord)
         
         for key in keys_to_remove:
@@ -407,12 +407,12 @@ class AGI3(Agent):
                         continue
                     
                     candidate['last_index'] = current_index
-                    print(f"📈 Resource candidate {coord} confidence is now {candidate['confidence']}.")
+                    print(f"📈 Resource candidate at row {coord[1]} confidence is now {candidate['confidence']}.")
 
                     if candidate['confidence'] >= self.RESOURCE_CONFIDENCE_THRESHOLD:
                         self.confirmed_resource_indicator = {'coord': coord, **candidate}
                         self.ignore_for_state_hash.add(coord)
-                        print(f"✅ Confirmed resource indicator at coordinate {coord}! It will now be ignored for state uniqueness checks.")
+                        print(f"✅ Confirmed resource indicator at row {coord[1]}! It will now be ignored for state uniqueness checks.")
                         self.resource_indicator_candidates.clear()
                         return
                 else:
@@ -426,7 +426,7 @@ class AGI3(Agent):
                     'value_direction': value_direction,
                     'index_direction': None # Will be determined on the next consistent change
                 }
-                print(f"🤔 New resource candidate found at coordinate {coord}.")
+                print(f"🤔 New resource candidate found at row {coord[1]}.")
 
     def segment_objects(self, latest_frame: FrameData):
         """Scans the grid to find and define all objects."""
