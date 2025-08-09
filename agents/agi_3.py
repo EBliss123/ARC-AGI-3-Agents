@@ -37,6 +37,7 @@ class AGI3(Agent):
         self.static_pixels = []
         self.debug_counter = 0
         self.visited_grids = set() # Stores previously seen grid states
+        self.ignore_for_state_hash = set()
 
         # --- State Management ---
         self.agent_state = AgentState.DISCOVERY
@@ -114,10 +115,21 @@ class AGI3(Agent):
             self.level_start_frame = copy.deepcopy(latest_frame.frame)
             self.level_start_score = latest_frame.score
         
-        # Convert the current grid to a hashable format for memory storage.
-        grid_tuple = tuple(tuple(tuple(p) for p in row) for row in latest_frame.frame)
+        # To check for new states, create a version of the grid that ignores noisy coordinates.
+        grid_for_hashing = copy.deepcopy(latest_frame.frame)
 
-        # Check if this grid state is new before adding it to memory.
+        # Mask all coordinates that are flagged to be ignored (e.g., resource indicators).
+        # This ensures states are considered identical even if ignored UI elements change.
+        if self.ignore_for_state_hash:
+            for r, c in self.ignore_for_state_hash:
+                # Ensure the coordinate is within the current grid's bounds before masking.
+                if r < len(grid_for_hashing) and c < len(grid_for_hashing[0]):
+                    grid_for_hashing[r][c] = [-1] # Use a constant, non-game value.
+
+        # Convert the (potentially masked) grid to a hashable format for memory storage.
+        grid_tuple = tuple(tuple(tuple(p) for p in row) for row in grid_for_hashing)
+
+        # Check if this masked grid state is new before adding it to memory.
         if grid_tuple not in self.visited_grids:
             print(f"🔎 New grid state discovered! Total unique states seen: {len(self.visited_grids) + 1}")
             self.visited_grids.add(grid_tuple)
@@ -140,10 +152,10 @@ class AGI3(Agent):
             return GameAction.RESET
 
         # --- 2. Perception & Consequence of Last Action ---
-        changes_found, change_descriptions, structured_changes = self.perceive(latest_frame)
+        novel_changes_found, known_changes_found, change_descriptions, structured_changes = self.perceive(latest_frame)
 
         # --- Special Handling for Dimension Changes (New Level or Lost Life) ---
-        if changes_found and change_descriptions == ["Frame dimensions changed"]:
+        if novel_changes_found and change_descriptions == ["Frame dimensions changed"]:
             new_grid = latest_frame.frame
             new_score = latest_frame.score
 
@@ -169,8 +181,9 @@ class AGI3(Agent):
 
         # Process the result of the last action.
         if self.last_action:
-            if changes_found:
-                # --- Action SUCCEEDED (caused a change) ---
+            # A "successful" action is one that causes a novel, non-indicator change.
+            if novel_changes_found:
+                # --- Action SUCCEEDED (caused a novel change) ---
                 was_cleared = len(self.ineffective_actions) > 0
                 self.ineffective_actions.clear()
                 clear_message = " Clearing ineffective actions list." if was_cleared else ""
@@ -178,28 +191,35 @@ class AGI3(Agent):
                 if self.agent_state == AgentState.DISCOVERY:
                     self.action_effects[self.last_action] = change_descriptions
                     self.discovered_in_current_run = True
-                    print(f"Action {self.last_action.name} caused {len(change_descriptions)} changes. Storing success.{clear_message}")
+                    print(f"Action {self.last_action.name} caused {len(change_descriptions)} novel changes. Storing success.{clear_message}")
                 else: # RANDOM_ACTION state
-                    print(f"Known action {self.last_action.name} succeeded, causing {len(change_descriptions)} changes.{clear_message}")
+                    print(f"Known action {self.last_action.name} succeeded, causing {len(change_descriptions)} novel changes.{clear_message}")
 
                 for description in change_descriptions[:10]:
                     print(description)
                 if len(change_descriptions) > 10:
                     print("  - ...and more.")
 
-                self._update_resource_indicator_tracking(structured_changes, self.last_action)
-
             else:
-                # --- Action FAILED (caused no change) ---
+                # --- Action FAILED (caused no novel change) ---
+                # It might have only changed the resource indicator, which we treat as an ineffective action.
+                if known_changes_found:
+                    print("💧 Resource level changed, but no other effects were observed.")
+
                 if self.last_action not in self.ineffective_actions:
                     self.ineffective_actions.append(self.last_action)
 
                 if self.agent_state == AgentState.RANDOM_ACTION:
-                    print(f"Known action {self.last_action.name} had no effect. Storing failure context. Ineffective actions: {[a.name for a in self.ineffective_actions]}")
+                    print(f"Action {self.last_action.name} had no novel effect. Ineffective actions: {[a.name for a in self.ineffective_actions]}")
                     context = copy.deepcopy(self.previous_frame)
                     if self.last_action not in self.action_failures:
                         self.action_failures[self.last_action] = []
                     self.action_failures[self.last_action].append(context)
+
+            # Still run indicator tracking if ANY change happened, to keep it updated.
+            if novel_changes_found or known_changes_found:
+                # We pass `structured_changes` here, which contains ALL changes (novel and known).
+                self._update_resource_indicator_tracking(structured_changes, self.last_action)
 
         # --- 3. Choose a New Action to Take ---
         if self.agent_state == AgentState.DISCOVERY:
@@ -254,59 +274,59 @@ class AGI3(Agent):
 
     # --- Methods from your original plan ---
 
-    def perceive(self, latest_frame: FrameData) -> tuple[bool, list[str], list]:
-        """Compares the current frame with the previous one to detect changes.
-        Returns a tuple: (bool_if_changes_found, list_of_descriptions, structured_changes_list)."""
+    def perceive(self, latest_frame: FrameData) -> tuple[bool, bool, list[str], list]:
+        """Compares frames, separating novel changes from known indicator changes."""
         current_frame = latest_frame.frame
-        changes_found = False
-        change_descriptions = []
-        structured_changes = []
+        novel_changes_found = False
+        known_changes_found = False
+        novel_change_descriptions = []
+        all_structured_changes = []
 
         if not current_frame:
-            return False, [], []
+            return False, False, [], []
 
         if self.previous_frame is None:
             self.previous_frame = copy.deepcopy(current_frame)
-            return False, [], []
+            return False, False, [], []
 
-        # Check for dimension changes first
         current_height, current_width = len(current_frame), len(current_frame[0])
         prev_height, prev_width = len(self.previous_frame), len(self.previous_frame[0])
         if current_height != prev_height or current_width != prev_width:
             print("--- Frame dimensions changed! Analyzing... ---")
             self.previous_frame = copy.deepcopy(current_frame)
-            return True, ["Frame dimensions changed"], []
+            # A dimension change is always considered a novel event.
+            return True, False, ["Frame dimensions changed"], []
 
-        # Find and describe pixel changes with index-level detail
         for r in range(current_height):
             for c in range(current_width):
-
                 old_pixel_data = self.previous_frame[r][c]
                 new_pixel_data = current_frame[r][c]
 
                 if old_pixel_data != new_pixel_data:
-                    changes_found = True
-                    change_descriptions.append(f"  - Changes at coordinate ({r},{c}):")
-
+                    # First, create structured data for ALL changes.
                     pixel_level_changes = []
-                    # Log every single difference inside the pixel's data list
                     if len(old_pixel_data) == len(new_pixel_data):
                         for i in range(len(old_pixel_data)):
                             if old_pixel_data[i] != new_pixel_data[i]:
-                                old_val = old_pixel_data[i]
-                                new_val = new_pixel_data[i]
-                                change_descriptions.append(f"    - Index {i}: From {old_val} to {new_val}")
-                                pixel_level_changes.append({'index': i, 'from': old_val, 'to': new_val})
-                    else:
-                        change_descriptions.append(f"    - Data lists changed length.")
-                    
+                                pixel_level_changes.append({'index': i, 'from': old_pixel_data[i], 'to': new_pixel_data[i]})
                     if pixel_level_changes:
-                        structured_changes.append({'coord': (r, c), 'changes': pixel_level_changes})
+                        all_structured_changes.append({'coord': (r, c), 'changes': pixel_level_changes})
 
-        # Save a deep copy for the next comparison
+                    # Second, check if it's a known indicator change or a novel one.
+                    if self.confirmed_resource_indicator and (r, c) == self.confirmed_resource_indicator['coord']:
+                        known_changes_found = True
+                    else:
+                        # For novel changes, also create human-readable descriptions for logging.
+                        novel_changes_found = True
+                        novel_change_descriptions.append(f"  - Changes at coordinate ({r},{c}):")
+                        if len(old_pixel_data) == len(new_pixel_data):
+                             for change in pixel_level_changes:
+                                 novel_change_descriptions.append(f"    - Index {change['index']}: From {change['from']} to {change['to']}")
+                        else:
+                            novel_change_descriptions.append(f"    - Data lists changed length.")
+
         self.previous_frame = copy.deepcopy(current_frame)
-
-        return changes_found, change_descriptions, structured_changes
+        return novel_changes_found, known_changes_found, novel_change_descriptions, all_structured_changes
 
     def _update_resource_indicator_tracking(self, structured_changes: list, action: GameAction):
         """Analyzes changes to find a resource indicator, which depletes on any action."""
@@ -366,7 +386,8 @@ class AGI3(Agent):
 
                     if candidate['confidence'] >= self.RESOURCE_CONFIDENCE_THRESHOLD:
                         self.confirmed_resource_indicator = {'coord': coord, **candidate}
-                        print(f"✅ Confirmed resource indicator at coordinate {coord}!")
+                        self.ignore_for_state_hash.add(coord)
+                        print(f"✅ Confirmed resource indicator at coordinate {coord}! It will now be ignored for state uniqueness checks.")
                         self.resource_indicator_candidates.clear()
                         return
                 else:
