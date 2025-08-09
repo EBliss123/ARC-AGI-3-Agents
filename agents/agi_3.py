@@ -131,10 +131,11 @@ class AGI3(Agent):
         # Mask all coordinates that are flagged to be ignored (e.g., resource indicators).
         # This ensures states are considered identical even if ignored UI elements change.
         if self.ignore_for_state_hash:
-            for r, c in self.ignore_for_state_hash:
+            for row_index in self.ignore_for_state_hash:
                 # Ensure the coordinate is within the current grid's bounds before masking.
-                if r < len(grid_for_hashing) and c < len(grid_for_hashing[0]):
-                    grid_for_hashing[r][c] = [-1] # Use a constant, non-game value.
+                # The grid is effectively frame[0], so we check if the index is valid for that list.
+                if row_index < len(grid_for_hashing[0]):
+                    grid_for_hashing[0][row_index] = [-1] # Use a constant, non-game value.
 
         # Convert the (potentially masked) grid to a hashable format for memory storage.
         grid_tuple = tuple(tuple(tuple(p) for p in row) for row in grid_for_hashing)
@@ -314,41 +315,41 @@ class AGI3(Agent):
             self.previous_frame = copy.deepcopy(current_frame)
             return False, False, [], []
 
-        current_height, current_width = len(current_frame), len(current_frame[0])
-        prev_height, prev_width = len(self.previous_frame), len(self.previous_frame[0])
-        if current_height != prev_height or current_width != prev_width:
-            print("--- Frame dimensions changed! Analyzing... ---")
+        # The "grid" is a list containing one list of rows. The number of rows is the "width".
+        num_rows = len(current_frame[0])
+        prev_num_rows = len(self.previous_frame[0])
+
+        if num_rows != prev_num_rows:
+            print("--- Frame dimensions changed (number of rows)! Analyzing... ---")
             self.previous_frame = copy.deepcopy(current_frame)
-            # A dimension change is always considered a novel event.
             return True, False, ["Frame dimensions changed"], []
 
-        for r in range(current_height):
-            for c in range(current_width):
-                old_pixel_data = self.previous_frame[r][c]
-                new_pixel_data = current_frame[r][c]
+        # Iterate through the list of rows. The "coordinate" is just the row_index.
+        for row_index in range(num_rows):
+            old_row_data = self.previous_frame[0][row_index]
+            new_row_data = current_frame[0][row_index]
 
-                if old_pixel_data != new_pixel_data:
-                    # First, create structured data for ALL changes.
-                    pixel_level_changes = []
-                    if len(old_pixel_data) == len(new_pixel_data):
-                        for i in range(len(old_pixel_data)):
-                            if old_pixel_data[i] != new_pixel_data[i]:
-                                pixel_level_changes.append({'index': i, 'from': old_pixel_data[i], 'to': new_pixel_data[i]})
-                    if pixel_level_changes:
-                        all_structured_changes.append({'coord': (r, c), 'changes': pixel_level_changes})
+            if old_row_data != new_row_data:
+                # First, create structured data for ALL changes.
+                pixel_level_changes = []
+                if len(old_row_data) == len(new_row_data):
+                    for i in range(len(old_row_data)):
+                        if old_row_data[i] != new_row_data[i]:
+                            pixel_level_changes.append({'index': i, 'from': old_row_data[i], 'to': new_row_data[i]})
+                if pixel_level_changes:
+                    all_structured_changes.append({'row_index': row_index, 'changes': pixel_level_changes})
 
-                    # Second, check if it's a known indicator change or a novel one.
-                    if self.confirmed_resource_indicator and (r, c) == self.confirmed_resource_indicator['coord']:
-                        known_changes_found = True
+                # Second, check if it's a known indicator change or a novel one.
+                if self.confirmed_resource_indicator and row_index == self.confirmed_resource_indicator['row_index']:
+                    known_changes_found = True
+                else:
+                    novel_changes_found = True
+                    novel_change_descriptions.append(f"  - Changes at row {row_index}:")
+                    if len(old_row_data) == len(new_row_data):
+                        for change in pixel_level_changes:
+                            novel_change_descriptions.append(f"    - Pixel {change['index']}: From {change['from']} to {change['to']}")
                     else:
-                        # For novel changes, also create human-readable descriptions for logging.
-                        novel_changes_found = True
-                        novel_change_descriptions.append(f"  - Changes at row {c}:")
-                        if len(old_pixel_data) == len(new_pixel_data):
-                             for change in pixel_level_changes:
-                                 novel_change_descriptions.append(f"    - Pixel {change['index']}: From {change['from']} to {change['to']}")
-                        else:
-                            novel_change_descriptions.append(f"    - Data lists changed length.")
+                        novel_change_descriptions.append(f"    - Data lists changed length.")
 
         self.previous_frame = copy.deepcopy(current_frame)
         return novel_changes_found, known_changes_found, novel_change_descriptions, all_structured_changes
@@ -358,26 +359,24 @@ class AGI3(Agent):
         if self.confirmed_resource_indicator or not action:
             return
 
-        changed_coords = {change['coord'] for change in structured_changes}
+        changed_rows = {change['row_index'] for change in structured_changes}
 
         # 1. Prune candidates that were expected to change but didn't.
-        # Any existing candidate that did NOT change on this turn is inconsistent.
         keys_to_remove = []
-        for coord in self.resource_indicator_candidates:
-            if coord not in changed_coords:
-                print(f"📉 Candidate at row {coord[1]} was inconsistent (did not change), removing.")
-                keys_to_remove.append(coord)
-        
+        for row_idx in self.resource_indicator_candidates:
+            if row_idx not in changed_rows:
+                print(f"📉 Candidate at row {row_idx} was inconsistent (did not change), removing.")
+                keys_to_remove.append(row_idx)
+
         for key in keys_to_remove:
             del self.resource_indicator_candidates[key]
 
         # 2. Check all changes for potential indicator patterns
         for change in structured_changes:
-            coord = change['coord']
-            # This pattern requires a single, distinct index change within the coordinate
+            row_idx = change['row_index']
             if len(change['changes']) != 1:
                 continue
-            
+
             detail = change['changes'][0]
             current_index, old_val, new_val = detail['index'], detail['from'], detail['to']
 
@@ -386,47 +385,40 @@ class AGI3(Agent):
 
             value_direction = 'inc' if new_val > old_val else 'dec'
 
-            if coord in self.resource_indicator_candidates:
-                # --- Update Existing Candidate ---
-                candidate = self.resource_indicator_candidates[coord]
-                
-                # Check for consistency in value change direction (action no longer matters)
+            if row_idx in self.resource_indicator_candidates:
+                candidate = self.resource_indicator_candidates[row_idx]
+
                 if candidate['value_direction'] == value_direction:
                     index_direction = 'inc' if current_index > candidate['last_index'] else 'dec'
 
-                    # On the 2nd hit, establish the index direction
                     if candidate.get('index_direction') is None:
                         candidate['index_direction'] = index_direction
                         candidate['confidence'] += 1
-                    # On subsequent hits, ensure the index direction is also consistent
                     elif candidate['index_direction'] == index_direction:
                         candidate['confidence'] += 1
                     else:
-                        # Index direction changed, this is not a consistent indicator
-                        del self.resource_indicator_candidates[coord]
+                        del self.resource_indicator_candidates[row_idx]
                         continue
-                    
+
                     candidate['last_index'] = current_index
-                    print(f"📈 Resource candidate at row {coord[1]} confidence is now {candidate['confidence']}.")
+                    print(f"📈 Resource candidate at row {row_idx} confidence is now {candidate['confidence']}.")
 
                     if candidate['confidence'] >= self.RESOURCE_CONFIDENCE_THRESHOLD:
-                        self.confirmed_resource_indicator = {'coord': coord, **candidate}
-                        self.ignore_for_state_hash.add(coord)
-                        print(f"✅ Confirmed resource indicator at row {coord[1]}! It will now be ignored for state uniqueness checks.")
+                        self.confirmed_resource_indicator = {'row_index': row_idx, **candidate}
+                        self.ignore_for_state_hash.add(row_idx)
+                        print(f"✅ Confirmed resource indicator at row {row_idx}! It will now be ignored for state uniqueness checks.")
                         self.resource_indicator_candidates.clear()
                         return
                 else:
-                    # Value direction was inconsistent, remove
-                    del self.resource_indicator_candidates[coord]
+                    del self.resource_indicator_candidates[row_idx]
             else:
-                # --- Add New Candidate ---
-                self.resource_indicator_candidates[coord] = {
+                self.resource_indicator_candidates[row_idx] = {
                     'confidence': 1,
                     'last_index': current_index,
                     'value_direction': value_direction,
-                    'index_direction': None # Will be determined on the next consistent change
+                    'index_direction': None
                 }
-                print(f"🤔 New resource candidate found at row {coord[1]}.")
+                print(f"🤔 New resource candidate found at row {row_idx}.")
 
     def segment_objects(self, latest_frame: FrameData):
         """Scans the grid to find and define all objects."""
