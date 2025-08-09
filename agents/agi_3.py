@@ -68,7 +68,10 @@ class AGI3(Agent):
             self.secondary_actions = []
 
         # --- Discovery Phase Tracking ---
-        self.actions_to_try = self.primary_actions.copy()
+        # Start the first discovery run with a shuffled list of primary actions.
+        actions_for_first_run = self.primary_actions.copy()
+        random.shuffle(actions_for_first_run)
+        self.actions_to_try = actions_for_first_run
         self.discovery_sub_phase = 'PRIMARY' # Can be 'PRIMARY' or 'SECONDARY'
         self.discovered_in_current_run = False
         self.level_knowledge_is_learned = False
@@ -85,8 +88,10 @@ class AGI3(Agent):
             self.agent_state = AgentState.RANDOM_ACTION
             self.level_knowledge_is_learned = True
         else:
-            # Reset for the next full run, starting with primary actions
-            self.actions_to_try = self.primary_actions.copy()
+            # Set up the next run with a new, randomly shuffled sequence.
+            next_run_actions = self.primary_actions.copy()
+            random.shuffle(next_run_actions)
+            self.actions_to_try = next_run_actions
             self.discovery_sub_phase = 'PRIMARY'
             self.discovered_in_current_run = False
 
@@ -105,7 +110,10 @@ class AGI3(Agent):
         else:
             self.agent_state = AgentState.DISCOVERY
             self.discovery_runs = 0
-            self.actions_to_try = self.primary_actions.copy()
+            # Reset to the first discovery run with a fresh shuffled sequence.
+            initial_actions = self.primary_actions.copy()
+            random.shuffle(initial_actions)
+            self.actions_to_try = initial_actions
             self.discovery_sub_phase = 'PRIMARY'
             self.discovered_in_current_run = False
 
