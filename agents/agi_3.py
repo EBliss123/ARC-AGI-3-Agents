@@ -38,6 +38,8 @@ class AGI3(Agent):
         self.debug_counter = 0
         self.visited_grids = set() # Stores previously seen grid states
         self.ignore_for_state_hash = set()
+        self.state_graph = {} # Stores stateA -> action -> stateB
+        self.last_grid_tuple = None
 
         # --- State Management ---
         self.agent_state = AgentState.DISCOVERY
@@ -133,6 +135,14 @@ class AGI3(Agent):
         if grid_tuple not in self.visited_grids:
             print(f"🔎 New grid state discovered! Total unique states seen: {len(self.visited_grids) + 1}")
             self.visited_grids.add(grid_tuple)
+
+        # If we have a previous state and action, record the transition in our graph.
+        if self.last_grid_tuple and self.last_action:
+            # Ensure the 'from' state is in the graph.
+            if self.last_grid_tuple not in self.state_graph:
+                self.state_graph[self.last_grid_tuple] = {}
+            # Record that last_action from last_state leads to the current state.
+            self.state_graph[self.last_grid_tuple][self.last_action] = grid_tuple
         
         # --- 1. Check for Win/Loss State First (Highest Priority) ---
         if latest_frame.state is GameState.WIN:
@@ -239,36 +249,43 @@ class AGI3(Agent):
                 self.last_action = action
                 return action
 
-        # If discovery is over, we are in the RANDOM_ACTION state.
-        if self.action_effects:
-            known_actions = list(self.action_effects.keys())
+        # If discovery is over, use the state graph to explore intelligently.
+        if self.agent_state == AgentState.RANDOM_ACTION:
+            print("--- Choosing Action Based on State Graph ---")
             
-            # Filter out any actions that have recently been ineffective.
-            candidate_actions = [a for a in known_actions if a not in self.ineffective_actions]
-            
-            # If no candidates are left, all known actions have failed. Reset and try again.
-            if not candidate_actions and known_actions:
-                print("--- All known actions are ineffective. Resetting list and trying again. ---")
+            # 1. Identify all possible actions.
+            base_actions = list(self.action_effects.keys())
+            available_actions = [a for a in base_actions if a not in self.ineffective_actions]
+            if not available_actions and base_actions:
+                print("--- All actions were ineffective. Resetting list. ---")
                 self.ineffective_actions.clear()
-                candidate_actions = known_actions # Use the full list for this one attempt
+                available_actions = base_actions
 
-            # Choose from the available, effective actions.
-            if candidate_actions:
-                action = random.choice(candidate_actions)
-            else:
-                # Fallback if there are no known_actions at all.
-                all_possible_actions = self.primary_actions + self.secondary_actions
-                if all_possible_actions:
-                    action = random.choice(all_possible_actions)
+            # 2. Categorize actions based on the state graph.
+            novel_actions = []
+            boring_actions = []
+            known_transitions = self.state_graph.get(grid_tuple, {})
+
+            for act in available_actions:
+                if act not in known_transitions:
+                    # This action has not been tried from this specific grid state. It's novel.
+                    novel_actions.append(act)
                 else:
-                    action = GameAction.NOOP
-        else:
-            all_possible_actions = self.primary_actions + self.secondary_actions
-            if all_possible_actions:
-                action = random.choice(all_possible_actions)
-            else:
-                action = GameAction.NOOP
+                    # We know where this action leads. We'll consider it "boring" to prioritize novelty.
+                    boring_actions.append(act)
 
+            print(f"Novel actions from this state: {[a.name for a in novel_actions]}")
+            print(f"Boring actions from this state: {[a.name for a in boring_actions]}")
+
+            # 3. Prioritize novel actions to maximize discovery.
+            if novel_actions:
+                action = random.choice(novel_actions)
+            elif boring_actions:
+                action = random.choice(boring_actions)
+            else:
+                action = GameAction.NOOP # Fallback if no actions are available
+
+        self.last_grid_tuple = grid_tuple
         self.last_action = action
         return action
 
