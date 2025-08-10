@@ -4,6 +4,7 @@ import copy
 from enum import Enum
 from .agent import Agent
 from .structs import FrameData, GameAction, GameState
+from collections import Counter
 
 # --- Game Environment Classes ---
 # These classes will hold the state and logic for each specific game.
@@ -57,6 +58,13 @@ class AGI3(Agent):
         # --- Object & Shape Tracking ---
         self.observed_object_shapes = {} # Maps shape tuple -> count
         self.last_known_objects = [] # Stores full object descriptions from the last frame
+        self.world_model = {
+            'player_signature': None,
+            'floor_color': None
+        }
+        # This will store hypotheses like {(obj_signature, color): confidence_count}
+        self.player_floor_hypothesis = {}
+        self.CONCEPT_CONFIDENCE_THRESHOLD = 5 # Number of times a pattern must be seen to be learned
 
         # --- Generic Action Groups ---
         # Get all possible actions, excluding RESET, to create generic groups.
@@ -252,14 +260,64 @@ class AGI3(Agent):
 
             # 2. Track objects from the last frame to the current one
             if self.last_known_objects: # Can only track if we have a "before" state
-                tracking_logs = self._track_objects(current_objects, self.last_known_objects)
+                
+                # --- Filter objects to only those involved in the current action ---
+                changed_coords = set()
+                for change in structured_changes:
+                    for px_change in change['changes']:
+                        changed_coords.add((change['row_index'], px_change['index']))
+
+                active_current_objects = []
+                for obj in current_objects:
+                    # Check if any part of the object's bounding box overlaps with a changed pixel
+                    for r in range(obj['top_row'], obj['top_row'] + obj['height']):
+                        if any((r, c) in changed_coords for c in range(obj['left_index'], obj['left_index'] + obj['width'])):
+                            active_current_objects.append(obj)
+                            break # Go to the next object once one match is found
+                
+                active_last_objects = []
+                for obj in self.last_known_objects:
+                    # Check if any part of the object's bounding box overlaps with a changed pixel
+                    for r in range(obj['top_row'], obj['top_row'] + obj['height']):
+                        if any((r, c) in changed_coords for c in range(obj['left_index'], obj['left_index'] + obj['width'])):
+                            active_last_objects.append(obj)
+                            break # Go to the next object once one match is found
+
+                # Call the tracking method with the clean, filtered lists
+                tracking_logs = self._track_objects(active_current_objects, active_last_objects, latest_frame.frame, structured_changes)
+                
                 if tracking_logs:
                     print(f"--- Object Tracking Report (Action: {self.last_action.name}) ---")
                     for log in tracking_logs:
                         print(log)
 
-            # 3. Update memory for the next turn
-            self.last_known_objects = current_objects
+            # 3. Update memory for the next turn by merging static and changed objects
+            new_object_memory = []
+            
+            # First, add all static objects from the previous turn's memory
+            if self.last_known_objects:
+                # Get the set of coordinates that changed in this turn
+                changed_coords = set()
+                for change in structured_changes:
+                    for px_change in change['changes']:
+                        changed_coords.add((change['row_index'], px_change['index']))
+                
+                # Add any object from memory that was NOT in a changed location
+                for obj in self.last_known_objects:
+                    is_static = True
+                    for r in range(obj['top_row'], obj['top_row'] + obj['height']):
+                        if any((r, c) in changed_coords for c in range(obj['left_index'], obj['left_index'] + obj['width'])):
+                            is_static = False
+                            break
+                    if is_static:
+                        new_object_memory.append(obj)
+            
+            # Second, add the new, updated objects from the current turn
+            # (The 'current_objects' list only contains objects from changed areas)
+            new_object_memory.extend(current_objects)
+
+            # Finally, set the agent's memory for the next turn
+            self.last_known_objects = new_object_memory
 
         # --- 3. Choose a New Action to Take ---
         if self.agent_state == AgentState.DISCOVERY:
@@ -486,46 +544,68 @@ class AGI3(Agent):
 
         return final_objects
     
-    def _track_objects(self, current_objects: list, last_objects: list) -> list[str]:
+    def _track_objects(self, current_objects: list, last_objects: list, latest_grid: list, structured_changes: list) -> list[str]:
         """Compares current objects to last known objects to track movement and changes."""
-        log_messages, unmatched_current, unmatched_last = [], list(current_objects), list(last_objects)
+        log_messages = []
+        unmatched_current = list(current_objects)
+        unmatched_last = list(last_objects)
 
-        # --- Stage 1: Match by exact data_map (fingerprint) ---
-        # This is the most reliable match for moves.
-        matched = []
-        for curr_obj in list(unmatched_current):
-            for last_obj in list(unmatched_last):
-                if curr_obj['data_map'] == last_obj['data_map']:
-                    pos1, pos2 = f"({last_obj['top_row']}, {last_obj['left_index']})", f"({curr_obj['top_row']}, {curr_obj['left_index']})"
-                    if pos1 != pos2:
-                        log_messages.append(f"🧠 MOVE: Object [{curr_obj['height']}x{curr_obj['width']}] moved from {pos1} to {pos2}.")
-                    # If position is same, it's static. We can ignore for cleaner logs.
-                    matched.append((curr_obj, last_obj))
-                    break
-        for curr, last in matched:
-            if curr in unmatched_current: unmatched_current.remove(curr)
-            if last in unmatched_last: unmatched_last.remove(last)
-
-        # --- Stage 2: Match by same position & shape (for Recolor) ---
-        matched = []
-        for curr_obj in list(unmatched_current):
-            for last_obj in list(unmatched_last):
+        # --- Stage 1: Match by same position & shape (for Recolor) ---
+        # This is the highest priority. We use a safe while loop to handle list modification.
+        i = 0
+        while i < len(unmatched_current):
+            curr_obj = unmatched_current[i]
+            match_found = False
+            j = 0
+            while j < len(unmatched_last):
+                last_obj = unmatched_last[j]
                 if (curr_obj['top_row'] == last_obj['top_row'] and
                     curr_obj['left_index'] == last_obj['left_index'] and
                     curr_obj['height'] == last_obj['height'] and
                     curr_obj['width'] == last_obj['width']):
-                    log_messages.append(f"🎨 RECOLOR: Object at ({curr_obj['top_row']}, {curr_obj['left_index']}) changed its data.")
-                    matched.append((curr_obj, last_obj))
-                    break
-        for curr, last in matched:
-            if curr in unmatched_current: unmatched_current.remove(curr)
-            if last in unmatched_last: unmatched_last.remove(last)
+                    
+                    if curr_obj['data_map'] != last_obj['data_map']:
+                        log_messages.append(f"🎨 RECOLOR: Object at ({curr_obj['top_row']}, {curr_obj['left_index']}) changed its data.")
+                    
+                    # Pair found. Remove both from their lists and stop searching for this curr_obj.
+                    unmatched_current.pop(i)
+                    unmatched_last.pop(j)
+                    match_found = True
+                    break # Exit the inner (j) loop
+                else:
+                    j += 1
+            
+            if not match_found:
+                # If no match was found for curr_obj, move to the next one.
+                i += 1
 
-        # --- Stage 3: Handle leftovers ---
+        # --- Stage 2: Match by exact data_map (for Moves) ---
+        # This stage now only sees objects that were not part of a recolor event.
+        i = 0
+        while i < len(unmatched_current):
+            curr_obj = unmatched_current[i]
+            match_found = False
+            j = 0
+            while j < len(unmatched_last):
+                last_obj = unmatched_last[j]
+                if curr_obj['data_map'] == last_obj['data_map']:
+                    log_messages.append(f"🧠 MOVE: Object [{curr_obj['height']}x{curr_obj['width']}] moved from ({last_obj['top_row']}, {last_obj['left_index']}) to ({curr_obj['top_row']}, {curr_obj['left_index']}).")
+                    unmatched_current.pop(i)
+                    unmatched_last.pop(j)
+                    match_found = True
+                    break # Exit the inner (j) loop
+                else:
+                    j += 1
+            
+            if not match_found:
+                i += 1
+
+        # --- Stage 3: Handle leftovers (Appear/Disappear) ---
         for curr_obj in unmatched_current:
             log_messages.append(f"➕ APPEAR: A new [{curr_obj['height']}x{curr_obj['width']}] object appeared at ({curr_obj['top_row']}, {curr_obj['left_index']}).")
         for last_obj in unmatched_last:
             log_messages.append(f"➖ DISAPPEAR: A [{last_obj['height']}x{last_obj['width']}] object disappeared from ({last_obj['top_row']}, {last_obj['left_index']}).")
+        
         return log_messages
     
     def _update_resource_indicator_tracking(self, structured_changes: list, action: GameAction):
