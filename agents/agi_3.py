@@ -377,6 +377,12 @@ class AGI3(Agent):
 
     def _find_and_describe_objects(self, structured_changes: list, latest_frame: list) -> list[dict]:
         """Finds objects by grouping changed pixels by their new color first, then clustering."""
+        changed_coords = set()
+        for change in structured_changes:
+            row_idx = change['row_index']
+            for pixel_change in change['changes']:
+                changed_coords.add((row_idx, pixel_change['index']))
+        
         if not structured_changes:
             return []
 
@@ -413,20 +419,71 @@ class AGI3(Agent):
         # 3. For now, we treat each part as a separate object.
         # A future improvement could merge touching parts of different colors.
         final_objects = []
+        grid = latest_frame[0]
+        grid_height = len(grid)
+        grid_width = len(grid[0]) if grid_height > 0 else 0
+
         for obj_points in monochromatic_parts:
             if not obj_points: continue
+
+            # --- Background Verification Step ---
+            # Check if this changed patch is connected to a static area of the same color.
+            is_part_of_background = False
+            sample_point = next(iter(obj_points))
+            obj_color = grid[sample_point[0]][sample_point[1]]
+
+            for r, p_idx in obj_points:
+                for dr, dp_idx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                    neighbor = (r + dr, p_idx + dp_idx)
+                    
+                    # Check if neighbor is within bounds, didn't change, and has the same color.
+                    if (0 <= neighbor[0] < grid_height and
+                        0 <= neighbor[1] < grid_width and
+                        neighbor not in changed_coords and
+                        grid[neighbor[0]][neighbor[1]] == obj_color):
+                        
+                        is_part_of_background = True
+                        break
+                if is_part_of_background:
+                    break
+            
+            # If it's part of the background, do not classify it as an object.
+            if is_part_of_background:
+                print(f"🕵️‍♀️ Change at {sample_point} with color {obj_color} is contiguous with a static background. Ignoring.")
+                continue
+
+            # --- If it's a real object, proceed with description ---
             min_row = min(r for r, _ in obj_points)
             max_row = max(r for r, _ in obj_points)
             min_idx = min(p_idx for _, p_idx in obj_points)
             max_idx = max(p_idx for _, p_idx in obj_points)
             height, width = max_row - min_row + 1, max_idx - min_idx + 1
 
+            # The background check from the last update is still useful for context.
+            border_colors = []
+            background_color = None
+            border_min_row = max(0, min_row - 1)
+            border_max_row = min(grid_height - 1, max_row + 1)
+            border_min_idx = max(0, min_idx - 1)
+            border_max_idx = min(grid_width - 1, max_idx + 1)
+
+            for r in range(border_min_row, border_max_row + 1):
+                for p_idx in range(border_min_idx, border_max_idx + 1):
+                    is_on_border = (r < min_row or r > max_row or p_idx < min_idx or p_idx > max_idx)
+                    if is_on_border:
+                        border_colors.append(grid[r][p_idx])
+            
+            if border_colors and all(c == border_colors[0] for c in border_colors):
+                background_color = border_colors[0]
+
             data_map = tuple(tuple(latest_frame[0][r][p] for p in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
 
             final_objects.append({
                 'height': height, 'width': width, 'top_row': min_row,
-                'left_index': min_idx, 'data_map': data_map
+                'left_index': min_idx, 'data_map': data_map,
+                'background_color': background_color
             })
+
         return final_objects
     
     def _track_objects(self, current_objects: list, last_objects: list) -> list[str]:
