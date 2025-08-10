@@ -260,32 +260,7 @@ class AGI3(Agent):
 
             # 2. Track objects from the last frame to the current one
             if self.last_known_objects: # Can only track if we have a "before" state
-                
-                # --- Filter objects to only those involved in the current action ---
-                changed_coords = set()
-                for change in structured_changes:
-                    for px_change in change['changes']:
-                        changed_coords.add((change['row_index'], px_change['index']))
-
-                active_current_objects = []
-                for obj in current_objects:
-                    # Check if any part of the object's bounding box overlaps with a changed pixel
-                    for r in range(obj['top_row'], obj['top_row'] + obj['height']):
-                        if any((r, c) in changed_coords for c in range(obj['left_index'], obj['left_index'] + obj['width'])):
-                            active_current_objects.append(obj)
-                            break # Go to the next object once one match is found
-                
-                active_last_objects = []
-                for obj in self.last_known_objects:
-                    # Check if any part of the object's bounding box overlaps with a changed pixel
-                    for r in range(obj['top_row'], obj['top_row'] + obj['height']):
-                        if any((r, c) in changed_coords for c in range(obj['left_index'], obj['left_index'] + obj['width'])):
-                            active_last_objects.append(obj)
-                            break # Go to the next object once one match is found
-
-                # Call the tracking method with the clean, filtered lists
-                tracking_logs = self._track_objects(active_current_objects, active_last_objects, latest_frame.frame, structured_changes)
-                
+                tracking_logs = self._track_objects(current_objects, self.last_known_objects, latest_frame.frame, structured_changes)
                 if tracking_logs:
                     print(f"--- Object Tracking Report (Action: {self.last_action.name}) ---")
                     for log in tracking_logs:
@@ -579,8 +554,8 @@ class AGI3(Agent):
                 # If no match was found for curr_obj, move to the next one.
                 i += 1
 
-        # --- Stage 2: Match by exact data_map (for Moves) ---
-        # This stage now only sees objects that were not part of a recolor event.
+        # --- Stage 2: Move Detection & Composite Grouping ---
+        move_matched_pairs = []
         i = 0
         while i < len(unmatched_current):
             curr_obj = unmatched_current[i]
@@ -589,24 +564,79 @@ class AGI3(Agent):
             while j < len(unmatched_last):
                 last_obj = unmatched_last[j]
                 if curr_obj['data_map'] == last_obj['data_map']:
-                    log_messages.append(f"🧠 MOVE: Object [{curr_obj['height']}x{curr_obj['width']}] moved from ({last_obj['top_row']}, {last_obj['left_index']}) to ({curr_obj['top_row']}, {curr_obj['left_index']}).")
+                    move_matched_pairs.append((curr_obj, last_obj))
                     unmatched_current.pop(i)
                     unmatched_last.pop(j)
                     match_found = True
-                    break # Exit the inner (j) loop
+                    break
                 else:
                     j += 1
-            
             if not match_found:
                 i += 1
 
-        # --- Stage 3: Handle leftovers (Appear/Disappear) ---
+        # --- Group moves by vector ---
+        moves_by_vector = {}
+        for curr, last in move_matched_pairs:
+            vector = (curr['top_row'] - last['top_row'], curr['left_index'] - last['left_index'])
+            if vector not in moves_by_vector:
+                moves_by_vector[vector] = []
+            moves_by_vector[vector].append((curr, last))
+
+        # --- Analyze groups for composite objects ---
+        processed_pairs = []
+        for vector, pairs in moves_by_vector.items():
+            if len(pairs) < 2: continue
+
+            unclustered = list(pairs)
+            while unclustered:
+                cluster = [unclustered.pop(0)]
+                while True:
+                    new_neighbor_found = False
+                    for neighbor_pair in list(unclustered):
+                        is_adjacent = any(self._are_objects_adjacent(neighbor_pair[0], member_pair[0]) for member_pair in cluster)
+                        if is_adjacent:
+                            cluster.append(neighbor_pair)
+                            unclustered.remove(neighbor_pair)
+                            new_neighbor_found = True
+                    if not new_neighbor_found:
+                        break
+                
+                if len(cluster) > 1:
+                    min_row = min(p[0]['top_row'] for p in cluster)
+                    max_row = max(p[0]['top_row'] + p[0]['height'] for p in cluster)
+                    min_col = min(p[0]['left_index'] for p in cluster)
+                    max_col = max(p[0]['left_index'] + p[0]['width'] for p in cluster)
+                    
+                    comp_h, comp_w = max_row - min_row, max_col - min_col
+                    log_messages.append(f"🧠 COMPOSITE MOVE: Object [{comp_h}x{comp_w}] moved by vector {vector}.")
+                    for pair in cluster: processed_pairs.append(pair)
+
+        # Log all individual moves that weren't part of a composite
+        for curr, last in move_matched_pairs:
+            if (curr, last) not in processed_pairs:
+                log_messages.append(f"🧠 MOVE: Object [{curr['height']}x{curr['width']}] moved from ({last['top_row']}, {last['left_index']}) to ({curr['top_row']}, {curr['left_index']}).")
+
+        # --- Stage 3: Leftovers (Appear/Disappear) ---
         for curr_obj in unmatched_current:
             log_messages.append(f"➕ APPEAR: A new [{curr_obj['height']}x{curr_obj['width']}] object appeared at ({curr_obj['top_row']}, {curr_obj['left_index']}).")
         for last_obj in unmatched_last:
             log_messages.append(f"➖ DISAPPEAR: A [{last_obj['height']}x{last_obj['width']}] object disappeared from ({last_obj['top_row']}, {last_obj['left_index']}).")
-        
+            
         return log_messages
+    
+    def _are_objects_adjacent(self, obj1: dict, obj2: dict) -> bool:
+        """Checks if two objects' bounding boxes are touching."""
+        # Check for horizontal adjacency
+        if obj1['top_row'] == obj2['top_row'] and obj1['height'] == obj2['height']:
+            if obj1['left_index'] + obj1['width'] == obj2['left_index'] or \
+               obj2['left_index'] + obj2['width'] == obj1['left_index']:
+                return True
+        # Check for vertical adjacency
+        if obj1['left_index'] == obj2['left_index'] and obj1['width'] == obj2['width']:
+            if obj1['top_row'] + obj1['height'] == obj2['top_row'] or \
+               obj2['top_row'] + obj2['height'] == obj1['top_row']:
+                return True
+        return False
     
     def _update_resource_indicator_tracking(self, structured_changes: list, action: GameAction):
         """Analyzes changes to find a resource indicator, which depletes on any action."""
