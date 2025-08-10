@@ -54,6 +54,10 @@ class AGI3(Agent):
         self.confirmed_resource_indicator = None
         self.RESOURCE_CONFIDENCE_THRESHOLD = 3 # Actions in a row to confirm
 
+        # --- Object & Shape Tracking ---
+        self.observed_object_shapes = {} # Maps shape tuple -> count
+        self.last_known_objects = [] # Stores full object descriptions from the last frame
+
         # --- Generic Action Groups ---
         # Get all possible actions, excluding RESET, to create generic groups.
         all_discoverable_actions = [a for a in GameAction if a is not GameAction.RESET]
@@ -104,6 +108,7 @@ class AGI3(Agent):
         """Resets the agent's state for a new life or attempt without printing."""
         self.previous_frame = None
         self.last_action = None
+        self.last_known_objects = []
 
         if self.level_knowledge_is_learned:
             self.agent_state = AgentState.RANDOM_ACTION
@@ -240,6 +245,22 @@ class AGI3(Agent):
                 # We pass `structured_changes` here, which contains ALL changes (novel and known).
                 self._update_resource_indicator_tracking(structured_changes, self.last_action)
 
+        # --- Object Finding and Tracking ---
+        if novel_changes_found:
+            # 1. Find and describe all objects in the current frame
+            current_objects = self._find_and_describe_objects(structured_changes, latest_frame.frame)
+
+            # 2. Track objects from the last frame to the current one
+            if self.last_known_objects: # Can only track if we have a "before" state
+                tracking_logs = self._track_objects(current_objects, self.last_known_objects)
+                if tracking_logs:
+                    print(f"--- Object Tracking Report (Action: {self.last_action.name}) ---")
+                    for log in tracking_logs:
+                        print(log)
+
+            # 3. Update memory for the next turn
+            self.last_known_objects = current_objects
+
         # --- 3. Choose a New Action to Take ---
         if self.agent_state == AgentState.DISCOVERY:
             if not self.actions_to_try:
@@ -354,6 +375,110 @@ class AGI3(Agent):
         self.previous_frame = copy.deepcopy(current_frame)
         return novel_changes_found, known_changes_found, novel_change_descriptions, all_structured_changes
 
+    def _find_and_describe_objects(self, structured_changes: list, latest_frame: list) -> list[dict]:
+        """
+        Finds connected-component objects based on changes, then describes them
+        by capturing the full data within their bounding box from the latest_frame.
+        """
+        if not structured_changes:
+            return []
+
+        # 1. Create a set of all individual changed points: {(row_idx, pixel_idx), ...}
+        all_points = set()
+        for change in structured_changes:
+            row_idx = change['row_index']
+            for pixel_change in change['changes']:
+                all_points.add((row_idx, pixel_change['index']))
+
+        objects = []
+        visited_points = set()
+        for point in all_points:
+            if point not in visited_points:
+                # 2. Cluster points into an object using flood-fill
+                current_object_points = set()
+                points_to_visit = [point]
+                visited_points.add(point)
+                while points_to_visit:
+                    r, p_idx = points_to_visit.pop()
+                    current_object_points.add((r, p_idx))
+                    for dr, dp_idx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                        neighbor = (r + dr, p_idx + dp_idx)
+                        if neighbor in all_points and neighbor not in visited_points:
+                            visited_points.add(neighbor)
+                            points_to_visit.append(neighbor)
+
+                # 3. Calculate the object's bounding box
+                min_row = min(r for r, _ in current_object_points)
+                max_row = max(r for r, _ in current_object_points)
+                min_idx = min(p_idx for _, p_idx in current_object_points)
+                max_idx = max(p_idx for _, p_idx in current_object_points)
+                height = max_row - min_row + 1
+                width = max_idx - min_idx + 1
+
+                # 4. Capture the full data map for the object from the frame
+                data_map_list = []
+                for r_scan in range(min_row, max_row + 1):
+                    row_data = []
+                    for p_scan in range(min_idx, max_idx + 1):
+                        row_data.append(latest_frame[0][r_scan][p_scan])
+                    data_map_list.append(tuple(row_data))
+
+                objects.append({
+                    'height': height, 'width': width, 'top_row': min_row, 
+                    'left_index': min_idx, 'data_map': tuple(data_map_list)
+                })
+        return objects
+    
+    def _track_objects(self, current_objects: list, last_objects: list) -> list[str]:
+        """Compares current objects to last known objects to track movement and changes."""
+        log_messages = []
+        unmatched_current = list(current_objects)
+        unmatched_last = list(last_objects)
+
+        # --- Stage 1: Match by exact position (Static & Recolor) ---
+        matched_in_stage1 = []
+        for curr_obj in list(unmatched_current):
+            for last_obj in list(unmatched_last):
+                if (curr_obj['top_row'] == last_obj['top_row'] and
+                    curr_obj['left_index'] == last_obj['left_index'] and
+                    curr_obj['height'] == last_obj['height'] and
+                    curr_obj['width'] == last_obj['width']):
+                    if curr_obj['data_map'] != last_obj['data_map']:
+                        log_messages.append(f"🎨 RECOLOR: Object at ({curr_obj['top_row']}, {curr_obj['left_index']}) changed its data.")
+                    matched_in_stage1.append((curr_obj, last_obj))
+                    break
+        for curr, last in matched_in_stage1:
+            unmatched_current.remove(curr)
+            unmatched_last.remove(last)
+
+        # --- Stage 2: Match by shape and proximity (Move & Move+Recolor) ---
+        matched_in_stage2 = []
+        for curr_obj in list(unmatched_current):
+            best_match, min_dist = None, 6 # Proximity limit of 5 pixels
+            for last_obj in list(unmatched_last):
+                if (curr_obj['height'] == last_obj['height'] and curr_obj['width'] == last_obj['width']):
+                    dist = abs(curr_obj['top_row'] - last_obj['top_row']) + abs(curr_obj['left_index'] - last_obj['left_index'])
+                    if dist < min_dist:
+                        min_dist, best_match = dist, last_obj
+            if best_match:
+                pos1 = f"({best_match['top_row']}, {best_match['left_index']})"
+                pos2 = f"({curr_obj['top_row']}, {curr_obj['left_index']})"
+                if curr_obj['data_map'] == best_match['data_map']:
+                    log_messages.append(f"🧠 MOVE: Object [{curr_obj['height']}x{curr_obj['width']}] moved from {pos1} to {pos2}.")
+                else:
+                    log_messages.append(f"🔄 MOVE & RECOLOR: Object [{curr_obj['height']}x{curr_obj['width']}] moved from {pos1} to {pos2} and changed data.")
+                matched_in_stage2.append((curr_obj, best_match))
+        for curr, last in matched_in_stage2:
+            unmatched_current.remove(curr)
+            unmatched_last.remove(last)
+
+        # --- Stage 3: Handle leftovers (Appear & Disappear) ---
+        for curr_obj in unmatched_current:
+            log_messages.append(f"➕ APPEAR: A new [{curr_obj['height']}x{curr_obj['width']}] object appeared at ({curr_obj['top_row']}, {curr_obj['left_index']}).")
+        for last_obj in unmatched_last:
+            log_messages.append(f"➖ DISAPPEAR: A [{last_obj['height']}x{last_obj['width']}] object disappeared from ({last_obj['top_row']}, {last_obj['left_index']}).")
+        return log_messages
+    
     def _update_resource_indicator_tracking(self, structured_changes: list, action: GameAction):
         """Analyzes changes to find a resource indicator, which depletes on any action."""
         if self.confirmed_resource_indicator or not action:
