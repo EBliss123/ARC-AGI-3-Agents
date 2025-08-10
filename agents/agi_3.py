@@ -376,103 +376,95 @@ class AGI3(Agent):
         return novel_changes_found, known_changes_found, novel_change_descriptions, all_structured_changes
 
     def _find_and_describe_objects(self, structured_changes: list, latest_frame: list) -> list[dict]:
-        """
-        Finds connected-component objects based on changes, then describes them
-        by capturing the full data within their bounding box from the latest_frame.
-        """
+        """Finds objects by grouping changed pixels by their new color first, then clustering."""
         if not structured_changes:
             return []
 
-        # 1. Create a set of all individual changed points: {(row_idx, pixel_idx), ...}
-        all_points = set()
+        # 1. Group all changed points by their new color
+        points_by_color = {}
         for change in structured_changes:
             row_idx = change['row_index']
             for pixel_change in change['changes']:
-                all_points.add((row_idx, pixel_change['index']))
+                new_color = latest_frame[0][row_idx][pixel_change['index']]
+                if new_color not in points_by_color:
+                    points_by_color[new_color] = set()
+                points_by_color[new_color].add((row_idx, pixel_change['index']))
 
-        objects = []
-        visited_points = set()
-        for point in all_points:
-            if point not in visited_points:
-                # 2. Cluster points into an object using flood-fill
-                current_object_points = set()
-                points_to_visit = [point]
-                visited_points.add(point)
-                while points_to_visit:
-                    r, p_idx = points_to_visit.pop()
-                    current_object_points.add((r, p_idx))
-                    for dr, dp_idx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                        neighbor = (r + dr, p_idx + dp_idx)
-                        if neighbor in all_points and neighbor not in visited_points:
-                            visited_points.add(neighbor)
-                            points_to_visit.append(neighbor)
+        # 2. Run flood-fill on each color group to find monochromatic object parts
+        monochromatic_parts = []
+        for color, points in points_by_color.items():
+            visited = set()
+            for point in points:
+                if point not in visited:
+                    component_points = set()
+                    q = [point]
+                    visited.add(point)
+                    while q:
+                        p = q.pop(0)
+                        component_points.add(p)
+                        r, p_idx = p
+                        for dr, dp_idx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                            neighbor = (r + dr, p_idx + dp_idx)
+                            if neighbor in points and neighbor not in visited:
+                                visited.add(neighbor)
+                                q.append(neighbor)
+                    monochromatic_parts.append(component_points)
 
-                # 3. Calculate the object's bounding box
-                min_row = min(r for r, _ in current_object_points)
-                max_row = max(r for r, _ in current_object_points)
-                min_idx = min(p_idx for _, p_idx in current_object_points)
-                max_idx = max(p_idx for _, p_idx in current_object_points)
-                height = max_row - min_row + 1
-                width = max_idx - min_idx + 1
+        # 3. For now, we treat each part as a separate object.
+        # A future improvement could merge touching parts of different colors.
+        final_objects = []
+        for obj_points in monochromatic_parts:
+            if not obj_points: continue
+            min_row = min(r for r, _ in obj_points)
+            max_row = max(r for r, _ in obj_points)
+            min_idx = min(p_idx for _, p_idx in obj_points)
+            max_idx = max(p_idx for _, p_idx in obj_points)
+            height, width = max_row - min_row + 1, max_idx - min_idx + 1
 
-                # 4. Capture the full data map for the object from the frame
-                data_map_list = []
-                for r_scan in range(min_row, max_row + 1):
-                    row_data = []
-                    for p_scan in range(min_idx, max_idx + 1):
-                        row_data.append(latest_frame[0][r_scan][p_scan])
-                    data_map_list.append(tuple(row_data))
+            data_map = tuple(tuple(latest_frame[0][r][p] for p in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
 
-                objects.append({
-                    'height': height, 'width': width, 'top_row': min_row, 
-                    'left_index': min_idx, 'data_map': tuple(data_map_list)
-                })
-        return objects
+            final_objects.append({
+                'height': height, 'width': width, 'top_row': min_row,
+                'left_index': min_idx, 'data_map': data_map
+            })
+        return final_objects
     
     def _track_objects(self, current_objects: list, last_objects: list) -> list[str]:
         """Compares current objects to last known objects to track movement and changes."""
-        log_messages = []
-        unmatched_current = list(current_objects)
-        unmatched_last = list(last_objects)
+        log_messages, unmatched_current, unmatched_last = [], list(current_objects), list(last_objects)
 
-        # --- Stage 1: Match by exact position (Static & Recolor) ---
-        matched_in_stage1 = []
+        # --- Stage 1: Match by exact data_map (fingerprint) ---
+        # This is the most reliable match for moves.
+        matched = []
+        for curr_obj in list(unmatched_current):
+            for last_obj in list(unmatched_last):
+                if curr_obj['data_map'] == last_obj['data_map']:
+                    pos1, pos2 = f"({last_obj['top_row']}, {last_obj['left_index']})", f"({curr_obj['top_row']}, {curr_obj['left_index']})"
+                    if pos1 != pos2:
+                        log_messages.append(f"🧠 MOVE: Object [{curr_obj['height']}x{curr_obj['width']}] moved from {pos1} to {pos2}.")
+                    # If position is same, it's static. We can ignore for cleaner logs.
+                    matched.append((curr_obj, last_obj))
+                    break
+        for curr, last in matched:
+            if curr in unmatched_current: unmatched_current.remove(curr)
+            if last in unmatched_last: unmatched_last.remove(last)
+
+        # --- Stage 2: Match by same position & shape (for Recolor) ---
+        matched = []
         for curr_obj in list(unmatched_current):
             for last_obj in list(unmatched_last):
                 if (curr_obj['top_row'] == last_obj['top_row'] and
                     curr_obj['left_index'] == last_obj['left_index'] and
                     curr_obj['height'] == last_obj['height'] and
                     curr_obj['width'] == last_obj['width']):
-                    if curr_obj['data_map'] != last_obj['data_map']:
-                        log_messages.append(f"🎨 RECOLOR: Object at ({curr_obj['top_row']}, {curr_obj['left_index']}) changed its data.")
-                    matched_in_stage1.append((curr_obj, last_obj))
+                    log_messages.append(f"🎨 RECOLOR: Object at ({curr_obj['top_row']}, {curr_obj['left_index']}) changed its data.")
+                    matched.append((curr_obj, last_obj))
                     break
-        for curr, last in matched_in_stage1:
-            unmatched_current.remove(curr)
-            unmatched_last.remove(last)
+        for curr, last in matched:
+            if curr in unmatched_current: unmatched_current.remove(curr)
+            if last in unmatched_last: unmatched_last.remove(last)
 
-        # --- Stage 2: Match by shape and proximity (Move & Move+Recolor) ---
-        matched_in_stage2 = []
-        for curr_obj in list(unmatched_current):
-            best_match, min_dist = None, 6 # Proximity limit of 5 pixels
-            for last_obj in list(unmatched_last):
-                if (curr_obj['height'] == last_obj['height'] and curr_obj['width'] == last_obj['width']):
-                    dist = abs(curr_obj['top_row'] - last_obj['top_row']) + abs(curr_obj['left_index'] - last_obj['left_index'])
-                    if dist < min_dist:
-                        min_dist, best_match = dist, last_obj
-            if best_match:
-                pos1 = f"({best_match['top_row']}, {best_match['left_index']})"
-                pos2 = f"({curr_obj['top_row']}, {curr_obj['left_index']})"
-                if curr_obj['data_map'] == best_match['data_map']:
-                    log_messages.append(f"🧠 MOVE: Object [{curr_obj['height']}x{curr_obj['width']}] moved from {pos1} to {pos2}.")
-                else:
-                    log_messages.append(f"🔄 MOVE & RECOLOR: Object [{curr_obj['height']}x{curr_obj['width']}] moved from {pos1} to {pos2} and changed data.")
-                matched_in_stage2.append((curr_obj, best_match))
-        for curr, last in matched_in_stage2:
-            unmatched_current.remove(curr)
-            unmatched_last.remove(last)
-
-        # --- Stage 3: Handle leftovers (Appear & Disappear) ---
+        # --- Stage 3: Handle leftovers ---
         for curr_obj in unmatched_current:
             log_messages.append(f"➕ APPEAR: A new [{curr_obj['height']}x{curr_obj['width']}] object appeared at ({curr_obj['top_row']}, {curr_obj['left_index']}).")
         for last_obj in unmatched_last:
