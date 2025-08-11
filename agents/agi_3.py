@@ -60,13 +60,15 @@ class AGI3(Agent):
         self.last_known_objects = [] # Stores full object descriptions from the last frame
         self.world_model = {
             'player_signature': None,
-            'floor_color': None
+            'floor_color': None,
+            'action_map': {} # Will store confirmed action -> effect mappings
         }
         # This will store hypotheses like {(obj_signature, color): confidence_count}
         self.player_floor_hypothesis = {}
         self.agent_move_hypothesis = {} # Tracks how many times a shape has moved
         self.floor_hypothesis = {} # Tracks how many times a color has been identified as floor
-        self.CONCEPT_CONFIDENCE_THRESHOLD = 5 # Number of times a pattern must be seen to be learned
+        self.action_effect_hypothesis = {} # Tracks action -> effect hypotheses
+        self.CONCEPT_CONFIDENCE_THRESHOLD = 3 # Number of times a pattern must be seen to be learned
 
         # --- Generic Action Groups ---
         # Get all possible actions, excluding RESET, to create generic groups.
@@ -285,7 +287,7 @@ class AGI3(Agent):
 
             # 2. Track objects from the last frame to the current one
             if self.last_known_objects: # Can only track if we have a "before" state
-                tracking_logs = self._track_objects(current_objects, self.last_known_objects, latest_frame.frame, object_logic_changes)
+                tracking_logs = self._track_objects(current_objects, self.last_known_objects, latest_frame.frame, object_logic_changes, self.last_action)
                 if tracking_logs:
                     print(f"--- Object Tracking Report (Action: {self.last_action.name}) ---")
                     for log in tracking_logs:
@@ -566,7 +568,7 @@ class AGI3(Agent):
 
         return final_objects
     
-    def _track_objects(self, current_objects: list, last_objects: list, latest_grid: list, structured_changes: list) -> list[str]:
+    def _track_objects(self, current_objects: list, last_objects: list, latest_grid: list, structured_changes: list, action: GameAction) -> list[str]:
         """Compares current objects to last known objects to track movement and changes."""
         log_messages = []
         unmatched_current = list(current_objects)
@@ -663,8 +665,8 @@ class AGI3(Agent):
                         log_messages.append(f"🧠 [AGENT] moved by vector {vector}.")
                     else:
                         log_messages.append(f"🧠 COMPOSITE MOVE: Object [{comp_h}x{comp_w}] moved by vector {vector}.")
-                    true_moves.append({'type': 'composite', 'signature': signature, 'parts': cluster})
-                    for pair in cluster: processed_pairs.append(pair)
+                true_moves.append({'type': 'composite', 'signature': signature, 'parts': cluster, 'vector': vector})
+                for pair in cluster: processed_pairs.append(pair)
 
         # Log individual moves and collect their structured info.
         for curr, last in move_matched_pairs:
@@ -675,7 +677,9 @@ class AGI3(Agent):
                     log_messages.append(f"🧠 [AGENT] moved from ({last['top_row']}, {last['left_index']}) to ({curr['top_row']}, {curr['left_index']}).")
                 else:
                     log_messages.append(f"🧠 MOVE: Object [{curr['height']}x{curr['width']}] moved from ({last['top_row']}, {last['left_index']}) to ({curr['top_row']}, {curr['left_index']}).")
-                true_moves.append({'type': 'individual', 'signature': signature, 'last_obj': last})
+
+                vector = (curr['top_row'] - last['top_row'], curr['left_index'] - last['left_index'])
+                true_moves.append({'type': 'individual', 'signature': signature, 'last_obj': last, 'vector': vector})
 
         # --- Concept Learning from Movement (Agent and Floor) ---
         if not true_moves: return log_messages # No moves, nothing to learn.
@@ -718,6 +722,33 @@ class AGI3(Agent):
                             self.world_model['floor_color'] = floor_candidate
                             log_messages.append(f"✅ Confirmed Floor Color: {floor_candidate}.")
                             break # Stop after confirming.
+
+        # --- Action Effect Learning ---
+        # Learn how actions affect the agent.
+        if self.world_model['player_signature'] is not None and action:
+            for move in true_moves:
+                if move['signature'] == self.world_model['player_signature']:
+                    # The agent moved. This is an effect of the last action.
+                    effect_vector = move['vector']
+
+                    # We only learn about actions that aren't already confirmed.
+                    if action not in self.world_model['action_map']:
+                        # Initialize hypothesis dict for this action if it doesn't exist.
+                        if action not in self.action_effect_hypothesis:
+                            self.action_effect_hypothesis[action] = {}
+
+                        hypo_dict = self.action_effect_hypothesis[action]
+                        hypo_dict[effect_vector] = hypo_dict.get(effect_vector, 0) + 1
+                        confidence = hypo_dict[effect_vector]
+
+                        log_messages.append(f"🕵️‍♀️ Action Hypothesis: {action.name} -> move by {effect_vector} (Confidence: {confidence}).")
+
+                        if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
+                            self.world_model['action_map'][action] = {'move_vector': effect_vector}
+                            log_messages.append(f"✅ Confirmed Action Effect: {action.name} consistently moves the agent by vector {effect_vector}.")
+                            del self.action_effect_hypothesis[action] # Clean up memory
+
+                    break # Agent's move found, no need to check other moves.
 
         return log_messages
     
