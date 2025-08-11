@@ -255,12 +255,35 @@ class AGI3(Agent):
 
         # --- Object Finding and Tracking ---
         if novel_changes_found:
+            # --- Separate UI changes from game-world changes for analysis ---
+            object_logic_changes = []
+            if self.confirmed_resource_indicator:
+                indicator_row = self.confirmed_resource_indicator['row_index']
+                indicator_changes = []
+
+                for change in structured_changes:
+                    if change['row_index'] == indicator_row:
+                        indicator_changes.append(change)
+                    else:
+                        object_logic_changes.append(change)
+
+                # If changes happened on the indicator, log them in the desired format.
+                if indicator_changes:
+                    print("--- UI Resource Indicator Update ---")
+                    for change in indicator_changes:
+                        row = change['row_index']
+                        for px_change in change['changes']:
+                            print(f"🎨 RECOLOR: 1x1 unit at ({row}, {px_change['index']}) changed from {px_change['from']} to {px_change['to']}.")
+            else:
+                # If no indicator is confirmed, all changes are for game-world object logic.
+                object_logic_changes = structured_changes
+
             # 1. Find and describe all objects in the current frame
-            current_objects = self._find_and_describe_objects(structured_changes, latest_frame.frame)
+            current_objects = self._find_and_describe_objects(object_logic_changes, latest_frame.frame)
 
             # 2. Track objects from the last frame to the current one
             if self.last_known_objects: # Can only track if we have a "before" state
-                tracking_logs = self._track_objects(current_objects, self.last_known_objects, latest_frame.frame, structured_changes)
+                tracking_logs = self._track_objects(current_objects, self.last_known_objects, latest_frame.frame, object_logic_changes)
                 if tracking_logs:
                     print(f"--- Object Tracking Report (Action: {self.last_action.name}) ---")
                     for log in tracking_logs:
@@ -273,12 +296,18 @@ class AGI3(Agent):
             if self.last_known_objects:
                 # Get the set of coordinates that changed in this turn
                 changed_coords = set()
-                for change in structured_changes:
+                for change in object_logic_changes:
                     for px_change in change['changes']:
                         changed_coords.add((change['row_index'], px_change['index']))
                 
                 # Add any object from memory that was NOT in a changed location
                 for obj in self.last_known_objects:
+                    # Purge any object from memory that is on the confirmed indicator row.
+                    if self.confirmed_resource_indicator:
+                        indicator_row = self.confirmed_resource_indicator['row_index']
+                        obj_rows = range(obj['top_row'], obj['top_row'] + obj['height'])
+                        if indicator_row in obj_rows:
+                            continue # Skip this object, it's on the UI row.
                     is_static = True
                     for r in range(obj['top_row'], obj['top_row'] + obj['height']):
                         if any((r, c) in changed_coords for c in range(obj['left_index'], obj['left_index'] + obj['width'])):
