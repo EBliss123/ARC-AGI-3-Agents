@@ -65,6 +65,7 @@ class AGI3(Agent):
         # This will store hypotheses like {(obj_signature, color): confidence_count}
         self.player_floor_hypothesis = {}
         self.agent_move_hypothesis = {} # Tracks how many times a shape has moved
+        self.floor_hypothesis = {} # Tracks how many times a color has been identified as floor
         self.CONCEPT_CONFIDENCE_THRESHOLD = 5 # Number of times a pattern must be seen to be learned
 
         # --- Generic Action Groups ---
@@ -512,8 +513,21 @@ class AGI3(Agent):
             
             # If it's part of the background, do not classify it as an object.
             if is_part_of_background:
-                print(f"🕵️‍♀️ Change at {sample_point} with color {obj_color} is contiguous with a static background. Ignoring.")
-                continue
+                log_message = f"🕵️‍♀️ Change at {sample_point} with color {obj_color} is contiguous with static background."
+
+                # If this event occurs, the color revealed is a strong candidate for the floor.
+                if self.world_model['floor_color'] is None:
+                    self.floor_hypothesis[obj_color] = self.floor_hypothesis.get(obj_color, 0) + 1
+                    confidence = self.floor_hypothesis[obj_color]
+                    log_message += f" Adding as floor candidate (Confidence: {confidence})."
+
+                    # Confirm the floor color if confidence threshold is met.
+                    if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
+                        self.world_model['floor_color'] = obj_color
+                        log_message += f" ✅ Confirmed Floor Color: {obj_color}."
+
+                print(log_message)
+                continue # Still skip creating an object from this background change.
 
             # --- If it's a real object, proceed with description ---
             min_row = min(r for r, _ in obj_points)
@@ -614,7 +628,7 @@ class AGI3(Agent):
 
         # --- Analyze groups for composite objects and identify true moves ---
         processed_pairs = []
-        true_move_signatures = [] # This will store the final signatures of moved objects.
+        true_moves = [] # Will store structured info about each move.
 
         for vector, pairs in moves_by_vector.items():
             if len(pairs) < 2: continue
@@ -641,28 +655,56 @@ class AGI3(Agent):
 
                     comp_h, comp_w = max_row - min_row, max_col - min_col
                     log_messages.append(f"🧠 COMPOSITE MOVE: Object [{comp_h}x{comp_w}] moved by vector {vector}.")
-                    true_move_signatures.append((comp_h, comp_w)) # Add the composite signature.
+                    true_moves.append({'type': 'composite', 'signature': (comp_h, comp_w), 'parts': cluster})
                     for pair in cluster: processed_pairs.append(pair)
 
-        # Log all individual moves and collect their signatures.
+        # Log individual moves and collect their structured info.
         for curr, last in move_matched_pairs:
             if (curr, last) not in processed_pairs:
                 log_messages.append(f"🧠 MOVE: Object [{curr['height']}x{curr['width']}] moved from ({last['top_row']}, {last['left_index']}) to ({curr['top_row']}, {curr['left_index']}).")
-                true_move_signatures.append((curr['height'], curr['width'])) # Add individual signature.
+                true_moves.append({'type': 'individual', 'signature': (curr['height'], curr['width']), 'last_obj': last})
 
-        # --- Agent Identification from Movement ---
-        # This logic now uses the corrected list of signatures.
-        if self.world_model['player_signature'] is None and true_move_signatures:
-            for signature in true_move_signatures:
+        # --- Concept Learning from Movement (Agent and Floor) ---
+        if not true_moves: return log_messages # No moves, nothing to learn.
+
+        # 1. Identify the Agent
+        if self.world_model['player_signature'] is None:
+            for move in true_moves:
+                signature = move['signature']
                 self.agent_move_hypothesis[signature] = self.agent_move_hypothesis.get(signature, 0) + 1
                 confidence = self.agent_move_hypothesis[signature]
-
                 log_messages.append(f"🕵️‍♂️ Agent Hypothesis: Signature {signature} has moved {confidence} time(s).")
 
                 if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
                     self.world_model['player_signature'] = signature
-                    log_messages.append(f"✅ Confirmed Agent Signature: {signature}. This object will now be identified as the agent.")
-                    break
+                    log_messages.append(f"✅ Confirmed Agent Signature: {signature}.")
+                    break # Stop after confirming.
+
+        # 2. Identify the Floor (can only happen after agent is known)
+        if self.world_model['player_signature'] is not None and self.world_model['floor_color'] is None:
+            for move in true_moves:
+                if move['signature'] == self.world_model['player_signature']:
+                    # The agent moved. Find the color of the ground it was on.
+                    background_colors = set()
+                    if move['type'] == 'individual':
+                        color = move['last_obj'].get('background_color')
+                        if color is not None: background_colors.add(color)
+                    else: # Composite move
+                        for _, last_part in move['parts']:
+                            color = last_part.get('background_color')
+                            if color is not None: background_colors.add(color)
+
+                    # If we found one consistent background color for all parts, it's a candidate.
+                    if len(background_colors) == 1:
+                        floor_candidate = background_colors.pop()
+                        self.floor_hypothesis[floor_candidate] = self.floor_hypothesis.get(floor_candidate, 0) + 1
+                        confidence = self.floor_hypothesis[floor_candidate]
+                        log_messages.append(f"🕵️‍♀️ Floor Hypothesis: Color {floor_candidate} is a candidate (Confidence: {confidence}).")
+
+                        if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
+                            self.world_model['floor_color'] = floor_candidate
+                            log_messages.append(f"✅ Confirmed Floor Color: {floor_candidate}.")
+                            break # Stop after confirming.
 
         return log_messages
     
