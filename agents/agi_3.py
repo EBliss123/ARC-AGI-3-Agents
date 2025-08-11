@@ -61,6 +61,7 @@ class AGI3(Agent):
         self.world_model = {
             'player_signature': None,
             'floor_color': None,
+            'wall_colors': set(), # Use a set for multiple possible wall colors
             'action_map': {} # Will store confirmed action -> effect mappings
         }
         # This will store hypotheses like {(obj_signature, color): confidence_count}
@@ -68,6 +69,8 @@ class AGI3(Agent):
         self.agent_move_hypothesis = {} # Tracks how many times a shape has moved
         self.floor_hypothesis = {} # Tracks how many times a color has been identified as floor
         self.action_effect_hypothesis = {} # Tracks action -> effect hypotheses
+        self.wall_hypothesis = {} # Tracks wall color candidates
+        self.last_known_player_obj = None # Stores the full player object from the last frame
         self.CONCEPT_CONFIDENCE_THRESHOLD = 3 # Number of times a pattern must be seen to be learned
 
         # --- Generic Action Groups ---
@@ -237,8 +240,11 @@ class AGI3(Agent):
                     print("  - ...and more.")
 
             else:
-                # --- Action FAILED (caused no novel change) ---
-                # It might have only changed the resource indicator, which we treat as an ineffective action.
+                # --- An action failed to produce a novel change ---
+                # If this was a KNOWN action, it's a learning opportunity.
+                if self.last_action in self.world_model['action_map']:
+                    self._learn_from_interaction_failure(self.last_action, self.previous_frame)
+
                 if known_changes_found:
                     print("💧 Resource level changed, but no other effects were observed.")
 
@@ -285,9 +291,18 @@ class AGI3(Agent):
             # 1. Find and describe all objects in the current frame
             current_objects = self._find_and_describe_objects(object_logic_changes, latest_frame.frame)
 
+            # --- DEBUG: Show all found objects ---
+            print("--- Found Objects Report ---")
+            if not current_objects:
+                print("  - No objects were found in changed areas.")
+            for i, obj in enumerate(current_objects):
+                print(f"  - Obj {i}: HxW=({obj['height']}x{obj['width']}), Pos=(top:{obj['top_row']}, left:{obj['left_index']})")
+            # --- END DEBUG ---
+
+            moved_agent_this_turn = None
             # 2. Track objects from the last frame to the current one
             if self.last_known_objects: # Can only track if we have a "before" state
-                tracking_logs = self._track_objects(current_objects, self.last_known_objects, latest_frame.frame, object_logic_changes, self.last_action)
+                tracking_logs, moved_agent_this_turn = self._track_objects(current_objects, self.last_known_objects, latest_frame.frame, object_logic_changes, self.last_action)
                 if tracking_logs:
                     print(f"--- Object Tracking Report (Action: {self.last_action.name}) ---")
                     for log in tracking_logs:
@@ -326,6 +341,20 @@ class AGI3(Agent):
 
             # Finally, set the agent's memory for the next turn
             self.last_known_objects = new_object_memory
+
+            # 4. Update the player object's known position
+            # If the tracker saw the agent move, use that new position.
+            if moved_agent_this_turn:
+                self.last_known_player_obj = moved_agent_this_turn
+            # Otherwise, try to find it from memory (this is the old, flawed logic, now a fallback)
+            else:
+                self.last_known_player_obj = None
+                if self.world_model.get('player_signature'):
+                    player_sig = self.world_model['player_signature']
+                    for obj in self.last_known_objects:
+                        if (obj['height'], obj['width']) == player_sig:
+                            self.last_known_player_obj = obj
+                            break # Found it
 
         # --- 3. Choose a New Action to Take ---
         if self.agent_state == AgentState.DISCOVERY:
@@ -568,6 +597,29 @@ class AGI3(Agent):
 
         return final_objects
     
+    def _are_objects_adjacent(self, obj1: dict, obj2: dict) -> bool:
+        """Checks if two objects' bounding boxes are touching or overlapping."""
+        # Define the bounding box edges for obj1
+        obj1_left = obj1['left_index']
+        obj1_right = obj1['left_index'] + obj1['width']
+        obj1_top = obj1['top_row']
+        obj1_bottom = obj1['top_row'] + obj1['height']
+
+        # Define the bounding box edges for obj2
+        obj2_left = obj2['left_index']
+        obj2_right = obj2['left_index'] + obj2['width']
+        obj2_top = obj2['top_row']
+        obj2_bottom = obj2['top_row'] + obj2['height']
+
+        # Check for no overlap. Two rectangles do NOT overlap if one is entirely
+        # to the left, right, above, or below the other.
+        if (obj1_right < obj2_left or obj2_right < obj1_left or
+            obj1_bottom < obj2_top or obj2_bottom < obj1_top):
+            return False
+        
+        # If they are not completely separate, they must be adjacent or overlapping.
+        return True
+    
     def _track_objects(self, current_objects: list, last_objects: list, latest_grid: list, structured_changes: list, action: GameAction) -> list[str]:
         """Compares current objects to last known objects to track movement and changes."""
         log_messages = []
@@ -682,7 +734,9 @@ class AGI3(Agent):
                 true_moves.append({'type': 'individual', 'signature': signature, 'last_obj': last, 'vector': vector})
 
         # --- Concept Learning from Movement (Agent and Floor) ---
-        if not true_moves: return log_messages # No moves, nothing to learn.
+        moved_agent_obj = None
+        if not true_moves:
+            return log_messages, moved_agent_obj
 
         # 1. Identify the Agent
         if self.world_model['player_signature'] is None:
@@ -728,10 +782,23 @@ class AGI3(Agent):
         if self.world_model['player_signature'] is not None and action:
             for move in true_moves:
                 if move['signature'] == self.world_model['player_signature']:
-                    # The agent moved. This is an effect of the last action.
+                    # --- THE AGENT MOVED ---
                     effect_vector = move['vector']
 
-                    # We only learn about actions that aren't already confirmed.
+                    # 1. Combine the agent's fragments into a single bounding box
+                    agent_parts = [p[0] for p in move['parts']] if move['type'] == 'composite' else [move['last_obj']]
+                    
+                    min_row = min(p['top_row'] for p in agent_parts)
+                    max_row = max(p['top_row'] + p['height'] for p in agent_parts)
+                    min_col = min(p['left_index'] for p in agent_parts)
+                    max_col = max(p['left_index'] + p['width'] for p in agent_parts)
+
+                    moved_agent_obj = {
+                        'height': max_row - min_row, 'width': max_col - min_col,
+                        'top_row': min_row, 'left_index': min_col
+                    }
+
+                    # 2. Learn the action effect (if not already known)
                     if action not in self.world_model['action_map']:
                         # Initialize hypothesis dict for this action if it doesn't exist.
                         if action not in self.action_effect_hypothesis:
@@ -750,21 +817,82 @@ class AGI3(Agent):
 
                     break # Agent's move found, no need to check other moves.
 
-        return log_messages
+        return log_messages, moved_agent_obj
     
-    def _are_objects_adjacent(self, obj1: dict, obj2: dict) -> bool:
-        """Checks if two objects' bounding boxes are touching."""
-        # Check for horizontal adjacency
-        if obj1['top_row'] == obj2['top_row'] and obj1['height'] == obj2['height']:
-            if obj1['left_index'] + obj1['width'] == obj2['left_index'] or \
-               obj2['left_index'] + obj2['width'] == obj1['left_index']:
-                return True
-        # Check for vertical adjacency
-        if obj1['left_index'] == obj2['left_index'] and obj1['width'] == obj2['width']:
-            if obj1['top_row'] + obj1['height'] == obj2['top_row'] or \
-               obj2['top_row'] + obj2['height'] == obj1['top_row']:
-                return True
-        return False
+    def _learn_from_interaction_failure(self, action: GameAction, last_grid: list):
+        """Analyzes why a known action failed by checking pixels adjacent to the agent."""
+        # --- 1. Check if we have enough information to analyze the failure ---
+        player_sig = self.world_model.get('player_signature')
+        action_effect = self.world_model['action_map'].get(action)
+        
+        if not (player_sig and self.last_known_player_obj and action_effect and 'move_vector' in action_effect):
+            return
+
+        # --- 2. FULL DIAGNOSTICS: Print all calculation inputs ---
+        print(f"--- Analyzing Failure: Known action {action.name} was ineffective. ---")
+        move_vector = action_effect['move_vector']
+        last_obj = self.last_known_player_obj
+        print(f"  - Action's Learned Move Vector: {move_vector}")
+        print(f"  - Agent's Last Known Position (top_row, left_index): ({last_obj.get('top_row')}, {last_obj.get('left_index')})")
+        print(f"  - Agent's Size (height, width): ({last_obj.get('height')}, {last_obj.get('width')})")
+        
+        # --- 3. Identify the specific pixels to check based on the direction of movement ---
+        grid_height = len(last_grid[0])
+        grid_width = len(last_grid[0][0]) if grid_height > 0 else 0
+        blocking_colors = Counter()
+        coords_to_check = []
+        
+        row_change, col_change = move_vector
+
+        if col_change != 0: # Moving Horizontally
+            target_col = last_obj['left_index'] + last_obj['width'] if col_change > 0 else last_obj['left_index'] - 1
+            print(f"  - Calculated Target Column: {target_col}") # More specific debug
+            for r in range(last_obj['top_row'], last_obj['top_row'] + last_obj['height']):
+                coords_to_check.append((r, target_col))
+
+        elif row_change != 0: # Moving Vertically
+            target_row = last_obj['top_row'] + last_obj['height'] if row_change > 0 else last_obj['top_row'] - 1
+            print(f"  - Calculated Target Row: {target_row}") # More specific debug
+            for p_idx in range(last_obj['left_index'], last_obj['left_index'] + last_obj['width']):
+                coords_to_check.append((target_row, p_idx))
+
+        # --- 4. Investigate the identified pixels for obstacles ---
+        floor_color = self.world_model.get('floor_color')
+        if not coords_to_check:
+             print("  - NO coordinates were identified to check.")
+             return
+
+        print(f"  - AGI's confirmed floor color is: {floor_color}")
+
+        for r, p_idx in coords_to_check:
+            if 0 <= r < grid_height and 0 <= p_idx < grid_width:
+                color = last_grid[0][r][p_idx]
+                print(f"    - Checking pixel at ({r}, {p_idx})... Found color: {color}. (Is it floor? {color == floor_color})")
+                if color != floor_color:
+                    blocking_colors[color] += 1
+            else:
+                print(f"    - SKIPPING pixel at ({r}, {p_idx}) because it is out of bounds.")
+                        
+        print(f"  - Investigating colors found at target: {dict(blocking_colors)}")
+        if not blocking_colors:
+            return
+
+        wall_candidate_color = blocking_colors.most_common(1)[0][0]
+
+        # --- 5. Update Wall Hypothesis ---
+        if wall_candidate_color in self.world_model['wall_colors']:
+            print(f"Collision with known wall (Color: {wall_candidate_color}) detected.")
+            return
+
+        self.wall_hypothesis[wall_candidate_color] = self.wall_hypothesis.get(wall_candidate_color, 0) + 1
+        confidence = self.wall_hypothesis[wall_candidate_color]
+        print(f"🧱 Wall Hypothesis: Color {wall_candidate_color} blocked movement (Confidence: {confidence}).")
+
+        # --- 6. Confirm Hypothesis if Threshold is Met ---
+        if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
+            self.world_model['wall_colors'].add(wall_candidate_color)
+            print(f"✅ [WALL] Confirmed: Color {wall_candidate_color} is a wall.")
+            del self.wall_hypothesis[wall_candidate_color]
     
     def _update_resource_indicator_tracking(self, structured_changes: list, action: GameAction):
         """Analyzes changes to find a resource indicator, which depletes on any action."""
