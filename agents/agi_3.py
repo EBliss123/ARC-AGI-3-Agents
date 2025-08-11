@@ -64,6 +64,7 @@ class AGI3(Agent):
         }
         # This will store hypotheses like {(obj_signature, color): confidence_count}
         self.player_floor_hypothesis = {}
+        self.agent_move_hypothesis = {} # Tracks how many times a shape has moved
         self.CONCEPT_CONFIDENCE_THRESHOLD = 5 # Number of times a pattern must be seen to be learned
 
         # --- Generic Action Groups ---
@@ -611,8 +612,10 @@ class AGI3(Agent):
                 moves_by_vector[vector] = []
             moves_by_vector[vector].append((curr, last))
 
-        # --- Analyze groups for composite objects ---
+        # --- Analyze groups for composite objects and identify true moves ---
         processed_pairs = []
+        true_move_signatures = [] # This will store the final signatures of moved objects.
+
         for vector, pairs in moves_by_vector.items():
             if len(pairs) < 2: continue
 
@@ -629,28 +632,38 @@ class AGI3(Agent):
                             new_neighbor_found = True
                     if not new_neighbor_found:
                         break
-                
+
                 if len(cluster) > 1:
                     min_row = min(p[0]['top_row'] for p in cluster)
                     max_row = max(p[0]['top_row'] + p[0]['height'] for p in cluster)
                     min_col = min(p[0]['left_index'] for p in cluster)
                     max_col = max(p[0]['left_index'] + p[0]['width'] for p in cluster)
-                    
+
                     comp_h, comp_w = max_row - min_row, max_col - min_col
                     log_messages.append(f"🧠 COMPOSITE MOVE: Object [{comp_h}x{comp_w}] moved by vector {vector}.")
+                    true_move_signatures.append((comp_h, comp_w)) # Add the composite signature.
                     for pair in cluster: processed_pairs.append(pair)
 
-        # Log all individual moves that weren't part of a composite
+        # Log all individual moves and collect their signatures.
         for curr, last in move_matched_pairs:
             if (curr, last) not in processed_pairs:
                 log_messages.append(f"🧠 MOVE: Object [{curr['height']}x{curr['width']}] moved from ({last['top_row']}, {last['left_index']}) to ({curr['top_row']}, {curr['left_index']}).")
+                true_move_signatures.append((curr['height'], curr['width'])) # Add individual signature.
 
-        # --- Stage 3: Leftovers (Appear/Disappear) ---
-        for curr_obj in unmatched_current:
-            log_messages.append(f"➕ APPEAR: A new [{curr_obj['height']}x{curr_obj['width']}] object appeared at ({curr_obj['top_row']}, {curr_obj['left_index']}).")
-        for last_obj in unmatched_last:
-            log_messages.append(f"➖ DISAPPEAR: A [{last_obj['height']}x{last_obj['width']}] object disappeared from ({last_obj['top_row']}, {last_obj['left_index']}).")
-            
+        # --- Agent Identification from Movement ---
+        # This logic now uses the corrected list of signatures.
+        if self.world_model['player_signature'] is None and true_move_signatures:
+            for signature in true_move_signatures:
+                self.agent_move_hypothesis[signature] = self.agent_move_hypothesis.get(signature, 0) + 1
+                confidence = self.agent_move_hypothesis[signature]
+
+                log_messages.append(f"🕵️‍♂️ Agent Hypothesis: Signature {signature} has moved {confidence} time(s).")
+
+                if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
+                    self.world_model['player_signature'] = signature
+                    log_messages.append(f"✅ Confirmed Agent Signature: {signature}. This object will now be identified as the agent.")
+                    break
+
         return log_messages
     
     def _are_objects_adjacent(self, obj1: dict, obj2: dict) -> bool:
