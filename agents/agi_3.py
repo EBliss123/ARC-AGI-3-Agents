@@ -291,14 +291,6 @@ class AGI3(Agent):
             # 1. Find and describe all objects in the current frame
             current_objects = self._find_and_describe_objects(object_logic_changes, latest_frame.frame)
 
-            # --- DEBUG: Show all found objects ---
-            print("--- Found Objects Report ---")
-            if not current_objects:
-                print("  - No objects were found in changed areas.")
-            for i, obj in enumerate(current_objects):
-                print(f"  - Obj {i}: HxW=({obj['height']}x{obj['width']}), Pos=(top:{obj['top_row']}, left:{obj['left_index']})")
-            # --- END DEBUG ---
-
             moved_agent_this_turn = None
             # 2. Track objects from the last frame to the current one
             if self.last_known_objects: # Can only track if we have a "before" state
@@ -820,7 +812,7 @@ class AGI3(Agent):
         return log_messages, moved_agent_obj
     
     def _learn_from_interaction_failure(self, action: GameAction, last_grid: list):
-        """Analyzes why a known action failed by checking pixels adjacent to the agent."""
+        """Analyzes why a known action failed by checking the intended destination area."""
         # --- 1. Check if we have enough information to analyze the failure ---
         player_sig = self.world_model.get('player_signature')
         action_effect = self.world_model['action_map'].get(action)
@@ -828,70 +820,55 @@ class AGI3(Agent):
         if not (player_sig and self.last_known_player_obj and action_effect and 'move_vector' in action_effect):
             return
 
-        # --- 2. FULL DIAGNOSTICS: Print all calculation inputs ---
-        print(f"--- Analyzing Failure: Known action {action.name} was ineffective. ---")
+        # --- 2. Calculate the intended destination bounding box ---
         move_vector = action_effect['move_vector']
         last_obj = self.last_known_player_obj
-        print(f"  - Action's Learned Move Vector: {move_vector}")
-        print(f"  - Agent's Last Known Position (top_row, left_index): ({last_obj.get('top_row')}, {last_obj.get('left_index')})")
-        print(f"  - Agent's Size (height, width): ({last_obj.get('height')}, {last_obj.get('width')})")
+        row_change, col_change = move_vector
+
+        final_top_row = last_obj['top_row'] + row_change
+        final_left_index = last_obj['left_index'] + col_change
+        final_bottom_row = final_top_row + last_obj['height']
+        final_right_index = final_left_index + last_obj['width']
         
-        # --- 3. Identify the specific pixels to check based on the direction of movement ---
+        # --- 3. Investigate the destination area for obstacles ---
         grid_height = len(last_grid[0])
         grid_width = len(last_grid[0][0]) if grid_height > 0 else 0
         blocking_colors = Counter()
-        coords_to_check = []
-        
-        row_change, col_change = move_vector
-
-        if col_change != 0: # Moving Horizontally
-            target_col = last_obj['left_index'] + last_obj['width'] if col_change > 0 else last_obj['left_index'] - 1
-            print(f"  - Calculated Target Column: {target_col}") # More specific debug
-            for r in range(last_obj['top_row'], last_obj['top_row'] + last_obj['height']):
-                coords_to_check.append((r, target_col))
-
-        elif row_change != 0: # Moving Vertically
-            target_row = last_obj['top_row'] + last_obj['height'] if row_change > 0 else last_obj['top_row'] - 1
-            print(f"  - Calculated Target Row: {target_row}") # More specific debug
-            for p_idx in range(last_obj['left_index'], last_obj['left_index'] + last_obj['width']):
-                coords_to_check.append((target_row, p_idx))
-
-        # --- 4. Investigate the identified pixels for obstacles ---
         floor_color = self.world_model.get('floor_color')
-        if not coords_to_check:
-             print("  - NO coordinates were identified to check.")
-             return
+        
+        for r in range(final_top_row, final_bottom_row):
+            for p_idx in range(final_left_index, final_right_index):
+                if 0 <= r < grid_height and 0 <= p_idx < grid_width:
+                    color = last_grid[0][r][p_idx]
 
-        print(f"  - AGI's confirmed floor color is: {floor_color}")
+                    # --- EFFICIENT CHECK: Is this a pre-confirmed wall? ---
+                    if color in self.world_model['wall_colors']:
+                        print(f"🧱 [WALL] Collision with known wall (Color: {color}) detected.")
+                        return # Exit immediately, our job is done.
 
-        for r, p_idx in coords_to_check:
-            if 0 <= r < grid_height and 0 <= p_idx < grid_width:
-                color = last_grid[0][r][p_idx]
-                print(f"    - Checking pixel at ({r}, {p_idx})... Found color: {color}. (Is it floor? {color == floor_color})")
-                if color != floor_color:
-                    blocking_colors[color] += 1
-            else:
-                print(f"    - SKIPPING pixel at ({r}, {p_idx}) because it is out of bounds.")
+                    if color != floor_color:
+                        blocking_colors[color] += 1
+                else:
+                    if -1 in self.world_model['wall_colors']:
+                        print("🧱 [WALL] Collision with known wall (Out of Bounds) detected.")
+                        return
+                    blocking_colors[-1] += 1
                         
-        print(f"  - Investigating colors found at target: {dict(blocking_colors)}")
         if not blocking_colors:
             return
 
+        # --- 4. If no known walls were hit, proceed with new wall discovery ---
         wall_candidate_color = blocking_colors.most_common(1)[0][0]
-
-        # --- 5. Update Wall Hypothesis ---
-        if wall_candidate_color in self.world_model['wall_colors']:
-            print(f"Collision with known wall (Color: {wall_candidate_color}) detected.")
-            return
 
         self.wall_hypothesis[wall_candidate_color] = self.wall_hypothesis.get(wall_candidate_color, 0) + 1
         confidence = self.wall_hypothesis[wall_candidate_color]
-        print(f"🧱 Wall Hypothesis: Color {wall_candidate_color} blocked movement (Confidence: {confidence}).")
+        wall_name = "Out of Bounds" if wall_candidate_color == -1 else f"Color {wall_candidate_color}"
+        print(f"🧱 Wall Hypothesis: {wall_name} blocked movement (Confidence: {confidence}).")
 
-        # --- 6. Confirm Hypothesis if Threshold is Met ---
+        # --- 5. Confirm Hypothesis if Threshold is Met ---
         if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
             self.world_model['wall_colors'].add(wall_candidate_color)
-            print(f"✅ [WALL] Confirmed: Color {wall_candidate_color} is a wall.")
+            print(f"✅ [WALL] Confirmed: {wall_name} is a wall.")
             del self.wall_hypothesis[wall_candidate_color]
     
     def _update_resource_indicator_tracking(self, structured_changes: list, action: GameAction):
