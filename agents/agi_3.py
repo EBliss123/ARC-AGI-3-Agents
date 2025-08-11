@@ -275,7 +275,7 @@ class AGI3(Agent):
                     for change in indicator_changes:
                         row = change['row_index']
                         for px_change in change['changes']:
-                            print(f"🎨 RECOLOR: 1x1 unit at ({row}, {px_change['index']}) changed from {px_change['from']} to {px_change['to']}.")
+                            print(f"🎨 [RESOURCE INDICATOR]: Indicator at ({row}, {px_change['index']}) changed from {px_change['from']} to {px_change['to']}.")
             else:
                 # If no indicator is confirmed, all changes are for game-world object logic.
                 object_logic_changes = structured_changes
@@ -511,23 +511,26 @@ class AGI3(Agent):
                 if is_part_of_background:
                     break
             
-            # If it's part of the background, do not classify it as an object.
             if is_part_of_background:
-                log_message = f"🕵️‍♀️ Change at {sample_point} with color {obj_color} is contiguous with static background."
+                # This event is a strong clue for what the floor is.
+                log_message = f"🕵️‍♀️ A change at {sample_point} revealed what may be the background (Color: {obj_color})."
 
-                # If this event occurs, the color revealed is a strong candidate for the floor.
+                # If the floor color is not yet known, this is a learning opportunity.
                 if self.world_model['floor_color'] is None:
                     self.floor_hypothesis[obj_color] = self.floor_hypothesis.get(obj_color, 0) + 1
                     confidence = self.floor_hypothesis[obj_color]
-                    log_message += f" Adding as floor candidate (Confidence: {confidence})."
+                    print(f"🕵️‍♀️ Floor Hypothesis: A change at {sample_point} revealed color {obj_color} (Confidence: {confidence}).")
 
-                    # Confirm the floor color if confidence threshold is met.
+                    # Check for confirmation and print the one-time confirmation message.
                     if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
                         self.world_model['floor_color'] = obj_color
-                        log_message += f" ✅ Confirmed Floor Color: {obj_color}."
+                        print(f"✅ [FLOOR] Confirmed: Color {obj_color} is the floor.")
 
-                print(log_message)
-                continue # Still skip creating an object from this background change.
+                # If the floor is already known, log any event where it is revealed again.
+                elif obj_color == self.world_model['floor_color']:
+                    print(f"🕵️‍♀️ [FLOOR]: A change at {sample_point} revealed the known floor color ({obj_color}).")
+
+                continue # Always skip creating an object from this background change.
 
             # --- If it's a real object, proceed with description ---
             min_row = min(r for r, _ in obj_points)
@@ -654,15 +657,25 @@ class AGI3(Agent):
                     max_col = max(p[0]['left_index'] + p[0]['width'] for p in cluster)
 
                     comp_h, comp_w = max_row - min_row, max_col - min_col
-                    log_messages.append(f"🧠 COMPOSITE MOVE: Object [{comp_h}x{comp_w}] moved by vector {vector}.")
-                    true_moves.append({'type': 'composite', 'signature': (comp_h, comp_w), 'parts': cluster})
+                    signature = (comp_h, comp_w)
+                    # Generate a simpler log if the moved object is the confirmed agent.
+                    if signature == self.world_model.get('player_signature'):
+                        log_messages.append(f"🧠 [AGENT] moved by vector {vector}.")
+                    else:
+                        log_messages.append(f"🧠 COMPOSITE MOVE: Object [{comp_h}x{comp_w}] moved by vector {vector}.")
+                    true_moves.append({'type': 'composite', 'signature': signature, 'parts': cluster})
                     for pair in cluster: processed_pairs.append(pair)
 
         # Log individual moves and collect their structured info.
         for curr, last in move_matched_pairs:
             if (curr, last) not in processed_pairs:
-                log_messages.append(f"🧠 MOVE: Object [{curr['height']}x{curr['width']}] moved from ({last['top_row']}, {last['left_index']}) to ({curr['top_row']}, {curr['left_index']}).")
-                true_moves.append({'type': 'individual', 'signature': (curr['height'], curr['width']), 'last_obj': last})
+                signature = (curr['height'], curr['width'])
+                # Generate a simpler log if the moved object is the confirmed agent.
+                if signature == self.world_model.get('player_signature'):
+                    log_messages.append(f"🧠 [AGENT] moved from ({last['top_row']}, {last['left_index']}) to ({curr['top_row']}, {curr['left_index']}).")
+                else:
+                    log_messages.append(f"🧠 MOVE: Object [{curr['height']}x{curr['width']}] moved from ({last['top_row']}, {last['left_index']}) to ({curr['top_row']}, {curr['left_index']}).")
+                true_moves.append({'type': 'individual', 'signature': signature, 'last_obj': last})
 
         # --- Concept Learning from Movement (Agent and Floor) ---
         if not true_moves: return log_messages # No moves, nothing to learn.
