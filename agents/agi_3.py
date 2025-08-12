@@ -45,8 +45,6 @@ class AGI3(Agent):
 
         # --- State Management ---
         self.agent_state = AgentState.DISCOVERY
-        self.stability_counter = 0
-        self.STABILITY_THRESHOLD = 3 # Frames to wait for stability
         self.MASSIVE_CHANGE_THRESHOLD = 4000 # Num changes to trigger wait
         self.discovery_runs = 0
         self.last_action = None
@@ -147,16 +145,12 @@ class AGI3(Agent):
         """This is the main decision-making method for the AGI."""
         # --- Handle screen transitions before any other logic ---
         if self.agent_state == AgentState.AWAITING_STABILITY:
-            # We perceive here to check if the screen is still changing.
+            # We perceive here to check if the screen has stopped changing.
             novel_changes_found, _, _, _ = self.perceive(latest_frame)
 
+            # If there are NO changes from the last frame, the screen is stable.
             if not novel_changes_found:
-                self.stability_counter += 1
-            else:
-                self.stability_counter = 0 # Reset if screen is still changing
-
-            if self.stability_counter >= self.STABILITY_THRESHOLD:
-                print("✅ Screen is stable. Analyzing outcome...")
+                print("✅ Screen is stable (no change from last frame). Analyzing outcome...")
                 new_score = latest_frame.score
 
                 if new_score > self.level_start_score:
@@ -167,12 +161,9 @@ class AGI3(Agent):
                 else:
                     print("--- Lost a Life (Score did not increase). Resetting attempt. ---")
                     self._reset_for_new_attempt()
-                    # By removing "return GameAction.RESET", the agent will now choose
-                    # a new action immediately after resetting its internal state.
-
-                # Fall through to normal logic after handling the transition
             else:
-                return self.wait_action # Keep waiting
+                # If the screen is still changing, just wait.
+                return self.wait_action
 
         # --- 1. Store initial level state if not already set ---
         if self.level_start_frame is None:
