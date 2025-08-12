@@ -68,7 +68,8 @@ class AGI3(Agent):
             'wall_colors': set(), # Use a set for multiple possible wall colors
             'action_map': {} # Will store confirmed action -> effect mappings
         }
-        # This will store hypotheses like {(obj_signature, color): confidence_count}
+        self.world_model['life_indicator_object'] = None
+        self.life_indicator_hypothesis = {}
         self.player_floor_hypothesis = {}
         self.agent_move_hypothesis = {} # Tracks how many times a shape has moved
         self.floor_hypothesis = {} # Tracks how many times a color has been identified as floor
@@ -204,11 +205,32 @@ class AGI3(Agent):
                                 life_indicator_objects = self._find_and_describe_objects(structured_life_changes, latest_frame.frame)
                                 
                                 if life_indicator_objects:
-                                    print("-> These changes form the following object(s), likely a life indicator:")
+                                    print("-> These changes form the following object(s):")
                                     for i, obj in enumerate(life_indicator_objects):
                                         pos = (obj['top_row'], obj['left_index'])
                                         size = (obj['height'], obj['width'])
                                         print(f"  - Object {i+1}: A {size[0]}x{size[1]} object at position {pos}.")
+
+                                        # --- Life Indicator Learning Logic ---
+                                        # If the indicator hasn't been confirmed, try to learn it.
+                                        if not self.world_model.get('life_indicator_object'):
+                                            # Get both the original and new color.
+                                            old_color = obj.get('original_color')
+                                            new_color = obj['color']
+                                            
+                                            # Only proceed if we have the original color data.
+                                            if old_color is not None:
+                                                # The new signature includes the full color transition.
+                                                signature = (obj['height'], obj['width'], old_color, new_color)
+                                                
+                                                self.life_indicator_hypothesis[signature] = self.life_indicator_hypothesis.get(signature, 0) + 1
+                                                confidence = self.life_indicator_hypothesis[signature]
+                                                print(f"🕵️‍♀️ Life Indicator Hypothesis: Signature ({signature[0]}x{signature[1]}) with Color Change {signature[2]} -> {signature[3]} (Confidence: {confidence}).")
+                                                
+                                                if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
+                                                    self.world_model['life_indicator_object'] = signature
+                                                    print(f"✅ [LIFE INDICATOR] Confirmed: A color change from {signature[2]} to {signature[3]} on a ({signature[0]}x{signature[1]}) object is the life indicator.")
+                                                    self.life_indicator_hypothesis.clear() # Clear memory once learned.
                                 else:
                                     print("-> The changes did not form a distinct object (likely a background reveal).")
                             else:
@@ -498,6 +520,13 @@ class AGI3(Agent):
 
     def _find_and_describe_objects(self, structured_changes: list, latest_frame: list) -> list[dict]:
         """Finds objects by grouping changed pixels by their new color first, then clustering."""
+        # --- Create a lookup map for original colors ---
+        from_color_map = {}
+        for change in structured_changes:
+            row_idx = change['row_index']
+            for pixel_change in change['changes']:
+                from_color_map[(row_idx, pixel_change['index'])] = pixel_change['from']
+
         changed_coords = set()
         for change in structured_changes:
             row_idx = change['row_index']
@@ -615,9 +644,13 @@ class AGI3(Agent):
 
             data_map = tuple(tuple(latest_frame[0][r][p] for p in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
 
+            original_color = from_color_map.get(sample_point) # Get original color from our map
+
             final_objects.append({
                 'height': height, 'width': width, 'top_row': min_row,
-                'left_index': min_idx, 'data_map': data_map,
+                'left_index': min_idx, 'color': obj_color,
+                'original_color': original_color,
+                'data_map': data_map,
                 'background_color': background_color
             })
 
