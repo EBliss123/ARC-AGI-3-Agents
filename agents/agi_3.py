@@ -25,6 +25,7 @@ class AgentState(Enum):
     """Represents the agent's current operational state."""
     DISCOVERY = 1
     RANDOM_ACTION = 2
+    AWAITING_STABILITY = 3
 
 # --- Core AGI Logic ---
 
@@ -44,6 +45,9 @@ class AGI3(Agent):
 
         # --- State Management ---
         self.agent_state = AgentState.DISCOVERY
+        self.stability_counter = 0
+        self.STABILITY_THRESHOLD = 3 # Frames to wait for stability
+        self.MASSIVE_CHANGE_THRESHOLD = 4000 # Num changes to trigger wait
         self.discovery_runs = 0
         self.last_action = None
         self.action_effects = {} # Will store actions and all their resulting changes
@@ -54,6 +58,8 @@ class AGI3(Agent):
         self.resource_indicator_candidates = {}
         self.confirmed_resource_indicator = None
         self.RESOURCE_CONFIDENCE_THRESHOLD = 3 # Actions in a row to confirm
+        self.level_knowledge_is_learned = False
+        self.wait_action = GameAction.ACTION6 # Use a secondary action for waiting
 
         # --- Object & Shape Tracking ---
         self.observed_object_shapes = {} # Maps shape tuple -> count
@@ -139,45 +145,41 @@ class AGI3(Agent):
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
+        # --- Handle screen transitions before any other logic ---
+        if self.agent_state == AgentState.AWAITING_STABILITY:
+            # We perceive here to check if the screen is still changing.
+            novel_changes_found, _, _, _ = self.perceive(latest_frame)
+
+            if not novel_changes_found:
+                self.stability_counter += 1
+            else:
+                self.stability_counter = 0 # Reset if screen is still changing
+
+            if self.stability_counter >= self.STABILITY_THRESHOLD:
+                print("✅ Screen is stable. Analyzing outcome...")
+                new_score = latest_frame.score
+
+                if new_score > self.level_start_score:
+                    print(f"--- New Level Detected! Score increased to {new_score}. ---")
+                    self.level_start_frame = copy.deepcopy(latest_frame.frame)
+                    self.level_start_score = new_score
+                    self._reset_for_new_attempt() # Reset discovery for the new level
+                else:
+                    print("--- Lost a Life (Score did not increase). Resetting attempt. ---")
+                    self._reset_for_new_attempt()
+                    # By removing "return GameAction.RESET", the agent will now choose
+                    # a new action immediately after resetting its internal state.
+
+                # Fall through to normal logic after handling the transition
+            else:
+                return self.wait_action # Keep waiting
+
         # --- 1. Store initial level state if not already set ---
         if self.level_start_frame is None:
-            print("--- New Level Detected (Initial Frame). Storing start state. ---")
+            print("--- New Level Detected. Storing initial frame and score. ---")
             self.level_start_frame = copy.deepcopy(latest_frame.frame)
             self.level_start_score = latest_frame.score
-        
-        # To check for new states, create a version of the grid that ignores noisy coordinates.
-        grid_for_hashing = copy.deepcopy(latest_frame.frame)
-
-        # Mask all coordinates that are flagged to be ignored (e.g., resource indicators).
-        # This ensures states are considered identical even if ignored UI elements change.
-        if self.ignore_for_state_hash:
-            for row_index in self.ignore_for_state_hash:
-                # Ensure the coordinate is within the current grid's bounds before masking.
-                # The grid is effectively frame[0], so we check if the index is valid for that list.
-                if row_index < len(grid_for_hashing[0]):
-                    grid_for_hashing[0][row_index] = [-1] # Use a constant, non-game value.
-
-        # Convert the (potentially masked) grid to a hashable format for memory storage.
-        grid_tuple = tuple(tuple(tuple(p) for p in row) for row in grid_for_hashing)
-
-        # Check if this masked grid state is new before adding it to memory.
-        if grid_tuple not in self.visited_grids:
-            print(f"🔎 New grid state discovered! Total unique states seen: {len(self.visited_grids) + 1}")
-            self.visited_grids.add(grid_tuple)
-
-        # If we have a previous state and action, record the transition in our graph.
-        if self.last_grid_tuple and self.last_action:
-            # Ensure the 'from' state is in the graph.
-            if self.last_grid_tuple not in self.state_graph:
-                self.state_graph[self.last_grid_tuple] = {}
-            # Record that last_action from last_state leads to the current state.
-            self.state_graph[self.last_grid_tuple][self.last_action] = grid_tuple
-        
-        # --- 1. Check for Win/Loss State First (Highest Priority) ---
-        if latest_frame.state is GameState.WIN:
-            print("🏆 Level Solved! Awaiting next level. 🏆")
-            # We don't reset here, just wait for the new level to load.
-            return GameAction.NOOP # Do nothing until the next level starts
+            # After initializing, we allow the code to continue to the main logic below.
         
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
             # If the whole game is new/over, reset everything.
@@ -193,33 +195,21 @@ class AGI3(Agent):
         # --- 2. Perception & Consequence of Last Action ---
         novel_changes_found, known_changes_found, change_descriptions, structured_changes = self.perceive(latest_frame)
 
-        # --- Special Handling for Dimension Changes (New Level or Lost Life) ---
-        if novel_changes_found and change_descriptions == ["Frame dimensions changed"]:
-            new_grid = latest_frame.frame
-            new_score = latest_frame.score
+        # Create a hashable representation of the grid for state graph tracking.
+        grid_tuple = tuple(tuple(row) for row in latest_frame.frame[0])
 
-            # A new level is detected if the grid changes AND the score increases.
-            is_new_level = (new_grid != self.level_start_frame and new_score > self.level_start_score)
+        # --- Check for massive changes indicating a transition ---
+        if novel_changes_found:
+            is_dimension_change = "Frame dimensions changed" in change_descriptions
+            if len(change_descriptions) > self.MASSIVE_CHANGE_THRESHOLD or is_dimension_change:
+                print(f"💥 Massive change detected ({len(change_descriptions)} changes). Waiting for stability...")
+                self.agent_state = AgentState.AWAITING_STABILITY
+                self.stability_counter = 0
+                self.previous_frame = None # Invalidate frame to ensure fresh perception after stability
+                return self.wait_action
 
-            if is_new_level:
-                print(f"--- New Level Detected! Score increased to {new_score}. ---")
-                # Update the baseline for the new level
-                self.level_start_frame = copy.deepcopy(new_grid)
-                self.level_start_score = new_score
-                # Attribute success to the last action and describe it as a level advance.
-                change_descriptions = [f"Advanced to a new level with score {new_score}."]
-            else:
-                # If the state matches the start of the level, it's a lost life. 
-                if self.level_knowledge_is_learned:
-                    print("--- Lost a Life (Frame reset). Knowledge retained, resuming... ---")
-                else:
-                    print("--- Lost a Life (Frame reset). Resetting discovery process. ---")
-                
-                self._reset_for_new_attempt()
-                return GameAction.RESET
-
-        # Process the result of the last action.
-        if self.last_action:
+        # Process the result of the last action, but only if it wasn't a wait action.
+        if self.last_action and self.last_action is not self.wait_action:
             # A "successful" action is one that causes a novel, non-indicator change.
             if novel_changes_found:
                 # --- Action SUCCEEDED (caused a novel change) ---
@@ -400,7 +390,7 @@ class AGI3(Agent):
             elif boring_actions:
                 action = random.choice(boring_actions)
             else:
-                action = GameAction.NOOP # Fallback if no actions are available
+                action = self.wait_action # Fallback if no actions are available
 
         self.last_grid_tuple = grid_tuple
         self.last_action = action
