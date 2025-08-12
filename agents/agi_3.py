@@ -39,7 +39,7 @@ class AGI3(Agent):
         self.static_pixels = []
         self.debug_counter = 0
         self.visited_grids = set() # Stores previously seen grid states
-        self.ignore_for_state_hash = set()
+        self.ignored_areas = []
         self.state_graph = {} # Stores stateA -> action -> stateB
         self.last_grid_tuple = None
 
@@ -69,7 +69,6 @@ class AGI3(Agent):
             'action_map': {} # Will store confirmed action -> effect mappings
         }
         self.world_model['life_indicator_object'] = None
-        self.life_indicator_hypothesis = {}
         self.player_floor_hypothesis = {}
         self.agent_move_hypothesis = {} # Tracks how many times a shape has moved
         self.floor_hypothesis = {} # Tracks how many times a color has been identified as floor
@@ -101,6 +100,28 @@ class AGI3(Agent):
         self.level_knowledge_is_learned = False
 
         print(f"Custom AGI initialized for game: {self.game_id}")
+
+    def _get_grid_state_tuple(self, frame_data: list) -> tuple:
+        """Creates a hashable tuple of the grid, ignoring specific rectangular areas."""
+        if not frame_data or not frame_data[0]:
+            return tuple()
+
+        # Create a mutable copy of the grid to modify.
+        grid_copy = [list(row) for row in frame_data[0]]
+
+        # "Neutralize" the pixels within each ignored rectangle.
+        for area in self.ignored_areas:
+            start_row, end_row = area['top_row'], area['top_row'] + area['height']
+            start_col, end_col = area['left_index'], area['left_index'] + area['width']
+
+            for r in range(start_row, end_row):
+                if 0 <= r < len(grid_copy):
+                    for c in range(start_col, end_col):
+                        if 0 <= c < len(grid_copy[r]):
+                            grid_copy[r][c] = -1 # Use a neutral "ignored" value.
+        
+        # Convert the modified grid to an immutable, hashable tuple.
+        return tuple(tuple(row) for row in grid_copy)
 
     def _end_discovery_run(self):
         """Helper method to finalize a discovery run and set up for the next."""
@@ -144,7 +165,6 @@ class AGI3(Agent):
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
-        print(f"--- Turn Start --- State: {self.agent_state.name}, Level Start Frame is None: {self.level_start_frame is None}")
         # --- 1. Store initial level state if not already set ---
         if self.level_start_frame is None:
             # Only store the initial frame if it actually contains data.
@@ -212,25 +232,29 @@ class AGI3(Agent):
                                         print(f"  - Object {i+1}: A {size[0]}x{size[1]} object at position {pos}.")
 
                                         # --- Life Indicator Learning Logic ---
-                                        # If the indicator hasn't been confirmed, try to learn it.
+                                        # If the indicator isn't known, learn it from this first observation.
                                         if not self.world_model.get('life_indicator_object'):
-                                            # Get both the original and new color.
                                             old_color = obj.get('original_color')
                                             new_color = obj['color']
                                             
-                                            # Only proceed if we have the original color data.
                                             if old_color is not None:
-                                                # The new signature includes the full color transition.
+                                                # The signature includes the full color transition.
                                                 signature = (obj['height'], obj['width'], old_color, new_color)
                                                 
-                                                self.life_indicator_hypothesis[signature] = self.life_indicator_hypothesis.get(signature, 0) + 1
-                                                confidence = self.life_indicator_hypothesis[signature]
-                                                print(f"🕵️‍♀️ Life Indicator Hypothesis: Signature ({signature[0]}x{signature[1]}) with Color Change {signature[2]} -> {signature[3]} (Confidence: {confidence}).")
+                                                # Immediately confirm the concept and store it.
+                                                self.world_model['life_indicator_object'] = signature
+                                                print(f"✅ [LIFE INDICATOR] Confirmed: A color change from {signature[2]} to {signature[3]} on a ({signature[0]}x{signature[1]}) object is the life indicator.")
                                                 
-                                                if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
-                                                    self.world_model['life_indicator_object'] = signature
-                                                    print(f"✅ [LIFE INDICATOR] Confirmed: A color change from {signature[2]} to {signature[3]} on a ({signature[0]}x{signature[1]}) object is the life indicator.")
-                                                    self.life_indicator_hypothesis.clear() # Clear memory once learned.
+                                                # Add the object's specific rectangle to the ignore list.
+                                                new_area = {
+                                                    'top_row': obj['top_row'],
+                                                    'left_index': obj['left_index'],
+                                                    'height': obj['height'],
+                                                    'width': obj['width']
+                                                }
+                                                self.ignored_areas.append(new_area)
+                                                print(f"-> Ignoring the {new_area['height']}x{new_area['width']} area at ({new_area['top_row']}, {new_area['left_index']}) for uniqueness checks.")
+                                                    
                                 else:
                                     print("-> The changes did not form a distinct object (likely a background reveal).")
                             else:
@@ -261,14 +285,13 @@ class AGI3(Agent):
         novel_changes_found, known_changes_found, change_descriptions, structured_changes = self.perceive(latest_frame)
 
         # Create a hashable representation of the grid for state graph tracking.
-        grid_tuple = tuple(tuple(row) for row in latest_frame.frame[0])
+        grid_tuple = self._get_grid_state_tuple(latest_frame.frame)
 
         # --- Check for massive changes indicating a transition ---
         if novel_changes_found:
             is_dimension_change = "Frame dimensions changed" in change_descriptions
             if len(change_descriptions) > self.MASSIVE_CHANGE_THRESHOLD or is_dimension_change:
                 print(f"💥 Massive change detected ({len(change_descriptions)} changes). Waiting for stability...")
-                print(f"--- Pre-Stability State --- Level Start Frame is None: {self.level_start_frame is None}")
                 self.agent_state = AgentState.AWAITING_STABILITY
                 self.stability_counter = 0
                 self.previous_frame = None # Invalidate frame to ensure fresh perception after stability
@@ -989,7 +1012,12 @@ class AGI3(Agent):
 
                     if candidate['confidence'] >= self.RESOURCE_CONFIDENCE_THRESHOLD:
                         self.confirmed_resource_indicator = {'row_index': row_idx, **candidate}
-                        self.ignore_for_state_hash.add(row_idx)
+                        # Define the full row as a rectangle and add it to the ignore list.
+                        grid_width = len(self.previous_frame[0][0]) if self.previous_frame and self.previous_frame[0] else 0
+                        self.ignored_areas.append({
+                            'top_row': row_idx, 'left_index': 0,
+                            'height': 1, 'width': grid_width
+                        })
                         print(f"✅ Confirmed resource indicator at row {row_idx}! It will now be ignored for state uniqueness checks.")
                         self.resource_indicator_candidates.clear()
                         return
