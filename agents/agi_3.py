@@ -269,6 +269,17 @@ class AGI3(Agent):
             else:
                 # If the screen is still changing, just wait.
                 return self.wait_action
+            
+        # --- State Graph Update ---
+        # If we have a previous state and an action that led to the current state,
+        # update the state graph to record the transition.
+        grid_tuple = self._get_grid_state_tuple(latest_frame.frame)
+        if self.last_grid_tuple is not None and self.last_action is not None:
+            if self.last_grid_tuple not in self.state_graph:
+                self.state_graph[self.last_grid_tuple] = {}
+            self.state_graph[self.last_grid_tuple][self.last_action] = grid_tuple
+
+        # ---
 
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
             # If the whole game is new/over, reset everything.
@@ -286,6 +297,18 @@ class AGI3(Agent):
 
         # Create a hashable representation of the grid for state graph tracking.
         grid_tuple = self._get_grid_state_tuple(latest_frame.frame)
+
+        # Create a hashable representation of the grid for state graph tracking.
+        # We already did this above for the state graph, so we just use the variable.
+        
+        # Check if the current state is one we've seen before.
+        if grid_tuple in self.visited_grids:
+            print(f"-> State already visited ({len(self.visited_grids)} unique states known).")
+        else:
+            print(f"✅ New unique state discovered! ({len(self.visited_grids) + 1} total)")
+            self.visited_grids.add(grid_tuple)
+
+        # --- Check for massive changes indicating a transition ---
 
         # --- Check for massive changes indicating a transition ---
         if novel_changes_found:
