@@ -143,6 +143,22 @@ class AGI3(Agent):
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
+        print(f"--- Turn Start --- State: {self.agent_state.name}, Level Start Frame is None: {self.level_start_frame is None}")
+        # --- 1. Store initial level state if not already set ---
+        if self.level_start_frame is None:
+            # Only store the initial frame if it actually contains data.
+            if latest_frame.frame:
+                print("--- New Level Detected. Storing initial valid frame and score. ---")
+                self.level_start_frame = copy.deepcopy(latest_frame.frame)
+                self.level_start_score = latest_frame.score
+            else:
+                # If the frame is blank, print a message but do nothing else.
+                # This allows the normal action-selection logic below to run,
+                # preventing the VALIDATION_ERROR. We'll try to store the frame
+                # again on the next turn.
+                print("--- Ignoring blank starting frame. Waiting for a valid one... ---")
+        
+        
         # --- Handle screen transitions before any other logic ---
         if self.agent_state == AgentState.AWAITING_STABILITY:
             # We perceive here to check if the screen has stopped changing.
@@ -158,20 +174,56 @@ class AGI3(Agent):
                     self.level_start_frame = copy.deepcopy(latest_frame.frame)
                     self.level_start_score = new_score
                     self._reset_for_new_attempt() # Reset discovery for the new level
+                    return self.wait_action
                 else:
-                    print("--- Lost a Life (Score did not increase). Resetting attempt. ---")
+                    print("--- Lost a Life (Score did not increase). Analyzing reset state... ---")
+                    if self.level_start_frame is not None:
+                        print("-> Comparing current grid with the grid from the start of the level...")
+
+                        # Safety check to prevent crashing on an empty frame
+                        if not self.level_start_frame or not latest_frame.frame:
+                            print("-> Analysis skipped: A frame needed for comparison is empty.")
+                        else:
+                            # This logic is now protected from the crash
+                            grid_start = self.level_start_frame[0]
+                            grid_current = latest_frame.frame[0]
+                            
+                            # Step 1: Collect all pixel changes into a structured format.
+                            structured_life_changes = []
+                            if len(grid_start) == len(grid_current):
+                                for i in range(len(grid_start)):
+                                    row_start, row_current = grid_start[i], grid_current[i]
+                                    if row_start != row_current and len(row_start) == len(row_current):
+                                        pixel_changes = [{'index': j, 'from': row_start[j], 'to': row_current[j]} for j in range(len(row_start)) if row_start[j] != row_current[j]]
+                                        if pixel_changes:
+                                            structured_life_changes.append({'row_index': i, 'changes': pixel_changes})
+
+                            # Step 2: Use the agent's own object finder on these changes.
+                            if structured_life_changes:
+                                print("-> Analysis result: Found differences from the level start.")
+                                life_indicator_objects = self._find_and_describe_objects(structured_life_changes, latest_frame.frame)
+                                
+                                if life_indicator_objects:
+                                    print("-> These changes form the following object(s), likely a life indicator:")
+                                    for i, obj in enumerate(life_indicator_objects):
+                                        pos = (obj['top_row'], obj['left_index'])
+                                        size = (obj['height'], obj['width'])
+                                        print(f"  - Object {i+1}: A {size[0]}x{size[1]} object at position {pos}.")
+                                else:
+                                    print("-> The changes did not form a distinct object (likely a background reveal).")
+                            else:
+                                print("-> Analysis result: The grid has returned to the exact visual state as the start of the level.")
+
+                    else:
+                        print("-> Could not perform analysis: The start-of-level frame was not stored.")
+                    
                     self._reset_for_new_attempt()
+                    # After handling the transition, wait for the next turn to act.
+                    return self.wait_action
             else:
                 # If the screen is still changing, just wait.
                 return self.wait_action
 
-        # --- 1. Store initial level state if not already set ---
-        if self.level_start_frame is None:
-            print("--- New Level Detected. Storing initial frame and score. ---")
-            self.level_start_frame = copy.deepcopy(latest_frame.frame)
-            self.level_start_score = latest_frame.score
-            # After initializing, we allow the code to continue to the main logic below.
-        
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
             # If the whole game is new/over, reset everything.
             if latest_frame.state == GameState.NOT_PLAYED:
@@ -194,6 +246,7 @@ class AGI3(Agent):
             is_dimension_change = "Frame dimensions changed" in change_descriptions
             if len(change_descriptions) > self.MASSIVE_CHANGE_THRESHOLD or is_dimension_change:
                 print(f"💥 Massive change detected ({len(change_descriptions)} changes). Waiting for stability...")
+                print(f"--- Pre-Stability State --- Level Start Frame is None: {self.level_start_frame is None}")
                 self.agent_state = AgentState.AWAITING_STABILITY
                 self.stability_counter = 0
                 self.previous_frame = None # Invalidate frame to ensure fresh perception after stability
