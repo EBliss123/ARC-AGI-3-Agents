@@ -584,36 +584,78 @@ class AGI3(Agent):
         return action
 
     def _build_level_map(self, grid: list):
-        """Creates a tile-based map of the level based on the discovered tile size."""
+        """
+        Creates a refined tile-based map. First, it maps the grid by color,
+        then finds the player's reachable floor area, and finally re-classifies
+        all tiles based on their relationship to that reachable area.
+        """
         if not self.tile_size or not grid:
             return
 
-        self.tile_map.clear()
+        # --- Pass 1: Initial color-based classification ---
+        # We create a temporary map to help the floor-finding algorithm.
+        temp_tile_map = {}
         grid_data = grid[0]
         grid_height = len(grid_data)
         grid_width = len(grid_data[0]) if grid_height > 0 else 0
         floor_color = self.world_model['floor_color']
         wall_colors = self.world_model['wall_colors']
 
-        # Iterate through the grid in steps of tile_size to create a macro grid
         for r in range(0, grid_height, self.tile_size):
             for c in range(0, grid_width, self.tile_size):
-                # Sample the top-left pixel of the tile to classify it
                 sample_color = grid_data[r][c]
                 tile_coords = (r // self.tile_size, c // self.tile_size)
 
                 if sample_color in wall_colors:
-                    self.tile_map[tile_coords] = CellType.WALL
+                    temp_tile_map[tile_coords] = CellType.WALL
                 elif sample_color == floor_color:
-                    self.tile_map[tile_coords] = CellType.FLOOR
+                    temp_tile_map[tile_coords] = CellType.FLOOR
                 else:
-                    self.tile_map[tile_coords] = CellType.INTERACTABLE
-
-        counts = Counter(self.tile_map.values())
-        print(f"🗺️ Tile Map built ({len(self.tile_map)} tiles): {counts[CellType.FLOOR]} floor, {counts[CellType.WALL]} wall, {counts[CellType.INTERACTABLE]} interactable.")
+                    # Tentatively classify as INTERACTABLE
+                    temp_tile_map[tile_coords] = CellType.INTERACTABLE
         
-        # After building the map, identify the area reachable by the player.
+        # Use the temporary map to find the reachable floor area
+        self.tile_map = temp_tile_map
         self.reachable_floor_area = self._find_reachable_floor_tiles()
+
+        # --- Pass 2: Refine the map based on reachability ---
+        if not self.reachable_floor_area:
+            print("🗺️ No reachable area found. Map will not be refined.")
+            # We leave the color-based map as is if nothing is reachable.
+            return
+
+        refined_tile_map = {}
+        all_tile_coords = list(self.tile_map.keys())
+
+        for tile_coords in all_tile_coords:
+            # Rule 1: Any tile within the reachable area is FLOOR.
+            if tile_coords in self.reachable_floor_area:
+                refined_tile_map[tile_coords] = CellType.FLOOR
+                continue
+
+            # Rule 2: For other tiles, check if they are adjacent to the floor.
+            is_adjacent_to_floor = False
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                neighbor_tile = (tile_coords[0] + dr, tile_coords[1] + dc)
+                if neighbor_tile in self.reachable_floor_area:
+                    is_adjacent_to_floor = True
+                    break
+            
+            if is_adjacent_to_floor:
+                # It's a WALL if its color matches known wall colors.
+                if temp_tile_map.get(tile_coords) == CellType.WALL:
+                    refined_tile_map[tile_coords] = CellType.WALL
+                # Otherwise, it's an INTERACTABLE object.
+                else:
+                    refined_tile_map[tile_coords] = CellType.INTERACTABLE
+            else:
+                # Rule 3: If it's not floor and not adjacent, it's UNKNOWN.
+                refined_tile_map[tile_coords] = CellType.UNKNOWN
+
+        # Update the agent's main tile map with the refined version.
+        self.tile_map = refined_tile_map
+        counts = Counter(self.tile_map.values())
+        print(f"🗺️ Refined Map ({len(self.tile_map)} tiles): {counts[CellType.FLOOR]} floor, {counts[CellType.WALL]} wall, {counts[CellType.INTERACTABLE]} interactable, {counts[CellType.UNKNOWN]} unknown.")
 
     def _find_target_and_plan(self) -> bool:
         """Finds the closest interactable tile and creates a path to it."""
