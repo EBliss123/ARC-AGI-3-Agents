@@ -99,6 +99,7 @@ class AGI3(Agent):
         self.exploration_target = None # Stores (row, col) of the current target
         self.exploration_plan = [] # Stores a list of GameActions to execute
         self.inverse_action_map = {} # e.g., {(0, 1): GameAction.RIGHT} for pathfinding
+        self.reachable_floor_area = set() # Stores all floor tiles connected to the player
 
         # --- Generic Action Groups ---
         # Get all possible actions, excluding RESET, to create generic groups.
@@ -610,6 +611,9 @@ class AGI3(Agent):
 
         counts = Counter(self.tile_map.values())
         print(f"🗺️ Tile Map built ({len(self.tile_map)} tiles): {counts[CellType.FLOOR]} floor, {counts[CellType.WALL]} wall, {counts[CellType.INTERACTABLE]} interactable.")
+        
+        # After building the map, identify the area reachable by the player.
+        self.reachable_floor_area = self._find_reachable_floor_tiles()
 
     def _find_target_and_plan(self) -> bool:
         """Finds the closest interactable tile and creates a path to it."""
@@ -673,6 +677,45 @@ class AGI3(Agent):
         
         print(f"⚠️ No path found from tile {start_tile} to {target_tile}.")
         return []
+    
+    def _find_reachable_floor_tiles(self) -> set:
+        """
+        Performs a BFS/flood-fill from the player's position to find all connected floor tiles.
+        """
+        # Ensure we have the necessary information to start.
+        if not self.last_known_player_obj or not self.tile_size or not self.tile_map:
+            print("⚠️ Cannot find reachable floor tiles: Missing player, tile size, or map.")
+            return set()
+
+        # 1. Get the player's starting position in tile coordinates.
+        player_pixel_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
+        start_tile = (player_pixel_pos[0] // self.tile_size, player_pixel_pos[1] // self.tile_size)
+
+        # The player might be on an interactable tile, which is also a valid starting point.
+        start_tile_type = self.tile_map.get(start_tile)
+        if start_tile_type not in [CellType.FLOOR, CellType.INTERACTABLE]:
+            print(f"⚠️ Player starting tile {start_tile} is not on a known FLOOR or INTERACTABLE. Aborting flood fill.")
+            return set()
+
+        # 2. Initialize BFS data structures.
+        q = [start_tile]
+        visited = {start_tile}
+
+        # 3. Perform the flood-fill.
+        while q:
+            current_tile = q.pop(0)
+
+            # Explore neighbors (up, down, left, right in tile space).
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                neighbor_tile = (current_tile[0] + dr, current_tile[1] + dc)
+
+                # We can only traverse through tiles classified as FLOOR.
+                if self.tile_map.get(neighbor_tile) == CellType.FLOOR and neighbor_tile not in visited:
+                    visited.add(neighbor_tile)
+                    q.append(neighbor_tile)
+        
+        print(f"🗺️ Found {len(visited)} reachable tiles connected to the player.")
+        return visited
     
     def perceive(self, latest_frame: FrameData) -> tuple[bool, bool, list[str], list]:
         """Compares frames, separating novel changes from known indicator changes."""
