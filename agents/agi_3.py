@@ -658,66 +658,90 @@ class AGI3(Agent):
         print(f"🗺️ Refined Map ({len(self.tile_map)} tiles): {counts[CellType.FLOOR]} floor, {counts[CellType.WALL]} wall, {counts[CellType.INTERACTABLE]} interactable, {counts[CellType.UNKNOWN]} unknown.")
 
     def _find_target_and_plan(self) -> bool:
-        """Finds the closest interactable tile and creates a path to it."""
+        """
+        Finds the best interactable tile by pathfinding to all available targets
+        and picking the one with the shortest path.
+        """
         self.exploration_target = None
         self.exploration_plan = []
-        if not self.last_known_player_obj or not self.tile_size: return False
+        if not self.last_known_player_obj or not self.tile_size:
+            return False
 
-        # Convert the player's pixel position to a tile position
         player_pixel_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
         player_tile_pos = (player_pixel_pos[0] // self.tile_size, player_pixel_pos[1] // self.tile_size)
 
-        # Find all interactable tiles that are not the player's current tile
-        targets = [pos for pos, type in self.tile_map.items() 
-                   if type == CellType.INTERACTABLE and pos != player_tile_pos]
-        if not targets: return False
+        # 1. Find all potential targets on the map.
+        potential_targets = [pos for pos, type in self.tile_map.items() if type == CellType.INTERACTABLE]
+        if not potential_targets:
+            return False
 
-        # Find the closest target tile
-        closest_target_tile = min(targets, key=lambda pos: abs(pos[0] - player_tile_pos[0]) + abs(pos[1] - player_tile_pos[1]))
-        
-        # Store the target in pixel coordinates for potential future use, but plan in tiles
-        self.exploration_target = (closest_target_tile[0] * self.tile_size, closest_target_tile[1] * self.tile_size)
-        
-        path = self._find_path_to_target(player_tile_pos, closest_target_tile)
+        # 2. Find paths to all potential targets and store the ones that are reachable.
+        reachable_targets = []
+        for target_pos in potential_targets:
+            if target_pos == player_tile_pos:
+                continue
+                
+            path = self._find_path_to_target(player_tile_pos, target_pos)
+            if path:
+                reachable_targets.append({'pos': target_pos, 'path': path})
 
-        if path:
-            self.exploration_plan = path
-            return True
-        return False
+        if not reachable_targets:
+            print("🧐 All interactable targets are currently unreachable.")
+            return False
+
+        # 3. From the list of reachable targets, select the one with the shortest path.
+        best_target = min(reachable_targets, key=lambda t: len(t['path']))
+        
+        # 4. Set the exploration plan based on the best target found.
+        self.exploration_target = (best_target['pos'][0] * self.tile_size, best_target['pos'][1] * self.tile_size)
+        self.exploration_plan = best_target['path']
+        print(f"🎯 New target acquired at {best_target['pos']}. Plan created with {len(self.exploration_plan)} steps.")
+        
+        return True
 
     def _find_path_to_target(self, start_tile: tuple, target_tile: tuple) -> list:
-        """Uses BFS to find the shortest action sequence on the tile map."""
-        if not self.inverse_action_map:
-            # This logic should now be robust enough to handle tile-based conversion
+        """
+        Finds the shortest sequence of actions to reach a target using the learned action model.
+        """
+        # 1. Build a fresh map from TILE vectors to actions at the start of every call.
+        # This ensures we always use the latest learned movement abilities.
+        tile_vector_to_action = {}
+        if self.tile_size and self.world_model.get('action_map'):
             for action, effect in self.world_model['action_map'].items():
                 if 'move_vector' in effect:
-                    self.inverse_action_map[effect['move_vector']] = action
+                    px_vec = effect['move_vector']
+                    # Convert the pixel vector to a tile vector
+                    tile_vec = (px_vec[0] // self.tile_size, px_vec[1] // self.tile_size)
+                    # Only store actions that result in actual tile movement
+                    if tile_vec != (0, 0):
+                        tile_vector_to_action[tile_vec] = action
 
-        q = [(start_tile, [])]
+        if not tile_vector_to_action:
+            # This will only be printed if the agent genuinely has no learned move actions.
+            return []
+
+        # 2. Perform a Breadth-First Search (BFS) to find the shortest path of actions.
+        q = [(start_tile, [])]  # Queue stores (current_tile, path_of_actions_so_far)
         visited = {start_tile}
 
         while q:
             current_tile, path = q.pop(0)
 
             if current_tile == target_tile:
-                return path # Path found!
+                return path  # Path of actions found!
 
-            # Explore neighbors using learned move actions, converted to tile vectors
-            for vector_px, action in self.inverse_action_map.items():
-                # Convert pixel vector to tile vector
-                vector_tile = (vector_px[0] // self.tile_size, vector_px[1] // self.tile_size)
-                
-                neighbor_tile = (current_tile[0] + vector_tile[0], current_tile[1] + vector_tile[1])
-                
-                # The agent can move to any FLOOR tile or the final TARGET tile
+            # 3. Explore neighbors using the learned actions.
+            for tile_vec, action in tile_vector_to_action.items():
+                neighbor_tile = (current_tile[0] + tile_vec[0], current_tile[1] + tile_vec[1])
+
                 tile_type = self.tile_map.get(neighbor_tile)
-                can_move_to = tile_type == CellType.FLOOR or neighbor_tile == target_tile
+                can_move_to = tile_type in [CellType.FLOOR, CellType.INTERACTABLE]
 
                 if can_move_to and neighbor_tile not in visited:
                     visited.add(neighbor_tile)
+                    # Add the action that gets to the neighbor to the path
                     q.append((neighbor_tile, path + [action]))
-        
-        print(f"⚠️ No path found from tile {start_tile} to {target_tile}.")
+
         return []
     
     def _find_reachable_floor_tiles(self) -> set:
