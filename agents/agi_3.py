@@ -21,6 +21,21 @@ class VC33_Game:
     """Environment for the VC33 game."""
     pass
 
+class CellType(Enum):
+    """Represents the classification of a single grid cell."""
+    UNKNOWN = 0
+    FLOOR = 1
+    WALL = 2
+    INTERACTABLE = 3 # For identified but not fully understood objects
+    PLAYER = 4
+
+class ExplorationPhase(Enum):
+    """Manages the agent's goal-oriented exploration strategy."""
+    INACTIVE = 0
+    BUILDING_MAP = 1
+    SEEKING_TARGET = 2
+    EXECUTING_PLAN = 3
+
 class AgentState(Enum):
     """Represents the agent's current operational state."""
     DISCOVERY = 1
@@ -76,6 +91,14 @@ class AGI3(Agent):
         self.wall_hypothesis = {} # Tracks wall color candidates
         self.last_known_player_obj = None # Stores the full player object from the last frame
         self.CONCEPT_CONFIDENCE_THRESHOLD = 3 # Number of times a pattern must be seen to be learned
+
+        # --- Exploration & Pathfinding ---
+        self.exploration_phase = ExplorationPhase.INACTIVE
+        self.tile_map = {} # Stores (tile_x, tile_y) -> CellType for the macro grid
+        self.tile_size = None # Stores the grid size (e.g., 8)
+        self.exploration_target = None # Stores (row, col) of the current target
+        self.exploration_plan = [] # Stores a list of GameActions to execute
+        self.inverse_action_map = {} # e.g., {(0, 1): GameAction.RIGHT} for pathfinding
 
         # --- Generic Action Groups ---
         # Get all possible actions, excluding RESET, to create generic groups.
@@ -450,6 +473,57 @@ class AGI3(Agent):
                             self.last_known_player_obj = obj
                             break # Found it
 
+        # --- Intelligent Exploration Logic ---
+        # Check if the agent has learned enough to begin exploring intelligently.
+        can_explore = (self.world_model.get('player_signature') and
+               self.world_model.get('floor_color') and
+               self.world_model.get('action_map') and
+               self.last_known_player_obj and
+               self.tile_size) 
+
+        if can_explore and self.exploration_phase == ExplorationPhase.INACTIVE:
+            print("🤖 World model is sufficiently complete. Activating exploration phase.")
+            self.exploration_phase = ExplorationPhase.BUILDING_MAP
+
+        # --- Handle Exploration Phases ---
+        if self.exploration_phase != ExplorationPhase.INACTIVE:
+            # If a plan is being executed, prioritize it.
+            if self.exploration_phase == ExplorationPhase.EXECUTING_PLAN:
+                if self.exploration_plan:
+                    action = self.exploration_plan.pop(0)
+                    print(f"🗺️ Executing plan: {action.name}. {len(self.exploration_plan)} steps remaining.")
+                    self.last_action = action
+                    self.last_grid_tuple = grid_tuple
+                    return action
+                else:
+                    print("✅ Plan complete. Re-evaluating map and finding new target.")
+                    self.exploration_phase = ExplorationPhase.BUILDING_MAP
+
+            # Build or rebuild the map if needed.
+            if self.exploration_phase == ExplorationPhase.BUILDING_MAP:
+                print("🗺️ Building/updating the level map...")
+                self._build_level_map(latest_frame.frame)
+                self.exploration_phase = ExplorationPhase.SEEKING_TARGET
+
+            # Find a new target and create a plan.
+            if self.exploration_phase == ExplorationPhase.SEEKING_TARGET:
+                print("🗺️ Seeking a new exploration target...")
+                target_found = self._find_target_and_plan()
+                if target_found:
+                    print(f"🎯 New target acquired at {self.exploration_target}. Plan created with {len(self.exploration_plan)} steps.")
+                    self.exploration_phase = ExplorationPhase.EXECUTING_PLAN
+                    # Execute the first step of the new plan immediately.
+                    if self.exploration_plan:
+                        action = self.exploration_plan.pop(0)
+                        print(f"🗺️ Executing plan: {action.name}. {len(self.exploration_plan)} steps remaining.")
+                        self.last_action = action
+                        self.last_grid_tuple = grid_tuple
+                        return action
+                else:
+                    print("🧐 No more unknown objects to explore. Reverting to random discovery.")
+                    self.exploration_phase = ExplorationPhase.INACTIVE
+                    # Fall through to the default random action state
+
         # --- 3. Choose a New Action to Take ---
         if self.agent_state == AgentState.DISCOVERY:
             if not self.actions_to_try:
@@ -508,8 +582,98 @@ class AGI3(Agent):
         self.last_action = action
         return action
 
-    # --- Methods from your original plan ---
+    def _build_level_map(self, grid: list):
+        """Creates a tile-based map of the level based on the discovered tile size."""
+        if not self.tile_size or not grid:
+            return
 
+        self.tile_map.clear()
+        grid_data = grid[0]
+        grid_height = len(grid_data)
+        grid_width = len(grid_data[0]) if grid_height > 0 else 0
+        floor_color = self.world_model['floor_color']
+        wall_colors = self.world_model['wall_colors']
+
+        # Iterate through the grid in steps of tile_size to create a macro grid
+        for r in range(0, grid_height, self.tile_size):
+            for c in range(0, grid_width, self.tile_size):
+                # Sample the top-left pixel of the tile to classify it
+                sample_color = grid_data[r][c]
+                tile_coords = (r // self.tile_size, c // self.tile_size)
+
+                if sample_color in wall_colors:
+                    self.tile_map[tile_coords] = CellType.WALL
+                elif sample_color == floor_color:
+                    self.tile_map[tile_coords] = CellType.FLOOR
+                else:
+                    self.tile_map[tile_coords] = CellType.INTERACTABLE
+
+        counts = Counter(self.tile_map.values())
+        print(f"🗺️ Tile Map built ({len(self.tile_map)} tiles): {counts[CellType.FLOOR]} floor, {counts[CellType.WALL]} wall, {counts[CellType.INTERACTABLE]} interactable.")
+
+    def _find_target_and_plan(self) -> bool:
+        """Finds the closest interactable tile and creates a path to it."""
+        self.exploration_target = None
+        self.exploration_plan = []
+        if not self.last_known_player_obj or not self.tile_size: return False
+
+        # Convert the player's pixel position to a tile position
+        player_pixel_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
+        player_tile_pos = (player_pixel_pos[0] // self.tile_size, player_pixel_pos[1] // self.tile_size)
+
+        # Find all interactable tiles that are not the player's current tile
+        targets = [pos for pos, type in self.tile_map.items() 
+                   if type == CellType.INTERACTABLE and pos != player_tile_pos]
+        if not targets: return False
+
+        # Find the closest target tile
+        closest_target_tile = min(targets, key=lambda pos: abs(pos[0] - player_tile_pos[0]) + abs(pos[1] - player_tile_pos[1]))
+        
+        # Store the target in pixel coordinates for potential future use, but plan in tiles
+        self.exploration_target = (closest_target_tile[0] * self.tile_size, closest_target_tile[1] * self.tile_size)
+        
+        path = self._find_path_to_target(player_tile_pos, closest_target_tile)
+
+        if path:
+            self.exploration_plan = path
+            return True
+        return False
+
+    def _find_path_to_target(self, start_tile: tuple, target_tile: tuple) -> list:
+        """Uses BFS to find the shortest action sequence on the tile map."""
+        if not self.inverse_action_map:
+            # This logic should now be robust enough to handle tile-based conversion
+            for action, effect in self.world_model['action_map'].items():
+                if 'move_vector' in effect:
+                    self.inverse_action_map[effect['move_vector']] = action
+
+        q = [(start_tile, [])]
+        visited = {start_tile}
+
+        while q:
+            current_tile, path = q.pop(0)
+
+            if current_tile == target_tile:
+                return path # Path found!
+
+            # Explore neighbors using learned move actions, converted to tile vectors
+            for vector_px, action in self.inverse_action_map.items():
+                # Convert pixel vector to tile vector
+                vector_tile = (vector_px[0] // self.tile_size, vector_px[1] // self.tile_size)
+                
+                neighbor_tile = (current_tile[0] + vector_tile[0], current_tile[1] + vector_tile[1])
+                
+                # The agent can move to any FLOOR tile or the final TARGET tile
+                tile_type = self.tile_map.get(neighbor_tile)
+                can_move_to = tile_type == CellType.FLOOR or neighbor_tile == target_tile
+
+                if can_move_to and neighbor_tile not in visited:
+                    visited.add(neighbor_tile)
+                    q.append((neighbor_tile, path + [action]))
+        
+        print(f"⚠️ No path found from tile {start_tile} to {target_tile}.")
+        return []
+    
     def perceive(self, latest_frame: FrameData) -> tuple[bool, bool, list[str], list]:
         """Compares frames, separating novel changes from known indicator changes."""
         current_frame = latest_frame.frame
@@ -918,6 +1082,13 @@ class AGI3(Agent):
                         if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
                             self.world_model['action_map'][action] = {'move_vector': effect_vector}
                             log_messages.append(f"✅ Confirmed Action Effect: {action.name} consistently moves the agent by vector {effect_vector}.")
+                            if self.tile_size is None:
+                                # The tile size is the magnitude of the move vector.
+                                # We take the absolute value and check both components of the vector.
+                                size_from_vector = abs(effect_vector[0]) + abs(effect_vector[1])
+                                if size_from_vector > 1: # A move of 1 is ambiguous
+                                    self.tile_size = size_from_vector
+                                    print(f"📏 Tile Size Discovered: {self.tile_size}px based on agent movement.")
                             del self.action_effect_hypothesis[action] # Clean up memory
 
                     break # Agent's move found, no need to check other moves.
