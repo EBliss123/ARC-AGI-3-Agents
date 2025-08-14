@@ -747,6 +747,24 @@ class AGI3(Agent):
                 # Rule 3: If it's not floor and not adjacent, it's UNKNOWN.
                 refined_tile_map[tile_coords] = CellType.UNKNOWN
 
+         # --- Pass 3: Final Verification Safety Net ---
+        # Check all interactable candidates and correct them if their color matches a known type.
+        grid_data = grid[0]
+        floor_color = self.world_model.get('floor_color')
+        wall_colors = self.world_model.get('wall_colors', set())
+        
+        # We iterate over a copy of the items since we are modifying the dictionary.
+        for tile_coords, cell_type in list(refined_tile_map.items()):
+            if cell_type in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE]:
+                # Sample the tile's color from the grid's raw data.
+                sample_color = grid_data[tile_coords[0] * self.tile_size][tile_coords[1] * self.tile_size]
+                
+                # If the color is a known type, correct the classification.
+                if floor_color and sample_color == floor_color:
+                    refined_tile_map[tile_coords] = CellType.FLOOR
+                elif wall_colors and sample_color in wall_colors:
+                    refined_tile_map[tile_coords] = CellType.WALL
+
         # Update the agent's main tile map with the refined version.
         self.tile_map = refined_tile_map
         counts = Counter(self.tile_map.values())
