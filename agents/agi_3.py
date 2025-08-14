@@ -102,6 +102,11 @@ class AGI3(Agent):
         self.inverse_action_map = {} # e.g., {(0, 1): GameAction.RIGHT} for pathfinding
         self.reachable_floor_area = set() # Stores all floor tiles connected to the player
 
+        # --- Interaction Learning ---
+        self.observing_interaction_for_tile = None # Stores the coords of the tile being observed
+        self.interaction_observation_phase = None # Can be 'IMMEDIATE' or 'AFTERMATH'
+        self.interaction_hypotheses = {} # signature -> {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
+
         # --- Generic Action Groups ---
         # Get all possible actions, excluding RESET, to create generic groups.
         all_discoverable_actions = [a for a in GameAction if a is not GameAction.RESET]
@@ -498,15 +503,50 @@ class AGI3(Agent):
                     self.last_grid_tuple = grid_tuple
                     return action
                 else:
-                    print("✅ Plan complete. Re-evaluating map and finding new target.")
-                    # --- Promote the completed target to CONFIRMED_INTERACTABLE ---
-                    if self.exploration_target and self.tile_size:
-                        target_tile_coords = (self.exploration_target[0] // self.tile_size, self.exploration_target[1] // self.tile_size)
-                        if self.tile_map.get(target_tile_coords) == CellType.POTENTIALLY_INTERACTABLE:
-                            self.tile_map[target_tile_coords] = CellType.CONFIRMED_INTERACTABLE
-                            print(f"✅ Target at {target_tile_coords} confirmed as interactable.")
+                    # This block handles the completion of a plan.
+                    if self.interaction_observation_phase == 'AFTERMATH':
+                        # This means the "step away" plan just finished.
+                        print("-> Stepped away. Observing aftermath...")
+                        self._analyze_and_log_interaction_effect(structured_changes, 'aftermath_effect')
+                        
+                        # End the full observation cycle and return to normal exploration.
+                        self.observing_interaction_for_tile = None
+                        self.interaction_observation_phase = None
+                        self.exploration_phase = ExplorationPhase.BUILDING_MAP
                     
-                    self.exploration_phase = ExplorationPhase.BUILDING_MAP
+                    else:
+                        # This means a normal exploration plan to an interactable has finished.
+                        print("✅ Plan complete. Beginning interaction observation.")
+                        if self.exploration_target and self.tile_size:
+                            target_tile = (self.exploration_target[0] // self.tile_size, self.exploration_target[1] // self.tile_size)
+
+                            if self.tile_map.get(target_tile) == CellType.POTENTIALLY_INTERACTABLE:
+                                self.tile_map[target_tile] = CellType.CONFIRMED_INTERACTABLE
+                                print(f"✅ Target at {target_tile} confirmed as interactable.")
+
+                            # Set the tile we're observing.
+                            self.observing_interaction_for_tile = target_tile
+                            
+                            # --- Observation 1: Analyze immediate effects ---
+                            # The 'structured_changes' from the top of the function are from landing on the tile.
+                            self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect')
+
+                            # --- Create a new micro-plan to step away for Observation 2 ---
+                            move_away_plan = self._plan_step_away(target_tile)
+                            if move_away_plan:
+                                print(f"-> Planning to step away ({move_away_plan[0].name}) to observe aftermath.")
+                                self.exploration_plan = move_away_plan
+                                self.interaction_observation_phase = 'AFTERMATH'
+                                self.exploration_phase = ExplorationPhase.EXECUTING_PLAN # Trigger execution of the new plan
+                            else:
+                                # If we can't step away, the observation cycle ends here.
+                                print("-> Cannot find path to step away. Ending interaction observation.")
+                                self.observing_interaction_for_tile = None
+                                self.interaction_observation_phase = None
+                                self.exploration_phase = ExplorationPhase.BUILDING_MAP
+                        else:
+                            # If there was no target, just go back to mapping.
+                            self.exploration_phase = ExplorationPhase.BUILDING_MAP
             # Build or rebuild the map if needed.
             if self.exploration_phase == ExplorationPhase.BUILDING_MAP:
                 print("🗺️ Building/updating the level map...")
@@ -1277,6 +1317,27 @@ class AGI3(Agent):
         if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
             self.world_model['wall_colors'].add(wall_candidate_color)
             print(f"✅ [WALL] Confirmed: {wall_name} is a wall.")
+
+            # --- New Map Cleanup Logic ---
+            if self.tile_size:
+                reclassified_count = 0
+                # Iterate over a copy of the items because the dictionary size may change.
+                for tile_coords, cell_type in list(self.tile_map.items()):
+                    if cell_type in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE]:
+                        # Get the top-left pixel of the tile to sample its color from the last grid state.
+                        tile_row = tile_coords[0] * self.tile_size
+                        tile_col = tile_coords[1] * self.tile_size
+                        
+                        # Ensure coordinates are within the grid bounds before checking.
+                        if 0 <= tile_row < len(last_grid[0]) and 0 <= tile_col < len(last_grid[0][0]):
+                            tile_color = last_grid[0][tile_row][tile_col]
+                            if tile_color == wall_candidate_color:
+                                self.tile_map[tile_coords] = CellType.WALL
+                                reclassified_count += 1
+                
+                if reclassified_count > 0:
+                    print(f"🧹 Map Cleanup: Reclassified {reclassified_count} interactable tile(s) as newly confirmed walls.")
+
             del self.wall_hypothesis[wall_candidate_color]
     
     def _update_resource_indicator_tracking(self, structured_changes: list, action: GameAction):
@@ -1350,6 +1411,80 @@ class AGI3(Agent):
                 }
                 print(f"🤔 New resource candidate found at row {row_idx}.")
 
+    def _plan_step_away(self, from_tile: tuple) -> list:
+        """Finds an adjacent floor tile and returns a one-step plan to move there."""
+        if not self.world_model.get('action_map'):
+            return []
+
+        # Invert the action map for easy lookup: tile_vector -> action
+        tile_vector_to_action = {}
+        if self.tile_size:
+            for action, effect in self.world_model['action_map'].items():
+                if 'move_vector' in effect:
+                    px_vec = effect['move_vector']
+                    tile_vec = (px_vec[0] // self.tile_size, px_vec[1] // self.tile_size)
+                    if tile_vec != (0, 0):
+                        tile_vector_to_action[tile_vec] = action
+        
+        # Find a valid move action that leads to a floor tile.
+        for tile_vec, action in tile_vector_to_action.items():
+            neighbor_tile = (from_tile[0] + tile_vec[0], from_tile[1] + tile_vec[1])
+            if self.tile_map.get(neighbor_tile) == CellType.FLOOR:
+                return [action] # Return a plan with just this one action.
+
+        return [] # Return empty list if no escape route is found.
+
+    def _analyze_and_log_interaction_effect(self, structured_changes: list, effect_type: str):
+        """Analyzes pixel changes from an interaction and logs them as a hypothesis."""
+        if self.observing_interaction_for_tile is None:
+            return
+
+        # 1. Get a simple signature for the object that was interacted with.
+        observed_tile = self.observing_interaction_for_tile
+        object_signature = None
+        if self.tile_size and self.previous_frame:
+            tile_top_row = observed_tile[0] * self.tile_size
+            tile_left_index = observed_tile[1] * self.tile_size
+            
+            # Use the color of the tile (before any potential change) as a simple signature.
+            sample_color = self.previous_frame[0][tile_top_row][tile_left_index]
+            object_signature = f"tile_color_{sample_color}"
+        
+        if not object_signature:
+            return
+
+        # 2. Filter out changes caused by the player's own movement.
+        interaction_effects = []
+        player_coords = set()
+        if self.last_known_player_obj:
+            player_box = self.last_known_player_obj
+            for r in range(player_box['top_row'], player_box['top_row'] + player_box['height']):
+                for c in range(player_box['left_index'], player_box['left_index'] + player_box['width']):
+                    player_coords.add((r,c))
+
+        for change in structured_changes:
+            change_is_on_player = False
+            for px_change in change['changes']:
+                if (change['row_index'], px_change['index']) in player_coords:
+                    change_is_on_player = True
+                    break
+            if not change_is_on_player:
+                interaction_effects.append(change)
+
+        if not interaction_effects:
+            print(f"-> No observable '{effect_type}' pixel changes found (excluding player movement).")
+            return
+
+        print(f"-> Found {len(interaction_effects)} raw pixel changes for '{effect_type}'.")
+
+        # 3. Log the raw pixel changes as a hypothesis.
+        if object_signature not in self.interaction_hypotheses:
+            self.interaction_hypotheses[object_signature] = {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
+        
+        # Store the raw change data.
+        self.interaction_hypotheses[object_signature][effect_type] = interaction_effects
+        print(f"📖 Hypothesis logged for '{object_signature}': {effect_type} has been recorded.")
+    
     def segment_objects(self, latest_frame: FrameData):
         """Scans the grid to find and define all objects."""
         # Identify objects from the grid here.
