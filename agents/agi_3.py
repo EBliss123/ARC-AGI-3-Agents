@@ -104,7 +104,6 @@ class AGI3(Agent):
 
         # --- Interaction Learning ---
         self.observing_interaction_for_tile = None # Stores the coords of the tile being observed
-        self.interaction_observation_phase = None # Can be 'IMMEDIATE' or 'AFTERMATH'
         self.interaction_hypotheses = {} # signature -> {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
 
         # --- Generic Action Groups ---
@@ -331,6 +330,17 @@ class AGI3(Agent):
                 # If the screen is still changing, just wait.
                 return self.wait_action
             
+        novel_changes_found, known_changes_found, change_descriptions, structured_changes = self.perceive(latest_frame)    
+        
+        # --- NEW: Check for and analyze the "aftermath" of an interaction ---
+        if self.observing_interaction_for_tile is not None:
+            print("-> Stepped away from observed tile. Analyzing aftermath...")
+            self._analyze_and_log_interaction_effect(structured_changes, 'aftermath_effect')
+
+            # End the full observation cycle and return to normal exploration.
+            self.observing_interaction_for_tile = None
+            self.exploration_phase = ExplorationPhase.BUILDING_MAP # Resume normal exploration
+            
         # --- State Graph Update ---
         # If we have a previous state and an action that led to the current state,
         # update the state graph to record the transition.
@@ -354,8 +364,6 @@ class AGI3(Agent):
             return GameAction.RESET
 
         # --- 2. Perception & Consequence of Last Action ---
-        novel_changes_found, known_changes_found, change_descriptions, structured_changes = self.perceive(latest_frame)
-
         # Create a hashable representation of the grid for state graph tracking.
         grid_tuple = self._get_grid_state_tuple(latest_frame.frame)
 
@@ -533,50 +541,23 @@ class AGI3(Agent):
                     self.last_grid_tuple = grid_tuple
                     return action
                 else:
-                    # This block handles the completion of a plan.
-                    if self.interaction_observation_phase == 'AFTERMATH':
-                        # This means the "step away" plan just finished.
-                        print("-> Stepped away. Observing aftermath...")
-                        self._analyze_and_log_interaction_effect(structured_changes, 'aftermath_effect')
-                        
-                        # End the full observation cycle and return to normal exploration.
-                        self.observing_interaction_for_tile = None
-                        self.interaction_observation_phase = None
-                        self.exploration_phase = ExplorationPhase.BUILDING_MAP
-                    
-                    else:
-                        # This means a normal exploration plan to an interactable has finished.
-                        print("✅ Plan complete. Beginning interaction observation.")
-                        if self.exploration_target and self.tile_size:
-                            target_tile = (self.exploration_target[0] // self.tile_size, self.exploration_target[1] // self.tile_size)
+                    # This block handles the completion of a plan to an interactable.
+                    print("✅ Plan complete. Beginning interaction observation.")
+                    if self.exploration_target and self.tile_size:
+                        target_tile = (self.exploration_target[0] // self.tile_size, self.exploration_target[1] // self.tile_size)
 
-                            if self.tile_map.get(target_tile) == CellType.POTENTIALLY_INTERACTABLE:
-                                self.tile_map[target_tile] = CellType.CONFIRMED_INTERACTABLE
-                                print(f"✅ Target at {target_tile} confirmed as interactable.")
+                        if self.tile_map.get(target_tile) == CellType.POTENTIALLY_INTERACTABLE:
+                            self.tile_map[target_tile] = CellType.CONFIRMED_INTERACTABLE
+                            print(f"✅ Target at {target_tile} confirmed as interactable.")
 
-                            # Set the tile we're observing.
-                            self.observing_interaction_for_tile = target_tile
-                            
-                            # --- Observation 1: Analyze immediate effects ---
-                            # The 'structured_changes' from the top of the function are from landing on the tile.
-                            self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect')
+                        # --- Observation 1: Analyze immediate effects ---
+                        # Set the tile we're observing so we can check the aftermath on the next turn.
+                        self.observing_interaction_for_tile = target_tile
+                        self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect')
 
-                            # --- Create a new micro-plan to step away for Observation 2 ---
-                            move_away_plan = self._plan_step_away(target_tile)
-                            if move_away_plan:
-                                print(f"-> Planning to step away ({move_away_plan[0].name}) to observe aftermath.")
-                                self.exploration_plan = move_away_plan
-                                self.interaction_observation_phase = 'AFTERMATH'
-                                self.exploration_phase = ExplorationPhase.EXECUTING_PLAN # Trigger execution of the new plan
-                            else:
-                                # If we can't step away, the observation cycle ends here.
-                                print("-> Cannot find path to step away. Ending interaction observation.")
-                                self.observing_interaction_for_tile = None
-                                self.interaction_observation_phase = None
-                                self.exploration_phase = ExplorationPhase.BUILDING_MAP
-                        else:
-                            # If there was no target, just go back to mapping.
-                            self.exploration_phase = ExplorationPhase.BUILDING_MAP
+                    # Immediately transition to find a new target. The next action will be the "step away".
+                    self.exploration_phase = ExplorationPhase.BUILDING_MAP
+
             # Build or rebuild the map if needed.
             if self.exploration_phase == ExplorationPhase.BUILDING_MAP:
                 print("🗺️ Building/updating the level map...")
@@ -1504,29 +1485,6 @@ class AGI3(Agent):
                     'index_direction': None
                 }
                 print(f"🤔 New resource candidate found at row {row_idx}.")
-
-    def _plan_step_away(self, from_tile: tuple) -> list:
-        """Finds an adjacent floor tile and returns a one-step plan to move there."""
-        if not self.world_model.get('action_map'):
-            return []
-
-        # Invert the action map for easy lookup: tile_vector -> action
-        tile_vector_to_action = {}
-        if self.tile_size:
-            for action, effect in self.world_model['action_map'].items():
-                if 'move_vector' in effect:
-                    px_vec = effect['move_vector']
-                    tile_vec = (px_vec[0] // self.tile_size, px_vec[1] // self.tile_size)
-                    if tile_vec != (0, 0):
-                        tile_vector_to_action[tile_vec] = action
-        
-        # Find a valid move action that leads to a floor tile.
-        for tile_vec, action in tile_vector_to_action.items():
-            neighbor_tile = (from_tile[0] + tile_vec[0], from_tile[1] + tile_vec[1])
-            if self.tile_map.get(neighbor_tile) == CellType.FLOOR:
-                return [action] # Return a plan with just this one action.
-
-        return [] # Return empty list if no escape route is found.
 
     def _analyze_and_log_interaction_effect(self, structured_changes: list, effect_type: str):
         """Analyzes pixel changes from an interaction and logs them as a hypothesis."""
