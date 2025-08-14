@@ -201,15 +201,12 @@ class AGI3(Agent):
         self.last_known_objects = []
         self.last_known_player_obj = None # Make sure agent has to re-find itself on the new map.
 
-        # 2. Reset the discovery process to explore the new layout.
-        self.agent_state = AgentState.DISCOVERY
-        self.discovery_runs = 0
-        initial_actions = self.primary_actions.copy()
-        random.shuffle(initial_actions)
-        self.actions_to_try = initial_actions
-        self.discovery_sub_phase = 'PRIMARY'
-        self.discovered_in_current_run = False
-
+        # 2. Set the agent state to use its existing knowledge.
+        # Since the world model is preserved, we can skip discovery and move
+        # directly to intelligent action/exploration.
+        print("🧠 Knowledge preserved. Skipping discovery and entering action state.")
+        self.agent_state = AgentState.RANDOM_ACTION
+        
         # 3. Reset all map and exploration data. This "forgets the layout".
         print("🧹 Wiping all level layout and exploration data.")
         self.tile_map = {}
