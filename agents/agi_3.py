@@ -717,6 +717,9 @@ class AGI3(Agent):
         Finds the best interactable tile by pathfinding to all available targets
         and picking the one with the shortest path.
         """
+
+        self._print_debug_map()
+        
         self.exploration_target = None
         self.exploration_plan = []
         if not self.last_known_player_obj or not self.tile_size:
@@ -1485,6 +1488,51 @@ class AGI3(Agent):
         self.interaction_hypotheses[object_signature][effect_type] = interaction_effects
         print(f"📖 Hypothesis logged for '{object_signature}': {effect_type} has been recorded.")
     
+    
+    def _print_debug_map(self):
+        """Prints a human-readable version of the agent's tile_map to the console."""
+        if not self.tile_map:
+            print("🗺️ Debug Map: No map data to print.")
+            return
+
+        print("\n--- Agent's Debug Map ---")
+        player_tile = None
+        if self.last_known_player_obj and self.tile_size:
+            player_tile = (self.last_known_player_obj['top_row'] // self.tile_size, 
+                           self.last_known_player_obj['left_index'] // self.tile_size)
+
+        target_tile = None
+        if self.exploration_target and self.tile_size:
+            target_tile = (self.exploration_target[0] // self.tile_size, 
+                           self.exploration_target[1] // self.tile_size)
+
+        min_r = min(r for r, c in self.tile_map.keys())
+        max_r = max(r for r, c in self.tile_map.keys())
+        min_c = min(c for r, c in self.tile_map.keys())
+        max_c = max(c for r, c in self.tile_map.keys())
+
+        for r in range(min_r, max_r + 1):
+            row_str = ""
+            for c in range(min_c, max_c + 1):
+                if (r, c) == player_tile:
+                    row_str += " P "
+                elif (r, c) == target_tile:
+                    row_str += " T "
+                else:
+                    cell = self.tile_map.get((r, c), CellType.UNKNOWN)
+                    if cell == CellType.FLOOR:
+                        row_str += " . "
+                    elif cell == CellType.WALL:
+                        row_str += " # "
+                    elif cell == CellType.POTENTIALLY_INTERACTABLE:
+                        row_str += " ? "
+                    elif cell == CellType.CONFIRMED_INTERACTABLE:
+                        row_str += " ! "
+                    else: # UNKNOWN
+                        row_str += "   "
+            print(row_str)
+        print("--- Key: P=Player, T=Target, .=Floor, #=Wall, ?=Potential, !=Confirmed ---\n")
+
     def segment_objects(self, latest_frame: FrameData):
         """Scans the grid to find and define all objects."""
         # Identify objects from the grid here.
