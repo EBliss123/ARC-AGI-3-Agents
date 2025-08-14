@@ -26,8 +26,9 @@ class CellType(Enum):
     UNKNOWN = 0
     FLOOR = 1
     WALL = 2
-    INTERACTABLE = 3 # For identified but not fully understood objects
+    POTENTIALLY_INTERACTABLE = 3 # For identified but not fully understood objects
     PLAYER = 4
+    CONFIRMED_INTERACTABLE = 5
 
 class ExplorationPhase(Enum):
     """Manages the agent's goal-oriented exploration strategy."""
@@ -498,8 +499,14 @@ class AGI3(Agent):
                     return action
                 else:
                     print("✅ Plan complete. Re-evaluating map and finding new target.")
+                    # --- Promote the completed target to CONFIRMED_INTERACTABLE ---
+                    if self.exploration_target and self.tile_size:
+                        target_tile_coords = (self.exploration_target[0] // self.tile_size, self.exploration_target[1] // self.tile_size)
+                        if self.tile_map.get(target_tile_coords) == CellType.POTENTIALLY_INTERACTABLE:
+                            self.tile_map[target_tile_coords] = CellType.CONFIRMED_INTERACTABLE
+                            print(f"✅ Target at {target_tile_coords} confirmed as interactable.")
+                    
                     self.exploration_phase = ExplorationPhase.BUILDING_MAP
-
             # Build or rebuild the map if needed.
             if self.exploration_phase == ExplorationPhase.BUILDING_MAP:
                 print("🗺️ Building/updating the level map...")
@@ -591,6 +598,9 @@ class AGI3(Agent):
         """
         if not self.tile_size or not grid:
             return
+        
+        # Preserve tiles that have already been confirmed as interactable before rebuilding.
+        confirmed_interactables = {pos for pos, cell_type in self.tile_map.items() if cell_type == CellType.CONFIRMED_INTERACTABLE}
 
         # --- Pass 1: Initial color-based classification ---
         # We create a temporary map to help the floor-finding algorithm.
@@ -611,8 +621,8 @@ class AGI3(Agent):
                 elif sample_color == floor_color:
                     temp_tile_map[tile_coords] = CellType.FLOOR
                 else:
-                    # Tentatively classify as INTERACTABLE
-                    temp_tile_map[tile_coords] = CellType.INTERACTABLE
+                    # Tentatively classify as potentially interactable
+                    temp_tile_map[tile_coords] = CellType.POTENTIALLY_INTERACTABLE
         
         # Use the temporary map to find the reachable floor area
         self.tile_map = temp_tile_map
@@ -628,6 +638,11 @@ class AGI3(Agent):
         all_tile_coords = list(self.tile_map.keys())
 
         for tile_coords in all_tile_coords:
+            # Rule 0: Preserve confirmed interactables above all else.
+            if tile_coords in confirmed_interactables:
+                refined_tile_map[tile_coords] = CellType.CONFIRMED_INTERACTABLE
+                continue
+
             # Rule 1: Any tile within the reachable area is FLOOR.
             if tile_coords in self.reachable_floor_area:
                 refined_tile_map[tile_coords] = CellType.FLOOR
@@ -647,7 +662,7 @@ class AGI3(Agent):
                     refined_tile_map[tile_coords] = CellType.WALL
                 # Otherwise, it's an INTERACTABLE object.
                 else:
-                    refined_tile_map[tile_coords] = CellType.INTERACTABLE
+                    refined_tile_map[tile_coords] = CellType.POTENTIALLY_INTERACTABLE
             else:
                 # Rule 3: If it's not floor and not adjacent, it's UNKNOWN.
                 refined_tile_map[tile_coords] = CellType.UNKNOWN
@@ -655,8 +670,8 @@ class AGI3(Agent):
         # Update the agent's main tile map with the refined version.
         self.tile_map = refined_tile_map
         counts = Counter(self.tile_map.values())
-        print(f"🗺️ Refined Map ({len(self.tile_map)} tiles): {counts[CellType.FLOOR]} floor, {counts[CellType.WALL]} wall, {counts[CellType.INTERACTABLE]} interactable, {counts[CellType.UNKNOWN]} unknown.")
-
+        print(f"🗺️ Refined Map ({len(self.tile_map)} tiles): {counts[CellType.FLOOR]} floor, {counts[CellType.WALL]} wall, {counts.get(CellType.POTENTIALLY_INTERACTABLE, 0)} potentially interactable, {counts.get(CellType.CONFIRMED_INTERACTABLE, 0)} interactable.")
+    
     def _find_target_and_plan(self) -> bool:
         """
         Finds the best interactable tile by pathfinding to all available targets
@@ -671,7 +686,7 @@ class AGI3(Agent):
         player_tile_pos = (player_pixel_pos[0] // self.tile_size, player_pixel_pos[1] // self.tile_size)
 
         # 1. Find all potential targets on the map.
-        potential_targets = [pos for pos, type in self.tile_map.items() if type == CellType.INTERACTABLE]
+        potential_targets = [pos for pos, type in self.tile_map.items() if type == CellType.POTENTIALLY_INTERACTABLE]
         if not potential_targets:
             return False
 
@@ -735,7 +750,7 @@ class AGI3(Agent):
                 neighbor_tile = (current_tile[0] + tile_vec[0], current_tile[1] + tile_vec[1])
 
                 tile_type = self.tile_map.get(neighbor_tile)
-                can_move_to = tile_type in [CellType.FLOOR, CellType.INTERACTABLE]
+                can_move_to = tile_type in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE]
 
                 if can_move_to and neighbor_tile not in visited:
                     visited.add(neighbor_tile)
@@ -759,7 +774,7 @@ class AGI3(Agent):
 
         # The player might be on an interactable tile, which is also a valid starting point.
         start_tile_type = self.tile_map.get(start_tile)
-        if start_tile_type not in [CellType.FLOOR, CellType.INTERACTABLE]:
+        if start_tile_type not in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE]:
             print(f"⚠️ Player starting tile {start_tile} is not on a known FLOOR or INTERACTABLE. Aborting flood fill.")
             return set()
 
