@@ -470,15 +470,14 @@ class AGI3(Agent):
             # If the tracker saw the agent move, use that new position.
             if moved_agent_this_turn:
                 self.last_known_player_obj = moved_agent_this_turn
-            # Otherwise, try to find it from memory (this is the old, flawed logic, now a fallback)
+            # 4. Update the player object's known position
+            # If the tracker saw the agent move, use that new position.
+            if moved_agent_this_turn:
+                self.last_known_player_obj = moved_agent_this_turn
+            # If no agent moved this turn (e.g., after a reset), we don't know its
+            # location. We must wait for movement to find it again.
             else:
                 self.last_known_player_obj = None
-                if self.world_model.get('player_signature'):
-                    player_sig = self.world_model['player_signature']
-                    for obj in self.last_known_objects:
-                        if (obj['height'], obj['width']) == player_sig:
-                            self.last_known_player_obj = obj
-                            break # Found it
 
         # --- Intelligent Exploration Logic ---
         # Check if the agent has learned enough to begin exploring intelligently.
@@ -651,6 +650,11 @@ class AGI3(Agent):
         floor_color = self.world_model['floor_color']
         wall_colors = self.world_model['wall_colors']
 
+        player_tile_coords = None
+        if self.last_known_player_obj and self.tile_size:
+            player_pixel_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
+            player_tile_coords = (player_pixel_pos[0] // self.tile_size, player_pixel_pos[1] // self.tile_size)
+
         for r in range(0, grid_height, self.tile_size):
             for c in range(0, grid_width, self.tile_size):
                 sample_color = grid_data[r][c]
@@ -672,7 +676,6 @@ class AGI3(Agent):
         if not self.reachable_floor_area:
             print("🗺️ No reachable area found. Map will not be refined.")
             # We leave the color-based map as is if nothing is reachable.
-            return
 
         refined_tile_map = {}
         all_tile_coords = list(self.tile_map.keys())
@@ -700,9 +703,15 @@ class AGI3(Agent):
                 # It's a WALL if its color matches known wall colors.
                 if temp_tile_map.get(tile_coords) == CellType.WALL:
                     refined_tile_map[tile_coords] = CellType.WALL
-                # Otherwise, it's an INTERACTABLE object.
+                # Otherwise, check the color before assuming it's interactable.
                 else:
-                    refined_tile_map[tile_coords] = CellType.POTENTIALLY_INTERACTABLE
+                    # This handles cases where a floor tile wasn't reached by the
+                    # initial flood fill, correctly classifying it as FLOOR.
+                    sample_color = grid_data[tile_coords[0] * self.tile_size][tile_coords[1] * self.tile_size]
+                    if sample_color == floor_color:
+                        refined_tile_map[tile_coords] = CellType.FLOOR
+                    else:
+                        refined_tile_map[tile_coords] = CellType.POTENTIALLY_INTERACTABLE
             else:
                 # Rule 3: If it's not floor and not adjacent, it's UNKNOWN.
                 refined_tile_map[tile_coords] = CellType.UNKNOWN
@@ -989,6 +998,22 @@ class AGI3(Agent):
                         self.world_model['floor_color'] = obj_color
                         print(f"✅ [FLOOR] Confirmed: Color {obj_color} is the floor.")
 
+                        # --- Map Cleanup Logic ---
+                        if self.tile_size:
+                            reclassified_count = 0
+                            grid_data = latest_frame[0]
+                            for tile_coords, cell_type in list(self.tile_map.items()):
+                                if cell_type != CellType.FLOOR:
+                                    tile_row = tile_coords[0] * self.tile_size
+                                    tile_col = tile_coords[1] * self.tile_size
+                                    if 0 <= tile_row < len(grid_data) and 0 <= tile_col < len(grid_data[0]):
+                                        tile_color = grid_data[tile_row][tile_col]
+                                        if tile_color == obj_color:
+                                            self.tile_map[tile_coords] = CellType.FLOOR
+                                            reclassified_count += 1
+                            if reclassified_count > 0:
+                                print(f"🧹 Map Cleanup: Reclassified {reclassified_count} tile(s) as newly confirmed floor.")
+
                 # If the floor is already known, log any event where it is revealed again.
                 elif obj_color == self.world_model['floor_color']:
                     print(f"🕵️‍♀️ [FLOOR]: A change at {sample_point} revealed the known floor color ({obj_color}).")
@@ -1211,6 +1236,23 @@ class AGI3(Agent):
                         if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
                             self.world_model['floor_color'] = floor_candidate
                             log_messages.append(f"✅ Confirmed Floor Color: {floor_candidate}.")
+
+                            # --- Map Cleanup Logic ---
+                            if self.tile_size:
+                                reclassified_count = 0
+                                grid_data = latest_grid[0]
+                                for tile_coords, cell_type in list(self.tile_map.items()):
+                                    if cell_type != CellType.FLOOR:
+                                        tile_row = tile_coords[0] * self.tile_size
+                                        tile_col = tile_coords[1] * self.tile_size
+                                        if 0 <= tile_row < len(grid_data) and 0 <= tile_col < len(grid_data[0]):
+                                            tile_color = grid_data[tile_row][tile_col]
+                                            if tile_color == floor_candidate:
+                                                self.tile_map[tile_coords] = CellType.FLOOR
+                                                reclassified_count += 1
+                                if reclassified_count > 0:
+                                    log_messages.append(f"🧹 Map Cleanup: Reclassified {reclassified_count} tile(s) as newly confirmed floor.")
+
                             break # Stop after confirming.
 
         # --- Action Effect Learning ---
