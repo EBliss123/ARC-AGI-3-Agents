@@ -193,6 +193,32 @@ class AGI3(Agent):
             self.discovery_sub_phase = 'PRIMARY'
             self.discovered_in_current_run = False
 
+    def _reset_for_new_level(self):
+        """Resets all level-specific knowledge for a new level, preserving core learned concepts."""
+        # 1. Reset transient state and all object position data.
+        self.previous_frame = None
+        self.last_action = None
+        self.last_known_objects = []
+        self.last_known_player_obj = None # Make sure agent has to re-find itself on the new map.
+
+        # 2. Reset the discovery process to explore the new layout.
+        self.agent_state = AgentState.DISCOVERY
+        self.discovery_runs = 0
+        initial_actions = self.primary_actions.copy()
+        random.shuffle(initial_actions)
+        self.actions_to_try = initial_actions
+        self.discovery_sub_phase = 'PRIMARY'
+        self.discovered_in_current_run = False
+
+        # 3. Reset all map and exploration data. This "forgets the layout".
+        print("🧹 Wiping all level layout and exploration data.")
+        self.tile_map = {}
+        self.exploration_phase = ExplorationPhase.INACTIVE
+        self.exploration_target = None
+        self.exploration_plan = []
+        self.reachable_floor_area = set()
+        self.interaction_hypotheses.clear() # Interaction effects are tied to the specific layout.
+
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
         # --- 1. Store initial level state if not already set ---
@@ -209,6 +235,14 @@ class AGI3(Agent):
                 # again on the next turn.
                 print("--- Ignoring blank starting frame. Waiting for a valid one... ---")
         
+        # --- NEW, SIMPLIFIED NEW-LEVEL DETECTION ---
+        # If the score has increased at any point, assume it's a new level and reset.
+        if latest_frame.score > self.level_start_score:
+            print(f"--- New Level Detected (Score Increased)! Resetting layout knowledge. ---")
+            self.level_start_frame = copy.deepcopy(latest_frame.frame)
+            self.level_start_score = latest_frame.score
+            self._reset_for_new_level()
+            return self.wait_action
         
         # --- Handle screen transitions before any other logic ---
         if self.agent_state == AgentState.AWAITING_STABILITY:
@@ -224,7 +258,7 @@ class AGI3(Agent):
                     print(f"--- New Level Detected! Score increased to {new_score}. ---")
                     self.level_start_frame = copy.deepcopy(latest_frame.frame)
                     self.level_start_score = new_score
-                    self._reset_for_new_attempt() # Reset discovery for the new level
+                    self._reset_for_new_level() 
                     return self.wait_action
                 else:
                     print("--- Lost a Life (Score did not increase). Analyzing reset state... ---")
