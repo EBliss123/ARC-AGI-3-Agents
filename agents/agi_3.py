@@ -1032,16 +1032,27 @@ class AGI3(Agent):
                         break
             
                 if is_part_of_background:
-                    # This event is a strong clue for what the floor is.
-                    log_message = f"🕵️‍♀️ A change at {sample_point} revealed what may be the background (Color: {obj_color})."
+                    known_floor_color = self.world_model.get('floor_color')
 
-                    # If the floor color is not yet known, this is a learning opportunity.
-                    if self.world_model['floor_color'] is None:
+                    # Case 1: The floor color IS KNOWN. Use it to make a smarter decision.
+                    if known_floor_color is not None:
+                        if obj_color == known_floor_color:
+                            # This is genuinely the floor being revealed. Log it and skip creating an object.
+                            print(f"🕵️‍♀️ [FLOOR]: A change at {sample_point} revealed the known floor color ({obj_color}).")
+                            continue
+                        else:
+                            # A background was revealed, but it's NOT the floor. This is likely a UI element.
+                            # We must treat it as a distinct object.
+                            print(f"🎨 [UI/OBJECT]: A background-like change at {sample_point} revealed a non-floor color ({obj_color}). Treating as an object.")
+                            # By not calling 'continue', we fall through to the object description logic below.
+                    
+                    # Case 2: The floor color is NOT KNOWN yet. Use this as a learning opportunity.
+                    else:
                         self.floor_hypothesis[obj_color] = self.floor_hypothesis.get(obj_color, 0) + 1
                         confidence = self.floor_hypothesis[obj_color]
                         print(f"🕵️‍♀️ Floor Hypothesis: A change at {sample_point} revealed color {obj_color} (Confidence: {confidence}).")
 
-                        # Check for confirmation and print the one-time confirmation message.
+                        # Check for confirmation and run one-time setup.
                         if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
                             self.world_model['floor_color'] = obj_color
                             print(f"✅ [FLOOR] Confirmed: Color {obj_color} is the floor.")
@@ -1061,12 +1072,9 @@ class AGI3(Agent):
                                                 reclassified_count += 1
                                 if reclassified_count > 0:
                                     print(f"🧹 Map Cleanup: Reclassified {reclassified_count} tile(s) as newly confirmed floor.")
-
-                    # If the floor is already known, log any event where it is revealed again.
-                    elif obj_color == self.world_model['floor_color']:
-                        print(f"🕵️‍♀️ [FLOOR]: A change at {sample_point} revealed the known floor color ({obj_color}).")
-
-                    continue # Always skip creating an object from this background change.
+                        
+                        # While learning what the floor is, we skip creating an object from background reveals.
+                        continue
 
             # --- If it's a real object, proceed with description ---
             min_row = min(r for r, _ in obj_points)
@@ -1521,20 +1529,54 @@ class AGI3(Agent):
                 for c in range(player_box['left_index'], player_box['left_index'] + player_box['width']):
                     player_coords.add((r,c))
 
+        # Get the resource indicator row, if it's known.
+        indicator_row = None
+        if self.confirmed_resource_indicator:
+            indicator_row = self.confirmed_resource_indicator.get('row_index')
+
         for change in structured_changes:
+            # Check if the change is part of the player's movement.
             is_player_move = any((change['row_index'], px['index']) in player_coords for px in change['changes'])
-            if not is_player_move:
+            
+            # Check if the change is on the known resource indicator row.
+            is_resource_indicator = (indicator_row is not None and change['row_index'] == indicator_row)
+            
+            # Only keep the change if it's NOT the player and NOT the resource indicator.
+            if not is_player_move and not is_resource_indicator:
                 interaction_effects_pixels.append(change)
 
+        # --- NEW: Report raw changes first, THEN try to find objects. ---
         if not interaction_effects_pixels:
-            print(f"-> No observable '{effect_type}' pixel changes found (excluding player movement).")
+            print(f"-> No observable '{effect_type}' pixel changes found (excluding player movement and UI).")
             return
+
+        # Group changes by tile to give a concise summary.
+        changes_by_tile = {}
+        if self.tile_size:
+            for change in interaction_effects_pixels:
+                row = change['row_index']
+                for px in change['changes']:
+                    col = px['index']
+                    tile_coords = (row // self.tile_size, col // self.tile_size)
+                    if tile_coords not in changes_by_tile:
+                        changes_by_tile[tile_coords] = 0
+                    changes_by_tile[tile_coords] += 1
+
+        if changes_by_tile:
+            print(f"-> Found raw pixel changes for '{effect_type}' on the following tiles:")
+            for tile, count in changes_by_tile.items():
+                print(f"  - Tile {tile}: {count} pixel(s) changed.")
+        else:
+            # Fallback for when tile size isn't known
+            print(f"-> Found {len(interaction_effects_pixels)} raw change groups for '{effect_type}'.")
+
 
         # 3. Convert the raw pixel changes into whole OBJECTS.
         effect_objects = self._find_and_describe_objects(interaction_effects_pixels, latest_grid)
 
         if not effect_objects:
-            print(f"-> Interaction effects did not form any distinct objects.")
+            print(f"-> The above pixel changes did not form any distinct objects according to the current model.")
+            # We return here, but it's okay because we already logged the raw changes.
             return
 
         # 4. Log the OBJECTS as the hypothesis.
