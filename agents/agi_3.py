@@ -289,7 +289,8 @@ class AGI3(Agent):
                                     for i, obj in enumerate(life_indicator_objects):
                                         pos = (obj['top_row'], obj['left_index'])
                                         size = (obj['height'], obj['width'])
-                                        print(f"  - Object {i+1}: A {size[0]}x{size[1]} object at position {pos}.")
+                                        tile_pos = (pos[0] // self.tile_size, pos[1] // self.tile_size)
+                                        print(f"  - Object {i+1}: A {size[0]}x{size[1]} object at pixel {pos} (tile {tile_pos}).")
 
                                         # --- Life Indicator Learning Logic ---
                                         # If the indicator isn't known, learn it from this first observation.
@@ -335,7 +336,7 @@ class AGI3(Agent):
         # --- NEW: Check for and analyze the "aftermath" of an interaction ---
         if self.observing_interaction_for_tile is not None:
             print("-> Stepped away from observed tile. Analyzing aftermath...")
-            self._analyze_and_log_interaction_effect(structured_changes, 'aftermath_effect')
+            self._analyze_and_log_interaction_effect(structured_changes, 'aftermath_effect', latest_frame.frame)
 
             # End the full observation cycle and return to normal exploration.
             self.observing_interaction_for_tile = None
@@ -553,7 +554,7 @@ class AGI3(Agent):
                         # --- Observation 1: Analyze immediate effects ---
                         # Set the tile we're observing so we can check the aftermath on the next turn.
                         self.observing_interaction_for_tile = target_tile
-                        self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect')
+                        self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect', latest_frame.frame)
 
                     # Immediately transition to find a new target. The next action will be the "step away".
                     self.exploration_phase = ExplorationPhase.BUILDING_MAP
@@ -569,7 +570,8 @@ class AGI3(Agent):
                 print("🗺️ Seeking a new exploration target...")
                 target_found = self._find_target_and_plan()
                 if target_found:
-                    print(f"🎯 New target acquired at {self.exploration_target}. Plan created with {len(self.exploration_plan)} steps.")
+                    target_tile_coords = (self.exploration_target[0] // self.tile_size, self.exploration_target[1] // self.tile_size)
+                    print(f"🎯 New target acquired at pixel {self.exploration_target} (tile {target_tile_coords}). Plan created with {len(self.exploration_plan)} steps.")
                     self.exploration_phase = ExplorationPhase.EXECUTING_PLAN
                     # Execute the first step of the new plan immediately.
                     if self.exploration_plan:
@@ -998,57 +1000,73 @@ class AGI3(Agent):
             sample_point = next(iter(obj_points))
             obj_color = grid[sample_point[0]][sample_point[1]]
 
-            for r, p_idx in obj_points:
-                for dr, dp_idx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                    neighbor = (r + dr, p_idx + dp_idx)
-                    
-                    # Check if neighbor is within bounds, didn't change, and has the same color.
-                    if (0 <= neighbor[0] < grid_height and
-                        0 <= neighbor[1] < grid_width and
-                        neighbor not in changed_coords and
-                        grid[neighbor[0]][neighbor[1]] == obj_color):
+            # Determine if we should run the background check.
+            is_in_playable_area = False
+            # If the map doesn't exist yet, we are in the early learning phase.
+            # Allow the background/floor check to run anywhere on the screen.
+            if not self.tile_map:
+                is_in_playable_area = True
+            else:
+                # If the map EXISTS, only run the check for objects inside of it.
+                if self.tile_size:
+                    obj_tile_coords = (sample_point[0] // self.tile_size, sample_point[1] // self.tile_size)
+                    if obj_tile_coords in self.tile_map:
+                        is_in_playable_area = True
+
+            # The background check should only run for objects inside the playable area.
+            if is_in_playable_area:
+
+                for r, p_idx in obj_points:
+                    for dr, dp_idx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                        neighbor = (r + dr, p_idx + dp_idx)
                         
-                        is_part_of_background = True
+                        # Check if neighbor is within bounds, didn't change, and has the same color.
+                        if (0 <= neighbor[0] < grid_height and
+                            0 <= neighbor[1] < grid_width and
+                            neighbor not in changed_coords and
+                            grid[neighbor[0]][neighbor[1]] == obj_color):
+                            
+                            is_part_of_background = True
+                            break
+                    if is_part_of_background:
                         break
-                if is_part_of_background:
-                    break
             
-            if is_part_of_background:
-                # This event is a strong clue for what the floor is.
-                log_message = f"🕵️‍♀️ A change at {sample_point} revealed what may be the background (Color: {obj_color})."
+                if is_part_of_background:
+                    # This event is a strong clue for what the floor is.
+                    log_message = f"🕵️‍♀️ A change at {sample_point} revealed what may be the background (Color: {obj_color})."
 
-                # If the floor color is not yet known, this is a learning opportunity.
-                if self.world_model['floor_color'] is None:
-                    self.floor_hypothesis[obj_color] = self.floor_hypothesis.get(obj_color, 0) + 1
-                    confidence = self.floor_hypothesis[obj_color]
-                    print(f"🕵️‍♀️ Floor Hypothesis: A change at {sample_point} revealed color {obj_color} (Confidence: {confidence}).")
+                    # If the floor color is not yet known, this is a learning opportunity.
+                    if self.world_model['floor_color'] is None:
+                        self.floor_hypothesis[obj_color] = self.floor_hypothesis.get(obj_color, 0) + 1
+                        confidence = self.floor_hypothesis[obj_color]
+                        print(f"🕵️‍♀️ Floor Hypothesis: A change at {sample_point} revealed color {obj_color} (Confidence: {confidence}).")
 
-                    # Check for confirmation and print the one-time confirmation message.
-                    if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
-                        self.world_model['floor_color'] = obj_color
-                        print(f"✅ [FLOOR] Confirmed: Color {obj_color} is the floor.")
+                        # Check for confirmation and print the one-time confirmation message.
+                        if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
+                            self.world_model['floor_color'] = obj_color
+                            print(f"✅ [FLOOR] Confirmed: Color {obj_color} is the floor.")
 
-                        # --- Map Cleanup Logic ---
-                        if self.tile_size:
-                            reclassified_count = 0
-                            grid_data = latest_frame[0]
-                            for tile_coords, cell_type in list(self.tile_map.items()):
-                                if cell_type != CellType.FLOOR:
-                                    tile_row = tile_coords[0] * self.tile_size
-                                    tile_col = tile_coords[1] * self.tile_size
-                                    if 0 <= tile_row < len(grid_data) and 0 <= tile_col < len(grid_data[0]):
-                                        tile_color = grid_data[tile_row][tile_col]
-                                        if tile_color == obj_color:
-                                            self.tile_map[tile_coords] = CellType.FLOOR
-                                            reclassified_count += 1
-                            if reclassified_count > 0:
-                                print(f"🧹 Map Cleanup: Reclassified {reclassified_count} tile(s) as newly confirmed floor.")
+                            # --- Map Cleanup Logic ---
+                            if self.tile_size:
+                                reclassified_count = 0
+                                grid_data = latest_frame[0]
+                                for tile_coords, cell_type in list(self.tile_map.items()):
+                                    if cell_type != CellType.FLOOR:
+                                        tile_row = tile_coords[0] * self.tile_size
+                                        tile_col = tile_coords[1] * self.tile_size
+                                        if 0 <= tile_row < len(grid_data) and 0 <= tile_col < len(grid_data[0]):
+                                            tile_color = grid_data[tile_row][tile_col]
+                                            if tile_color == obj_color:
+                                                self.tile_map[tile_coords] = CellType.FLOOR
+                                                reclassified_count += 1
+                                if reclassified_count > 0:
+                                    print(f"🧹 Map Cleanup: Reclassified {reclassified_count} tile(s) as newly confirmed floor.")
 
-                # If the floor is already known, log any event where it is revealed again.
-                elif obj_color == self.world_model['floor_color']:
-                    print(f"🕵️‍♀️ [FLOOR]: A change at {sample_point} revealed the known floor color ({obj_color}).")
+                    # If the floor is already known, log any event where it is revealed again.
+                    elif obj_color == self.world_model['floor_color']:
+                        print(f"🕵️‍♀️ [FLOOR]: A change at {sample_point} revealed the known floor color ({obj_color}).")
 
-                continue # Always skip creating an object from this background change.
+                    continue # Always skip creating an object from this background change.
 
             # --- If it's a real object, proceed with description ---
             min_row = min(r for r, _ in obj_points)
@@ -1486,27 +1504,16 @@ class AGI3(Agent):
                 }
                 print(f"🤔 New resource candidate found at row {row_idx}.")
 
-    def _analyze_and_log_interaction_effect(self, structured_changes: list, effect_type: str):
+    def _analyze_and_log_interaction_effect(self, structured_changes: list, effect_type: str, latest_grid: list):
         """Analyzes pixel changes from an interaction and logs them as a hypothesis."""
         if self.observing_interaction_for_tile is None:
             return
-
-        # 1. Get a simple signature for the object that was interacted with.
-        observed_tile = self.observing_interaction_for_tile
-        object_signature = None
-        if self.tile_size and self.previous_frame:
-            tile_top_row = observed_tile[0] * self.tile_size
-            tile_left_index = observed_tile[1] * self.tile_size
-            
-            # Use the color of the tile (before any potential change) as a simple signature.
-            sample_color = self.previous_frame[0][tile_top_row][tile_left_index]
-            object_signature = f"tile_color_{sample_color}"
         
-        if not object_signature:
-            return
+        # 1. Get a signature based on the TILE POSITION.
+        object_signature = f"tile_pos_{self.observing_interaction_for_tile}"
 
         # 2. Filter out changes caused by the player's own movement.
-        interaction_effects = []
+        interaction_effects_pixels = []
         player_coords = set()
         if self.last_known_player_obj:
             player_box = self.last_known_player_obj
@@ -1515,28 +1522,85 @@ class AGI3(Agent):
                     player_coords.add((r,c))
 
         for change in structured_changes:
-            change_is_on_player = False
-            for px_change in change['changes']:
-                if (change['row_index'], px_change['index']) in player_coords:
-                    change_is_on_player = True
-                    break
-            if not change_is_on_player:
-                interaction_effects.append(change)
+            is_player_move = any((change['row_index'], px['index']) in player_coords for px in change['changes'])
+            if not is_player_move:
+                interaction_effects_pixels.append(change)
 
-        if not interaction_effects:
+        if not interaction_effects_pixels:
             print(f"-> No observable '{effect_type}' pixel changes found (excluding player movement).")
             return
 
-        print(f"-> Found {len(interaction_effects)} raw pixel changes for '{effect_type}'.")
+        # 3. Convert the raw pixel changes into whole OBJECTS.
+        effect_objects = self._find_and_describe_objects(interaction_effects_pixels, latest_grid)
 
-        # 3. Log the raw pixel changes as a hypothesis.
+        if not effect_objects:
+            print(f"-> Interaction effects did not form any distinct objects.")
+            return
+
+        # 4. Log the OBJECTS as the hypothesis.
+        print(f"-> Found {len(effect_objects)} object(s) as a result of the '{effect_type}':")
+        for i, obj in enumerate(effect_objects):
+            pos = (obj['top_row'], obj['left_index'])
+            size = (obj['height'], obj['width'])
+            tile_pos = (pos[0] // self.tile_size, pos[1] // self.tile_size)
+            print(f"  - Object {i+1}: A {size[0]}x{size[1]} object at pixel {pos} (tile {tile_pos}).")
+
         if object_signature not in self.interaction_hypotheses:
             self.interaction_hypotheses[object_signature] = {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
-        
-        # Store the raw change data.
-        self.interaction_hypotheses[object_signature][effect_type] = interaction_effects
+
+        self.interaction_hypotheses[object_signature][effect_type] = effect_objects
         print(f"📖 Hypothesis logged for '{object_signature}': {effect_type} has been recorded.")
+
+        # 5. Pass the list of objects to the synthesizer for analysis.
+        self._synthesize_interaction_rules(object_signature, effect_objects, latest_grid)
     
+    def _synthesize_interaction_rules(self, interacted_obj_sig: str, effect_objects: list, latest_grid: list):
+        """Analyzes interaction effects by scanning the ENTIRE GRID for matching keys."""
+        if not effect_objects or not latest_grid:
+            return
+
+        print(f"🔬 Synthesizing rules from interaction with '{interacted_obj_sig}'...")
+
+        grid_data = latest_grid[0]
+        grid_height = len(grid_data)
+        grid_width = len(grid_data[0]) if grid_height > 0 else 0
+        
+        match_found = False
+        # Iterate through each object that resulted from the interaction (the dynamic keys).
+        for dynamic_key_obj in effect_objects:
+            dynamic_key_datamap = dynamic_key_obj['data_map']
+            dk_h, dk_w = dynamic_key_obj['height'], dynamic_key_obj['width']
+            dk_pos = (dynamic_key_obj['top_row'], dynamic_key_obj['left_index'])
+            dk_tile_pos = (dk_pos[0] // self.tile_size, dk_pos[1] // self.tile_size)
+            print(f"-> Analyzing dynamic key: A {dk_h}x{dk_w} object at pixel {dk_pos} (tile {dk_tile_pos}).")
+
+            # Scan the entire grid for a static object that matches this dynamic key.
+            # We iterate through every possible top-left coordinate.
+            for r in range(grid_height - dk_h + 1):
+                for c in range(grid_width - dk_w + 1):
+                    # Avoid matching the object with itself.
+                    if (r, c) == dk_pos:
+                        continue
+
+                    # Extract the data map for the current grid position.
+                    static_key_datamap = tuple(
+                        tuple(grid_data[row][col] for col in range(c, c + dk_w))
+                        for row in range(r, r + dk_h)
+                    )
+
+                    if static_key_datamap == dynamic_key_datamap:
+                        dk_tile_pos = (dk_pos[0] // self.tile_size, dk_pos[1] // self.tile_size)
+                        sk_tile_pos = (r // self.tile_size, c // self.tile_size)
+                        print(f"✅ GOAL HYPOTHESIS: Dynamic key at pixel {dk_pos} (tile {dk_tile_pos}) matches a static key at pixel ({r}, {c}) (tile {sk_tile_pos})!")
+                        match_found = True
+                        break
+                if match_found:
+                    break
+            if match_found:
+                break
+        
+        if not match_found:
+            print("-> No matching static key found on the grid for any produced dynamic keys.")
     
     def _print_debug_map(self):
         """Prints a human-readable version of the agent's tile_map to the console."""
