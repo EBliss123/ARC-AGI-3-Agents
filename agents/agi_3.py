@@ -338,7 +338,7 @@ class AGI3(Agent):
         # --- NEW: Check for and analyze the "aftermath" of an interaction ---
         if self.observing_interaction_for_tile is not None:
             print("-> Stepped away from observed tile. Analyzing aftermath...")
-            self._analyze_and_log_interaction_effect(structured_changes, 'aftermath_effect', latest_frame.frame, self.last_known_objects)
+            self._analyze_consumable_aftermath(latest_frame.frame)
 
             # End the full observation cycle and return to normal exploration.
             self.observing_interaction_for_tile = None
@@ -1659,74 +1659,63 @@ class AGI3(Agent):
         if self.observing_interaction_for_tile is None:
             return
         
-        # 1. Get a signature based on the TILE POSITION.
         object_signature = f"tile_pos_{self.observing_interaction_for_tile}"
 
-        # 2. Filter out changes caused by the player's own movement.
-        interaction_effects_pixels = []
-        player_coords = set()
+        # 1. Define ignore zones to filter out irrelevant changes (player movement, UI).
+        ignore_coords = set()
+        
+        # Add the player's last known position to the ignore zone.
         if self.last_known_player_obj:
             player_box = self.last_known_player_obj
             for r in range(player_box['top_row'], player_box['top_row'] + player_box['height']):
                 for c in range(player_box['left_index'], player_box['left_index'] + player_box['width']):
-                    player_coords.add((r,c))
+                    ignore_coords.add((r,c))
 
-        # Get the resource indicator row, if it's known.
-        indicator_row = None
+        # Add the resource indicator row, if known.
         if self.confirmed_resource_indicator:
             indicator_row = self.confirmed_resource_indicator.get('row_index')
+            # Add the entire row to the ignore zone.
+            grid_width = len(latest_grid[0][0]) if latest_grid and latest_grid[0] else 0
+            for c in range(grid_width):
+                ignore_coords.add((indicator_row, c))
 
+        # 2. Filter the raw pixel changes using the ignore zones.
+        interaction_effects_pixels = []
         for change in structured_changes:
-            # Check if the change is part of the player's movement.
-            is_player_move = any((change['row_index'], px['index']) in player_coords for px in change['changes'])
+            filtered_pixel_changes = []
+            for px in change['changes']:
+                if (change['row_index'], px['index']) not in ignore_coords:
+                    filtered_pixel_changes.append(px)
             
-            # Check if the change is on the known resource indicator row.
-            is_resource_indicator = (indicator_row is not None and change['row_index'] == indicator_row)
-            
-            # Only keep the change if it's NOT the player and NOT the resource indicator.
-            if not is_player_move and not is_resource_indicator:
-                interaction_effects_pixels.append(change)
+            if filtered_pixel_changes:
+                interaction_effects_pixels.append({'row_index': change['row_index'], 'changes': filtered_pixel_changes})
 
-        # --- NEW: Report raw changes first, THEN try to find objects. ---
         if not interaction_effects_pixels:
-            print(f"-> No observable '{effect_type}' pixel changes found (excluding player movement and UI).")
+            print(f"-> No observable '{effect_type}' pixel changes found (excluding agent movement and UI).")
             return
 
-        # Group changes by tile to give a concise summary.
-        changes_by_tile = {}
-        if self.tile_size:
-            for change in interaction_effects_pixels:
-                row = change['row_index']
-                for px in change['changes']:
-                    col = px['index']
-                    tile_coords = (row // self.tile_size, col // self.tile_size)
-                    if tile_coords not in changes_by_tile:
-                        changes_by_tile[tile_coords] = 0
-                    changes_by_tile[tile_coords] += 1
-
-        if changes_by_tile:
-            print(f"-> Found raw pixel changes for '{effect_type}' on the following tiles:")
-            for tile, count in changes_by_tile.items():
-                print(f"  - Tile {tile}: {count} pixel(s) changed.")
-        else:
-            # Fallback for when tile size isn't known
-            print(f"-> Found {len(interaction_effects_pixels)} raw change groups for '{effect_type}'.")
-
-
-        # 3. Convert the raw pixel changes into whole OBJECTS.
+        # 3. Convert the filtered pixel changes into whole OBJECTS.
         effect_objects = self._find_and_describe_objects(interaction_effects_pixels, latest_grid)
+        
+        # 4. A second, object-level filter to catch the agent's new appearance.
+        player_signature = self.world_model.get('player_signature')
+        if player_signature:
+            original_count = len(effect_objects)
+            effect_objects = [obj for obj in effect_objects if (obj['height'], obj['width']) != player_signature]
+            filtered_count = original_count - len(effect_objects)
+            if filtered_count > 0:
+                print(f"🕵️‍♂️ Filtered out {filtered_count} object(s) matching the agent's new appearance.")
 
         if not effect_objects:
-            print(f"-> The above pixel changes did not form any distinct objects according to the current model.")
-            # We return here, but it's okay because we already logged the raw changes.
+            print(f"-> The remaining pixel changes did not form any distinct objects.")
             return
 
-        # 4. Log the OBJECTS as the hypothesis.
+        # 5. Log the results and synthesize rules.
         print(f"-> Found {len(effect_objects)} object(s) as a result of the '{effect_type}':")
         for i, obj in enumerate(effect_objects):
             pos = (obj['top_row'], obj['left_index'])
             size = (obj['height'], obj['width'])
-            tile_pos = (pos[0] // self.tile_size, pos[1] // self.tile_size)
+            tile_pos = (pos[0] // self.tile_size, pos[1] // self.tile_size) if self.tile_size else pos
             print(f"  - Object {i+1}: A {size[0]}x{size[1]} object at pixel {pos} (tile {tile_pos}).")
 
         if object_signature not in self.interaction_hypotheses:
@@ -1734,10 +1723,36 @@ class AGI3(Agent):
 
         self.interaction_hypotheses[object_signature][effect_type] = effect_objects
         print(f"📖 Hypothesis logged for '{object_signature}': {effect_type} has been recorded.")
-
-        # 5. Pass the list of objects to the synthesizer for analysis.
+        
         self._synthesize_interaction_rules(object_signature, effect_objects)
     
+    def _analyze_consumable_aftermath(self, latest_grid: list):
+        """Checks if the interacted-with object was consumed (i.e., turned to floor)."""
+        interacted_tile = self.observing_interaction_for_tile
+        if not interacted_tile or not self.tile_size or not latest_grid:
+            return
+
+        floor_color = self.world_model.get('floor_color')
+        if floor_color is None:
+            print("-> Aftermath check skipped: Floor color is not yet known.")
+            return
+
+        # Sample the top-left pixel of the tile to determine its current state.
+        tile_r, tile_c = interacted_tile
+        tile_pixel_r, tile_pixel_c = tile_r * self.tile_size, tile_c * self.tile_size
+        current_tile_color = latest_grid[0][tile_pixel_r][tile_pixel_c]
+
+        object_signature = f"tile_pos_{interacted_tile}"
+
+        if current_tile_color == floor_color:
+            print(f"✅ Aftermath: Object at tile {interacted_tile} was consumed (turned to floor).")
+            if object_signature in self.interaction_hypotheses:
+                self.interaction_hypotheses[object_signature]['is_consumable'] = True
+        else:
+            print(f"🔄 Aftermath: Object at tile {interacted_tile} is persistent (did not turn to floor).")
+            if object_signature in self.interaction_hypotheses:
+                self.interaction_hypotheses[object_signature]['is_consumable'] = False
+
     def _synthesize_interaction_rules(self, interacted_obj_sig: str, effect_objects: list):
         """
         Analyzes interaction effects by first finding static objects that match the dynamic key's color,
