@@ -1,6 +1,7 @@
 # ARC-AGI-3 Main Script
 import random
 import copy
+import math
 from enum import Enum
 from .agent import Agent
 from .structs import FrameData, GameAction, GameState
@@ -105,6 +106,7 @@ class AGI3(Agent):
         # --- Interaction Learning ---
         self.observing_interaction_for_tile = None # Stores the coords of the tile being observed
         self.interaction_hypotheses = {} # signature -> {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
+        self.static_level_objects = []
 
         # --- Generic Action Groups ---
         # Get all possible actions, excluding RESET, to create generic groups.
@@ -336,7 +338,7 @@ class AGI3(Agent):
         # --- NEW: Check for and analyze the "aftermath" of an interaction ---
         if self.observing_interaction_for_tile is not None:
             print("-> Stepped away from observed tile. Analyzing aftermath...")
-            self._analyze_and_log_interaction_effect(structured_changes, 'aftermath_effect', latest_frame.frame)
+            self._analyze_and_log_interaction_effect(structured_changes, 'aftermath_effect', latest_frame.frame, self.last_known_objects)
 
             # End the full observation cycle and return to normal exploration.
             self.observing_interaction_for_tile = None
@@ -554,7 +556,7 @@ class AGI3(Agent):
                         # --- Observation 1: Analyze immediate effects ---
                         # Set the tile we're observing so we can check the aftermath on the next turn.
                         self.observing_interaction_for_tile = target_tile
-                        self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect', latest_frame.frame)
+                        self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect', latest_frame.frame, self.last_known_objects)
 
                     # Immediately transition to find a new target. The next action will be the "step away".
                     self.exploration_phase = ExplorationPhase.BUILDING_MAP
@@ -936,6 +938,100 @@ class AGI3(Agent):
         self.previous_frame = copy.deepcopy(current_frame)
         return novel_changes_found, known_changes_found, novel_change_descriptions, all_structured_changes
 
+    def _create_normalized_fingerprint(self, obj_datamap: tuple) -> tuple:
+        """
+        Creates a scale-invariant fingerprint of an object's data map.
+        This allows matching objects of different sizes that have the same proportions and pattern.
+        """
+        if not obj_datamap or not obj_datamap[0]:
+            return None, None # Return None if datamap is empty
+
+        height = len(obj_datamap)
+        width = len(obj_datamap[0])
+
+        # 1. Find the greatest common divisor (GCD) to get the base aspect ratio.
+        divisor = math.gcd(height, width)
+        base_h = height // divisor
+        base_w = width // divisor
+
+        # The scale factor tells us how many pixels in the original map
+        # correspond to one pixel in the normalized map.
+        scale_h = divisor
+        scale_w = divisor
+
+        # 2. Create the normalized map by sampling pixels.
+        normalized_map_list = []
+        for r in range(base_h):
+            new_row = []
+            for c in range(base_w):
+                # Sample the top-left pixel of the corresponding block in the original map.
+                original_row = r * scale_h
+                original_col = c * scale_w
+                sampled_pixel = obj_datamap[original_row][original_col]
+                new_row.append(sampled_pixel)
+            normalized_map_list.append(tuple(new_row))
+        
+        normalized_map_tuple = tuple(normalized_map_list)
+
+        # 3. Generate the final fingerprint using a hash of the tuple.
+        fingerprint = hash(normalized_map_tuple)
+        
+        # Return the base shape tuple and the fingerprint
+        return ((base_h, base_w), fingerprint)
+
+    
+    def _find_static_candidates_by_color(self, color: int, grid_data: list) -> list[dict]:
+        """Scans the entire grid to find and describe all objects of a specific color."""
+        if not grid_data or not grid_data[0]:
+            return []
+
+        candidates = []
+        grid_height = len(grid_data)
+        grid_width = len(grid_data[0])
+        visited_coords = set()
+
+        for r in range(grid_height):
+            for c in range(grid_width):
+                if (r, c) not in visited_coords and grid_data[r][c] == color:
+                    # Found a starting point for a potential candidate object.
+                    # Use flood-fill to find all its connected pixels.
+                    component_points = set()
+                    q = [(r, c)]
+                    visited_coords.add((r, c))
+                    
+                    while q:
+                        p = q.pop(0)
+                        component_points.add(p)
+                        row, col = p
+                        
+                        for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                            neighbor = (row + dr, col + dc)
+                            if (0 <= neighbor[0] < grid_height and 
+                                0 <= neighbor[1] < grid_width and 
+                                neighbor not in visited_coords and 
+                                grid_data[neighbor[0]][neighbor[1]] == color):
+                                
+                                visited_coords.add(neighbor)
+                                q.append(neighbor)
+                    
+                    # If an object was found, describe it.
+                    if component_points:
+                        min_row = min(r for r, _ in component_points)
+                        max_row = max(r for r, _ in component_points)
+                        min_idx = min(p_idx for _, p_idx in component_points)
+                        max_idx = max(p_idx for _, p_idx in component_points)
+                        height, width = max_row - min_row + 1, max_idx - min_idx + 1
+
+                        data_map = tuple(tuple(grid_data[r][p] for p in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
+                        base_shape, fingerprint = self._create_normalized_fingerprint(data_map)
+
+                        candidates.append({
+                            'height': height, 'width': width, 'top_row': min_row,
+                            'left_index': min_idx, 'color': color,
+                            'data_map': data_map, 'fingerprint': fingerprint, 'base_shape': base_shape    
+                        })
+        return candidates
+
     def _find_and_describe_objects(self, structured_changes: list, latest_frame: list) -> list[dict]:
         """Finds objects by grouping changed pixels by their new color first, then clustering."""
         # --- Create a lookup map for original colors ---
@@ -1088,6 +1184,7 @@ class AGI3(Agent):
                 background_color = border_colors[0]
 
             data_map = tuple(tuple(latest_frame[0][r][p] for p in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
+            base_shape, fingerprint = self._create_normalized_fingerprint(data_map)
 
             original_color = from_color_map.get(sample_point) # Get original color from our map
 
@@ -1096,7 +1193,9 @@ class AGI3(Agent):
                 'left_index': min_idx, 'color': obj_color,
                 'original_color': original_color,
                 'data_map': data_map,
-                'background_color': background_color
+                'background_color': background_color,
+                'fingerprint': fingerprint, 
+                'base_shape': base_shape    
             })
 
         return final_objects
@@ -1168,7 +1267,7 @@ class AGI3(Agent):
             j = 0
             while j < len(unmatched_last):
                 last_obj = unmatched_last[j]
-                if curr_obj['data_map'] == last_obj['data_map']:
+                if curr_obj.get('fingerprint') and curr_obj['fingerprint'] == last_obj.get('fingerprint'):
                     move_matched_pairs.append((curr_obj, last_obj))
                     unmatched_current.pop(i)
                     unmatched_last.pop(j)
@@ -1499,7 +1598,63 @@ class AGI3(Agent):
                 }
                 print(f"🤔 New resource candidate found at row {row_idx}.")
 
-    def _analyze_and_log_interaction_effect(self, structured_changes: list, effect_type: str, latest_grid: list):
+    def _extract_object_at_tile(self, tile_coords: tuple, grid_data: list, visited_tiles: set) -> dict | None:
+        """
+        Performs a flood-fill starting from a tile to find, describe, and fingerprint a complete static object.
+        This can handle objects that span multiple tiles.
+        """
+        if tile_coords in visited_tiles:
+            return None
+
+        # Get known background colors to define the object's boundaries
+        floor_color = self.world_model.get('floor_color')
+        wall_colors = self.world_model.get('wall_colors', set())
+        background_colors = {floor_color} | wall_colors
+        
+        # Flood-fill to find all tiles belonging to this object
+        q = [tile_coords]
+        object_tiles = set(q)
+        visited_tiles.add(tile_coords)
+
+        while q:
+            current_tile = q.pop(0)
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                neighbor = (current_tile[0] + dr, current_tile[1] + dc)
+                if self.tile_map.get(neighbor) in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE] and neighbor not in visited_tiles:
+                    visited_tiles.add(neighbor)
+                    object_tiles.add(neighbor)
+                    q.append(neighbor)
+        
+        # Now, find all the actual pixels for the object
+        object_pixels = set()
+        for r_tile, c_tile in object_tiles:
+            for r_pixel in range(r_tile * self.tile_size, (r_tile + 1) * self.tile_size):
+                for c_pixel in range(c_tile * self.tile_size, (c_tile + 1) * self.tile_size):
+                    if 0 <= r_pixel < len(grid_data) and 0 <= c_pixel < len(grid_data[0]):
+                        if grid_data[r_pixel][c_pixel] not in background_colors:
+                            object_pixels.add((r_pixel, c_pixel))
+
+        if not object_pixels:
+            return None
+
+        # Use the same logic from _find_and_describe_objects to create the description
+        min_row = min(r for r, _ in object_pixels)
+        max_row = max(r for r, _ in object_pixels)
+        min_idx = min(p_idx for _, p_idx in object_pixels)
+        max_idx = max(p_idx for _, p_idx in object_pixels)
+        height, width = max_row - min_row + 1, max_idx - min_idx + 1
+
+        data_map = tuple(tuple(grid_data[r][p] for p in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
+        base_shape, fingerprint = self._create_normalized_fingerprint(data_map)
+
+        # Return a complete object description
+        return {
+            'height': height, 'width': width, 'top_row': min_row,
+            'left_index': min_idx, 'color': grid_data[min_row][min_idx], # Sample color
+            'data_map': data_map, 'fingerprint': fingerprint, 'base_shape': base_shape    
+        }
+
+    def _analyze_and_log_interaction_effect(self, structured_changes: list, effect_type: str, latest_grid: list, static_objects_before_action: list):
         """Analyzes pixel changes from an interaction and logs them as a hypothesis."""
         if self.observing_interaction_for_tile is None:
             return
@@ -1581,147 +1736,64 @@ class AGI3(Agent):
         print(f"📖 Hypothesis logged for '{object_signature}': {effect_type} has been recorded.")
 
         # 5. Pass the list of objects to the synthesizer for analysis.
-        self._synthesize_interaction_rules(object_signature, effect_objects, latest_grid)
+        self._synthesize_interaction_rules(object_signature, effect_objects)
     
-    def _synthesize_interaction_rules(self, interacted_obj_sig: str, effect_objects: list, latest_grid: list):
-        """Analyzes interaction effects by comparing shape fingerprints (including rotations/flips)."""
-        if not effect_objects or not latest_grid or not self.tile_size:
+    def _synthesize_interaction_rules(self, interacted_obj_sig: str, effect_objects: list):
+        """
+        Analyzes interaction effects by first finding static objects that match the dynamic key's color,
+        and then comparing their fingerprints.
+        """
+        if not effect_objects or not self.previous_frame:
             return
 
         print(f"🔬 Synthesizing rules from interaction with '{interacted_obj_sig}'...")
-
-        grid_data = latest_grid[0]
         
+        grid_before_action = self.previous_frame[0]
+        match_found = False
+
+        # Iterate through each object that resulted from the interaction (the dynamic keys).
         for dynamic_key_obj in effect_objects:
-            dk_pos = (dynamic_key_obj['top_row'], dynamic_key_obj['left_index'])
-            dk_tile_pos = (dk_pos[0] // self.tile_size, dk_pos[1] // self.tile_size)
-            
-            dynamic_fingerprint = self._create_shape_fingerprint(dynamic_key_obj['data_map'], self.tile_size)
-            
-            if not any(1 in row for row in dynamic_fingerprint):
-                print(f"-> Dynamic key at tile {dk_tile_pos} has no discernible shape. Skipping.")
+            dk_fingerprint = dynamic_key_obj.get('fingerprint')
+            dk_color = dynamic_key_obj.get('color')
+            if dk_fingerprint is None or dk_color is None:
                 continue
 
-            # --- NEW: Generate all 8 symmetries (4 rotations + 4 flipped rotations) ---
-            symmetries = set()
-            current_fp = dynamic_fingerprint
-            for _ in range(4):
-                symmetries.add(current_fp)
-                symmetries.add(self._flip_fingerprint(current_fp))
-                current_fp = self._rotate_fingerprint(current_fp)
-            
-            print(f"-> Analyzing dynamic key at tile {dk_tile_pos} (checking 8 orientations).")
+            dk_size = (dynamic_key_obj['height'], dynamic_key_obj['width'])
+            dk_pos = (dynamic_key_obj['top_row'], dynamic_key_obj['left_index'])
+            print(f"-> Analyzing dynamic key: A {dk_size[0]}x{dk_size[1]} object of color {dk_color} at pixel {dk_pos}.")
 
-            static_key_candidates = [pos for pos, type in self.tile_map.items() 
-                                     if type in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE]]
+            # Find all static objects on the grid that have the same primary color.
+            static_candidates = self._find_static_candidates_by_color(dk_color, grid_before_action)
 
-            match_found = False
-            for sk_tile_pos in static_key_candidates:
-                if sk_tile_pos == dk_tile_pos:
-                    continue
+            if not static_candidates:
+                print(f"-> No static objects of color {dk_color} found on the grid.")
+                continue
 
-                r, c = sk_tile_pos[0] * self.tile_size, sk_tile_pos[1] * self.tile_size
-                h, w = self.tile_size, self.tile_size
-                
-                static_key_datamap = tuple(
-                    tuple(grid_data[row][col] for col in range(c, c + w))
-                    for row in range(r, r + h)
-                )
+            print(f"-> Found {len(static_candidates)} static candidate(s) with matching color.")
+            # Now, compare the dynamic key against just these relevant candidates.
+            for static_obj in static_candidates:
+                sk_fingerprint = static_obj.get('fingerprint')
 
-                static_fingerprint = self._create_shape_fingerprint(static_key_datamap, self.tile_size)
-
-                # --- NEW: Check if the static shape matches ANY of the dynamic shape's orientations ---
-                if static_fingerprint in symmetries:
-                    print(f"✅ GOAL HYPOTHESIS: Dynamic key at tile {dk_tile_pos} has a shape that matches a rotated/flipped static key at tile {sk_tile_pos}!")
+                if dk_fingerprint == sk_fingerprint:
+                    sk_size = (static_obj['height'], static_obj['width'])
+                    sk_pos = (static_obj['top_row'], static_obj['left_index'])
+                    
+                    # A true match requires the objects to be different, otherwise it's just finding itself.
+                    if dk_pos == sk_pos and dk_size == sk_size:
+                        continue
+                    
+                    dk_tile_pos = (dk_pos[0] // self.tile_size, dk_pos[1] // self.tile_size) if self.tile_size else dk_pos
+                    sk_tile_pos = (sk_pos[0] // self.tile_size, sk_pos[1] // self.tile_size) if self.tile_size else sk_pos
+                    
+                    print(f"✅ GOAL HYPOTHESIS: Dynamic key ({dk_size[0]}x{dk_size[1]}) at tile {dk_tile_pos} matches static key ({sk_size[0]}x{sk_size[1]}) at tile {sk_tile_pos}!")
                     match_found = True
                     break
             
-            if not match_found:
-                print(f"-> No matching static key found on the map for the shape at {dk_tile_pos} in any orientation.")
-            else:
+            if match_found:
                 break
 
-    def _create_shape_fingerprint(self, data_map: tuple, target_size: int) -> tuple:
-        """
-        Creates a scale-invariant fingerprint by resampling a shape to a target size.
-        This allows objects of different sizes to be compared for shape similarity by
-        normalizing them to the agent's discovered tile size.
-        """
-        empty_fingerprint = tuple([0] * target_size for _ in range(target_size))
-        if not data_map or not data_map[0] or not target_size:
-            return empty_fingerprint
-
-        # 1. Find background color and identify all foreground pixels.
-        all_pixels = [p for row in data_map for p in row]
-        if not all_pixels:
-            return empty_fingerprint
-        background_color = Counter(all_pixels).most_common(1)[0][0]
-        
-        foreground_coords = []
-        for r, row in enumerate(data_map):
-            for c, pixel in enumerate(row):
-                if pixel != background_color:
-                    foreground_coords.append((r, c))
-
-        if not foreground_coords:
-            return empty_fingerprint
-
-        # 2. Find the shape's true bounding box to crop out padding.
-        min_r = min(r for r, c in foreground_coords)
-        max_r = max(r for r, c in foreground_coords)
-        min_c = min(c for r, c in foreground_coords)
-        max_c = max(c for r, c in foreground_coords)
-        shape_h = max_r - min_r + 1
-        shape_w = max_c - min_c + 1
-
-        # 3. Resample the cropped shape onto the standard fingerprint grid.
-        fingerprint = [[0] * target_size for _ in range(target_size)]
-        h_ratio = shape_h / target_size
-        w_ratio = shape_w / target_size
-
-        for fp_r in range(target_size):
-            for fp_c in range(target_size):
-                # Define the sample region in the original, cropped shape coordinates.
-                orig_r_start = int(fp_r * h_ratio)
-                orig_r_end = int((fp_r + 1) * h_ratio)
-                orig_c_start = int(fp_c * w_ratio)
-                orig_c_end = int((fp_c + 1) * w_ratio)
-
-                # Count foreground pixels in this region.
-                foreground_count = 0
-                total_count = 0
-                for r in range(orig_r_start, orig_r_end):
-                    for c in range(orig_c_start, orig_c_end):
-                        # Check the original data_map, adjusting for the crop offset.
-                        pixel = data_map[min_r + r][min_c + c]
-                        if pixel != background_color:
-                            foreground_count += 1
-                        total_count += 1
-                
-                # If the proportion of foreground pixels is above a threshold, mark the cell.
-                if total_count > 0 and (foreground_count / total_count) > 0.25:
-                    fingerprint[fp_r][fp_c] = 1
-
-        return tuple(tuple(row) for row in fingerprint)
-
-    def _rotate_fingerprint(self, fingerprint: tuple) -> tuple:
-        """Rotates a grid-based fingerprint 90 degrees clockwise."""
-        if not fingerprint:
-            return tuple()
-        # Transpose and then reverse each row
-        size = len(fingerprint)
-        rotated = [[0] * size for _ in range(size)]
-        for r in range(size):
-            for c in range(size):
-                rotated[c][size - 1 - r] = fingerprint[r][c]
-        return tuple(tuple(row) for row in rotated)
-
-    def _flip_fingerprint(self, fingerprint: tuple) -> tuple:
-        """Flips a grid-based fingerprint horizontally."""
-        if not fingerprint:
-            return tuple()
-        # Reverse each row
-        return tuple(tuple(reversed(row)) for row in fingerprint)
+        if not match_found:
+            print("-> No matching static key found for any produced dynamic keys.")
 
     def _print_debug_map(self):
         """Prints a human-readable version of the agent's tile_map to the console."""
