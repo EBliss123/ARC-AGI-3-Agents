@@ -964,24 +964,43 @@ class AGI3(Agent):
                     points_by_color[new_color] = set()
                 points_by_color[new_color].add((row_idx, pixel_change['index']))
 
-        # 2. Run flood-fill on each color group to find monochromatic object parts
+        # 2. Run a more comprehensive flood-fill starting from each changed pixel
+        #    to find the full extent of each object, including its static parts.
         monochromatic_parts = []
+        visited_coords = set() # Use one visited set for the whole grid, including static pixels explored.
+        grid = latest_frame[0]
+        grid_height = len(grid)
+        grid_width = len(grid[0]) if grid_height > 0 else 0
+
+        # We still iterate through the changed points to find starting locations for our search.
         for color, points in points_by_color.items():
-            visited = set()
             for point in points:
-                if point not in visited:
+                if point not in visited_coords:
+                    # Start a new search for a component.
                     component_points = set()
                     q = [point]
-                    visited.add(point)
+                    visited_coords.add(point) # Mark as visited to avoid redundant searches.
+                    
                     while q:
                         p = q.pop(0)
                         component_points.add(p)
                         r, p_idx = p
+                        
+                        # Explore all four neighbors.
                         for dr, dp_idx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
                             neighbor = (r + dr, p_idx + dp_idx)
-                            if neighbor in points and neighbor not in visited:
-                                visited.add(neighbor)
+
+                            # Check if neighbor is within grid boundaries.
+                            if not (0 <= neighbor[0] < grid_height and 0 <= neighbor[1] < grid_width):
+                                continue
+                            
+                            # The crucial change: If the neighbor is the same color and we haven't
+                            # visited it yet, add it to the queue. This allows the search to
+                            # expand across both changed and static pixels.
+                            if neighbor not in visited_coords and grid[neighbor[0]][neighbor[1]] == color:
+                                visited_coords.add(neighbor)
                                 q.append(neighbor)
+                                
                     monochromatic_parts.append(component_points)
 
         # 3. For now, we treat each part as a separate object.
@@ -995,86 +1014,47 @@ class AGI3(Agent):
             if not obj_points: continue
 
             # --- Background Verification Step ---
-            # Check if this changed patch is connected to a static area of the same color.
-            is_part_of_background = False
+            # An "object" is likely a background reveal if it's the known floor color,
+            # or if the number of pixels that actually changed is tiny compared to its total size.
             sample_point = next(iter(obj_points))
             obj_color = grid[sample_point[0]][sample_point[1]]
+            known_floor_color = self.world_model.get('floor_color')
 
-            # Determine if we should run the background check.
-            is_in_playable_area = False
-            # If the map doesn't exist yet, we are in the early learning phase.
-            # Allow the background/floor check to run anywhere on the screen.
-            if not self.tile_map:
-                is_in_playable_area = True
+            # If we have confirmed the floor color, the check is simple and reliable.
+            if known_floor_color is not None:
+                if obj_color == known_floor_color:
+                    # This is just the floor being revealed. Log it and skip creating an object.
+                    print(f"🕵️‍♀️ [FLOOR]: A change revealed the known floor color ({obj_color}). Ignoring as object.")
+                    continue
+                # Otherwise, if it's not the floor color, it must be a real object.
+
             else:
-                # If the map EXISTS, only run the check for objects inside of it.
-                if self.tile_size:
-                    obj_tile_coords = (sample_point[0] // self.tile_size, sample_point[1] // self.tile_size)
-                    if obj_tile_coords in self.tile_map:
-                        is_in_playable_area = True
+                # If we DON'T know the floor color yet, we use a heuristic to learn it.
+                # A background reveal happens when a small change connects to a massive static area.
+                changed_pixels_in_component = changed_coords.intersection(obj_points)
 
-            # The background check should only run for objects inside the playable area.
-            if is_in_playable_area:
+                # Heuristic: If the component is large and the changed part is small, it's probably background.
+                # This prevents the entire 64x64 background from being treated as an object.
+                is_background_candidate = False
+                if len(obj_points) > 50: # Must be a reasonably large area
+                    # Avoid division by zero if obj_points is somehow empty, though we check earlier.
+                    if len(obj_points) > 0:
+                        ratio = len(changed_pixels_in_component) / len(obj_points)
+                        if ratio < 0.5: # The changed part is less than half the total size
+                            is_background_candidate = True
 
-                for r, p_idx in obj_points:
-                    for dr, dp_idx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                        neighbor = (r + dr, p_idx + dp_idx)
-                        
-                        # Check if neighbor is within bounds, didn't change, and has the same color.
-                        if (0 <= neighbor[0] < grid_height and
-                            0 <= neighbor[1] < grid_width and
-                            neighbor not in changed_coords and
-                            grid[neighbor[0]][neighbor[1]] == obj_color):
-                            
-                            is_part_of_background = True
-                            break
-                    if is_part_of_background:
-                        break
-            
-                if is_part_of_background:
-                    known_floor_color = self.world_model.get('floor_color')
+                if is_background_candidate:
+                    self.floor_hypothesis[obj_color] = self.floor_hypothesis.get(obj_color, 0) + 1
+                    confidence = self.floor_hypothesis[obj_color]
+                    print(f"🕵️‍♀️ Floor Hypothesis: A small change revealed a large area of color {obj_color} (Confidence: {confidence}).")
 
-                    # Case 1: The floor color IS KNOWN. Use it to make a smarter decision.
-                    if known_floor_color is not None:
-                        if obj_color == known_floor_color:
-                            # This is genuinely the floor being revealed. Log it and skip creating an object.
-                            print(f"🕵️‍♀️ [FLOOR]: A change at {sample_point} revealed the known floor color ({obj_color}).")
-                            continue
-                        else:
-                            # A background was revealed, but it's NOT the floor. This is likely a UI element.
-                            # We must treat it as a distinct object.
-                            print(f"🎨 [UI/OBJECT]: A background-like change at {sample_point} revealed a non-floor color ({obj_color}). Treating as an object.")
-                            # By not calling 'continue', we fall through to the object description logic below.
-                    
-                    # Case 2: The floor color is NOT KNOWN yet. Use this as a learning opportunity.
-                    else:
-                        self.floor_hypothesis[obj_color] = self.floor_hypothesis.get(obj_color, 0) + 1
-                        confidence = self.floor_hypothesis[obj_color]
-                        print(f"🕵️‍♀️ Floor Hypothesis: A change at {sample_point} revealed color {obj_color} (Confidence: {confidence}).")
+                    if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
+                        self.world_model['floor_color'] = obj_color
+                        print(f"✅ [FLOOR] Confirmed: Color {obj_color} is the floor.")
+                        # Future improvement: could add map cleanup logic here.
 
-                        # Check for confirmation and run one-time setup.
-                        if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
-                            self.world_model['floor_color'] = obj_color
-                            print(f"✅ [FLOOR] Confirmed: Color {obj_color} is the floor.")
-
-                            # --- Map Cleanup Logic ---
-                            if self.tile_size:
-                                reclassified_count = 0
-                                grid_data = latest_frame[0]
-                                for tile_coords, cell_type in list(self.tile_map.items()):
-                                    if cell_type != CellType.FLOOR:
-                                        tile_row = tile_coords[0] * self.tile_size
-                                        tile_col = tile_coords[1] * self.tile_size
-                                        if 0 <= tile_row < len(grid_data) and 0 <= tile_col < len(grid_data[0]):
-                                            tile_color = grid_data[tile_row][tile_col]
-                                            if tile_color == obj_color:
-                                                self.tile_map[tile_coords] = CellType.FLOOR
-                                                reclassified_count += 1
-                                if reclassified_count > 0:
-                                    print(f"🧹 Map Cleanup: Reclassified {reclassified_count} tile(s) as newly confirmed floor.")
-                        
-                        # While learning what the floor is, we skip creating an object from background reveals.
-                        continue
+                    # While learning what the floor is, we skip creating an object from background reveals.
+                    continue
 
             # --- If it's a real object, proceed with description ---
             min_row = min(r for r, _ in obj_points)
@@ -1082,6 +1062,13 @@ class AGI3(Agent):
             min_idx = min(p_idx for _, p_idx in obj_points)
             max_idx = max(p_idx for _, p_idx in obj_points)
             height, width = max_row - min_row + 1, max_idx - min_idx + 1
+
+            # --- NEW: Hard-coded filter for the 64x64 background object ---
+            # If an object is found that spans the entire grid, it's the background/wall canvas.
+            # We explicitly ignore it to prevent it from being treated as a dynamic game object.
+            if height >= 64 and width >= 64 and min_row == 0 and min_idx == 0:
+                print(f"🕵️‍♀️ Ignoring the {height}x{width} canvas object found at ({min_row}, {min_idx}).")
+                continue # Skip to the next monochromatic part
 
             # The background check from the last update is still useful for context.
             border_colors = []
