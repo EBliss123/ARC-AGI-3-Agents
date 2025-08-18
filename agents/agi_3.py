@@ -1584,53 +1584,145 @@ class AGI3(Agent):
         self._synthesize_interaction_rules(object_signature, effect_objects, latest_grid)
     
     def _synthesize_interaction_rules(self, interacted_obj_sig: str, effect_objects: list, latest_grid: list):
-        """Analyzes interaction effects by scanning the ENTIRE GRID for matching keys."""
-        if not effect_objects or not latest_grid:
+        """Analyzes interaction effects by comparing shape fingerprints (including rotations/flips)."""
+        if not effect_objects or not latest_grid or not self.tile_size:
             return
 
         print(f"🔬 Synthesizing rules from interaction with '{interacted_obj_sig}'...")
 
         grid_data = latest_grid[0]
-        grid_height = len(grid_data)
-        grid_width = len(grid_data[0]) if grid_height > 0 else 0
         
-        match_found = False
-        # Iterate through each object that resulted from the interaction (the dynamic keys).
         for dynamic_key_obj in effect_objects:
-            dynamic_key_datamap = dynamic_key_obj['data_map']
-            dk_h, dk_w = dynamic_key_obj['height'], dynamic_key_obj['width']
             dk_pos = (dynamic_key_obj['top_row'], dynamic_key_obj['left_index'])
             dk_tile_pos = (dk_pos[0] // self.tile_size, dk_pos[1] // self.tile_size)
-            print(f"-> Analyzing dynamic key: A {dk_h}x{dk_w} object at pixel {dk_pos} (tile {dk_tile_pos}).")
+            
+            dynamic_fingerprint = self._create_shape_fingerprint(dynamic_key_obj['data_map'], self.tile_size)
+            
+            if not any(1 in row for row in dynamic_fingerprint):
+                print(f"-> Dynamic key at tile {dk_tile_pos} has no discernible shape. Skipping.")
+                continue
 
-            # Scan the entire grid for a static object that matches this dynamic key.
-            # We iterate through every possible top-left coordinate.
-            for r in range(grid_height - dk_h + 1):
-                for c in range(grid_width - dk_w + 1):
-                    # Avoid matching the object with itself.
-                    if (r, c) == dk_pos:
-                        continue
+            # --- NEW: Generate all 8 symmetries (4 rotations + 4 flipped rotations) ---
+            symmetries = set()
+            current_fp = dynamic_fingerprint
+            for _ in range(4):
+                symmetries.add(current_fp)
+                symmetries.add(self._flip_fingerprint(current_fp))
+                current_fp = self._rotate_fingerprint(current_fp)
+            
+            print(f"-> Analyzing dynamic key at tile {dk_tile_pos} (checking 8 orientations).")
 
-                    # Extract the data map for the current grid position.
-                    static_key_datamap = tuple(
-                        tuple(grid_data[row][col] for col in range(c, c + dk_w))
-                        for row in range(r, r + dk_h)
-                    )
+            static_key_candidates = [pos for pos, type in self.tile_map.items() 
+                                     if type in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE]]
 
-                    if static_key_datamap == dynamic_key_datamap:
-                        dk_tile_pos = (dk_pos[0] // self.tile_size, dk_pos[1] // self.tile_size)
-                        sk_tile_pos = (r // self.tile_size, c // self.tile_size)
-                        print(f"✅ GOAL HYPOTHESIS: Dynamic key at pixel {dk_pos} (tile {dk_tile_pos}) matches a static key at pixel ({r}, {c}) (tile {sk_tile_pos})!")
-                        match_found = True
-                        break
-                if match_found:
+            match_found = False
+            for sk_tile_pos in static_key_candidates:
+                if sk_tile_pos == dk_tile_pos:
+                    continue
+
+                r, c = sk_tile_pos[0] * self.tile_size, sk_tile_pos[1] * self.tile_size
+                h, w = self.tile_size, self.tile_size
+                
+                static_key_datamap = tuple(
+                    tuple(grid_data[row][col] for col in range(c, c + w))
+                    for row in range(r, r + h)
+                )
+
+                static_fingerprint = self._create_shape_fingerprint(static_key_datamap, self.tile_size)
+
+                # --- NEW: Check if the static shape matches ANY of the dynamic shape's orientations ---
+                if static_fingerprint in symmetries:
+                    print(f"✅ GOAL HYPOTHESIS: Dynamic key at tile {dk_tile_pos} has a shape that matches a rotated/flipped static key at tile {sk_tile_pos}!")
+                    match_found = True
                     break
-            if match_found:
+            
+            if not match_found:
+                print(f"-> No matching static key found on the map for the shape at {dk_tile_pos} in any orientation.")
+            else:
                 break
+
+    def _create_shape_fingerprint(self, data_map: tuple, target_size: int) -> tuple:
+        """
+        Creates a scale-invariant fingerprint by resampling a shape to a target size.
+        This allows objects of different sizes to be compared for shape similarity by
+        normalizing them to the agent's discovered tile size.
+        """
+        empty_fingerprint = tuple([0] * target_size for _ in range(target_size))
+        if not data_map or not data_map[0] or not target_size:
+            return empty_fingerprint
+
+        # 1. Find background color and identify all foreground pixels.
+        all_pixels = [p for row in data_map for p in row]
+        if not all_pixels:
+            return empty_fingerprint
+        background_color = Counter(all_pixels).most_common(1)[0][0]
         
-        if not match_found:
-            print("-> No matching static key found on the grid for any produced dynamic keys.")
-    
+        foreground_coords = []
+        for r, row in enumerate(data_map):
+            for c, pixel in enumerate(row):
+                if pixel != background_color:
+                    foreground_coords.append((r, c))
+
+        if not foreground_coords:
+            return empty_fingerprint
+
+        # 2. Find the shape's true bounding box to crop out padding.
+        min_r = min(r for r, c in foreground_coords)
+        max_r = max(r for r, c in foreground_coords)
+        min_c = min(c for r, c in foreground_coords)
+        max_c = max(c for r, c in foreground_coords)
+        shape_h = max_r - min_r + 1
+        shape_w = max_c - min_c + 1
+
+        # 3. Resample the cropped shape onto the standard fingerprint grid.
+        fingerprint = [[0] * target_size for _ in range(target_size)]
+        h_ratio = shape_h / target_size
+        w_ratio = shape_w / target_size
+
+        for fp_r in range(target_size):
+            for fp_c in range(target_size):
+                # Define the sample region in the original, cropped shape coordinates.
+                orig_r_start = int(fp_r * h_ratio)
+                orig_r_end = int((fp_r + 1) * h_ratio)
+                orig_c_start = int(fp_c * w_ratio)
+                orig_c_end = int((fp_c + 1) * w_ratio)
+
+                # Count foreground pixels in this region.
+                foreground_count = 0
+                total_count = 0
+                for r in range(orig_r_start, orig_r_end):
+                    for c in range(orig_c_start, orig_c_end):
+                        # Check the original data_map, adjusting for the crop offset.
+                        pixel = data_map[min_r + r][min_c + c]
+                        if pixel != background_color:
+                            foreground_count += 1
+                        total_count += 1
+                
+                # If the proportion of foreground pixels is above a threshold, mark the cell.
+                if total_count > 0 and (foreground_count / total_count) > 0.25:
+                    fingerprint[fp_r][fp_c] = 1
+
+        return tuple(tuple(row) for row in fingerprint)
+
+    def _rotate_fingerprint(self, fingerprint: tuple) -> tuple:
+        """Rotates a grid-based fingerprint 90 degrees clockwise."""
+        if not fingerprint:
+            return tuple()
+        # Transpose and then reverse each row
+        size = len(fingerprint)
+        rotated = [[0] * size for _ in range(size)]
+        for r in range(size):
+            for c in range(size):
+                rotated[c][size - 1 - r] = fingerprint[r][c]
+        return tuple(tuple(row) for row in rotated)
+
+    def _flip_fingerprint(self, fingerprint: tuple) -> tuple:
+        """Flips a grid-based fingerprint horizontally."""
+        if not fingerprint:
+            return tuple()
+        # Reverse each row
+        return tuple(tuple(reversed(row)) for row in fingerprint)
+
     def _print_debug_map(self):
         """Prints a human-readable version of the agent's tile_map to the console."""
         if not self.tile_map:
@@ -1674,20 +1766,3 @@ class AGI3(Agent):
                         row_str += "   "
             print(row_str)
         print("--- Key: P=Player, T=Target, .=Floor, #=Wall, ?=Potential, !=Confirmed ---\n")
-
-    def segment_objects(self, latest_frame: FrameData):
-        """Scans the grid to find and define all objects."""
-        # Identify objects from the grid here.
-        pass
-
-    def discover_actions(self):
-        """Tries actions and logs the changes they cause."""
-        pass
-
-    def synthesize_rules(self):
-        """Creates object-based rules from observed actions."""
-        pass
-    
-    def explore(self):
-        """Uses curiosity to explore new game states."""
-        pass
