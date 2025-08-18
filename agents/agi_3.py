@@ -107,6 +107,7 @@ class AGI3(Agent):
         self.observing_interaction_for_tile = None # Stores the coords of the tile being observed
         self.interaction_hypotheses = {} # signature -> {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
         self.static_level_objects = []
+        self.has_summarized_interactions = False
 
         # --- Generic Action Groups ---
         # Get all possible actions, excluding RESET, to create generic groups.
@@ -216,6 +217,7 @@ class AGI3(Agent):
         self.exploration_plan = []
         self.reachable_floor_area = set()
         self.interaction_hypotheses.clear() # Interaction effects are tied to the specific layout.
+        self.has_summarized_interactions = False
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
@@ -774,6 +776,9 @@ class AGI3(Agent):
         # 1. Find all potential targets on the map.
         potential_targets = [pos for pos, type in self.tile_map.items() if type == CellType.POTENTIALLY_INTERACTABLE]
         if not potential_targets:
+            # If there are no more targets and we haven't summarized yet, review what we've learned.
+            if not self.has_summarized_interactions:
+                self._review_and_summarize_interactions()
             return False
 
         # 2. Find paths to all potential targets and store the ones that are reachable.
@@ -1802,6 +1807,17 @@ class AGI3(Agent):
                     
                     print(f"✅ GOAL HYPOTHESIS: Dynamic key ({dk_size[0]}x{dk_size[1]}) at tile {dk_tile_pos} matches static key ({sk_size[0]}x{sk_size[1]}) at tile {sk_tile_pos}!")
                     match_found = True
+
+                    # Store a clear summary of this successful interaction in the agent's memory.
+                    if interacted_obj_sig in self.interaction_hypotheses:
+                        outcome_summary = {
+                            'result': 'KEY_MATCH_SUCCESS',
+                            'dynamic_key_shape': dynamic_key_obj.get('base_shape'),
+                            'dynamic_key_color': dynamic_key_obj.get('color')
+                        }
+                        self.interaction_hypotheses[interacted_obj_sig]['outcome'] = outcome_summary
+                        print(f"💡 RULE LEARNED: Interaction with '{interacted_obj_sig}' leads to a successful key match.")
+
                     break
             
             if match_found:
@@ -1853,3 +1869,50 @@ class AGI3(Agent):
                         row_str += "   "
             print(row_str)
         print("--- Key: P=Player, T=Target, .=Floor, #=Wall, ?=Potential, !=Confirmed ---\n")
+
+    def _review_and_summarize_interactions(self):
+        """Reviews all interactable tiles and summarizes their learned properties."""
+        print("\n--- 🧠 Interaction Knowledge Summary 🧠 ---")
+        
+        interactable_tiles = [
+            pos for pos, cell_type in self.tile_map.items() 
+            if cell_type in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE]
+        ]
+
+        if not interactable_tiles:
+            print("No interactable tiles were identified on the map.")
+            self.has_summarized_interactions = True
+            return
+
+        for tile_pos in sorted(interactable_tiles):
+            signature = f"tile_pos_{tile_pos}"
+            hypothesis = self.interaction_hypotheses.get(signature)
+
+            print(f"Tile {tile_pos}:")
+
+            if not hypothesis:
+                # This tile is on the map as interactable, but no interaction was ever logged for it.
+                print(f"  - Function: No interaction or effect was recorded for this object.")
+                continue # Move to the next tile in the report
+
+            # --- This tile HAS been interacted with, so we report everything we know ---
+            
+            # 1. Report the primary Outcome (e.g., did it cause a key match?)
+            outcome_desc = "No conclusive outcome observed."
+            outcome = hypothesis.get('outcome')
+            if outcome and outcome.get('result') == 'KEY_MATCH_SUCCESS':
+                shape = outcome.get('dynamic_key_shape', 'N/A')
+                outcome_desc = f"SUCCESSFUL_KEY_MATCH (Dynamic key became a {shape} shape)."
+            print(f"  - Outcome: {outcome_desc}")
+
+            # 2. Report the Type (e.g., did it disappear after being used?)
+            type_desc = "Unknown"
+            is_consumable = hypothesis.get('is_consumable')
+            if is_consumable is True:
+                type_desc = "Consumable (disappears after use)."
+            elif is_consumable is False:
+                type_desc = "Persistent (remains after use)."
+            print(f"  - Type: {type_desc}")
+        
+        print("-----------------------------------------\n")
+        self.has_summarized_interactions = True
