@@ -1022,7 +1022,7 @@ class AGI3(Agent):
                         max_idx = max(p_idx for _, p_idx in component_points)
                         height, width = max_row - min_row + 1, max_idx - min_idx + 1
 
-                        data_map = tuple(tuple(grid_data[r][p] for p in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
+                        data_map = tuple(tuple(grid_data[r][p] if (r, p) in component_points else None for p in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
                         base_shape, fingerprint = self._create_normalized_fingerprint(data_map)
 
                         candidates.append({
@@ -1183,7 +1183,7 @@ class AGI3(Agent):
             if border_colors and all(c == border_colors[0] for c in border_colors):
                 background_color = border_colors[0]
 
-            data_map = tuple(tuple(latest_frame[0][r][p] for p in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
+            data_map = tuple(tuple(grid[r][p] if (r, p) in obj_points else None for p in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
             base_shape, fingerprint = self._create_normalized_fingerprint(data_map)
 
             original_color = from_color_map.get(sample_point) # Get original color from our map
