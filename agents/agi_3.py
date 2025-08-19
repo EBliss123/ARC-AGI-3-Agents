@@ -523,6 +523,7 @@ class AGI3(Agent):
                     return action
                 else:
                     print("✅ Plan complete. Beginning interaction observation.")
+                    self._print_debug_map()
                     if self.exploration_target and self.tile_size:
                         target_tile = (self.exploration_target[0] // self.tile_size, self.exploration_target[1] // self.tile_size)
                         if self.tile_map.get(target_tile) == CellType.POTENTIALLY_INTERACTABLE:
@@ -617,14 +618,11 @@ class AGI3(Agent):
 
     def _build_level_map(self, grid: list):
         """
-        Creates a refined tile-based map, aware of the player's current and previous positions.
+        Updates the agent's persistent tile-based map with new observations from the current grid.
         """
         if not self.tile_size or not grid:
             return
-        
-        confirmed_interactables = {pos for pos, cell_type in self.tile_map.items() if cell_type == CellType.CONFIRMED_INTERACTABLE}
 
-        temp_tile_map = {}
         grid_data = grid[0]
         grid_height = len(grid_data)
         grid_width = len(grid_data[0]) if grid_height > 0 else 0
@@ -636,71 +634,47 @@ class AGI3(Agent):
             player_pixel_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
             player_tile_coords = (player_pixel_pos[0] // self.tile_size, player_pixel_pos[1] // self.tile_size)
 
+        # Iterate through the entire grid view and update the main map.
         for r in range(0, grid_height, self.tile_size):
             for c in range(0, grid_width, self.tile_size):
                 tile_coords = (r // self.tile_size, c // self.tile_size)
-
-                if tile_coords == player_tile_coords or tile_coords == self.just_vacated_tile:
-                    if self.tile_map.get(tile_coords) == CellType.CONFIRMED_INTERACTABLE:
-                        temp_tile_map[tile_coords] = CellType.CONFIRMED_INTERACTABLE
-                    else:
-                        temp_tile_map[tile_coords] = CellType.FLOOR
-                    continue
-
+                
+                # Get the current color of the tile's top-left pixel.
                 sample_color = grid_data[r][c]
-                if sample_color in wall_colors:
-                    temp_tile_map[tile_coords] = CellType.WALL
-                elif sample_color == floor_color:
-                    temp_tile_map[tile_coords] = CellType.FLOOR
-                else:
-                    temp_tile_map[tile_coords] = CellType.POTENTIALLY_INTERACTABLE
-        
-        self.tile_map = temp_tile_map
-        self.reachable_floor_area = self._find_reachable_floor_tiles()
-
-        if not self.reachable_floor_area:
-            print("🗺️ No reachable area found. Map will not be refined.")
-
-        refined_tile_map = {}
-        for tile_coords in self.tile_map.keys():
-            if tile_coords in confirmed_interactables:
-                refined_tile_map[tile_coords] = CellType.CONFIRMED_INTERACTABLE
-                continue
-            if tile_coords in self.reachable_floor_area:
-                refined_tile_map[tile_coords] = CellType.FLOOR
-                continue
-            is_adjacent_to_floor = any((tile_coords[0] + dr, tile_coords[1] + dc) in self.reachable_floor_area for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)])
-            if is_adjacent_to_floor:
-                if temp_tile_map.get(tile_coords) == CellType.WALL:
-                    refined_tile_map[tile_coords] = CellType.WALL
-                else:
-                    sample_color = grid_data[tile_coords[0] * self.tile_size][tile_coords[1] * self.tile_size]
+                
+                # Preserve knowledge about confirmed interactables unless they've turned into floor/wall.
+                if self.tile_map.get(tile_coords) == CellType.CONFIRMED_INTERACTABLE:
                     if sample_color == floor_color:
-                        refined_tile_map[tile_coords] = CellType.FLOOR
-                    else:
-                        refined_tile_map[tile_coords] = CellType.POTENTIALLY_INTERACTABLE
-            else:
-                refined_tile_map[tile_coords] = CellType.UNKNOWN
+                        self.tile_map[tile_coords] = CellType.FLOOR
+                    elif sample_color in wall_colors:
+                        self.tile_map[tile_coords] = CellType.WALL
+                    continue # Otherwise, keep it as confirmed.
 
-        for tile_coords, cell_type in list(refined_tile_map.items()):
-            if cell_type in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE]:
-                sample_color = grid_data[tile_coords[0] * self.tile_size][tile_coords[1] * self.tile_size]
-                if floor_color and sample_color == floor_color:
-                    refined_tile_map[tile_coords] = CellType.FLOOR
-                elif wall_colors and sample_color in wall_colors:
-                    refined_tile_map[tile_coords] = CellType.WALL
-
-        self.tile_map = refined_tile_map
+                # If it's where the player is or was, it's floor. This is high-confidence info.
+                if tile_coords == player_tile_coords or tile_coords == self.just_vacated_tile:
+                    self.tile_map[tile_coords] = CellType.FLOOR
+                    continue
+                
+                # Classify based on color.
+                if sample_color in wall_colors:
+                    self.tile_map[tile_coords] = CellType.WALL
+                elif sample_color == floor_color:
+                    self.tile_map[tile_coords] = CellType.FLOOR
+                else:
+                    # Only mark as 'potentially interactable' if we don't already know it's a wall.
+                    # This prevents flickering if a wall color isn't perfectly consistent.
+                    if self.tile_map.get(tile_coords) != CellType.WALL:
+                         self.tile_map[tile_coords] = CellType.POTENTIALLY_INTERACTABLE
+        
         counts = Counter(self.tile_map.values())
-        print(f"🗺️ Refined Map ({len(self.tile_map)} tiles): {counts[CellType.FLOOR]} floor, {counts[CellType.WALL]} wall, {counts.get(CellType.POTENTIALLY_INTERACTABLE, 0)} potentially interactable, {counts.get(CellType.CONFIRMED_INTERACTABLE, 0)} interactable.")
+        print(f"🗺️ Map updated ({len(self.tile_map)} tiles): {counts[CellType.FLOOR]} floor, {counts[CellType.WALL]} wall, {counts.get(CellType.POTENTIALLY_INTERACTABLE, 0)} potential, {counts.get(CellType.CONFIRMED_INTERACTABLE, 0)} confirmed.")
     
     def _find_target_and_plan(self) -> bool:
         """
         Finds the best interactable tile by pathfinding to all available targets
         and picking the one with the shortest path.
         """
-
-        self._print_debug_map()
+        self.reachable_floor_area = self._find_reachable_floor_tiles()
         
         self.exploration_target = None
         self.exploration_plan = []
@@ -712,14 +686,26 @@ class AGI3(Agent):
 
         # 1. Find all potential targets on the map.
         potential_targets = [pos for pos, type in self.tile_map.items() if type == CellType.POTENTIALLY_INTERACTABLE]
+        
+        # Before planning, review potential targets for any pre-existing knowledge.
+        known_interactables = []
+        for tile_pos in potential_targets:
+            signature = f"tile_pos_{tile_pos}"
+            if signature in self.interaction_hypotheses:
+                print(f"🧠 Pre-existing knowledge found for tile {tile_pos}. Reclassifying as CONFIRMED_INTERACTABLE.")
+                self.tile_map[tile_pos] = CellType.CONFIRMED_INTERACTABLE
+                known_interactables.append(tile_pos)
+        
+        # Remove the now-known interactables from the list of potential targets.
+        potential_targets = [p for p in potential_targets if p not in known_interactables]
+
         if not potential_targets:
-            if not potential_targets:
-                # If there are no targets, queue the summary for the *next* turn.
-                # This gives the agent one move to step away and observe the aftermath.
-                if not self.has_summarized_interactions and not self.awaiting_final_summary:
-                    print("🧐 No more targets. Queuing summary for the next turn to capture final aftermath.")
-                    self.awaiting_final_summary = True
-                return False
+            # If there are no targets, queue the summary for the *next* turn.
+            # This gives the agent one move to step away and observe the aftermath.
+            if not self.has_summarized_interactions and not self.awaiting_final_summary:
+                print("🧐 No more targets. Queuing summary for the next turn to capture final aftermath.")
+                self.awaiting_final_summary = True
+            return False
 
         # 2. Find paths to all potential targets and store the ones that are reachable.
         reachable_targets = []
@@ -742,6 +728,7 @@ class AGI3(Agent):
         self.exploration_target = (best_target['pos'][0] * self.tile_size, best_target['pos'][1] * self.tile_size)
         self.exploration_plan = best_target['path']
         print(f"🎯 New target acquired at {best_target['pos']}. Plan created with {len(self.exploration_plan)} steps.")
+        self._print_debug_map()
         
         return True
 
@@ -805,7 +792,7 @@ class AGI3(Agent):
 
         # The player might be on an interactable tile, which is also a valid starting point.
         start_tile_type = self.tile_map.get(start_tile)
-        if start_tile_type not in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE]:
+        if start_tile_type not in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE]:
             print(f"⚠️ Player starting tile {start_tile} is not on a known FLOOR or INTERACTABLE. Aborting flood fill.")
             return set()
 
@@ -1786,12 +1773,24 @@ class AGI3(Agent):
             print("-> No matching static key found for any produced dynamic keys.")
 
     def _print_debug_map(self):
-        """Prints a human-readable version of the agent's tile_map to the console."""
+        """Prints a human-readable version of the agent's tile_map focused on the playable area."""
         if not self.tile_map:
             print("🗺️ Debug Map: No map data to print.")
             return
+        
+        # The "playable area" includes reachable tiles and their immediate neighbors.
+        display_area = set(self.reachable_floor_area)
+        for r_tile, c_tile in self.reachable_floor_area:
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
+                neighbor = (r_tile + dr, c_tile + dc)
+                if neighbor in self.tile_map:
+                    display_area.add(neighbor)
+        
+        if not display_area:
+             print("🗺️ Debug Map: No playable area found to print.")
+             return
 
-        print("\n--- Agent's Debug Map ---")
+        print("\n--- Agent's Debug Map (Playable Area) ---")
         player_tile = None
         if self.last_known_player_obj and self.tile_size:
             player_tile = (self.last_known_player_obj['top_row'] // self.tile_size, 
@@ -1802,20 +1801,25 @@ class AGI3(Agent):
             target_tile = (self.exploration_target[0] // self.tile_size, 
                            self.exploration_target[1] // self.tile_size)
 
-        min_r = min(r for r, c in self.tile_map.keys())
-        max_r = max(r for r, c in self.tile_map.keys())
-        min_c = min(c for r, c in self.tile_map.keys())
-        max_c = max(c for r, c in self.tile_map.keys())
+        min_r = min(r for r, c in display_area)
+        max_r = max(r for r, c in display_area)
+        min_c = min(c for r, c in display_area)
+        max_c = max(c for r, c in display_area)
 
         for r in range(min_r, max_r + 1):
             row_str = ""
             for c in range(min_c, max_c + 1):
-                if (r, c) == player_tile:
+                current_tile = (r,c)
+                if current_tile not in display_area:
+                    row_str += "   " # Print empty space for non-playable area within the bounding box
+                    continue
+
+                if current_tile == player_tile:
                     row_str += " P "
-                elif (r, c) == target_tile:
+                elif current_tile == target_tile:
                     row_str += " T "
                 else:
-                    cell = self.tile_map.get((r, c), CellType.UNKNOWN)
+                    cell = self.tile_map.get(current_tile, CellType.UNKNOWN)
                     if cell == CellType.FLOOR:
                         row_str += " . "
                     elif cell == CellType.WALL:
