@@ -966,6 +966,11 @@ class AGI3(Agent):
 
     def _find_and_describe_objects(self, structured_changes: list, latest_frame: list) -> list[dict]:
         """Finds objects by grouping changed pixels by their new color first, then clustering."""
+        # Determine if the agent has a working model of the world.
+        agent_is_known = self.world_model.get('player_signature') is not None
+        floor_is_known = self.world_model.get('floor_color') is not None
+        world_is_known = agent_is_known and floor_is_known
+
         # --- Create a lookup map for original colors ---
         from_color_map = {}
         for change in structured_changes:
@@ -1022,12 +1027,22 @@ class AGI3(Agent):
                             if not (0 <= neighbor[0] < grid_height and 0 <= neighbor[1] < grid_width):
                                 continue
                             
-                            # The crucial change: If the neighbor is the same color and we haven't
-                            # visited it yet, add it to the queue. This allows the search to
-                            # expand across both changed and static pixels.
-                            if neighbor not in visited_coords and grid[neighbor[0]][neighbor[1]] == color:
-                                visited_coords.add(neighbor)
-                                q.append(neighbor)
+                            if world_is_known:
+                                # CONSTRAINED LOGIC: Once the world is known, only group
+                                # pixels that were part of the change. This prevents the
+                                # known agent from blending with a static background.
+                                if (neighbor in changed_coords and
+                                    neighbor not in visited_coords and
+                                    grid[neighbor[0]][neighbor[1]] == color):
+                                    visited_coords.add(neighbor)
+                                    q.append(neighbor)
+                            else:
+                                # GREEDY LOGIC: Before the world is known, expand into all
+                                # static pixels of the same color to learn the full shape
+                                # of potential agent objects.
+                                if neighbor not in visited_coords and grid[neighbor[0]][neighbor[1]] == color:
+                                    visited_coords.add(neighbor)
+                                    q.append(neighbor)
                                 
                     monochromatic_parts.append(component_points)
 
