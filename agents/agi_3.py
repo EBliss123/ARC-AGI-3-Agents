@@ -76,6 +76,9 @@ class AGI3(Agent):
         self.level_knowledge_is_learned = False
         self.wait_action = GameAction.ACTION6 # Use a secondary action for waiting
 
+        # --- Goal State Tracking ---
+        self.current_goal_state = None
+
         # --- Object & Shape Tracking ---
         self.observed_object_shapes = {} # Maps shape tuple -> count
         self.last_known_objects = [] # Stores full object descriptions from the last frame
@@ -466,6 +469,11 @@ class AGI3(Agent):
 
             # 1. Find and describe all objects in the current frame
             current_objects = self._find_and_describe_objects(object_logic_changes, latest_frame.frame)
+
+            # --- NEW: Independent Goal Pattern Matching ---
+            # After any change, check if the new objects on screen create a goal state.
+            if current_objects:
+                self._check_for_goal_match(current_objects, latest_frame.frame)
 
             moved_agent_this_turn = None
             # 2. Track objects from the last frame to the current one
@@ -981,8 +989,8 @@ class AGI3(Agent):
         # 3. Generate the final fingerprint using a hash of the tuple.
         fingerprint = hash(normalized_map_tuple)
         
-        # Return the base shape tuple and the fingerprint
-        return ((base_h, base_w), fingerprint)
+        # Return the base shape, the fingerprint, AND the normalized map itself for debugging.
+        return ((base_h, base_w), fingerprint, normalized_map_tuple)
 
     
     def _find_static_candidates_by_color(self, color: int, grid_data: list) -> list[dict]:
@@ -1028,12 +1036,12 @@ class AGI3(Agent):
                         height, width = max_row - min_row + 1, max_idx - min_idx + 1
 
                         data_map = tuple(tuple(grid_data[r][p] if (r, p) in component_points else None for p in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
-                        base_shape, fingerprint = self._create_normalized_fingerprint(data_map)
+                        base_shape, fingerprint, norm_map = self._create_normalized_fingerprint(data_map)
 
                         candidates.append({
                             'height': height, 'width': width, 'top_row': min_row,
                             'left_index': min_idx, 'color': color,
-                            'data_map': data_map, 'fingerprint': fingerprint, 'base_shape': base_shape    
+                            'data_map': data_map, 'fingerprint': fingerprint, 'base_shape': base_shape, 'normalized_map': norm_map
                         })
         return candidates
 
@@ -1189,7 +1197,7 @@ class AGI3(Agent):
                 background_color = border_colors[0]
 
             data_map = tuple(tuple(grid[r][p] if (r, p) in obj_points else None for p in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
-            base_shape, fingerprint = self._create_normalized_fingerprint(data_map)
+            base_shape, fingerprint, norm_map = self._create_normalized_fingerprint(data_map)
 
             original_color = from_color_map.get(sample_point) # Get original color from our map
 
@@ -1200,7 +1208,8 @@ class AGI3(Agent):
                 'data_map': data_map,
                 'background_color': background_color,
                 'fingerprint': fingerprint, 
-                'base_shape': base_shape    
+                'base_shape': base_shape,
+                'normalized_map': norm_map
             })
 
         return final_objects
@@ -1650,7 +1659,7 @@ class AGI3(Agent):
         height, width = max_row - min_row + 1, max_idx - min_idx + 1
 
         data_map = tuple(tuple(grid_data[r][p] for p in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
-        base_shape, fingerprint = self._create_normalized_fingerprint(data_map)
+        base_shape, fingerprint, norm_map = self._create_normalized_fingerprint(data_map)
 
         # Return a complete object description
         return {
@@ -1727,9 +1736,7 @@ class AGI3(Agent):
             self.interaction_hypotheses[object_signature] = {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
 
         self.interaction_hypotheses[object_signature][effect_type] = effect_objects
-        print(f"📖 Hypothesis logged for '{object_signature}': {effect_type} has been recorded.")
-        
-        self._synthesize_interaction_rules(object_signature, effect_objects)
+        print(f"💡 EFFECT LEARNED: The '{effect_type}' of interacting with '{object_signature}' has been recorded.")
     
     def _analyze_consumable_aftermath(self, latest_grid: list):
         """Checks if the interacted-with object was consumed (i.e., turned to floor)."""
@@ -1758,21 +1765,23 @@ class AGI3(Agent):
             if object_signature in self.interaction_hypotheses:
                 self.interaction_hypotheses[object_signature]['is_consumable'] = False
 
-    def _synthesize_interaction_rules(self, interacted_obj_sig: str, effect_objects: list):
+    def _check_for_goal_match(self, dynamic_objects: list, current_grid: list):
         """
-        Analyzes interaction effects by first finding static objects that match the dynamic key's color,
-        and then comparing their fingerprints.
+        Scans the grid for goal patterns by comparing dynamic (recently changed) objects
+        against all static objects. This is separate from learning an action's function.
         """
-        if not effect_objects or not self.previous_frame:
+        # Reset the goal state at the beginning of each check.
+        self.current_goal_state = None
+
+        if not dynamic_objects or not current_grid:
             return
 
-        print(f"🔬 Synthesizing rules from interaction with '{interacted_obj_sig}'...")
-        
-        grid_before_action = self.previous_frame[0]
+        print(f"🔬 Checking for goal patterns based on {len(dynamic_objects)} new object(s)...")
+        grid_data = current_grid[0]
         match_found = False
 
         # Iterate through each object that resulted from the interaction (the dynamic keys).
-        for dynamic_key_obj in effect_objects:
+        for dynamic_key_obj in dynamic_objects:
             dk_fingerprint = dynamic_key_obj.get('fingerprint')
             dk_color = dynamic_key_obj.get('color')
             if dk_fingerprint is None or dk_color is None:
@@ -1783,7 +1792,7 @@ class AGI3(Agent):
             print(f"-> Analyzing dynamic key: A {dk_size[0]}x{dk_size[1]} object of color {dk_color} at pixel {dk_pos}.")
 
             # Find all static objects on the grid that have the same primary color.
-            static_candidates = self._find_static_candidates_by_color(dk_color, grid_before_action)
+            static_candidates = self._find_static_candidates_by_color(dk_color, grid_data)
 
             if not static_candidates:
                 print(f"-> No static objects of color {dk_color} found on the grid.")
@@ -1793,6 +1802,9 @@ class AGI3(Agent):
             # Now, compare the dynamic key against just these relevant candidates.
             for static_obj in static_candidates:
                 sk_fingerprint = static_obj.get('fingerprint')
+
+                dk_norm_map = dynamic_key_obj.get('normalized_map')
+                sk_norm_map = static_obj.get('normalized_map')
 
                 if dk_fingerprint == sk_fingerprint:
                     sk_size = (static_obj['height'], static_obj['width'])
@@ -1805,18 +1817,14 @@ class AGI3(Agent):
                     dk_tile_pos = (dk_pos[0] // self.tile_size, dk_pos[1] // self.tile_size) if self.tile_size else dk_pos
                     sk_tile_pos = (sk_pos[0] // self.tile_size, sk_pos[1] // self.tile_size) if self.tile_size else sk_pos
                     
-                    print(f"✅ GOAL HYPOTHESIS: Dynamic key ({dk_size[0]}x{dk_size[1]}) at tile {dk_tile_pos} matches static key ({sk_size[0]}x{sk_size[1]}) at tile {sk_tile_pos}!")
+                    print(f"✅ GOAL PATTERN DETECTED: Dynamic key ({dk_size[0]}x{dk_size[1]}) at tile {dk_tile_pos} matches static key ({sk_size[0]}x{sk_size[1]}) at tile {sk_tile_pos}!")
                     match_found = True
-
-                    # Store a clear summary of this successful interaction in the agent's memory.
-                    if interacted_obj_sig in self.interaction_hypotheses:
-                        outcome_summary = {
-                            'result': 'KEY_MATCH_SUCCESS',
-                            'dynamic_key_shape': dynamic_key_obj.get('base_shape'),
-                            'dynamic_key_color': dynamic_key_obj.get('color')
-                        }
-                        self.interaction_hypotheses[interacted_obj_sig]['outcome'] = outcome_summary
-                        print(f"💡 RULE LEARNED: Interaction with '{interacted_obj_sig}' leads to a successful key match.")
+                    
+                    # Save the details of the goal state to the agent's memory.
+                    self.current_goal_state = {
+                        'dynamic_key': dynamic_key_obj,
+                        'static_key': static_obj
+                    }
 
                     break
             
