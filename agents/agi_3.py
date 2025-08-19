@@ -1718,7 +1718,19 @@ class AGI3(Agent):
             effect_objects = [obj for obj in effect_objects if (obj['height'], obj['width']) != player_signature]
             filtered_count = original_count - len(effect_objects)
             if filtered_count > 0:
-                print(f"🕵️‍♂️ Filtered out {filtered_count} object(s) matching the agent's new appearance.")
+                print(f"🕵️‍♂️ Filtered out {filtered_count} object(s) matching the agent's signature.")
+
+        # --- NEW: Third filter based on fingerprint ---
+        # This is more robust for catching the agent's new appearance after a move.
+        if self.last_known_player_obj and self.last_known_player_obj.get('fingerprint'):
+            player_fingerprint = self.last_known_player_obj['fingerprint']
+            if player_fingerprint: # Ensure fingerprint is not None
+                original_count = len(effect_objects)
+                # Only keep objects that DO NOT have the same fingerprint as the last known player object.
+                effect_objects = [obj for obj in effect_objects if obj.get('fingerprint') != player_fingerprint]
+                filtered_count = original_count - len(effect_objects)
+                if filtered_count > 0:
+                    print(f"🕵️‍♂️ Filtered out {filtered_count} object(s) matching the agent's last known fingerprint.")
 
         if not effect_objects:
             print(f"-> The remaining pixel changes did not form any distinct objects.")
@@ -1899,27 +1911,33 @@ class AGI3(Agent):
             print(f"Tile {tile_pos}:")
 
             if not hypothesis:
-                # This tile is on the map as interactable, but no interaction was ever logged for it.
-                print(f"  - Function: No interaction or effect was recorded for this object.")
-                continue # Move to the next tile in the report
+                print(f"  - Function: Untested.")
+                print(f"  - Type: Unknown.")
+                continue
 
-            # --- This tile HAS been interacted with, so we report everything we know ---
+            # 1. Report the learned function/effect
+            effect_desc = "No effect observed."
+            immediate_effect_objects = hypothesis.get('immediate_effect', [])
+            if immediate_effect_objects:
+                # Describe the first object from the effect for a concise summary.
+                obj = immediate_effect_objects[0]
+                size = (obj['height'], obj['width'])
+                pos = (obj['top_row'], obj['left_index'])
+                tile_pos_effect = (pos[0] // self.tile_size, pos[1] // self.tile_size) if self.tile_size else pos
+                effect_desc = f"Causes a {size[0]}x{size[1]} object to appear/change at tile {tile_pos_effect}."
+                if len(immediate_effect_objects) > 1:
+                    effect_desc += f" (+{len(immediate_effect_objects) - 1} other effects)."
             
-            # 1. Report the primary Outcome (e.g., did it cause a key match?)
-            outcome_desc = "No conclusive outcome observed."
-            outcome = hypothesis.get('outcome')
-            if outcome and outcome.get('result') == 'KEY_MATCH_SUCCESS':
-                shape = outcome.get('dynamic_key_shape', 'N/A')
-                outcome_desc = f"SUCCESSFUL_KEY_MATCH (Dynamic key became a {shape} shape)."
-            print(f"  - Outcome: {outcome_desc}")
+            print(f"  - Function: {effect_desc}")
 
-            # 2. Report the Type (e.g., did it disappear after being used?)
-            type_desc = "Unknown"
+            # 2. Report the Type (persistence)
+            type_desc = "Unknown (aftermath not observed)."
             is_consumable = hypothesis.get('is_consumable')
             if is_consumable is True:
                 type_desc = "Consumable (disappears after use)."
             elif is_consumable is False:
                 type_desc = "Persistent (remains after use)."
+            
             print(f"  - Type: {type_desc}")
         
         print("-----------------------------------------\n")
