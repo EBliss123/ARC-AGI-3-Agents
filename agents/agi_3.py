@@ -1736,6 +1736,19 @@ class AGI3(Agent):
         # 3. Convert the filtered pixel changes into whole OBJECTS.
         effect_objects = self._find_and_describe_objects(interaction_effects_pixels, latest_grid)
 
+        # 4. Filter out any objects that are known parts of the agent.
+        if self.last_known_player_obj and self.last_known_player_obj.get('parts'):
+            # Create a set of fingerprints from all parts of the last known agent object.
+            agent_part_fingerprints = {part['fingerprint'] for part in self.last_known_player_obj['parts'] if 'fingerprint' in part}
+            
+            if agent_part_fingerprints:
+                original_count = len(effect_objects)
+                # Keep only the objects whose fingerprint is NOT in the set of agent part fingerprints.
+                effect_objects = [obj for obj in effect_objects if obj.get('fingerprint') not in agent_part_fingerprints]
+                filtered_count = original_count - len(effect_objects)
+                if filtered_count > 0:
+                    print(f"🕵️‍♂️ Interaction analysis is ignoring {filtered_count} object(s) matching agent parts.")
+
         # 5. Log the results and synthesize rules.
         print(f"-> Found {len(effect_objects)} object(s) as a result of the '{effect_type}':")
         for i, obj in enumerate(effect_objects):
