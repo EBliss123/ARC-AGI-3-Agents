@@ -111,6 +111,7 @@ class AGI3(Agent):
         self.interaction_hypotheses = {} # signature -> {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
         self.static_level_objects = []
         self.has_summarized_interactions = False
+        self.awaiting_final_summary = False
 
         # --- Generic Action Groups ---
         # Get all possible actions, excluding RESET, to create generic groups.
@@ -349,6 +350,13 @@ class AGI3(Agent):
             self.observing_interaction_for_tile = None
             self.exploration_phase = ExplorationPhase.BUILDING_MAP # Resume normal exploration
             
+
+        # --- Trigger queued summary AFTER aftermath is processed ---
+        if self.awaiting_final_summary:
+            self._review_and_summarize_interactions()
+            self.awaiting_final_summary = False # Reset flag
+            self.exploration_phase = ExplorationPhase.INACTIVE # Officially end exploration
+        
         # --- State Graph Update ---
         # If we have a previous state and an action that led to the current state,
         # update the state graph to record the transition.
@@ -784,10 +792,13 @@ class AGI3(Agent):
         # 1. Find all potential targets on the map.
         potential_targets = [pos for pos, type in self.tile_map.items() if type == CellType.POTENTIALLY_INTERACTABLE]
         if not potential_targets:
-            # If there are no more targets and we haven't summarized yet, review what we've learned.
-            if not self.has_summarized_interactions:
-                self._review_and_summarize_interactions()
-            return False
+            if not potential_targets:
+                # If there are no targets, queue the summary for the *next* turn.
+                # This gives the agent one move to step away and observe the aftermath.
+                if not self.has_summarized_interactions and not self.awaiting_final_summary:
+                    print("🧐 No more targets. Queuing summary for the next turn to capture final aftermath.")
+                    self.awaiting_final_summary = True
+                return False
 
         # 2. Find paths to all potential targets and store the ones that are reachable.
         reachable_targets = []
