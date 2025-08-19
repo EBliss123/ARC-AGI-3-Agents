@@ -394,8 +394,6 @@ class AGI3(Agent):
             self.visited_grids.add(grid_tuple)
 
         # --- Check for massive changes indicating a transition ---
-
-        # --- Check for massive changes indicating a transition ---
         if novel_changes_found:
             is_dimension_change = "Frame dimensions changed" in change_descriptions
             if len(change_descriptions) > self.MASSIVE_CHANGE_THRESHOLD or is_dimension_change:
@@ -475,24 +473,30 @@ class AGI3(Agent):
                 # If no indicator is confirmed, all changes are for game-world object logic.
                 object_logic_changes = structured_changes
 
-            # 1. Find and describe all objects in the current frame
+            # 1. Find all new objects based on pixel changes.
             current_objects = self._find_and_describe_objects(object_logic_changes, latest_frame.frame)
 
-            # --- NEW: Independent Goal Pattern Matching ---
-            # After any change, check if the new objects on screen create a goal state.
-            if current_objects:
-                self._check_for_goal_match(current_objects, latest_frame.frame)
-
             moved_agent_this_turn = None
-            # 2. Track objects from the last frame to the current one
-            if self.last_known_objects: # Can only track if we have a "before" state
-                tracking_logs, moved_agent_this_turn = self._track_objects(current_objects, self.last_known_objects, latest_frame.frame, object_logic_changes, self.last_action)
+            agent_part_fingerprints = set()
+            
+            # 2. Track objects and identify the agent's parts FIRST.
+            if self.last_known_objects:
+                tracking_logs, moved_agent_this_turn, agent_part_fingerprints = self._track_objects(current_objects, self.last_known_objects, latest_frame.frame, object_logic_changes, self.last_action)
                 if tracking_logs:
                     print(f"--- Object Tracking Report (Action: {self.last_action.name}) ---")
                     for log in tracking_logs:
                         print(log)
 
-            # 3. Update memory for the next turn by merging static and changed objects
+            # 3. Filter out agent parts to get a list of true environmental changes.
+            non_agent_objects = [obj for obj in current_objects if obj.get('fingerprint') not in agent_part_fingerprints]
+            if len(current_objects) != len(non_agent_objects):
+                print(f"🕵️‍♂️ Goal check is ignoring {len(current_objects) - len(non_agent_objects)} object(s) identified as agent parts.")
+
+            # 4. Check for goal patterns on the REMAINING non-agent objects.
+            if non_agent_objects:
+                self._check_for_goal_match(non_agent_objects, latest_frame.frame)
+
+            # 5. Update memory for the next turn by merging static and changed objects
             new_object_memory = []
             
             # First, add all static objects from the previous turn's memory
@@ -526,18 +530,9 @@ class AGI3(Agent):
             # Finally, set the agent's memory for the next turn
             self.last_known_objects = new_object_memory
 
-            # 4. Update the player object's known position
-            # If the tracker saw the agent move, use that new position.
+            # 6. Update the player object's known position for the next turn.
             if moved_agent_this_turn:
                 self.last_known_player_obj = moved_agent_this_turn
-            # 4. Update the player object's known position
-            # If the tracker saw the agent move, use that new position.
-            if moved_agent_this_turn:
-                self.last_known_player_obj = moved_agent_this_turn
-            # If no agent moved this turn (e.g., after a reset), we don't know its
-            # location. We must wait for movement to find it again.
-            else:
-                self.last_known_player_obj = None
 
         # --- Intelligent Exploration Logic ---
         # Check if the agent has learned enough to begin exploring intelligently.
@@ -1359,12 +1354,16 @@ class AGI3(Agent):
                     log_messages.append(f"🧠 MOVE: Object [{curr['height']}x{curr['width']}] moved from ({last['top_row']}, {last['left_index']}) to ({curr['top_row']}, {curr['left_index']}).")
 
                 vector = (curr['top_row'] - last['top_row'], curr['left_index'] - last['left_index'])
-                true_moves.append({'type': 'individual', 'signature': signature, 'last_obj': last, 'vector': vector})
+                true_moves.append({'type': 'individual', 'signature': signature, 'curr_obj': curr, 'last_obj': last, 'vector': vector})
 
         # --- Concept Learning from Movement (Agent and Floor) ---
         moved_agent_obj = None
         if not true_moves:
-            return log_messages, moved_agent_obj
+            agent_part_fingerprints = set()
+            if moved_agent_obj and moved_agent_obj.get('parts'):
+                agent_part_fingerprints = {part['fingerprint'] for part in moved_agent_obj['parts'] if 'fingerprint' in part}
+            
+            return log_messages, moved_agent_obj, agent_part_fingerprints
 
         # 1. Identify the Agent
         if self.world_model['player_signature'] is None:
@@ -1430,17 +1429,28 @@ class AGI3(Agent):
                     # --- THE AGENT MOVED ---
                     effect_vector = move['vector']
 
-                    # 1. Combine the agent's fragments into a single bounding box
-                    agent_parts = [p[0] for p in move['parts']] if move['type'] == 'composite' else [move['last_obj']]
+                    # 1. Get the current-frame object descriptions for all agent parts.
+                    agent_parts = []
+                    if move['type'] == 'composite':
+                        agent_parts = [p[0] for p in move['parts']]
+                    elif move['type'] == 'individual' and 'curr_obj' in move:
+                        agent_parts = [move['curr_obj']]
                     
+                    if not agent_parts: continue # Safety check
+
+                    # 2. Combine the parts into a single descriptor for self.last_known_player_obj
                     min_row = min(p['top_row'] for p in agent_parts)
                     max_row = max(p['top_row'] + p['height'] for p in agent_parts)
                     min_col = min(p['left_index'] for p in agent_parts)
                     max_col = max(p['left_index'] + p['width'] for p in agent_parts)
 
+                    # Create a descriptor that includes the parts for future filtering.
                     moved_agent_obj = {
-                        'height': max_row - min_row, 'width': max_col - min_col,
-                        'top_row': min_row, 'left_index': min_col
+                        'height': max_row - min_row, 
+                        'width': max_col - min_col,
+                        'top_row': min_row, 
+                        'left_index': min_col,
+                        'parts': agent_parts  # Store the individual component objects
                     }
 
                     # 2. Learn the action effect (if not already known)
@@ -1469,7 +1479,11 @@ class AGI3(Agent):
 
                     break # Agent's move found, no need to check other moves.
 
-        return log_messages, moved_agent_obj
+        agent_part_fingerprints = set()
+        if moved_agent_obj and moved_agent_obj.get('parts'):
+            agent_part_fingerprints = {part['fingerprint'] for part in moved_agent_obj['parts'] if 'fingerprint' in part}
+        
+        return log_messages, moved_agent_obj, agent_part_fingerprints
     
     def _learn_from_interaction_failure(self, action: GameAction, last_grid: list):
         """Analyzes why a known action failed by checking the intended destination area."""
@@ -1721,31 +1735,6 @@ class AGI3(Agent):
 
         # 3. Convert the filtered pixel changes into whole OBJECTS.
         effect_objects = self._find_and_describe_objects(interaction_effects_pixels, latest_grid)
-        
-        # 4. A second, object-level filter to catch the agent's new appearance.
-        player_signature = self.world_model.get('player_signature')
-        if player_signature:
-            original_count = len(effect_objects)
-            effect_objects = [obj for obj in effect_objects if (obj['height'], obj['width']) != player_signature]
-            filtered_count = original_count - len(effect_objects)
-            if filtered_count > 0:
-                print(f"🕵️‍♂️ Filtered out {filtered_count} object(s) matching the agent's signature.")
-
-        # --- NEW: Third filter based on fingerprint ---
-        # This is more robust for catching the agent's new appearance after a move.
-        if self.last_known_player_obj and self.last_known_player_obj.get('fingerprint'):
-            player_fingerprint = self.last_known_player_obj['fingerprint']
-            if player_fingerprint: # Ensure fingerprint is not None
-                original_count = len(effect_objects)
-                # Only keep objects that DO NOT have the same fingerprint as the last known player object.
-                effect_objects = [obj for obj in effect_objects if obj.get('fingerprint') != player_fingerprint]
-                filtered_count = original_count - len(effect_objects)
-                if filtered_count > 0:
-                    print(f"🕵️‍♂️ Filtered out {filtered_count} object(s) matching the agent's last known fingerprint.")
-
-        if not effect_objects:
-            print(f"-> The remaining pixel changes did not form any distinct objects.")
-            return
 
         # 5. Log the results and synthesize rules.
         print(f"-> Found {len(effect_objects)} object(s) as a result of the '{effect_type}':")
