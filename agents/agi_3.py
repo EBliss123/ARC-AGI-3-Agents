@@ -183,10 +183,20 @@ class AGI3(Agent):
     
     def _reset_for_new_attempt(self):
         """Resets the agent's state for a new life or attempt without printing."""
+        # --- Core Resets for any attempt ---
         self.previous_frame = None
         self.last_action = None
         self.last_known_objects = []
+        self.last_known_player_obj = None # Crucial: Force agent to re-find itself.
 
+        # --- Reset Level-Specific Layout and Plans ---
+        self.tile_map.clear()
+        self.exploration_phase = ExplorationPhase.INACTIVE
+        self.exploration_plan = []
+        self.exploration_target = None
+        self.observing_interaction_for_tile = None
+        
+        # --- Reset Agent's Action State ---
         if self.level_knowledge_is_learned:
             self.agent_state = AgentState.RANDOM_ACTION
         else:
@@ -201,27 +211,17 @@ class AGI3(Agent):
 
     def _reset_for_new_level(self):
         """Resets all level-specific knowledge for a new level, preserving core learned concepts."""
-        # 1. Reset transient state and all object position data.
-        self.previous_frame = None
-        self.last_action = None
-        self.last_known_objects = []
-        self.last_known_player_obj = None # Make sure agent has to re-find itself on the new map.
+        # A new level is a more thorough version of a new attempt.
+        self._reset_for_new_attempt()
 
-        # 2. Set the agent state to use its existing knowledge.
-        # Since the world model is preserved, we can skip discovery and move
-        # directly to intelligent action/exploration.
+        # Additionally, reset knowledge that is strictly tied to a level's design.
+        print("🧹 Wiping interaction hypotheses for the new level.")
+        self.interaction_hypotheses.clear()
+        self.has_summarized_interactions = False
+
+        # Since the world model is preserved, we can skip discovery.
         print("🧠 Knowledge preserved. Skipping discovery and entering action state.")
         self.agent_state = AgentState.RANDOM_ACTION
-        
-        # 3. Reset all map and exploration data. This "forgets the layout".
-        print("🧹 Wiping all level layout and exploration data.")
-        self.tile_map = {}
-        self.exploration_phase = ExplorationPhase.INACTIVE
-        self.exploration_target = None
-        self.exploration_plan = []
-        self.reachable_floor_area = set()
-        self.interaction_hypotheses.clear() # Interaction effects are tied to the specific layout.
-        self.has_summarized_interactions = False
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
