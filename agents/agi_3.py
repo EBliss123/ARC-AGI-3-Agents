@@ -211,6 +211,12 @@ class AGI3(Agent):
 
     def _reset_for_new_level(self):
         """Resets all level-specific knowledge for a new level, preserving core learned concepts."""
+        # --- NEW: Print the summary of the level that was just completed ---
+        # Check if a summary wasn't already printed at the end of the level.
+        if not self.has_summarized_interactions:
+            print("\n--- Final Summary of Previous Level ---")
+            self._review_and_summarize_interactions()
+
         # A new level is a more thorough version of a new attempt.
         self._reset_for_new_attempt()
 
