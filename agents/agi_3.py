@@ -105,6 +105,7 @@ class AGI3(Agent):
         self.exploration_plan = [] # Stores a list of GameActions to execute
         self.inverse_action_map = {} # e.g., {(0, 1): GameAction.RIGHT} for pathfinding
         self.reachable_floor_area = set() # Stores all floor tiles connected to the player
+        self.just_vacated_tile = None
 
         # --- Interaction Learning ---
         self.observing_interaction_for_tile = None # Stores the coords of the tile being observed
@@ -460,27 +461,19 @@ class AGI3(Agent):
             object_logic_changes = []
             if self.confirmed_resource_indicator:
                 indicator_row = self.confirmed_resource_indicator['row_index']
-                indicator_changes = []
-
                 for change in structured_changes:
-                    if change['row_index'] == indicator_row:
-                        indicator_changes.append(change)
-                    else:
+                    if change['row_index'] != indicator_row:
                         object_logic_changes.append(change)
-
-                # If changes happened on the indicator, log them in the desired format.
-                if indicator_changes:
-                    print("--- UI Resource Indicator Update ---")
-                    for change in indicator_changes:
-                        row = change['row_index']
-                        for px_change in change['changes']:
-                            print(f"🎨 [RESOURCE INDICATOR]: Indicator at ({row}, {px_change['index']}) changed from {px_change['from']} to {px_change['to']}.")
             else:
-                # If no indicator is confirmed, all changes are for game-world object logic.
                 object_logic_changes = structured_changes
 
             # 1. Find all new objects based on pixel changes.
             current_objects = self._find_and_describe_objects(object_logic_changes, latest_frame.frame)
+
+            # NEW: Store the tile the agent is on before tracking its move.
+            self.just_vacated_tile = None
+            if self.last_known_player_obj and self.tile_size:
+                self.just_vacated_tile = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
 
             moved_agent_this_turn = None
             agent_part_fingerprints = set()
@@ -502,46 +495,14 @@ class AGI3(Agent):
             if non_agent_objects:
                 self._check_for_goal_match(non_agent_objects, latest_frame.frame)
 
-            # 5. Update memory for the next turn by merging static and changed objects
-            new_object_memory = []
-            
-            # First, add all static objects from the previous turn's memory
-            if self.last_known_objects:
-                # Get the set of coordinates that changed in this turn
-                changed_coords = set()
-                for change in object_logic_changes:
-                    for px_change in change['changes']:
-                        changed_coords.add((change['row_index'], px_change['index']))
-                
-                # Add any object from memory that was NOT in a changed location
-                for obj in self.last_known_objects:
-                    # Purge any object from memory that is on the confirmed indicator row.
-                    if self.confirmed_resource_indicator:
-                        indicator_row = self.confirmed_resource_indicator['row_index']
-                        obj_rows = range(obj['top_row'], obj['top_row'] + obj['height'])
-                        if indicator_row in obj_rows:
-                            continue # Skip this object, it's on the UI row.
-                    is_static = True
-                    for r in range(obj['top_row'], obj['top_row'] + obj['height']):
-                        if any((r, c) in changed_coords for c in range(obj['left_index'], obj['left_index'] + obj['width'])):
-                            is_static = False
-                            break
-                    if is_static:
-                        new_object_memory.append(obj)
-            
-            # Second, add the new, updated objects from the current turn
-            # (The 'current_objects' list only contains objects from changed areas)
-            new_object_memory.extend(current_objects)
-
-            # Finally, set the agent's memory for the next turn
-            self.last_known_objects = new_object_memory
+            # 5. Update memory for the next turn.
+            self.last_known_objects = current_objects
 
             # 6. Update the player object's known position for the next turn.
             if moved_agent_this_turn:
                 self.last_known_player_obj = moved_agent_this_turn
 
         # --- Intelligent Exploration Logic ---
-        # Check if the agent has learned enough to begin exploring intelligently.
         can_explore = (self.world_model.get('player_signature') and
                self.world_model.get('floor_color') and
                self.world_model.get('action_map') and
@@ -552,9 +513,7 @@ class AGI3(Agent):
             print("🤖 World model is sufficiently complete. Activating exploration phase.")
             self.exploration_phase = ExplorationPhase.BUILDING_MAP
 
-        # --- Handle Exploration Phases ---
         if self.exploration_phase != ExplorationPhase.INACTIVE:
-            # If a plan is being executed, prioritize it.
             if self.exploration_phase == ExplorationPhase.EXECUTING_PLAN:
                 if self.exploration_plan:
                     action = self.exploration_plan.pop(0)
@@ -563,30 +522,22 @@ class AGI3(Agent):
                     self.last_grid_tuple = grid_tuple
                     return action
                 else:
-                    # This block handles the completion of a plan to an interactable.
                     print("✅ Plan complete. Beginning interaction observation.")
                     if self.exploration_target and self.tile_size:
                         target_tile = (self.exploration_target[0] // self.tile_size, self.exploration_target[1] // self.tile_size)
-
                         if self.tile_map.get(target_tile) == CellType.POTENTIALLY_INTERACTABLE:
                             self.tile_map[target_tile] = CellType.CONFIRMED_INTERACTABLE
                             print(f"✅ Target at {target_tile} confirmed as interactable.")
-
-                        # --- Observation 1: Analyze immediate effects ---
-                        # Set the tile we're observing so we can check the aftermath on the next turn.
                         self.observing_interaction_for_tile = target_tile
                         self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect', latest_frame.frame, self.last_known_objects)
-
-                    # Immediately transition to find a new target. The next action will be the "step away".
                     self.exploration_phase = ExplorationPhase.BUILDING_MAP
 
-            # Build or rebuild the map if needed.
             if self.exploration_phase == ExplorationPhase.BUILDING_MAP:
                 print("🗺️ Building/updating the level map...")
                 self._build_level_map(latest_frame.frame)
+                self.just_vacated_tile = None # Clear the one-time flag after use.
                 self.exploration_phase = ExplorationPhase.SEEKING_TARGET
 
-            # Find a new target and create a plan.
             if self.exploration_phase == ExplorationPhase.SEEKING_TARGET:
                 print("🗺️ Seeking a new exploration target...")
                 target_found = self._find_target_and_plan()
@@ -666,18 +617,13 @@ class AGI3(Agent):
 
     def _build_level_map(self, grid: list):
         """
-        Creates a refined tile-based map. First, it maps the grid by color,
-        then finds the player's reachable floor area, and finally re-classifies
-        all tiles based on their relationship to that reachable area.
+        Creates a refined tile-based map, aware of the player's current and previous positions.
         """
         if not self.tile_size or not grid:
             return
         
-        # Preserve tiles that have already been confirmed as interactable before rebuilding.
         confirmed_interactables = {pos for pos, cell_type in self.tile_map.items() if cell_type == CellType.CONFIRMED_INTERACTABLE}
 
-        # --- Pass 1: Initial color-based classification ---
-        # We create a temporary map to help the floor-finding algorithm.
         temp_tile_map = {}
         grid_data = grid[0]
         grid_height = len(grid_data)
@@ -692,84 +638,58 @@ class AGI3(Agent):
 
         for r in range(0, grid_height, self.tile_size):
             for c in range(0, grid_width, self.tile_size):
-                sample_color = grid_data[r][c]
                 tile_coords = (r // self.tile_size, c // self.tile_size)
 
+                if tile_coords == player_tile_coords or tile_coords == self.just_vacated_tile:
+                    if self.tile_map.get(tile_coords) == CellType.CONFIRMED_INTERACTABLE:
+                        temp_tile_map[tile_coords] = CellType.CONFIRMED_INTERACTABLE
+                    else:
+                        temp_tile_map[tile_coords] = CellType.FLOOR
+                    continue
+
+                sample_color = grid_data[r][c]
                 if sample_color in wall_colors:
                     temp_tile_map[tile_coords] = CellType.WALL
                 elif sample_color == floor_color:
                     temp_tile_map[tile_coords] = CellType.FLOOR
                 else:
-                    # Tentatively classify as potentially interactable
                     temp_tile_map[tile_coords] = CellType.POTENTIALLY_INTERACTABLE
         
-        # Use the temporary map to find the reachable floor area
         self.tile_map = temp_tile_map
         self.reachable_floor_area = self._find_reachable_floor_tiles()
 
-        # --- Pass 2: Refine the map based on reachability ---
         if not self.reachable_floor_area:
             print("🗺️ No reachable area found. Map will not be refined.")
-            # We leave the color-based map as is if nothing is reachable.
 
         refined_tile_map = {}
-        all_tile_coords = list(self.tile_map.keys())
-
-        for tile_coords in all_tile_coords:
-            # Rule 0: Preserve confirmed interactables above all else.
+        for tile_coords in self.tile_map.keys():
             if tile_coords in confirmed_interactables:
                 refined_tile_map[tile_coords] = CellType.CONFIRMED_INTERACTABLE
                 continue
-
-            # Rule 1: Any tile within the reachable area is FLOOR.
             if tile_coords in self.reachable_floor_area:
                 refined_tile_map[tile_coords] = CellType.FLOOR
                 continue
-
-            # Rule 2: For other tiles, check if they are adjacent to the floor.
-            is_adjacent_to_floor = False
-            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                neighbor_tile = (tile_coords[0] + dr, tile_coords[1] + dc)
-                if neighbor_tile in self.reachable_floor_area:
-                    is_adjacent_to_floor = True
-                    break
-            
+            is_adjacent_to_floor = any((tile_coords[0] + dr, tile_coords[1] + dc) in self.reachable_floor_area for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)])
             if is_adjacent_to_floor:
-                # It's a WALL if its color matches known wall colors.
                 if temp_tile_map.get(tile_coords) == CellType.WALL:
                     refined_tile_map[tile_coords] = CellType.WALL
-                # Otherwise, check the color before assuming it's interactable.
                 else:
-                    # This handles cases where a floor tile wasn't reached by the
-                    # initial flood fill, correctly classifying it as FLOOR.
                     sample_color = grid_data[tile_coords[0] * self.tile_size][tile_coords[1] * self.tile_size]
                     if sample_color == floor_color:
                         refined_tile_map[tile_coords] = CellType.FLOOR
                     else:
                         refined_tile_map[tile_coords] = CellType.POTENTIALLY_INTERACTABLE
             else:
-                # Rule 3: If it's not floor and not adjacent, it's UNKNOWN.
                 refined_tile_map[tile_coords] = CellType.UNKNOWN
 
-         # --- Pass 3: Final Verification Safety Net ---
-        # Check all interactable candidates and correct them if their color matches a known type.
-        grid_data = grid[0]
-        floor_color = self.world_model.get('floor_color')
-        wall_colors = self.world_model.get('wall_colors', set())
-        
-        # We iterate over a copy of the items since we are modifying the dictionary.
         for tile_coords, cell_type in list(refined_tile_map.items()):
             if cell_type in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE]:
-                # Sample the tile's color from the grid's raw data.
                 sample_color = grid_data[tile_coords[0] * self.tile_size][tile_coords[1] * self.tile_size]
-                
-                # If the color is a known type, correct the classification.
                 if floor_color and sample_color == floor_color:
                     refined_tile_map[tile_coords] = CellType.FLOOR
                 elif wall_colors and sample_color in wall_colors:
                     refined_tile_map[tile_coords] = CellType.WALL
 
-        # Update the agent's main tile map with the refined version.
         self.tile_map = refined_tile_map
         counts = Counter(self.tile_map.values())
         print(f"🗺️ Refined Map ({len(self.tile_map)} tiles): {counts[CellType.FLOOR]} floor, {counts[CellType.WALL]} wall, {counts.get(CellType.POTENTIALLY_INTERACTABLE, 0)} potentially interactable, {counts.get(CellType.CONFIRMED_INTERACTABLE, 0)} interactable.")
