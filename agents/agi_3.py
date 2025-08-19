@@ -523,6 +523,7 @@ class AGI3(Agent):
                     return action
                 else:
                     print("✅ Plan complete. Beginning interaction observation.")
+                    self._print_debug_map()
                     if self.exploration_target and self.tile_size:
                         target_tile = (self.exploration_target[0] // self.tile_size, self.exploration_target[1] // self.tile_size)
                         if self.tile_map.get(target_tile) == CellType.POTENTIALLY_INTERACTABLE:
