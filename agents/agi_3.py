@@ -2028,6 +2028,12 @@ class AGI3(Agent):
 
             print(f"Tile {tile_pos}:")
 
+            # --- NEW: Special handling for the goal tile ---
+            if tile_pos == self.final_tile_of_level:
+                print(f"  - Function: Causes new level when interacted with.")
+                print(f"  - Type: Unknown (Level Ended Before Aftermath Observed).")
+                continue # Skip the normal summary for this tile.
+
             if not hypothesis:
                 print(f"  - Function: Untested.")
                 print(f"  - Type: Unknown.")
@@ -2051,9 +2057,7 @@ class AGI3(Agent):
             # 2. Report the Type (persistence)
             type_desc = "Unknown (aftermath not observed)."
             is_consumable = hypothesis.get('is_consumable')
-            if tile_pos == self.final_tile_of_level:
-                type_desc = "Unknown (Level Ended Before Aftermath Observed)."
-            elif is_consumable is True:
+            if is_consumable is True:
                 type_desc = "Consumable (disappears after use)."
             elif is_consumable is False:
                 type_desc = "Persistent (remains after use)."
