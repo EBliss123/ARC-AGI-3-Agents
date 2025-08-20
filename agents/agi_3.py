@@ -725,8 +725,9 @@ class AGI3(Agent):
 
         player_pixel_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
         player_tile_pos = (player_pixel_pos[0] // self.tile_size, player_pixel_pos[1] // self.tile_size)
-
-        # 1. Find all potential targets on the map.
+        
+        # --- PRIORITY 1: Explore all potentially interactable objects ---
+        print("🎯 Activating PRIORITY 1: Seeking all potentially interactable tiles.")
         potential_targets = [pos for pos, type in self.tile_map.items() if type == CellType.POTENTIALLY_INTERACTABLE]
         
         # Before planning, review potential targets for any pre-existing knowledge.
@@ -741,10 +742,33 @@ class AGI3(Agent):
         # Remove the now-known interactables from the list of potential targets.
         potential_targets = [p for p in potential_targets if p not in known_interactables]
         
+        # --- End of Priority 1 Logic ---
+
         if not potential_targets:
+            # --- PRIORITY 2: Test mysterious objects while a pattern is active ---
+            if self.active_patterns:
+                print("🎯 Activating PRIORITY 2: Pattern is active. Seeking interactables with no known effect.")
+                
+                interactables_with_no_effect = []
+                all_confirmed_interactables = [pos for pos, type in self.tile_map.items() if type == CellType.CONFIRMED_INTERACTABLE]
+
+                for tile_pos in all_confirmed_interactables:
+                    signature = f"tile_pos_{tile_pos}"
+                    hypothesis = self.interaction_hypotheses.get(signature)
+                    # "No effect observed" means a hypothesis exists, but it recorded no effects.
+                    if hypothesis and not hypothesis.get('immediate_effect') and not hypothesis.get('aftermath_effect'):
+                        interactables_with_no_effect.append(tile_pos)
+
+                if interactables_with_no_effect:
+                    print(f"-> Found {len(interactables_with_no_effect)} interactable(s) with no effect to re-test.")
+                    # If we found some, they become our new potential targets for this turn.
+                    potential_targets = interactables_with_no_effect
+                else:
+                    print("-> No mysterious objects to test. All interactables have an observed effect.")
+            # --- End of Priority 2 Logic ---
+
+            # If we still have no targets after P1 and P2, then exploration is complete for now.
             if not potential_targets:
-                # If there are no targets, queue the summary for the *next* turn.
-                # This gives the agent one move to step away and observe the aftermath.
                 if not self.has_summarized_interactions and not self.awaiting_final_summary:
                     print("🧐 No more targets. Queuing summary for the next turn to capture final aftermath.")
                     self.awaiting_final_summary = True
