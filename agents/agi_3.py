@@ -193,6 +193,8 @@ class AGI3(Agent):
 
         # --- Reset Level-Specific Layout and Plans ---
         self.tile_map.clear()
+        self.has_summarized_interactions = False
+        self.awaiting_final_summary = False
         self.exploration_phase = ExplorationPhase.INACTIVE
         self.exploration_plan = []
         self.exploration_target = None
@@ -756,7 +758,17 @@ class AGI3(Agent):
         
         # --- PRIORITY 1: Explore all potentially interactable objects ---
         print("🎯 Activating PRIORITY 1: Seeking all potentially interactable tiles.")
-        potential_targets = [pos for pos, type in self.tile_map.items() if type == CellType.POTENTIALLY_INTERACTABLE]
+        # First, calculate the visible "display area," just as the debug map does.
+        display_area = set(self.reachable_floor_area)
+        for r_tile, c_tile in self.reachable_floor_area:
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
+                neighbor = (r_tile + dr, c_tile + dc)
+                if neighbor in self.tile_map:
+                    display_area.add(neighbor)
+
+        # Now, search for targets ONLY within this visible area.
+        potential_targets = [pos for pos, type in self.tile_map.items() 
+                            if type == CellType.POTENTIALLY_INTERACTABLE and pos in display_area]
         
         # Before planning, review potential targets for any pre-existing knowledge.
         known_interactables = []
@@ -773,6 +785,11 @@ class AGI3(Agent):
         # --- End of Priority 1 Logic ---
 
         if not potential_targets:
+            # If there are no more potentially interactable tiles, queue the summary immediately.
+            if not self.has_summarized_interactions and not self.awaiting_final_summary:
+                    print("✅ All potential interactables discovered. Queuing knowledge summary for the next turn.")
+                    self.awaiting_final_summary = True
+            
             # --- PRIORITY 2: Test mysterious objects while a pattern is active ---
             if self.active_patterns:
                 print("🎯 Activating PRIORITY 2: Pattern is active. Seeking interactables with no known effect.")
@@ -818,9 +835,6 @@ class AGI3(Agent):
 
             # If we still have no targets after P1 and P2, then exploration is complete for now.
             if not potential_targets:
-                if not self.has_summarized_interactions and not self.awaiting_final_summary:
-                    print("🧐 No more targets. Queuing summary for the next turn to capture final aftermath.")
-                    self.awaiting_final_summary = True
                 return False
 
         # 2. Find paths to all potential targets and store the ones that are reachable.
