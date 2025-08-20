@@ -506,11 +506,21 @@ class AGI3(Agent):
             if moved_agent_this_turn:
                 self.last_known_player_obj = moved_agent_this_turn
 
-      
         # --- NEW, SIMPLIFIED NEW-LEVEL DETECTION ---
         # If the score has increased at any point, assume it's a new level and reset.
         if latest_frame.score > self.level_start_score:
-            print(f"--- New Level Detected (Score Increased)! Resetting layout knowledge. ---")
+            print(f"--- New Level Detected (Score Increased)! Analyzing final move before reset. ---")
+            
+            # --- Manually trigger interaction analysis for the goal tile ---
+            # This ensures we learn from the winning move before the summary is printed.
+            if self.last_known_player_obj and self.tile_size:
+                goal_tile = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
+                print(f"-> Analyzing winning interaction with tile {goal_tile}...")
+                self.observing_interaction_for_tile = goal_tile
+                self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect', latest_frame.frame, self.last_known_objects, agent_part_fingerprints)
+                self.observing_interaction_for_tile = None # Clear immediately after use.
+
+            # Now that the final interaction is logged, proceed with the reset.
             self.level_start_frame = copy.deepcopy(latest_frame.frame)
             self.level_start_score = latest_frame.score
             self._reset_for_new_level()
