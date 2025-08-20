@@ -246,15 +246,6 @@ class AGI3(Agent):
                 # again on the next turn.
                 print("--- Ignoring blank starting frame. Waiting for a valid one... ---")
         
-        # --- NEW, SIMPLIFIED NEW-LEVEL DETECTION ---
-        # If the score has increased at any point, assume it's a new level and reset.
-        if latest_frame.score > self.level_start_score:
-            print(f"--- New Level Detected (Score Increased)! Resetting layout knowledge. ---")
-            self.level_start_frame = copy.deepcopy(latest_frame.frame)
-            self.level_start_score = latest_frame.score
-            self._reset_for_new_level()
-            return self.wait_action
-        
         # --- Handle screen transitions before any other logic ---
         if self.agent_state == AgentState.AWAITING_STABILITY:
             # We perceive here to check if the screen has stopped changing.
@@ -501,6 +492,16 @@ class AGI3(Agent):
             # 6. Update the player object's known position for the next turn.
             if moved_agent_this_turn:
                 self.last_known_player_obj = moved_agent_this_turn
+
+      
+        # --- NEW, SIMPLIFIED NEW-LEVEL DETECTION ---
+        # If the score has increased at any point, assume it's a new level and reset.
+        if latest_frame.score > self.level_start_score:
+            print(f"--- New Level Detected (Score Increased)! Resetting layout knowledge. ---")
+            self.level_start_frame = copy.deepcopy(latest_frame.frame)
+            self.level_start_score = latest_frame.score
+            self._reset_for_new_level()
+            return self.wait_action
 
         # --- Intelligent Exploration Logic ---
         can_explore = (self.world_model.get('player_signature') and
