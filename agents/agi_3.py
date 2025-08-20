@@ -1648,6 +1648,29 @@ class AGI3(Agent):
                             'height': 1, 'width': grid_width
                         })
                         print(f"✅ Confirmed resource indicator at row {row_idx}! It will now be ignored for state uniqueness checks.")
+                        
+                        # --- NEW: Re-check active patterns to filter out the new indicator ---
+                        if self.active_patterns:
+                            print(f"🕵️‍♀️ Re-checking {len(self.active_patterns)} active pattern(s) against the new resource indicator...")
+                            
+                            valid_patterns = []
+                            removed_count = 0
+                            for pattern in self.active_patterns:
+                                dk = pattern['dynamic_key']
+                                # Check if the dynamic key's vertical span overlaps with the indicator row
+                                obj_top = dk['top_row']
+                                obj_bottom = obj_top + dk['height']
+                                
+                                if obj_top <= row_idx < obj_bottom:
+                                    # This pattern's dynamic key is on the indicator row. It's invalid.
+                                    removed_count += 1
+                                else:
+                                    valid_patterns.append(pattern)
+                            
+                            if removed_count > 0:
+                                print(f"-> Removed {removed_count} pattern(s) that were incorrectly tracking the resource indicator.")
+                                self.active_patterns = valid_patterns
+                        
                         self.resource_indicator_candidates.clear()
                         return
                 else:
@@ -1828,6 +1851,15 @@ class AGI3(Agent):
         known_pattern_fingerprints = {p['fingerprint'] for p in self.active_patterns}
 
         for dynamic_key_obj in dynamic_objects:
+            # --- NEW: Explicitly ignore objects on the resource indicator row ---
+            if self.confirmed_resource_indicator:
+                indicator_row = self.confirmed_resource_indicator['row_index']
+                # Check if the object's vertical span overlaps with the indicator row
+                obj_top = dynamic_key_obj['top_row']
+                obj_bottom = obj_top + dynamic_key_obj['height']
+                if obj_top <= indicator_row < obj_bottom:
+                    continue # Skip this object, it's part of the UI.
+
             dk_fingerprint = dynamic_key_obj.get('fingerprint')
             dk_color = dynamic_key_obj.get('color')
             if dk_fingerprint is None or dk_color is None: continue
