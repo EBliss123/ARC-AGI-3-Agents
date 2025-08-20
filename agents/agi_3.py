@@ -806,7 +806,7 @@ class AGI3(Agent):
                 neighbor_tile = (current_tile[0] + tile_vec[0], current_tile[1] + tile_vec[1])
 
                 tile_type = self.tile_map.get(neighbor_tile)
-                can_move_to = tile_type in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE]
+                can_move_to = tile_type in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE]
 
                 if can_move_to and neighbor_tile not in visited:
                     visited.add(neighbor_tile)
