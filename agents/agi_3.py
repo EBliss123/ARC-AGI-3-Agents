@@ -113,6 +113,7 @@ class AGI3(Agent):
         self.static_level_objects = []
         self.has_summarized_interactions = False
         self.awaiting_final_summary = False
+        self.final_tile_of_level = None
 
         # --- Generic Action Groups ---
         # Get all possible actions, excluding RESET, to create generic groups.
@@ -212,6 +213,10 @@ class AGI3(Agent):
 
     def _reset_for_new_level(self):
         """Resets all level-specific knowledge for a new level, preserving core learned concepts."""
+        # Record the agent's last position to correctly label the summary.
+        if self.last_known_player_obj and self.tile_size:
+            self.final_tile_of_level = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
+
         # --- NEW: Print the summary of the level that was just completed ---
         # Check if a summary wasn't already printed at the end of the level.
         if not self.has_summarized_interactions:
@@ -337,6 +342,7 @@ class AGI3(Agent):
                 # If the screen is still changing, just wait.
                 return self.wait_action
             
+        agent_part_fingerprints = set()
         novel_changes_found, known_changes_found, change_descriptions, structured_changes = self.perceive(latest_frame)    
         
         # --- NEW: Check for and analyze the "aftermath" of an interaction ---
@@ -467,7 +473,6 @@ class AGI3(Agent):
                 self.just_vacated_tile = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
 
             moved_agent_this_turn = None
-            agent_part_fingerprints = set()
             
             # 2. Track objects and identify the agent's parts FIRST.
             if self.last_known_objects:
@@ -531,7 +536,7 @@ class AGI3(Agent):
                             self.tile_map[target_tile] = CellType.CONFIRMED_INTERACTABLE
                             print(f"✅ Target at {target_tile} confirmed as interactable.")
                         self.observing_interaction_for_tile = target_tile
-                        self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect', latest_frame.frame, self.last_known_objects)
+                        self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect', latest_frame.frame, self.last_known_objects, agent_part_fingerprints)
                     self.exploration_phase = ExplorationPhase.BUILDING_MAP
 
             if self.exploration_phase == ExplorationPhase.BUILDING_MAP:
@@ -1704,7 +1709,7 @@ class AGI3(Agent):
             'data_map': data_map, 'fingerprint': fingerprint, 'base_shape': base_shape    
         }
 
-    def _analyze_and_log_interaction_effect(self, structured_changes: list, effect_type: str, latest_grid: list, static_objects_before_action: list):
+    def _analyze_and_log_interaction_effect(self, structured_changes: list, effect_type: str, latest_grid: list, static_objects_before_action: list, current_agent_fingerprints: set):
         """Analyzes pixel changes from an interaction and logs them as a hypothesis."""
         if self.observing_interaction_for_tile is None:
             return
@@ -1748,9 +1753,8 @@ class AGI3(Agent):
         effect_objects = self._find_and_describe_objects(interaction_effects_pixels, latest_grid)
 
         # 4. Filter out any objects that are known parts of the agent.
-        if self.last_known_player_obj and self.last_known_player_obj.get('parts'):
-            # Create a set of fingerprints from all parts of the last known agent object.
-            agent_part_fingerprints = {part['fingerprint'] for part in self.last_known_player_obj['parts'] if 'fingerprint' in part}
+        if current_agent_fingerprints:
+            agent_part_fingerprints = current_agent_fingerprints
             
             if agent_part_fingerprints:
                 original_count = len(effect_objects)
@@ -1973,7 +1977,9 @@ class AGI3(Agent):
             # 2. Report the Type (persistence)
             type_desc = "Unknown (aftermath not observed)."
             is_consumable = hypothesis.get('is_consumable')
-            if is_consumable is True:
+            if tile_pos == self.final_tile_of_level:
+                type_desc = "Unknown (Level Ended Before Aftermath Observed)."
+            elif is_consumable is True:
                 type_desc = "Consumable (disappears after use)."
             elif is_consumable is False:
                 type_desc = "Persistent (remains after use)."
