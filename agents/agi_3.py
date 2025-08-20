@@ -767,6 +767,27 @@ class AGI3(Agent):
                     print("-> No mysterious objects to test. All interactables have an observed effect.")
             # --- End of Priority 2 Logic ---
 
+            else:
+                # --- PRIORITY 3: Use known tools to create a pattern ---
+                print("🎯 Activating PRIORITY 3: No patterns active. Seeking interactables with a known function.")
+
+                interactables_with_known_function = []
+                all_confirmed_interactables = [pos for pos, type in self.tile_map.items() if type == CellType.CONFIRMED_INTERACTABLE]
+
+                for tile_pos in all_confirmed_interactables:
+                    signature = f"tile_pos_{tile_pos}"
+                    hypothesis = self.interaction_hypotheses.get(signature)
+                    # "Known function" means a hypothesis exists and it recorded some kind of effect.
+                    if hypothesis and (hypothesis.get('immediate_effect') or hypothesis.get('aftermath_effect')):
+                        interactables_with_known_function.append(tile_pos)
+                
+                if interactables_with_known_function:
+                    print(f"-> Found {len(interactables_with_known_function)} interactable(s) with known functions to test.")
+                    potential_targets = interactables_with_known_function
+                else:
+                    print("-> No interactable objects with known functions found.")
+            # --- End of Priority 3 Logic ---
+
             # If we still have no targets after P1 and P2, then exploration is complete for now.
             if not potential_targets:
                 if not self.has_summarized_interactions and not self.awaiting_final_summary:
