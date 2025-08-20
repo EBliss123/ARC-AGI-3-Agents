@@ -720,8 +720,25 @@ class AGI3(Agent):
                     refined_tile_map[tile_coords] = CellType.WALL
 
         self.tile_map = refined_tile_map
-        counts = Counter(self.tile_map.values())
-        print(f"🗺️ Refined Map ({len(self.tile_map)} tiles): {counts[CellType.FLOOR]} floor, {counts[CellType.WALL]} wall, {counts.get(CellType.POTENTIALLY_INTERACTABLE, 0)} potentially interactable, {counts.get(CellType.CONFIRMED_INTERACTABLE, 0)} interactable.")
+
+        # Calculate the "display area" which includes reachable tiles and their immediate neighbors.
+        display_area = set(self.reachable_floor_area)
+        for r_tile, c_tile in self.reachable_floor_area:
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
+                neighbor = (r_tile + dr, c_tile + dc)
+                if neighbor in self.tile_map:
+                    display_area.add(neighbor)
+
+        # Filter the map to only count tiles within this specific display area.
+        display_tile_types = [self.tile_map[tile] for tile in display_area if tile in self.tile_map]
+
+        # Count the cell types from the filtered list.
+        counts = Counter(display_tile_types)
+
+        # The total count in the log will now match the area shown on the debug map.
+        total_display_tiles = len(display_area)
+
+        print(f"🗺️ Refined Map ({total_display_tiles} visible tiles): {counts[CellType.FLOOR]} floor, {counts[CellType.WALL]} wall, {counts.get(CellType.POTENTIALLY_INTERACTABLE, 0)} potentially interactable, {counts.get(CellType.CONFIRMED_INTERACTABLE, 0)} interactable.")
     
     def _find_target_and_plan(self) -> bool:
         """
@@ -818,7 +835,10 @@ class AGI3(Agent):
 
         if not reachable_targets:
             print("🧐 All interactable targets are currently unreachable.")
-            return False
+            potential_targets = []
+
+            if not reachable_targets:
+                return False # If we still have no reachable targets after all checks, now we can exit.
 
         # 3. From the list of reachable targets, select the one with the shortest path.
         best_target = min(reachable_targets, key=lambda t: len(t['path']))
