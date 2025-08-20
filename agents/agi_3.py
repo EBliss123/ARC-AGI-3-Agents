@@ -227,8 +227,9 @@ class AGI3(Agent):
         self._reset_for_new_attempt()
 
         # Additionally, reset knowledge that is strictly tied to a level's design.
-        print("🧹 Wiping interaction hypotheses for the new level.")
+        print("🧹 Wiping interaction hypotheses and active patterns for the new level.")
         self.interaction_hypotheses.clear()
+        self.active_patterns.clear()
         self.has_summarized_interactions = False
 
         # Since the world model is preserved, we can skip discovery.
