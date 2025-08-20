@@ -1533,7 +1533,7 @@ class AGI3(Agent):
                     reconstructed_parts = [anchor_part]
                     
                     # Create a copy of unmatched objects to search through.
-                    search_pool = list(unmatched_current)
+                    search_pool = [obj for obj in current_objects if obj is not anchor_part]
                     if anchor_part in search_pool:
                         search_pool.remove(anchor_part)
 
