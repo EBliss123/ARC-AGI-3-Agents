@@ -1424,6 +1424,71 @@ class AGI3(Agent):
 
                     break # Agent's move found, no need to check other moves.
 
+            # --- NEW: Enhanced Fuzzy Matching with Full Body Reconstruction ---
+            if not moved_agent_obj and self.last_known_player_obj:
+                log_messages.append("⚠️ Agent signature not found. Re-acquiring by proximity and direction...")
+                last_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
+                expected_vector = self.world_model.get('action_map', {}).get(self.last_action, {}).get('move_vector')
+
+                best_candidate_move = None
+                min_distance = float('inf')
+                
+                # Find the single best "anchor" part of the agent.
+                for move in true_moves:
+                    if expected_vector:
+                        move_vector = move['vector']
+                        dot_product = (expected_vector[0] * move_vector[0]) + (expected_vector[1] * move_vector[1])
+                        if dot_product <= 0: continue
+
+                    last_obj_pos = None
+                    if move['type'] == 'individual':
+                        last_obj_pos = (move['last_obj']['top_row'], move['last_obj']['left_index'])
+                    elif move['type'] == 'composite':
+                        min_row = min(p[1]['top_row'] for p in move['parts'])
+                        min_col = min(p[1]['left_index'] for p in move['parts'])
+                        last_obj_pos = (min_row, min_col)
+                    
+                    if last_obj_pos:
+                        distance = math.sqrt((last_pos[0] - last_obj_pos[0])**2 + (last_pos[1] - last_obj_pos[1])**2)
+                        if distance < min_distance:
+                            min_distance = distance
+                            best_candidate_move = move
+                
+                threshold = self.tile_size * 2.5 if self.tile_size else 24
+                if best_candidate_move and min_distance < threshold:
+                    log_messages.append(f"✅ Agent Re-acquired: Found anchor part with signature {best_candidate_move['signature']} by proximity (distance: {min_distance:.2f}).")
+                    
+                    # --- Full Body Reconstruction ---
+                    # Now that we have an anchor, find all adjacent, untracked objects to rebuild the full agent.
+                    anchor_part = best_candidate_move['curr_obj']
+                    reconstructed_parts = [anchor_part]
+                    
+                    # Create a copy of unmatched objects to search through.
+                    search_pool = list(unmatched_current)
+                    if anchor_part in search_pool:
+                        search_pool.remove(anchor_part)
+
+                    cluster_q = [anchor_part]
+                    while cluster_q:
+                        current_part = cluster_q.pop(0)
+                        for other_part in list(search_pool):
+                            if self._are_objects_adjacent(current_part, other_part):
+                                reconstructed_parts.append(other_part)
+                                search_pool.remove(other_part)
+                                cluster_q.append(other_part)
+                    
+                    log_messages.append(f"✅ Reconstructed agent with {len(reconstructed_parts)} parts.")
+
+                    # Build the final agent object from all the reconstructed parts.
+                    min_row = min(p['top_row'] for p in reconstructed_parts)
+                    max_row = max(p['top_row'] + p['height'] for p in reconstructed_parts)
+                    min_col = min(p['left_index'] for p in reconstructed_parts)
+                    max_col = max(p['left_index'] + p['width'] for p in reconstructed_parts)
+                    moved_agent_obj = {
+                        'height': max_row - min_row, 'width': max_col - min_col,
+                        'top_row': min_row, 'left_index': min_col, 'parts': reconstructed_parts
+                    }
+
         agent_part_fingerprints = set()
         if moved_agent_obj and moved_agent_obj.get('parts'):
             agent_part_fingerprints = {part['fingerprint'] for part in moved_agent_obj['parts'] if 'fingerprint' in part}
