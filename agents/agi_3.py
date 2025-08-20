@@ -77,7 +77,7 @@ class AGI3(Agent):
         self.wait_action = GameAction.ACTION6 # Use a secondary action for waiting
 
         # --- Goal State Tracking ---
-        self.current_goal_state = None
+        self.active_patterns = [] # Stores a list of currently active patterns on the grid.
 
         # --- Object & Shape Tracking ---
         self.observed_object_shapes = {} # Maps shape tuple -> count
@@ -489,8 +489,16 @@ class AGI3(Agent):
 
             # 4. Check for goal patterns on the REMAINING non-agent objects.
             if non_agent_objects:
-                self._check_for_goal_match(non_agent_objects, latest_frame.frame)
-
+                self._find_and_update_patterns(non_agent_objects, latest_frame.frame)
+            if self.active_patterns:
+                print(f"--- {len(self.active_patterns)} Active Pattern(s) on Grid ---")
+                for i, pattern in enumerate(self.active_patterns):
+                    dk = pattern['dynamic_key']
+                    sk = pattern['static_key']
+                    dk_tile = (dk['top_row'] // self.tile_size, dk['left_index'] // self.tile_size) if self.tile_size else (dk['top_row'], dk['left_index'])
+                    sk_tile = (sk['top_row'] // self.tile_size, sk['left_index'] // self.tile_size) if self.tile_size else (sk['top_row'], sk['left_index'])
+                    print(f"  - Pattern {i+1}: Dynamic object at {dk_tile} matches static object at {sk_tile}.")
+           
             # 5. Update memory for the next turn.
             self.last_known_objects = current_objects
 
@@ -1805,74 +1813,52 @@ class AGI3(Agent):
             if object_signature in self.interaction_hypotheses:
                 self.interaction_hypotheses[object_signature]['is_consumable'] = False
 
-    def _check_for_goal_match(self, dynamic_objects: list, current_grid: list):
+    def _find_and_update_patterns(self, dynamic_objects: list, current_grid: list):
         """
-        Scans the grid for goal patterns by comparing dynamic (recently changed) objects
-        against all static objects. This is separate from learning an action's function.
+        Scans for patterns by matching dynamic objects to static ones and updates the
+        agent's list of currently active patterns.
         """
-        # Reset the goal state at the beginning of each check.
-        self.current_goal_state = None
-
         if not dynamic_objects or not current_grid:
             return
 
-        print(f"🔬 Checking for goal patterns based on {len(dynamic_objects)} new object(s)...")
+        print(f"🔬 Checking for patterns based on {len(dynamic_objects)} new object(s)...")
         grid_data = current_grid[0]
-        match_found = False
 
-        # Iterate through each object that resulted from the interaction (the dynamic keys).
+        # Get fingerprints of patterns already known to be active to avoid adding duplicates.
+        known_pattern_fingerprints = {p['fingerprint'] for p in self.active_patterns}
+
         for dynamic_key_obj in dynamic_objects:
             dk_fingerprint = dynamic_key_obj.get('fingerprint')
             dk_color = dynamic_key_obj.get('color')
-            if dk_fingerprint is None or dk_color is None:
-                continue
+            if dk_fingerprint is None or dk_color is None: continue
 
-            dk_size = (dynamic_key_obj['height'], dynamic_key_obj['width'])
-            dk_pos = (dynamic_key_obj['top_row'], dynamic_key_obj['left_index'])
-            print(f"-> Analyzing dynamic key: A {dk_size[0]}x{dk_size[1]} object of color {dk_color} at pixel {dk_pos}.")
-
-            # Find all static objects on the grid that have the same primary color.
             static_candidates = self._find_static_candidates_by_color(dk_color, grid_data)
+            if not static_candidates: continue
 
-            if not static_candidates:
-                print(f"-> No static objects of color {dk_color} found on the grid.")
-                continue
-
-            print(f"-> Found {len(static_candidates)} static candidate(s) with matching color.")
-            # Now, compare the dynamic key against just these relevant candidates.
             for static_obj in static_candidates:
-                sk_fingerprint = static_obj.get('fingerprint')
-
-                dk_norm_map = dynamic_key_obj.get('normalized_map')
-                sk_norm_map = static_obj.get('normalized_map')
-
-                if dk_fingerprint == sk_fingerprint:
+                if dk_fingerprint == static_obj.get('fingerprint'):
+                    dk_size = (dynamic_key_obj['height'], dynamic_key_obj['width'])
+                    dk_pos = (dynamic_key_obj['top_row'], dynamic_key_obj['left_index'])
                     sk_size = (static_obj['height'], static_obj['width'])
                     sk_pos = (static_obj['top_row'], static_obj['left_index'])
-                    
-                    # A true match requires the objects to be different, otherwise it's just finding itself.
-                    if dk_pos == sk_pos and dk_size == sk_size:
-                        continue
-                    
-                    dk_tile_pos = (dk_pos[0] // self.tile_size, dk_pos[1] // self.tile_size) if self.tile_size else dk_pos
-                    sk_tile_pos = (sk_pos[0] // self.tile_size, sk_pos[1] // self.tile_size) if self.tile_size else sk_pos
-                    
-                    print(f"✅ GOAL PATTERN DETECTED: Dynamic key ({dk_size[0]}x{dk_size[1]}) at tile {dk_tile_pos} matches static key ({sk_size[0]}x{sk_size[1]}) at tile {sk_tile_pos}!")
-                    match_found = True
-                    
-                    # Save the details of the goal state to the agent's memory.
-                    self.current_goal_state = {
-                        'dynamic_key': dynamic_key_obj,
-                        'static_key': static_obj
-                    }
 
-                    break
-            
-            if match_found:
-                break
+                    if dk_pos == sk_pos and dk_size == sk_size: continue
 
-        if not match_found:
-            print("-> No matching static key found for any produced dynamic keys.")
+                    # Create a unique ID for this specific pattern instance to avoid duplicates.
+                    pattern_fingerprint = (dk_fingerprint, static_obj.get('fingerprint'), sk_pos)
+
+                    if pattern_fingerprint not in known_pattern_fingerprints:
+                        dk_tile = (dk_pos[0] // self.tile_size, dk_pos[1] // self.tile_size) if self.tile_size else dk_pos
+                        sk_tile = (sk_pos[0] // self.tile_size, sk_pos[1] // self.tile_size) if self.tile_size else sk_pos
+                        print(f"✅ NEW PATTERN DETECTED: Dynamic key at tile {dk_tile} matches static key at tile {sk_tile}!")
+
+                        new_pattern = {
+                            'dynamic_key': dynamic_key_obj,
+                            'static_key': static_obj,
+                            'fingerprint': pattern_fingerprint
+                        }
+                        self.active_patterns.append(new_pattern)
+                        known_pattern_fingerprints.add(pattern_fingerprint)
 
     def _print_debug_map(self):
         """Prints a human-readable version of the agent's tile_map to the console."""
