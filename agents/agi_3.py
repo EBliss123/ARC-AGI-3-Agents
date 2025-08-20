@@ -581,9 +581,18 @@ class AGI3(Agent):
                         self.last_grid_tuple = grid_tuple
                         return action
                 else:
-                    print("🧐 No more unknown objects to explore. Reverting to random discovery.")
-                    self.exploration_phase = ExplorationPhase.INACTIVE
-                    # Fall through to the default random action state
+                    # If we just finished exploring and queued a summary, we should pause.
+                    # This allows the summary to print and the aftermath of the last action to be processed.
+                    if self.awaiting_final_summary:
+                        print("🧐 Pausing exploration to generate summary and process interaction aftermath.")
+                        self.last_action = self.wait_action
+                        self.last_grid_tuple = grid_tuple
+                        return self.wait_action
+                    else:
+                        # If there are no targets AND a summary isn't pending, exploration is truly done.
+                        print("🧐 No more targets found. Reverting to state graph exploration.")
+                        self.exploration_phase = ExplorationPhase.INACTIVE
+                        # Fall through to the default state graph action state
 
         # --- 3. Choose a New Action to Take ---
         if self.agent_state == AgentState.DISCOVERY:
