@@ -686,12 +686,28 @@ class AGI3(Agent):
                         temp_tile_map[tile_coords] = CellType.FLOOR
                     continue
 
-                sample_color = grid_data[r][c]
-                if sample_color in wall_colors:
-                    temp_tile_map[tile_coords] = CellType.WALL
-                elif sample_color == floor_color:
-                    temp_tile_map[tile_coords] = CellType.FLOOR
+               # Get all unique colors within the tile's bounds
+                tile_pixels = [
+                    grid_data[row][col]
+                    for row in range(r, r + self.tile_size)
+                    for col in range(c, c + self.tile_size)
+                    if 0 <= row < grid_height and 0 <= col < grid_width
+                ]
+                
+                unique_colors = set(tile_pixels)
+
+                # A tile is only one type if all its pixels are that one color.
+                if len(unique_colors) == 1:
+                    single_color = unique_colors.pop()
+                    if single_color == floor_color:
+                        temp_tile_map[tile_coords] = CellType.FLOOR
+                    elif single_color in wall_colors:
+                        temp_tile_map[tile_coords] = CellType.WALL
+                    else:
+                        # It's a uniform tile of an unknown type
+                        temp_tile_map[tile_coords] = CellType.POTENTIALLY_INTERACTABLE
                 else:
+                    # Mixed pixels mean it's definitely something to investigate
                     temp_tile_map[tile_coords] = CellType.POTENTIALLY_INTERACTABLE
         
         self.tile_map.update(temp_tile_map)
@@ -710,14 +726,11 @@ class AGI3(Agent):
                 continue
             is_adjacent_to_floor = any((tile_coords[0] + dr, tile_coords[1] + dc) in self.reachable_floor_area for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)])
             if is_adjacent_to_floor:
-                if temp_tile_map.get(tile_coords) == CellType.WALL:
-                    refined_tile_map[tile_coords] = CellType.WALL
-                else:
-                    sample_color = grid_data[tile_coords[0] * self.tile_size][tile_coords[1] * self.tile_size]
-                    if sample_color == floor_color:
-                        refined_tile_map[tile_coords] = CellType.FLOOR
-                    else:
-                        refined_tile_map[tile_coords] = CellType.POTENTIALLY_INTERACTABLE
+                # Trust the initial, more thorough classification for adjacent tiles.
+                # This prevents single-pixel errors during refinement.
+                initial_type = temp_tile_map.get(tile_coords)
+                if initial_type is not None:
+                    refined_tile_map[tile_coords] = initial_type
             else:
                 # Preserve the tile's existing type if it's not near the reachable area.
                 # This prevents erasing memory of explored but currently unreachable parts of the map.
@@ -726,11 +739,24 @@ class AGI3(Agent):
 
         for tile_coords, cell_type in list(refined_tile_map.items()):
             if cell_type in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE]:
-                sample_color = grid_data[tile_coords[0] * self.tile_size][tile_coords[1] * self.tile_size]
-                if floor_color and sample_color == floor_color:
+                # --- HYBRID CLEANUP LOGIC ---
+                # 1. Use a robust, full-tile check for Floors.
+                tile_pixels = [
+                    grid_data[row][col]
+                    for row in range(tile_coords[0] * self.tile_size, (tile_coords[0] + 1) * self.tile_size)
+                    for col in range(tile_coords[1] * self.tile_size, (tile_coords[1] + 1) * self.tile_size)
+                    if 0 <= row < grid_height and 0 <= col < grid_width
+                ]
+                unique_colors = set(tile_pixels)
+                is_uniform_floor = (len(unique_colors) == 1 and floor_color in unique_colors)
+
+                if is_uniform_floor:
                     refined_tile_map[tile_coords] = CellType.FLOOR
-                elif wall_colors and sample_color in wall_colors:
-                    refined_tile_map[tile_coords] = CellType.WALL
+                else:
+                    # 2. If not floor, use the original, single-pixel check for Walls.
+                    sample_color = grid_data[tile_coords[0] * self.tile_size][tile_coords[1] * self.tile_size]
+                    if wall_colors and sample_color in wall_colors:
+                        refined_tile_map[tile_coords] = CellType.WALL
 
         self.tile_map = refined_tile_map
 
