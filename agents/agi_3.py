@@ -362,12 +362,23 @@ class AGI3(Agent):
         
         # --- NEW: Check for and analyze the "aftermath" of an interaction ---
         if self.observing_interaction_for_tile is not None:
-            print("-> Stepped away from observed tile. Analyzing aftermath...")
-            self._analyze_consumable_aftermath(latest_frame.frame)
+            # Get the agent's CURRENT tile position to see if it successfully moved.
+            current_player_tile = None
+            if self.last_known_player_obj and self.tile_size:
+                current_player_tile = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
 
-            # End the full observation cycle and return to normal exploration.
-            self.observing_interaction_for_tile = None
-            self.exploration_phase = ExplorationPhase.BUILDING_MAP # Resume normal exploration
+            # If the player is still on the tile we're observing, their move failed.
+            if current_player_tile == self.observing_interaction_for_tile:
+                print(f"-> Aftermath check for tile {self.observing_interaction_for_tile} paused: Agent's move failed.")
+                # We do nothing else; the flag remains, and we'll re-check after the next move attempt.
+            else:
+                # The agent has successfully moved away. Now we can analyze the aftermath.
+                print("-> Stepped away from observed tile. Analyzing aftermath...")
+                self._analyze_consumable_aftermath(latest_frame.frame)
+
+                # End the full observation cycle and return to normal exploration.
+                self.observing_interaction_for_tile = None
+                self.exploration_phase = ExplorationPhase.BUILDING_MAP # Resume normal exploration
             
 
         # --- Trigger queued summary AFTER aftermath is processed ---
