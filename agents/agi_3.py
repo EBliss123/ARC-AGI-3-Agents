@@ -774,12 +774,17 @@ class AGI3(Agent):
 
         refined_tile_map = {}
         for tile_coords in self.tile_map.keys():
-            if tile_coords in confirmed_interactables:
-                refined_tile_map[tile_coords] = CellType.CONFIRMED_INTERACTABLE
+            # --- FIX: Preserve any tile that has a known function ---
+            # This prevents the refinement logic below from overwriting this knowledge.
+            existing_type = self.tile_map.get(tile_coords)
+            if existing_type in [CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE]:
+                refined_tile_map[tile_coords] = existing_type
                 continue
+
             if tile_coords in self.reachable_floor_area:
                 refined_tile_map[tile_coords] = CellType.FLOOR
                 continue
+
             is_adjacent_to_floor = any((tile_coords[0] + dr, tile_coords[1] + dc) in self.reachable_floor_area for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)])
             if is_adjacent_to_floor:
                 # Trust the initial, more thorough classification for adjacent tiles.
@@ -1021,10 +1026,9 @@ class AGI3(Agent):
 
         # The player might be on an interactable tile, which is also a valid starting point.
         start_tile_type = self.tile_map.get(start_tile)
-        if start_tile_type not in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE]:
-            print(f"⚠️ Player starting tile {start_tile} is not on a known FLOOR or INTERACTABLE. Aborting flood fill.")
+        if start_tile_type not in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE]:
+            print(f"⚠️ Player starting tile {start_tile} is not on a known FLOOR, INTERACTABLE, or RESOURCE. Aborting flood fill.")
             return set()
-
         # 2. Initialize BFS data structures.
         q = [start_tile]
         visited = {start_tile}
