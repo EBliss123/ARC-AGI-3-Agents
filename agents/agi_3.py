@@ -727,6 +727,14 @@ class AGI3(Agent):
             for c in range(0, grid_width, self.tile_size):
                 tile_coords = (r // self.tile_size, c // self.tile_size)
 
+                # --- NEW: Preserve confirmed knowledge ---
+                # If we already have a confirmed interaction for this tile,
+                # preserve its type and don't re-evaluate it based on color.
+                existing_type = self.tile_map.get(tile_coords)
+                if existing_type in [CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE]:
+                    temp_tile_map[tile_coords] = existing_type
+                    continue
+                
                 if tile_coords == player_tile_coords or tile_coords == self.just_vacated_tile:
                     if self.tile_map.get(tile_coords) == CellType.CONFIRMED_INTERACTABLE:
                         temp_tile_map[tile_coords] = CellType.CONFIRMED_INTERACTABLE
