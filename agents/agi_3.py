@@ -30,6 +30,7 @@ class CellType(Enum):
     POTENTIALLY_INTERACTABLE = 3 # For identified but not fully understood objects
     PLAYER = 4
     CONFIRMED_INTERACTABLE = 5
+    RESOURCE = 6
 
 class ExplorationPhase(Enum):
     """Manages the agent's goal-oriented exploration strategy."""
@@ -72,6 +73,8 @@ class AGI3(Agent):
         self.level_start_score = 0
         self.resource_indicator_candidates = {}
         self.confirmed_resource_indicator = None
+        self.resource_bar_full_state = None
+        self.resource_bar_empty_state = None
         self.RESOURCE_CONFIDENCE_THRESHOLD = 3 # Actions in a row to confirm
         self.level_knowledge_is_learned = False
         self.wait_action = GameAction.ACTION6 # Use a secondary action for waiting
@@ -248,6 +251,10 @@ class AGI3(Agent):
                 print("--- New Level Detected. Storing initial valid frame and score. ---")
                 self.level_start_frame = copy.deepcopy(latest_frame.frame)
                 self.level_start_score = latest_frame.score
+                if self.confirmed_resource_indicator:
+                    indicator_row_index = self.confirmed_resource_indicator['row_index']
+                    self.resource_bar_full_state = copy.deepcopy(latest_frame.frame[0][indicator_row_index])
+                    print(f"-> Captured the 'full' state of the resource bar at row {indicator_row_index}.")
             else:
                 # If the frame is blank, print a message but do nothing else.
                 # This allows the normal action-selection logic below to run,
@@ -273,6 +280,10 @@ class AGI3(Agent):
                     return self.wait_action
                 else:
                     print("--- Lost a Life (Score did not increase). Analyzing reset state... ---")
+                    if self.confirmed_resource_indicator:
+                        indicator_row_index = self.confirmed_resource_indicator['row_index']
+                        self.resource_bar_empty_state = copy.deepcopy(latest_frame.frame[0][indicator_row_index])
+                        print(f"-> Captured the 'empty' state of the resource bar at row {indicator_row_index}.")
                     if self.level_start_frame is not None:
                         print("-> Comparing current grid with the grid from the start of the level...")
 
@@ -455,6 +466,32 @@ class AGI3(Agent):
             if novel_changes_found or known_changes_found:
                 # We pass `structured_changes` here, which contains ALL changes (novel and known).
                 self._update_resource_indicator_tracking(structured_changes, self.last_action)
+
+            # --- NEW: Check for resource refill events ---
+            resource_event = None
+            if self.confirmed_resource_indicator:
+                indicator_row = self.confirmed_resource_indicator['row_index']
+                for change in structured_changes:
+                    if change['row_index'] == indicator_row:
+                        for pixel in change['changes']:
+                            if isinstance(pixel.get('to'), (int, float)) and isinstance(pixel.get('from'), (int, float)):
+                                if pixel['to'] > pixel['from']:
+                                    resource_event = "REFILLED"
+                                    break
+                    if resource_event:
+                        break
+            
+            if resource_event == "REFILLED":
+                print(f"✅ [RESOURCE] Resource bar was refilled!")
+                if self.last_known_player_obj and self.tile_size:
+                    player_tile = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
+                    print(f"-> Agent is on tile {player_tile}. Classifying as a resource.")
+                    self.tile_map[player_tile] = CellType.RESOURCE
+                    # Update interaction hypothesis for this tile
+                    signature = f"tile_pos_{player_tile}"
+                    if signature not in self.interaction_hypotheses:
+                        self.interaction_hypotheses[signature] = {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
+                    self.interaction_hypotheses[signature]['provides_resource'] = True
 
         # --- Object Finding and Tracking ---
         if novel_changes_found:
