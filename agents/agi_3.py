@@ -1682,40 +1682,46 @@ class AGI3(Agent):
         if not blocking_colors:
             return
 
-        # --- 4. If no known walls were hit, proceed with new wall discovery ---
-        wall_candidate_color = blocking_colors.most_common(1)[0][0]
+        # --- 4. Process every color found in the collision area as a potential wall ---
+        for wall_candidate_color in blocking_colors.keys():
+            self.wall_hypothesis[wall_candidate_color] = self.wall_hypothesis.get(wall_candidate_color, 0) + 1
+            confidence = self.wall_hypothesis[wall_candidate_color]
+            wall_name = "Out of Bounds" if wall_candidate_color == -1 else f"Color {wall_candidate_color}"
+            print(f"🧱 Wall Hypothesis: {wall_name} blocked movement (Confidence: {confidence}).")
 
-        self.wall_hypothesis[wall_candidate_color] = self.wall_hypothesis.get(wall_candidate_color, 0) + 1
-        confidence = self.wall_hypothesis[wall_candidate_color]
-        wall_name = "Out of Bounds" if wall_candidate_color == -1 else f"Color {wall_candidate_color}"
-        print(f"🧱 Wall Hypothesis: {wall_name} blocked movement (Confidence: {confidence}).")
+            # --- 5. Confirm Hypothesis if Threshold is Met ---
+            if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
+                # Add the color to the set of confirmed walls.
+                self.world_model['wall_colors'].add(wall_candidate_color)
+                print(f"✅ [WALL] Confirmed: {wall_name} is a wall.")
 
-        # --- 5. Confirm Hypothesis if Threshold is Met ---
-        if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
-            self.world_model['wall_colors'].add(wall_candidate_color)
-            print(f"✅ [WALL] Confirmed: {wall_name} is a wall.")
-
-            # --- New Map Cleanup Logic ---
-            if self.tile_size:
-                reclassified_count = 0
-                # Iterate over a copy of the items because the dictionary size may change.
-                for tile_coords, cell_type in list(self.tile_map.items()):
-                    if cell_type in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE]:
-                        # Get the top-left pixel of the tile to sample its color from the last grid state.
-                        tile_row = tile_coords[0] * self.tile_size
-                        tile_col = tile_coords[1] * self.tile_size
-                        
-                        # Ensure coordinates are within the grid bounds before checking.
-                        if 0 <= tile_row < len(last_grid[0]) and 0 <= tile_col < len(last_grid[0][0]):
-                            tile_color = last_grid[0][tile_row][tile_col]
-                            if tile_color == wall_candidate_color:
+                # --- Map Cleanup Logic ---
+                # This logic now runs for each newly confirmed wall color.
+                if self.tile_size:
+                    reclassified_count = 0
+                    for tile_coords, cell_type in list(self.tile_map.items()):
+                        # We only need to check tiles that are not already walls or floors.
+                        if cell_type not in [CellType.WALL, CellType.FLOOR]:
+                            # Use a full-tile check to see if it's a uniform wall.
+                            tile_row_start, tile_col_start = tile_coords[0] * self.tile_size, tile_coords[1] * self.tile_size
+                            tile_pixels = [
+                                last_grid[0][r][c]
+                                for r in range(tile_row_start, tile_row_start + self.tile_size)
+                                for c in range(tile_col_start, tile_col_start + self.tile_size)
+                                if 0 <= r < grid_height and 0 <= c < grid_width
+                            ]
+                            
+                            # If the tile is made up of only this newly confirmed wall color, reclassify it.
+                            if tile_pixels and all(p == wall_candidate_color for p in tile_pixels):
                                 self.tile_map[tile_coords] = CellType.WALL
                                 reclassified_count += 1
+                    
+                    if reclassified_count > 0:
+                        print(f"🧹 Map Cleanup: Reclassified {reclassified_count} tile(s) as newly confirmed wall ({wall_name}).")
                 
-                if reclassified_count > 0:
-                    print(f"🧹 Map Cleanup: Reclassified {reclassified_count} interactable tile(s) as newly confirmed walls.")
-
-            del self.wall_hypothesis[wall_candidate_color]
+                # Once confirmed, we can remove it from the hypothesis tracker.
+                if wall_candidate_color in self.wall_hypothesis:
+                    del self.wall_hypothesis[wall_candidate_color]
     
     def _update_resource_indicator_tracking(self, structured_changes: list, action: GameAction):
         """Analyzes changes to find a resource indicator, which depletes on any action."""
