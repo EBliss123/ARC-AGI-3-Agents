@@ -467,32 +467,6 @@ class AGI3(Agent):
                 # We pass `structured_changes` here, which contains ALL changes (novel and known).
                 self._update_resource_indicator_tracking(structured_changes, self.last_action)
 
-            # --- NEW: Check for resource refill events ---
-            resource_event = None
-            if self.confirmed_resource_indicator:
-                indicator_row = self.confirmed_resource_indicator['row_index']
-                for change in structured_changes:
-                    if change['row_index'] == indicator_row:
-                        for pixel in change['changes']:
-                            if isinstance(pixel.get('to'), (int, float)) and isinstance(pixel.get('from'), (int, float)):
-                                if pixel['to'] > pixel['from']:
-                                    resource_event = "REFILLED"
-                                    break
-                    if resource_event:
-                        break
-            
-            if resource_event == "REFILLED":
-                print(f"✅ [RESOURCE] Resource bar was refilled!")
-                if self.last_known_player_obj and self.tile_size:
-                    player_tile = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
-                    print(f"-> Agent is on tile {player_tile}. Classifying as a resource.")
-                    self.tile_map[player_tile] = CellType.RESOURCE
-                    # Update interaction hypothesis for this tile
-                    signature = f"tile_pos_{player_tile}"
-                    if signature not in self.interaction_hypotheses:
-                        self.interaction_hypotheses[signature] = {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
-                    self.interaction_hypotheses[signature]['provides_resource'] = True
-
         # --- Object Finding and Tracking ---
         if novel_changes_found:
             # --- Separate UI changes from game-world changes for analysis ---
@@ -546,6 +520,32 @@ class AGI3(Agent):
             # 6. Update the player object's known position for the next turn.
             if moved_agent_this_turn:
                 self.last_known_player_obj = moved_agent_this_turn
+
+                        # --- NEW: Check for resource refill events ---
+            resource_event = None
+            if self.confirmed_resource_indicator:
+                indicator_row = self.confirmed_resource_indicator['row_index']
+                for change in structured_changes:
+                    if change['row_index'] == indicator_row:
+                        for pixel in change['changes']:
+                            if isinstance(pixel.get('to'), (int, float)) and isinstance(pixel.get('from'), (int, float)):
+                                if pixel['to'] > pixel['from']:
+                                    resource_event = "REFILLED"
+                                    break
+                    if resource_event:
+                        break
+            
+            if resource_event == "REFILLED":
+                print(f"✅ [RESOURCE] Resource bar was refilled!")
+                if self.last_known_player_obj and self.tile_size:
+                    player_tile = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
+                    print(f"-> Agent is on tile {player_tile}. Classifying as a resource.")
+                    self.tile_map[player_tile] = CellType.RESOURCE
+                    # Update interaction hypothesis for this tile
+                    signature = f"tile_pos_{player_tile}"
+                    if signature not in self.interaction_hypotheses:
+                        self.interaction_hypotheses[signature] = {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
+                    self.interaction_hypotheses[signature]['provides_resource'] = True
 
         # --- NEW, SIMPLIFIED NEW-LEVEL DETECTION ---
         # If the score has increased at any point, assume it's a new level and reset.
@@ -2136,7 +2136,7 @@ class AGI3(Agent):
         
         interactable_tiles = [
             pos for pos, cell_type in self.tile_map.items() 
-            if cell_type in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE]
+            if cell_type in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE]
         ]
 
         if not interactable_tiles:
@@ -2163,16 +2163,19 @@ class AGI3(Agent):
 
             # 1. Report the learned function/effect
             effect_desc = "No effect observed."
-            immediate_effect_objects = hypothesis.get('immediate_effect', [])
-            if immediate_effect_objects:
-                # Describe the first object from the effect for a concise summary.
-                obj = immediate_effect_objects[0]
-                size = (obj['height'], obj['width'])
-                pos = (obj['top_row'], obj['left_index'])
-                tile_pos_effect = (pos[0] // self.tile_size, pos[1] // self.tile_size) if self.tile_size else pos
-                effect_desc = f"Causes a {size[0]}x{size[1]} object to appear/change at tile {tile_pos_effect}."
-                if len(immediate_effect_objects) > 1:
-                    effect_desc += f" (+{len(immediate_effect_objects) - 1} other effects)."
+            if hypothesis.get('provides_resource'):
+                effect_desc = "Resource (fills resource bar)."
+            else:
+                immediate_effect_objects = hypothesis.get('immediate_effect', [])
+                if immediate_effect_objects:
+                    # Describe the first object from the effect for a concise summary.
+                    obj = immediate_effect_objects[0]
+                    size = (obj['height'], obj['width'])
+                    pos = (obj['top_row'], obj['left_index'])
+                    tile_pos_effect = (pos[0] // self.tile_size, pos[1] // self.tile_size) if self.tile_size else pos
+                    effect_desc = f"Causes a {size[0]}x{size[1]} object to appear/change at tile {tile_pos_effect}."
+                    if len(immediate_effect_objects) > 1:
+                        effect_desc += f" (+{len(immediate_effect_objects) - 1} other effects)."
             
             print(f"  - Function: {effect_desc}")
 
