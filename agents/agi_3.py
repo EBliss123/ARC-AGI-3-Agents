@@ -114,6 +114,7 @@ class AGI3(Agent):
         self.has_summarized_interactions = False
         self.awaiting_final_summary = False
         self.final_tile_of_level = None
+        self.level_goal_hypotheses = []
 
         # --- Generic Action Groups ---
         # Get all possible actions, excluding RESET, to create generic groups.
@@ -526,6 +527,7 @@ class AGI3(Agent):
             # Now that the final interaction is logged, proceed with the reset.
             self.level_start_frame = copy.deepcopy(latest_frame.frame)
             self.level_start_score = latest_frame.score
+            self._summarize_level_goal()
             self._reset_for_new_level()
             return self.wait_action
 
@@ -1950,6 +1952,14 @@ class AGI3(Agent):
         known_pattern_fingerprints = {p['fingerprint'] for p in self.active_patterns}
 
         for dynamic_key_obj in dynamic_objects:
+            # If this object appeared on the tile the agent just left, it's a static
+            # object being revealed, not a true dynamic key. Ignore it for pattern matching.
+            if self.just_vacated_tile and self.tile_size:
+                obj_tile = (dynamic_key_obj['top_row'] // self.tile_size, dynamic_key_obj['left_index'] // self.tile_size)
+                if obj_tile == self.just_vacated_tile:
+                    print(f"🕵️‍♀️ Ignoring pattern check for object at {obj_tile} (revealed by agent movement).")
+                    continue
+
             # --- NEW: Explicitly ignore objects on the resource indicator row ---
             if self.confirmed_resource_indicator:
                 indicator_row = self.confirmed_resource_indicator['row_index']
@@ -2109,3 +2119,43 @@ class AGI3(Agent):
         
         print("-----------------------------------------\n")
         self.has_summarized_interactions = True
+
+    def _summarize_level_goal(self):
+        """Analyzes and stores the state of the game at the moment a level is won."""
+        print("\n--- 🎯 Post-Level Goal Hypothesis ---")
+
+        goal_hypothesis = {
+            'goal_tile_interaction': None,
+            'active_patterns_at_win': None
+        }
+
+        # 1. Capture the final, winning interaction.
+        goal_tile = None
+        if self.last_known_player_obj and self.tile_size:
+            goal_tile = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
+            signature = f"tile_pos_{goal_tile}"
+            interaction_summary = self.interaction_hypotheses.get(signature)
+            goal_hypothesis['goal_tile_interaction'] = interaction_summary
+
+            print(f"Final Interaction: Stepped on tile {goal_tile}.")
+            if not interaction_summary:
+                print("  -> Note: No specific interaction effect was recorded for this tile.")
+
+        # 2. Capture any active patterns on the grid.
+        if self.active_patterns:
+            goal_hypothesis['active_patterns_at_win'] = copy.deepcopy(self.active_patterns)
+            print(f"Active Pattern at Win-Time:")
+            for i, pattern in enumerate(self.active_patterns):
+                dk = pattern['dynamic_key']
+                sk = pattern['static_key']
+                dk_tile = (dk['top_row'] // self.tile_size, dk['left_index'] // self.tile_size)
+                sk_tile = (sk['top_row'] // self.tile_size, sk['left_index'] // self.tile_size)
+                print(f"  - Pattern {i+1}: Dynamic object at {dk_tile} matched Static object at {sk_tile}.")
+                # Future: Could print more detailed characteristics here.
+        else:
+            print("No active patterns were present at the end of the level.")
+
+        # 3. Store the hypothesis for future learning.
+        self.level_goal_hypotheses.append(goal_hypothesis)
+        print(f"Hypothesis stored. Total goal hypotheses: {len(self.level_goal_hypotheses)}")
+        print("-------------------------------------\n")
