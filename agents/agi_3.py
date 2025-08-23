@@ -2193,6 +2193,7 @@ class AGI3(Agent):
         interactable_tiles = [
             pos for pos, cell_type in self.tile_map.items() 
             if cell_type in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE]
+            and pos in self.reachable_floor_area
         ]
 
         if not interactable_tiles:
