@@ -767,7 +767,6 @@ class AGI3(Agent):
                     temp_tile_map[tile_coords] = CellType.POTENTIALLY_INTERACTABLE
         
         self.tile_map.update(temp_tile_map)
-        self.reachable_floor_area = self._find_reachable_floor_tiles()
 
         if not self.reachable_floor_area:
             print("🗺️ No reachable area found. Map will not be refined.")
@@ -817,24 +816,31 @@ class AGI3(Agent):
 
         self.tile_map = refined_tile_map
 
-        # Calculate the "display area" which includes reachable tiles and their immediate neighbors.
-        display_area = set(self.reachable_floor_area)
-        for r_tile, c_tile in self.reachable_floor_area:
-            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
-                neighbor = (r_tile + dr, c_tile + dc)
-                if neighbor in self.tile_map:
-                    display_area.add(neighbor)
+        self.reachable_floor_area = self._find_reachable_floor_tiles()
 
-        # Filter the map to only count tiles within this specific display area.
-        display_tile_types = [self.tile_map[tile] for tile in display_area if tile in self.tile_map]
+        # For the log, summarize the composition of the *reachable* area for consistency.
+        reachable_tile_types = [self.tile_map[tile] for tile in self.reachable_floor_area if tile in self.tile_map]
+        counts = Counter(reachable_tile_types)
+        total_reachable_tiles = len(self.reachable_floor_area)
 
-        # Count the cell types from the filtered list.
-        counts = Counter(display_tile_types)
-
-        # The total count in the log will now match the area shown on the debug map.
-        total_display_tiles = len(display_area)
-
-        print(f"🗺️ Refined Map ({total_display_tiles} visible tiles): {counts[CellType.FLOOR]} floor, {counts[CellType.WALL]} wall, {counts.get(CellType.POTENTIALLY_INTERACTABLE, 0)} potentially interactable, {counts.get(CellType.CONFIRMED_INTERACTABLE, 0)} interactable.")
+        # Build a dynamic string for the counts to avoid printing zero-count categories.
+        counts_parts = []
+        if counts[CellType.FLOOR]:
+            counts_parts.append(f"{counts[CellType.FLOOR]} floor")
+        if counts[CellType.POTENTIALLY_INTERACTABLE]:
+            counts_parts.append(f"{counts[CellType.POTENTIALLY_INTERACTABLE]} potential")
+        if counts[CellType.CONFIRMED_INTERACTABLE]:
+            counts_parts.append(f"{counts[CellType.CONFIRMED_INTERACTABLE]} interactable")
+        if counts[CellType.RESOURCE]:
+            counts_parts.append(f"{counts[CellType.RESOURCE]} resource")
+        # Note: Walls should not be in the reachable area, but include as a safety check.
+        if counts[CellType.WALL]:
+            counts_parts.append(f"{counts[CellType.WALL]} wall")
+            
+        counts_str = ", ".join(counts_parts)
+        
+        # This new print statement is for our test.
+        print(f"✅ TEST LOG ({total_reachable_tiles} reachable tiles): {counts_str}.")
     
     def _find_target_and_plan(self) -> bool:
         """
