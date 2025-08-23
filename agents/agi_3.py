@@ -73,11 +73,16 @@ class AGI3(Agent):
         self.level_start_score = 0
         self.resource_indicator_candidates = {}
         self.confirmed_resource_indicator = None
-        self.resource_bar_full_state = None
-        self.resource_bar_empty_state = None
         self.RESOURCE_CONFIDENCE_THRESHOLD = 3 # Actions in a row to confirm
         self.level_knowledge_is_learned = False
         self.wait_action = GameAction.ACTION6 # Use a secondary action for waiting
+
+        # --- NEW: Detailed Resource Tracking ---
+        self.resource_bar_map = {} # Maps bar state tuple -> moves remaining
+        self.resource_bar_history = [] # Records bar states during a single life
+        self.moves_remaining = None # Exact number of moves left
+        self.resource_bar_full_state = None
+        self.resource_bar_empty_state = None
 
         # --- Goal State Tracking ---
         self.active_patterns = [] # Stores a list of currently active patterns on the grid.
@@ -244,6 +249,26 @@ class AGI3(Agent):
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
+        # --- NEW: Record Resource Bar State & Update Moves Remaining ---
+        if self.confirmed_resource_indicator and latest_frame.frame:
+            indicator_row = self.confirmed_resource_indicator['row_index']
+            # Safety check to ensure the indicator row is valid for the current frame
+            if 0 <= indicator_row < len(latest_frame.frame[0]):
+                current_bar_state = tuple(latest_frame.frame[0][indicator_row])
+                
+                # 1. Update the number of moves remaining for this turn using our map.
+                if current_bar_state in self.resource_bar_map:
+                    self.moves_remaining = self.resource_bar_map[current_bar_state]
+                    # This print can be removed later, but is useful for debugging.
+                    print(f"📊 Moves Remaining: {self.moves_remaining}")
+                else:
+                    # We don't have calibrated data for this state yet.
+                    self.moves_remaining = None 
+                
+                # 2. Record the current state for future calibration, but only if an action was taken.
+                if self.last_action is not None and self.last_action is not self.wait_action:
+                    self.resource_bar_history.append(current_bar_state)
+
         # --- 1. Store initial level state if not already set ---
         if self.level_start_frame is None:
             # Only store the initial frame if it actually contains data.
@@ -280,6 +305,11 @@ class AGI3(Agent):
                     return self.wait_action
                 else:
                     print("--- Lost a Life (Score did not increase). Analyzing reset state... ---")
+
+                    # --- CALIBRATION TRIGGER ---
+                    # Before doing anything else, analyze the history from the life we just lost.
+                    self._calibrate_resource_bar()
+                    
                     if self.confirmed_resource_indicator:
                         indicator_row_index = self.confirmed_resource_indicator['row_index']
                         self.resource_bar_empty_state = copy.deepcopy(latest_frame.frame[0][indicator_row_index])
@@ -945,6 +975,11 @@ class AGI3(Agent):
                 
             path = self._find_path_to_target(player_tile_pos, target_pos)
             if path:
+                # --- NEW: Check if the path is affordable ---
+                if self.moves_remaining is not None and len(path) > self.moves_remaining:
+                    print(f"-> Target {target_pos} is too far ({len(path)} moves required, {self.moves_remaining} available).")
+                    continue # Skip this target; we can't afford the trip.
+
                 reachable_targets.append({'pos': target_pos, 'path': path})
 
         if not reachable_targets:
@@ -2186,6 +2221,30 @@ class AGI3(Agent):
             print(row_str)
         print("--- Key: P=Player, T=Target, .=Floor, #=Wall, ?=Potential, !=Confirmed ---\n")
 
+    def _calibrate_resource_bar(self):
+        """Analyzes the history of the resource bar to map states to move counts."""
+        if not self.resource_bar_history:
+            print("📊 Cannot calibrate resource bar: History is empty.")
+            return
+
+        total_moves = len(self.resource_bar_history)
+        print(f"📊 Calibrating resource bar based on {total_moves} moves from the last life.")
+
+        newly_calibrated_points = 0
+        # Iterate through the history to map each bar state to the moves that were remaining.
+        for i, bar_state in enumerate(self.resource_bar_history):
+            moves_remaining = total_moves - i
+            # Only add to the map if we haven't learned this exact state before.
+            if bar_state not in self.resource_bar_map:
+                self.resource_bar_map[bar_state] = moves_remaining
+                newly_calibrated_points += 1
+        
+        if newly_calibrated_points > 0:
+            print(f"-> Learned {newly_calibrated_points} new data points. Map now has {len(self.resource_bar_map)} entries.")
+        
+        # Clear the history for the next life.
+        self.resource_bar_history.clear()
+    
     def _review_and_summarize_interactions(self):
         """Reviews all interactable tiles and summarizes their learned properties."""
         print("\n--- 🧠 Interaction Knowledge Summary 🧠 ---")
