@@ -781,12 +781,8 @@ class AGI3(Agent):
                 refined_tile_map[tile_coords] = existing_type
                 continue
 
-            if tile_coords in self.reachable_floor_area:
-                refined_tile_map[tile_coords] = CellType.FLOOR
-                continue
-
-            is_adjacent_to_floor = any((tile_coords[0] + dr, tile_coords[1] + dc) in self.reachable_floor_area for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)])
-            if is_adjacent_to_floor:
+            is_in_or_adjacent_to_reachable = tile_coords in self.reachable_floor_area or any((tile_coords[0] + dr, tile_coords[1] + dc) in self.reachable_floor_area for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)])
+            if is_in_or_adjacent_to_reachable:
                 # Trust the initial, more thorough classification for adjacent tiles.
                 # This prevents single-pixel errors during refinement.
                 initial_type = temp_tile_map.get(tile_coords)
@@ -1042,7 +1038,7 @@ class AGI3(Agent):
                 neighbor_tile = (current_tile[0] + dr, current_tile[1] + dc)
 
                 # We can only traverse through tiles classified as FLOOR.
-                if self.tile_map.get(neighbor_tile) == CellType.FLOOR and neighbor_tile not in visited:
+                if self.tile_map.get(neighbor_tile) in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE] and neighbor_tile not in visited:
                     visited.add(neighbor_tile)
                     q.append(neighbor_tile)
         
@@ -1906,6 +1902,9 @@ class AGI3(Agent):
         
         # Now, find all the actual pixels for the object
         object_pixels = set()
+
+
+
         for r_tile, c_tile in object_tiles:
             for r_pixel in range(r_tile * self.tile_size, (r_tile + 1) * self.tile_size):
                 for c_pixel in range(c_tile * self.tile_size, (c_tile + 1) * self.tile_size):
