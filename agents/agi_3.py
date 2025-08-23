@@ -1211,15 +1211,43 @@ class AGI3(Agent):
         if not structured_changes:
             return []
 
-        # 1. Group all changed points by their new color
-        points_by_color = {}
+        # 1. Group points by object color, handling both additions and removals.
+        floor_color = self.world_model.get('floor_color')
+        wall_colors = self.world_model.get('wall_colors', set())
+        background_colors = {floor_color} | wall_colors
+        background_colors.discard(None)
+
+        points_by_color = {} # This is the dictionary the original function expects.
+        grid = latest_frame[0]
+        grid_height = len(grid)
+        grid_width = len(grid[0]) if grid_height > 0 else 0
+
         for change in structured_changes:
-            row_idx = change['row_index']
-            for pixel_change in change['changes']:
-                new_color = latest_frame[0][row_idx][pixel_change['index']]
-                if new_color not in points_by_color:
-                    points_by_color[new_color] = set()
-                points_by_color[new_color].add((row_idx, pixel_change['index']))
+            r = change['row_index']
+            for px_change in change['changes']:
+                c = px_change['index']
+                from_color = px_change['from']
+                to_color = px_change['to']
+                coord = (r, c)
+
+                # Case 1: A new object color appears. The changed pixel itself is the seed.
+                if to_color not in background_colors:
+                    if to_color not in points_by_color:
+                        points_by_color[to_color] = set()
+                    points_by_color[to_color].add(coord)
+
+                # Case 2: An old object color disappears. Seeds must be neighbors
+                # that are still the original color.
+                if from_color not in background_colors and to_color in background_colors:
+                    for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                        neighbor = (r + dr, c + dc)
+                        if not (0 <= neighbor[0] < grid_height and 0 <= neighbor[1] < grid_width):
+                            continue
+                        
+                        if grid[neighbor[0]][neighbor[1]] == from_color:
+                            if from_color not in points_by_color:
+                                points_by_color[from_color] = set()
+                            points_by_color[from_color].add(neighbor)
 
         # 2. Run a more comprehensive flood-fill starting from each changed pixel
         #    to find the full extent of each object, including its static parts.
