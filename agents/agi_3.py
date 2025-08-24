@@ -211,7 +211,8 @@ class AGI3(Agent):
         self.exploration_plan = []
         self.exploration_target = None
         self.observing_interaction_for_tile = None
-        
+        self.active_patterns.clear()
+
         # --- Reset Agent's Action State ---
         if self.level_knowledge_is_learned:
             self.agent_state = AgentState.RANDOM_ACTION
