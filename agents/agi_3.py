@@ -126,6 +126,7 @@ class AGI3(Agent):
         self.awaiting_final_summary = False
         self.final_tile_of_level = None
         self.level_goal_hypotheses = []
+        self.consumed_tiles_this_life = set()
 
         # --- Generic Action Groups ---
         # Get all possible actions, excluding RESET, to create generic groups.
@@ -213,6 +214,7 @@ class AGI3(Agent):
         self.exploration_target = None
         self.observing_interaction_for_tile = None
         self.active_patterns.clear()
+        self.consumed_tiles_this_life.clear()
 
         # --- Reset Agent's Action State ---
         if self.level_knowledge_is_learned:
@@ -921,6 +923,8 @@ class AGI3(Agent):
                 all_confirmed_interactables = [pos for pos, type in self.tile_map.items() if type == CellType.CONFIRMED_INTERACTABLE]
 
                 for tile_pos in all_confirmed_interactables:
+                    if tile_pos in self.consumed_tiles_this_life:
+                        continue
                     signature = f"tile_pos_{tile_pos}"
                     hypothesis = self.interaction_hypotheses.get(signature)
                     # "No effect observed" means a hypothesis exists, but it recorded no effects.
@@ -943,6 +947,8 @@ class AGI3(Agent):
                 all_confirmed_interactables = [pos for pos, type in self.tile_map.items() if type == CellType.CONFIRMED_INTERACTABLE]
 
                 for tile_pos in all_confirmed_interactables:
+                    if tile_pos in self.consumed_tiles_this_life:
+                        continue
                     signature = f"tile_pos_{tile_pos}"
                     hypothesis = self.interaction_hypotheses.get(signature)
                     # "Known function" means a hypothesis exists and it recorded some kind of effect.
@@ -1009,7 +1015,7 @@ class AGI3(Agent):
 
     def _find_nearest_resource(self, player_tile_pos: tuple) -> dict | None:
         """Finds the closest reachable resource tile."""
-        resource_tiles = [pos for pos, type in self.tile_map.items() if type == CellType.RESOURCE]
+        resource_tiles = [pos for pos, type in self.tile_map.items() if type == CellType.RESOURCE and pos not in self.consumed_tiles_this_life]
         if not resource_tiles:
             return None
 
@@ -2143,6 +2149,7 @@ class AGI3(Agent):
             print(f"✅ Aftermath: Object at tile {interacted_tile} was consumed (turned to floor).")
             if object_signature in self.interaction_hypotheses:
                 self.interaction_hypotheses[object_signature]['is_consumable'] = True
+            self.consumed_tiles_this_life.add(interacted_tile)
         else:
             print(f"🔄 Aftermath: Object at tile {interacted_tile} is persistent (did not turn to floor).")
             if object_signature in self.interaction_hypotheses:
