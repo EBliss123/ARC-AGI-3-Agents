@@ -980,6 +980,22 @@ class AGI3(Agent):
         # 3. From the list of reachable targets, select the one with the shortest path.
         best_target = min(reachable_targets, key=lambda t: len(t['path']))
         
+        # --- NEW: Resource Safety Check ---
+        # Before committing to the plan, check if we need to get resources first.
+        nearest_resource_info = self._find_nearest_resource(player_tile_pos)
+        if nearest_resource_info:
+            distance_to_resource = len(nearest_resource_info['path'])
+            # Add a small safety buffer. If current moves are just enough to get there (or less),
+            # the agent must prioritize survival.
+            safety_buffer = 1
+            if self.current_moves <= distance_to_resource + safety_buffer:
+                print(f"⚠️ Low on moves ({self.current_moves})! Resource is {distance_to_resource} steps away. Prioritizing survival.")
+                # Override the original plan with the resource-gathering plan.
+                best_target = nearest_resource_info
+            else:
+                print(f"-> Moves ({self.current_moves}) sufficient. Nearest resource is {distance_to_resource} steps away.")
+        # --- End of Safety Check ---
+
         # 4. Set the exploration plan based on the best target found.
         self.exploration_target = (best_target['pos'][0] * self.tile_size, best_target['pos'][1] * self.tile_size)
         self.exploration_plan = best_target['path']
@@ -990,6 +1006,24 @@ class AGI3(Agent):
         self._print_debug_map()
 
         return True
+
+    def _find_nearest_resource(self, player_tile_pos: tuple) -> dict | None:
+        """Finds the closest reachable resource tile."""
+        resource_tiles = [pos for pos, type in self.tile_map.items() if type == CellType.RESOURCE]
+        if not resource_tiles:
+            return None
+
+        reachable_resources = []
+        for resource_pos in resource_tiles:
+            path = self._find_path_to_target(player_tile_pos, resource_pos)
+            if path:
+                reachable_resources.append({'pos': resource_pos, 'path': path})
+
+        if not reachable_resources:
+            return None
+
+        # Return the resource with the shortest path
+        return min(reachable_resources, key=lambda r: len(r['path']))
 
     def _find_path_to_target(self, start_tile: tuple, target_tile: tuple) -> list:
         """
