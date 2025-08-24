@@ -2,6 +2,7 @@
 import random
 import copy
 import math
+import heapq
 from enum import Enum
 from .agent import Agent
 from .structs import FrameData, GameAction, GameState
@@ -992,48 +993,77 @@ class AGI3(Agent):
 
     def _find_path_to_target(self, start_tile: tuple, target_tile: tuple) -> list:
         """
-        Finds the shortest sequence of actions to reach a target using the learned action model.
+        Finds the shortest, resource-aware path to a target using the A* algorithm.
+        This path considers the agent's current moves and potential resource pickups.
         """
-        # 1. Build a fresh map from TILE vectors to actions at the start of every call.
-        # This ensures we always use the latest learned movement abilities.
+        # 1. Build a fresh map from TILE vectors to actions.
         tile_vector_to_action = {}
         if self.tile_size and self.world_model.get('action_map'):
             for action, effect in self.world_model['action_map'].items():
                 if 'move_vector' in effect:
                     px_vec = effect['move_vector']
-                    # Convert the pixel vector to a tile vector
                     tile_vec = (px_vec[0] // self.tile_size, px_vec[1] // self.tile_size)
-                    # Only store actions that result in actual tile movement
                     if tile_vec != (0, 0):
                         tile_vector_to_action[tile_vec] = action
 
         if not tile_vector_to_action:
-            # This will only be printed if the agent genuinely has no learned move actions.
             return []
 
-        # 2. Perform a Breadth-First Search (BFS) to find the shortest path of actions.
-        q = [(start_tile, [])]  # Queue stores (current_tile, path_of_actions_so_far)
-        visited = {start_tile}
+        # 2. A* Implementation
+        def heuristic(a, b):
+            """Manhattan distance heuristic for A*."""
+            return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
-        while q:
-            current_tile, path = q.pop(0)
+        # The priority queue stores: (f_score, g_score, tile, remaining_moves, path)
+        open_set = []
+        initial_f_score = heuristic(start_tile, target_tile)
+        heapq.heappush(open_set, (initial_f_score, 0, start_tile, self.current_moves, []))
+
+        # g_scores tracks the cost to reach a state: g_scores[(tile, moves)] = cost
+        g_scores = {(start_tile, self.current_moves): 0}
+
+        # Visited set to avoid re-processing states
+        visited_states = set()
+
+        while open_set:
+            _, g, current_tile, current_moves, path = heapq.heappop(open_set)
 
             if current_tile == target_tile:
-                return path  # Path of actions found!
+                return path  # Path found!
 
-            # 3. Explore neighbors using the learned actions.
+            state = (current_tile, current_moves)
+            if state in visited_states:
+                continue
+            visited_states.add(state)
+
             for tile_vec, action in tile_vector_to_action.items():
                 neighbor_tile = (current_tile[0] + tile_vec[0], current_tile[1] + tile_vec[1])
 
                 tile_type = self.tile_map.get(neighbor_tile)
-                can_move_to = tile_type in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE]
+                can_move_to = tile_type in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE]
 
-                if can_move_to and neighbor_tile not in visited:
-                    visited.add(neighbor_tile)
-                    # Add the action that gets to the neighbor to the path
-                    q.append((neighbor_tile, path + [action]))
+                if not can_move_to:
+                    continue
 
-        return []
+                # Calculate the state for the next step in the path
+                next_moves = current_moves - 1
+                if next_moves < 0:
+                    continue  # This path ran out of resources
+
+                # If the neighbor is a resource, refill the moves for the next state
+                if self.tile_map.get(neighbor_tile) == CellType.RESOURCE:
+                    next_moves = self.max_moves
+
+                tentative_g_score = g + 1
+                neighbor_state = (neighbor_tile, next_moves)
+
+                # Check if this new path to the neighbor is better than any previous one
+                if tentative_g_score < g_scores.get(neighbor_state, float('inf')):
+                    g_scores[neighbor_state] = tentative_g_score
+                    f_score = tentative_g_score + heuristic(neighbor_tile, target_tile)
+                    heapq.heappush(open_set, (f_score, tentative_g_score, neighbor_tile, next_moves, path + [action]))
+
+        return []  # No path found
     
     def _find_reachable_floor_tiles(self) -> set:
         """
