@@ -73,16 +73,18 @@ class AGI3(Agent):
         self.level_start_score = 0
         self.resource_indicator_candidates = {}
         self.confirmed_resource_indicator = None
+        self.resource_bar_full_state = None
+        self.resource_bar_empty_state = None
         self.RESOURCE_CONFIDENCE_THRESHOLD = 3 # Actions in a row to confirm
         self.level_knowledge_is_learned = False
         self.wait_action = GameAction.ACTION6 # Use a secondary action for waiting
 
-        # --- NEW: Detailed Resource Tracking ---
-        self.resource_bar_map = {} # Maps bar state tuple -> moves remaining
-        self.resource_bar_history = [] # Records bar states during a single life
-        self.moves_remaining = None # Exact number of moves left
-        self.resource_bar_full_state = None
-        self.resource_bar_empty_state = None
+        # --- Move Tracking ---
+        self.max_moves = 0
+        self.current_moves = 0
+        self.resource_pixel_color = None
+        self.resource_empty_color = None
+        self.resource_bar_indices = []
 
         # --- Goal State Tracking ---
         self.active_patterns = [] # Stores a list of currently active patterns on the grid.
@@ -196,6 +198,7 @@ class AGI3(Agent):
         """Resets the agent's state for a new life or attempt without printing."""
         # --- Core Resets for any attempt ---
         self.previous_frame = None
+        self.level_start_frame = None
         self.last_action = None
         self.last_known_objects = []
         self.last_known_player_obj = None # Crucial: Force agent to re-find itself.
@@ -249,26 +252,7 @@ class AGI3(Agent):
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
-        # --- NEW: Record Resource Bar State & Update Moves Remaining ---
-        if self.confirmed_resource_indicator and latest_frame.frame:
-            indicator_row = self.confirmed_resource_indicator['row_index']
-            # Safety check to ensure the indicator row is valid for the current frame
-            if 0 <= indicator_row < len(latest_frame.frame[0]):
-                current_bar_state = tuple(latest_frame.frame[0][indicator_row])
-                
-                # 1. Update the number of moves remaining for this turn using our map.
-                if current_bar_state in self.resource_bar_map:
-                    self.moves_remaining = self.resource_bar_map[current_bar_state]
-                    # This print can be removed later, but is useful for debugging.
-                    print(f"📊 Moves Remaining: {self.moves_remaining}")
-                else:
-                    # We don't have calibrated data for this state yet.
-                    self.moves_remaining = None 
-                
-                # 2. Record the current state for future calibration, but only if an action was taken.
-                if self.last_action is not None and self.last_action is not self.wait_action:
-                    self.resource_bar_history.append(current_bar_state)
-
+        frame_before_perception = copy.deepcopy(self.previous_frame)
         # --- 1. Store initial level state if not already set ---
         if self.level_start_frame is None:
             # Only store the initial frame if it actually contains data.
@@ -305,15 +289,6 @@ class AGI3(Agent):
                     return self.wait_action
                 else:
                     print("--- Lost a Life (Score did not increase). Analyzing reset state... ---")
-
-                    # --- CALIBRATION TRIGGER ---
-                    # Before doing anything else, analyze the history from the life we just lost.
-                    self._calibrate_resource_bar()
-                    
-                    if self.confirmed_resource_indicator:
-                        indicator_row_index = self.confirmed_resource_indicator['row_index']
-                        self.resource_bar_empty_state = copy.deepcopy(latest_frame.frame[0][indicator_row_index])
-                        print(f"-> Captured the 'empty' state of the resource bar at row {indicator_row_index}.")
                     if self.level_start_frame is not None:
                         print("-> Comparing current grid with the grid from the start of the level...")
 
@@ -390,6 +365,11 @@ class AGI3(Agent):
         agent_part_fingerprints = set()
         novel_changes_found, known_changes_found, change_descriptions, structured_changes = self.perceive(latest_frame)    
         
+        # --- Update and display move count ---
+        self._analyze_and_update_moves(latest_frame)
+        if self.max_moves > 0:
+            print(f"-> Moves Remaining: {self.current_moves}/{self.max_moves}")
+
         # --- NEW: Check for and analyze the "aftermath" of an interaction ---
         if self.observing_interaction_for_tile is not None:
             # Get the agent's CURRENT tile position to see if it successfully moved.
@@ -453,11 +433,22 @@ class AGI3(Agent):
             print(f"✅ New unique state discovered! ({len(self.visited_grids) + 1} total)")
             self.visited_grids.add(grid_tuple)
 
-        # --- Check for massive changes indicating a transition ---
+        # Check for massive changes indicating a transition
         if novel_changes_found:
             is_dimension_change = "Frame dimensions changed" in change_descriptions
             if len(change_descriptions) > self.MASSIVE_CHANGE_THRESHOLD or is_dimension_change:
-                print(f"💥 Massive change detected ({len(change_descriptions)} changes). Waiting for stability...")
+                print(f"💥 Massive change detected ({len(change_descriptions)} changes). Likely a level transition.")
+
+                # --- Capture the frame BEFORE the massive change as the potential 'empty' state ---
+                if self.confirmed_resource_indicator and frame_before_perception:
+                    # Check if score has NOT increased, indicating a death, not a win.
+                    if latest_frame.score <= self.level_start_score:
+                        indicator_row_index = self.confirmed_resource_indicator['row_index']
+                        # frame_before_perception holds the grid state right before the death animation.
+                        self.resource_bar_empty_state = copy.deepcopy(frame_before_perception[0][indicator_row_index])
+                        print(f"-> Captured potential 'empty' state of the resource bar from the frame before transition.")
+
+                print("-> Waiting for stability...")
                 self.agent_state = AgentState.AWAITING_STABILITY
                 self.stability_counter = 0
                 self.previous_frame = None # Invalidate frame to ensure fresh perception after stability
@@ -975,11 +966,6 @@ class AGI3(Agent):
                 
             path = self._find_path_to_target(player_tile_pos, target_pos)
             if path:
-                # --- NEW: Check if the path is affordable ---
-                if self.moves_remaining is not None and len(path) > self.moves_remaining:
-                    print(f"-> Target {target_pos} is too far ({len(path)} moves required, {self.moves_remaining} available).")
-                    continue # Skip this target; we can't afford the trip.
-
                 reachable_targets.append({'pos': target_pos, 'path': path})
 
         if not reachable_targets:
@@ -2221,30 +2207,6 @@ class AGI3(Agent):
             print(row_str)
         print("--- Key: P=Player, T=Target, .=Floor, #=Wall, ?=Potential, !=Confirmed ---\n")
 
-    def _calibrate_resource_bar(self):
-        """Analyzes the history of the resource bar to map states to move counts."""
-        if not self.resource_bar_history:
-            print("📊 Cannot calibrate resource bar: History is empty.")
-            return
-
-        total_moves = len(self.resource_bar_history)
-        print(f"📊 Calibrating resource bar based on {total_moves} moves from the last life.")
-
-        newly_calibrated_points = 0
-        # Iterate through the history to map each bar state to the moves that were remaining.
-        for i, bar_state in enumerate(self.resource_bar_history):
-            moves_remaining = total_moves - i
-            # Only add to the map if we haven't learned this exact state before.
-            if bar_state not in self.resource_bar_map:
-                self.resource_bar_map[bar_state] = moves_remaining
-                newly_calibrated_points += 1
-        
-        if newly_calibrated_points > 0:
-            print(f"-> Learned {newly_calibrated_points} new data points. Map now has {len(self.resource_bar_map)} entries.")
-        
-        # Clear the history for the next life.
-        self.resource_bar_history.clear()
-    
     def _review_and_summarize_interactions(self):
         """Reviews all interactable tiles and summarizes their learned properties."""
         print("\n--- 🧠 Interaction Knowledge Summary 🧠 ---")
@@ -2347,3 +2309,53 @@ class AGI3(Agent):
         self.level_goal_hypotheses.append(goal_hypothesis)
         print(f"Hypothesis stored. Total goal hypotheses: {len(self.level_goal_hypotheses)}")
         print("-------------------------------------\n")
+
+    def _analyze_and_update_moves(self, latest_frame: FrameData):
+        """Analyzes the resource bar to determine max and current moves."""
+        print(f"Debug Moves Analysis: IndicatorConfirmed={bool(self.confirmed_resource_indicator)}, FullStateSaved={self.resource_bar_full_state is not None}, EmptyStateSaved={self.resource_bar_empty_state is not None}")
+        # We need all three components to do anything.
+        if not self.confirmed_resource_indicator or self.resource_bar_full_state is None or self.resource_bar_empty_state is None:
+            return
+
+        # --- One-time analysis to learn about the bar ---
+        if self.max_moves == 0:
+            full_bar = self.resource_bar_full_state
+            empty_bar = self.resource_bar_empty_state
+
+            # Find the pixels that actually change, and what they change to/from.
+            # This makes the logic robust against bars with decorative, non-functional pixels.
+            for i in range(len(full_bar)):
+                if i < len(empty_bar) and full_bar[i] != empty_bar[i]:
+                    # This is a functional pixel of the resource bar.
+                    self.resource_bar_indices.append(i)
+                    # We only need to set the colors once.
+                    if self.resource_pixel_color is None:
+                        self.resource_pixel_color = full_bar[i]
+                        self.resource_empty_color = empty_bar[i]
+
+            if self.resource_bar_indices:
+                self.max_moves = len(self.resource_bar_indices)
+                print(f"✅ [RESOURCE] Moves logic initialized. Max Moves: {self.max_moves}. Resource Color: {self.resource_pixel_color}, Empty Color: {self.resource_empty_color}.")
+            else:
+                # This could happen if the full/empty states are identical for some reason.
+                print("⚠️ [RESOURCE] Could not determine move count. Full and empty resource bars are identical.")
+                return # Exit if we failed to initialize.
+
+        # --- Per-turn update of the current move count ---
+        if not latest_frame.frame or not latest_frame.frame[0]:
+            return # Cannot update if the frame is empty.
+
+        indicator_row_index = self.confirmed_resource_indicator['row_index']
+        
+        # Safety check for frame dimensions
+        if indicator_row_index >= len(latest_frame.frame[0]):
+            return
+            
+        current_bar = latest_frame.frame[0][indicator_row_index]
+        
+        current_count = 0
+        for i in self.resource_bar_indices:
+            if i < len(current_bar) and current_bar[i] == self.resource_pixel_color:
+                current_count += 1
+        
+        self.current_moves = current_count        
