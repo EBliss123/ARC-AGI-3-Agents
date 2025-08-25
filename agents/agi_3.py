@@ -928,7 +928,7 @@ class AGI3(Agent):
                     signature = f"tile_pos_{tile_pos}"
                     hypothesis = self.interaction_hypotheses.get(signature)
                     # "No effect observed" means a hypothesis exists, but it recorded no effects.
-                    if hypothesis and not hypothesis.get('immediate_effect') and not hypothesis.get('aftermath_effect'):
+                    if hypothesis and not hypothesis.get('immediate_effect') and not hypothesis.get('aftermath_effect') and not hypothesis.get('provides_resource'):
                         interactables_with_no_effect.append(tile_pos)
 
                 if interactables_with_no_effect:
