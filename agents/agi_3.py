@@ -228,6 +228,29 @@ class AGI3(Agent):
             self.discovery_sub_phase = 'PRIMARY'
             self.discovered_in_current_run = False
 
+        # --- NEW: Refresh consumable objects on the map for the new life ---
+        print("🔄 Refreshing knowledge of consumable objects for new life.")
+        refreshed_count = 0
+        for signature, hypothesis in self.interaction_hypotheses.items():
+            if hypothesis.get('is_consumable') is True:
+                # Extract tile coordinates from a signature like "tile_pos_(10, 5)"
+                try:
+                    tile_str = signature.replace("tile_pos_(", "").replace(")", "")
+                    tile_coords = tuple(map(int, tile_str.split(',')))
+                    
+                    # If this tile was marked as floor, restore its interactable status.
+                    if self.tile_map.get(tile_coords) == CellType.FLOOR:
+                        # If we know it provides a resource, mark it as such. Otherwise, CONFIRMED.
+                        if hypothesis.get('provides_resource'):
+                            self.tile_map[tile_coords] = CellType.RESOURCE
+                        else:
+                            self.tile_map[tile_coords] = CellType.CONFIRMED_INTERACTABLE
+                        refreshed_count += 1
+                except (ValueError, IndexError):
+                    continue # Signature was not in the expected format
+        if refreshed_count > 0:
+            print(f"-> Refreshed {refreshed_count} consumed tile(s) back to an interactable state.")
+
     def _reset_for_new_level(self):
         """Resets all level-specific knowledge for a new level, preserving core learned concepts."""
         # Record the agent's last position to correctly label the summary.
@@ -2155,6 +2178,7 @@ class AGI3(Agent):
 
         if current_tile_color == floor_color:
             print(f"✅ Aftermath: Object at tile {interacted_tile} was consumed (turned to floor).")
+            self.tile_map[interacted_tile] = CellType.FLOOR
             if object_signature in self.interaction_hypotheses:
                 self.interaction_hypotheses[object_signature]['is_consumable'] = True
             self.consumed_tiles_this_life.add(interacted_tile)
@@ -2282,6 +2306,8 @@ class AGI3(Agent):
                         row_str += " ? "
                     elif cell == CellType.CONFIRMED_INTERACTABLE:
                         row_str += " ! "
+                    elif cell == CellType.RESOURCE:
+                        row_str += " R "
                     else: # UNKNOWN
                         row_str += "   "
             print(row_str)
