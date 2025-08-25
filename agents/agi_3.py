@@ -1291,7 +1291,7 @@ class AGI3(Agent):
                         })
         return candidates
 
-    def _find_and_describe_objects(self, structured_changes: list, latest_frame: list) -> list[dict]:
+    def _find_and_describe_objects(self, structured_changes: list, latest_frame: list, is_interaction_analysis: bool = False) -> list[dict]:
         """Finds objects by grouping changed pixels by their new color first, then clustering."""
         # --- Create a lookup map for original colors ---
         from_color_map = {}
@@ -1395,6 +1395,15 @@ class AGI3(Agent):
 
         for obj_points in monochromatic_parts:
             if not obj_points: continue
+
+            # --- NEW: Filter for incidentally-discovered static objects ---
+            if not is_interaction_analysis:
+                # An object is static if it was only detected because it was adjacent to a
+                # change, but none of its own pixels actually changed this frame.
+                changed_pixels_in_component = changed_coords.intersection(obj_points)
+                if not changed_pixels_in_component:
+                    print(f"🕵️‍♀️ Ignoring static object discovered adjacent to a change.")
+                    continue
 
             # --- Background Verification Step ---
             # An "object" is likely a background reveal if it's the known floor color,
@@ -2099,7 +2108,7 @@ class AGI3(Agent):
             return
 
         # 3. Convert the filtered pixel changes into whole OBJECTS.
-        effect_objects = self._find_and_describe_objects(interaction_effects_pixels, latest_grid)
+        effect_objects = self._find_and_describe_objects(interaction_effects_pixels, latest_grid, is_interaction_analysis=True)
 
         # 4. Filter out any objects that are known parts of the agent.
         if current_agent_fingerprints:
