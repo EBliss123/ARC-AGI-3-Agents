@@ -1769,29 +1769,56 @@ class AGI3(Agent):
                         'parts': agent_parts  # Store the individual component objects
                     }
 
-                    # 2. Learn the action effect (if not already known)
-                    if action not in self.world_model['action_map']:
-                        # Initialize hypothesis dict for this action if it doesn't exist.
-                        if action not in self.action_effect_hypothesis:
-                            self.action_effect_hypothesis[action] = {}
+                    # 2. Update and test action effect hypotheses
+                    # Initialize hypothesis dict for this action if it doesn't exist.
+                    if action not in self.action_effect_hypothesis:
+                        self.action_effect_hypothesis[action] = {}
 
-                        hypo_dict = self.action_effect_hypothesis[action]
-                        hypo_dict[effect_vector] = hypo_dict.get(effect_vector, 0) + 1
-                        confidence = hypo_dict[effect_vector]
+                    hypo_dict = self.action_effect_hypothesis[action]
+                    hypo_dict[effect_vector] = hypo_dict.get(effect_vector, 0) + 1
+                    confidence = hypo_dict[effect_vector]
 
-                        log_messages.append(f"🕵️‍♀️ Action Hypothesis: {action.name} -> move by {effect_vector} (Confidence: {confidence}).")
+                    log_messages.append(f"🕵️‍♀️ Action Hypothesis: {action.name} -> move by {effect_vector} (Confidence: {confidence}).")
 
-                        if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
+                    # If confidence is high, check if this updates our world model.
+                    if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
+                        current_known_vector = self.world_model['action_map'].get(action, {}).get('move_vector')
+
+                        # Update if the action is new or the vector has changed.
+                        if effect_vector != current_known_vector:
                             self.world_model['action_map'][action] = {'move_vector': effect_vector}
-                            log_messages.append(f"✅ Confirmed Action Effect: {action.name} consistently moves the agent by vector {effect_vector}.")
-                            if self.tile_size is None:
-                                # The tile size is the magnitude of the move vector.
-                                # We take the absolute value and check both components of the vector.
-                                size_from_vector = abs(effect_vector[0]) + abs(effect_vector[1])
-                                if size_from_vector > 1: # A move of 1 is ambiguous
-                                    self.tile_size = size_from_vector
-                                    print(f"📏 Tile Size Discovered: {self.tile_size}px based on agent movement.")
-                            del self.action_effect_hypothesis[action] # Clean up memory
+                            log_messages.append(f"✅ UPDATED Action Effect: {action.name} now moves agent by vector {effect_vector}.")
+                            
+                            # Re-calculate tile size and generalize the new magnitude.
+                            new_magnitude = abs(effect_vector[0]) + abs(effect_vector[1])
+                            if new_magnitude > 1: # A move of 1 is ambiguous
+                                if self.tile_size != new_magnitude:
+                                    self.tile_size = new_magnitude
+                                    print(f"📏 Tile Size Re-evaluated: Now {self.tile_size}px based on new movement.")
+
+                                # --- Generalize this new magnitude to all other move actions ---
+                                log_messages.append(f" -> Generalizing new magnitude of {new_magnitude}px to all other move actions.")
+                                for other_action, effect in self.world_model['action_map'].items():
+                                    if other_action == action: continue # Skip the action we just updated
+                                    
+                                    if 'move_vector' in effect:
+                                        old_vec = effect['move_vector']
+                                        old_mag = abs(old_vec[0]) + abs(old_vec[1])
+                                        if old_mag == 0: continue # Skip zero vectors
+                                        
+                                        # Integer division works here for axis-aligned unit vectors
+                                        unit_vec = (old_vec[0] // old_mag, old_vec[1] // old_mag)
+                                        
+                                        # Create the new vector using the new magnitude
+                                        new_vec = (unit_vec[0] * new_magnitude, unit_vec[1] * new_magnitude)
+                                        
+                                        if old_vec != new_vec:
+                                            self.world_model['action_map'][other_action]['move_vector'] = new_vec
+                                            log_messages.append(f"    -> Updated {other_action.name} move vector to {new_vec}.")
+                            
+                            # This hypothesis is now confirmed, clear it to start fresh for the next change.
+                            if action in self.action_effect_hypothesis:
+                                del self.action_effect_hypothesis[action]
 
                     break # Agent's move found, no need to check other moves.
 
