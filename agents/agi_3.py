@@ -1633,19 +1633,36 @@ class AGI3(Agent):
                     max_col = max(p[0]['left_index'] + p[0]['width'] for p in cluster)
 
                     comp_h, comp_w = max_row - min_row, max_col - min_col
-                    signature = (comp_h, comp_w)
+                    
+                    # --- NEW: Build a full datamap for the composite object ---
+                    composite_datamap_list = [[None for _ in range(comp_w)] for _ in range(comp_h)]
+                    for curr_part, _ in cluster:
+                        part_h, part_w = curr_part['height'], curr_part['width']
+                        part_r_offset = curr_part['top_row'] - min_row
+                        part_c_offset = curr_part['left_index'] - min_col
+                        part_datamap = curr_part['data_map']
+                        for r in range(part_h):
+                            for c in range(part_w):
+                                if part_datamap[r][c] is not None:
+                                    composite_datamap_list[part_r_offset + r][part_c_offset + c] = part_datamap[r][c]
+                    composite_datamap = tuple(tuple(row) for row in composite_datamap_list)
+
+                    # --- NEW: Use the visual fingerprint as the signature ---
+                    _, signature, _ = self._create_normalized_fingerprint(composite_datamap)
+                    
                     # Generate a simpler log if the moved object is the confirmed agent.
                     if signature == self.world_model.get('player_signature'):
                         log_messages.append(f"🧠 [AGENT] moved by vector {vector}.")
                     else:
-                        log_messages.append(f"🧠 COMPOSITE MOVE: Object [{comp_h}x{comp_w}] moved by vector {vector}.")
-                true_moves.append({'type': 'composite', 'signature': signature, 'parts': cluster, 'vector': vector})
+                        log_messages.append(f"🧠 COMPOSITE MOVE: Object [{comp_h}x{comp_w}] with fingerprint {signature} moved by vector {vector}.")
+                
+                true_moves.append({'type': 'composite', 'signature': signature, 'dimensions': (comp_h, comp_w), 'parts': cluster, 'vector': vector})
                 for pair in cluster: processed_pairs.append(pair)
 
         # Log individual moves and collect their structured info.
         for curr, last in move_matched_pairs:
             if (curr, last) not in processed_pairs:
-                signature = (curr['height'], curr['width'])
+                signature = curr.get('fingerprint')
                 # Generate a simpler log if the moved object is the confirmed agent.
                 if signature == self.world_model.get('player_signature'):
                     log_messages.append(f"🧠 [AGENT] moved from ({last['top_row']}, {last['left_index']}) to ({curr['top_row']}, {curr['left_index']}).")
