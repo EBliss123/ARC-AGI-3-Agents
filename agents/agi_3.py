@@ -206,7 +206,6 @@ class AGI3(Agent):
         self.last_known_player_obj = None # Crucial: Force agent to re-find itself.
 
         # --- Reset Level-Specific Layout and Plans ---
-        self.tile_map.clear()
         self.has_summarized_interactions = False
         self.awaiting_final_summary = False
         self.exploration_phase = ExplorationPhase.INACTIVE
@@ -1021,7 +1020,7 @@ class AGI3(Agent):
 
         reachable_resources = []
         for resource_pos in resource_tiles:
-            path = self._find_path_to_target(player_tile_pos, resource_pos)
+            path = self._find_path_to_target(player_tile_pos, resource_pos, ignore_move_cost=True)
             if path:
                 reachable_resources.append({'pos': resource_pos, 'path': path})
 
@@ -1031,7 +1030,7 @@ class AGI3(Agent):
         # Return the resource with the shortest path
         return min(reachable_resources, key=lambda r: len(r['path']))
 
-    def _find_path_to_target(self, start_tile: tuple, target_tile: tuple) -> list:
+    def _find_path_to_target(self, start_tile: tuple, target_tile: tuple, ignore_move_cost: bool = False) -> list:
         """
         Finds the shortest, resource-aware path to a target using the A* algorithm.
         This path considers the agent's current moves and potential resource pickups.
@@ -1087,7 +1086,7 @@ class AGI3(Agent):
 
                 # Calculate the state for the next step in the path
                 next_moves = current_moves - 1
-                if next_moves < 0:
+                if not ignore_move_cost and next_moves < 0:
                     continue  # This path ran out of resources
 
                 # If the neighbor is a resource, refill the moves for the next state
