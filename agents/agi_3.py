@@ -97,7 +97,8 @@ class AGI3(Agent):
             'player_signature': None,
             'floor_color': None,
             'wall_colors': set(), # Use a set for multiple possible wall colors
-            'action_map': {} # Will store confirmed action -> effect mappings
+            'action_map': {}, # Will store confirmed action -> effect mappings
+            'resource_signatures': set()
         }
         self.world_model['life_indicator_object'] = None
         self.player_floor_hypothesis = {}
@@ -595,10 +596,20 @@ class AGI3(Agent):
             
             if resource_event == "REFILLED":
                 print(f"✅ [RESOURCE] Resource bar was refilled!")
-                if self.last_known_player_obj and self.tile_size:
+                if self.last_known_player_obj and self.tile_size and frame_before_perception:
                     player_tile = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
                     print(f"-> Agent is on tile {player_tile}. Classifying as a resource.")
                     self.tile_map[player_tile] = CellType.RESOURCE
+
+                    # --- NEW: Learn the visual signature of the resource object ---
+                    # Find the object that was on this tile in the frame *before* the move.
+                    resource_obj = self._find_object_on_tile(player_tile, frame_before_perception)
+                    if resource_obj and resource_obj.get('fingerprint'):
+                        res_fingerprint = resource_obj['fingerprint']
+                        if res_fingerprint not in self.world_model['resource_signatures']:
+                            self.world_model['resource_signatures'].add(res_fingerprint)
+                            print(f"✅ [RESOURCE] Learned new resource signature: {res_fingerprint}")
+
                     # Update interaction hypothesis for this tile
                     signature = f"tile_pos_{player_tile}"
                     if signature not in self.interaction_hypotheses:
@@ -928,6 +939,17 @@ class AGI3(Agent):
         
         # Remove the now-known interactables from the list of potential targets.
         potential_targets = [p for p in potential_targets if p not in known_interactables]
+
+        # Before planning, check if any potential targets are known resources.
+        resource_signatures = self.world_model.get('resource_signatures', set())
+        if resource_signatures and self.previous_frame:
+            grid_data = self.previous_frame # Use the most recent static frame for analysis
+            for tile_pos in list(potential_targets): # Iterate over a copy
+                obj_on_tile = self._find_object_on_tile(tile_pos, grid_data)
+                if obj_on_tile and obj_on_tile.get('fingerprint') in resource_signatures:
+                    print(f"🧠 Pre-existing knowledge found for tile {tile_pos}. Reclassifying as RESOURCE.")
+                    self.tile_map[tile_pos] = CellType.RESOURCE
+                    potential_targets.remove(tile_pos) # No longer a 'potential' target
         
         # --- End of Priority 1 Logic ---
 
@@ -2082,6 +2104,49 @@ class AGI3(Agent):
                     'index_direction': None
                 }
                 print(f"🤔 New resource candidate found at row {row_idx}.")
+
+    def _find_object_on_tile(self, tile_coords: tuple, grid: list) -> dict | None:
+        """Finds and describes the first non-background object found on a given tile."""
+        if not self.tile_size or not grid or not grid[0]:
+            return None
+        
+        grid_data = grid[0]
+        background_colors = {self.world_model.get('floor_color')} | self.world_model.get('wall_colors', set())
+        background_colors.discard(None) # Ensure None is not in the set
+        
+        # Scan pixels within the tile for a starting pixel of a non-background object
+        start_row, start_col = tile_coords[0] * self.tile_size, tile_coords[1] * self.tile_size
+        object_color = None
+        start_pixel_coord = None
+        for r in range(start_row, start_row + self.tile_size):
+            for c in range(start_col, start_col + self.tile_size):
+                if 0 <= r < len(grid_data) and 0 <= c < len(grid_data[0]):
+                    pixel_color = grid_data[r][c]
+                    if pixel_color not in background_colors:
+                        object_color = pixel_color
+                        start_pixel_coord = (r, c)
+                        break
+            if object_color is not None:
+                break
+                
+        if object_color is None:
+            return None # Tile is empty (floor/wall)
+            
+        # Now that we have a color, find all objects of that color on the entire grid
+        candidate_objects = self._find_static_candidates_by_color(object_color, grid_data)
+        
+        # Find the specific candidate that contains our start pixel
+        for obj in candidate_objects:
+            if (obj['top_row'] <= start_pixel_coord[0] < obj['top_row'] + obj['height'] and
+                obj['left_index'] <= start_pixel_coord[1] < obj['left_index'] + obj['width']):
+                
+                # Bounding box is a loose check; confirm pixel is part of the actual object data
+                relative_r = start_pixel_coord[0] - obj['top_row']
+                relative_c = start_pixel_coord[1] - obj['left_index']
+                if obj['data_map'][relative_r][relative_c] is not None:
+                    return obj # This is our object
+                
+        return None
 
     def _extract_object_at_tile(self, tile_coords: tuple, grid_data: list, visited_tiles: set) -> dict | None:
         """
