@@ -98,7 +98,8 @@ class AGI3(Agent):
             'floor_color': None,
             'wall_colors': set(), # Use a set for multiple possible wall colors
             'action_map': {}, # Will store confirmed action -> effect mappings
-            'resource_signatures': set()
+            'resource_canonical_signatures': set(),
+            'confirmed_interactable_canonical_signatures': set()
         }
         self.world_model['life_indicator_object'] = None
         self.player_floor_hypothesis = {}
@@ -268,7 +269,9 @@ class AGI3(Agent):
         self._reset_for_new_attempt()
 
         # Additionally, reset knowledge that is strictly tied to a level's design.
-        print("🧹 Wiping interaction hypotheses and active patterns for the new level.")
+        print("🧹 Wiping interaction hypotheses, map, and active patterns for the new level.")
+        self.tile_map.clear()
+        self.reachable_floor_area.clear()
         self.interaction_hypotheses.clear()
         self.active_patterns.clear()
         self.has_summarized_interactions = False
@@ -602,13 +605,12 @@ class AGI3(Agent):
                     self.tile_map[player_tile] = CellType.RESOURCE
 
                     # --- NEW: Learn the visual signature of the resource object ---
-                    # Find the object that was on this tile in the frame *before* the move.
                     resource_obj = self._find_object_on_tile(player_tile, frame_before_perception)
-                    if resource_obj and resource_obj.get('fingerprint'):
-                        res_fingerprint = resource_obj['fingerprint']
-                        if res_fingerprint not in self.world_model['resource_signatures']:
-                            self.world_model['resource_signatures'].add(res_fingerprint)
-                            print(f"✅ [RESOURCE] Learned new resource signature: {res_fingerprint}")
+                    if resource_obj and resource_obj.get('canonical_signature') is not None:
+                        res_sig = resource_obj['canonical_signature']
+                        if res_sig not in self.world_model['resource_canonical_signatures']:
+                            self.world_model['resource_canonical_signatures'].add(res_sig)
+                            print(f"✅ [RESOURCE] Learned new resource canonical signature: {res_sig}")
 
                     # Update interaction hypothesis for this tile
                     signature = f"tile_pos_{player_tile}"
@@ -664,6 +666,16 @@ class AGI3(Agent):
                         if self.tile_map.get(target_tile) == CellType.POTENTIALLY_INTERACTABLE:
                             self.tile_map[target_tile] = CellType.CONFIRMED_INTERACTABLE
                             print(f"✅ Target at {target_tile} confirmed as interactable.")
+                            # Learn the visual signature of this newly confirmed interactable.
+                            if self.previous_frame:
+                                interactable_obj = self._find_object_on_tile(target_tile, self.previous_frame)
+                                if interactable_obj and interactable_obj.get('canonical_signature') is not None:
+                                    obj_sig = interactable_obj['canonical_signature']
+                                    # Don't add if it's already known as a resource.
+                                    if obj_sig not in self.world_model['resource_canonical_signatures']:
+                                        if obj_sig not in self.world_model['confirmed_interactable_canonical_signatures']:
+                                            self.world_model['confirmed_interactable_canonical_signatures'].add(obj_sig)
+                                            print(f"✅ [INTERACTABLE] Learned new canonical signature: {obj_sig}")
                         self.observing_interaction_for_tile = target_tile
                         self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect', latest_frame.frame, self.last_known_objects, agent_part_fingerprints)
                     self.exploration_phase = ExplorationPhase.BUILDING_MAP
@@ -940,16 +952,26 @@ class AGI3(Agent):
         # Remove the now-known interactables from the list of potential targets.
         potential_targets = [p for p in potential_targets if p not in known_interactables]
 
-        # Before planning, check if any potential targets are known resources.
-        resource_signatures = self.world_model.get('resource_signatures', set())
-        if resource_signatures and self.previous_frame:
-            grid_data = self.previous_frame # Use the most recent static frame for analysis
-            for tile_pos in list(potential_targets): # Iterate over a copy
+        # Before planning, check for known resources or interactables using canonical signatures.
+        resource_sigs = self.world_model.get('resource_canonical_signatures', set())
+        interactable_sigs = self.world_model.get('confirmed_interactable_canonical_signatures', set())
+
+        if (resource_sigs or interactable_sigs) and self.previous_frame:
+            grid_data = self.previous_frame
+            for tile_pos in list(potential_targets):
                 obj_on_tile = self._find_object_on_tile(tile_pos, grid_data)
-                if obj_on_tile and obj_on_tile.get('fingerprint') in resource_signatures:
-                    print(f"🧠 Pre-existing knowledge found for tile {tile_pos}. Reclassifying as RESOURCE.")
-                    self.tile_map[tile_pos] = CellType.RESOURCE
-                    potential_targets.remove(tile_pos) # No longer a 'potential' target
+                if obj_on_tile and obj_on_tile.get('canonical_signature') is not None:
+                    signature = obj_on_tile['canonical_signature']
+                    
+                    # Prioritize resource classification
+                    if signature in resource_sigs:
+                        print(f"🧠 Pre-existing knowledge found for tile {tile_pos}. Reclassifying as RESOURCE.")
+                        self.tile_map[tile_pos] = CellType.RESOURCE
+                        potential_targets.remove(tile_pos)
+                    elif signature in interactable_sigs:
+                        print(f"🧠 Pre-existing knowledge found for tile {tile_pos}. Reclassifying as CONFIRMED_INTERACTABLE.")
+                        self.tile_map[tile_pos] = CellType.CONFIRMED_INTERACTABLE
+                        potential_targets.remove(tile_pos)
         
         # --- End of Priority 1 Logic ---
 
@@ -1282,7 +1304,51 @@ class AGI3(Agent):
         # Return the base shape, the fingerprint, AND the normalized map itself for debugging.
         return ((base_h, base_w), fingerprint, normalized_map_tuple)
 
-    
+    def _rotate_datamap_90(self, datamap: tuple) -> tuple:
+        """Rotates a 2D tuple-based datamap 90 degrees clockwise."""
+        if not datamap:
+            return tuple()
+        return tuple(zip(*datamap[::-1]))
+
+    def _flip_datamap_horizontal(self, datamap: tuple) -> tuple:
+        """Flips a 2D tuple-based datamap horizontally."""
+        if not datamap:
+            return tuple()
+        return tuple(row[::-1] for row in datamap)
+
+    def _get_canonical_signature(self, obj_datamap: tuple) -> int | None:
+        """
+        Generates 8 variations of an object (4 rotations and their flips) and returns
+        the minimum fingerprint among them as a canonical, orientation-invariant signature.
+        """
+        if not obj_datamap or not obj_datamap[0]:
+            return None
+
+        maps = set()
+        current_map = obj_datamap
+
+        # Get all 4 rotations
+        for _ in range(4):
+            maps.add(current_map)
+            try:
+                current_map = self._rotate_datamap_90(current_map)
+            except (TypeError, IndexError):
+                break # Rotation failed, likely inconsistent row lengths
+
+        # Get flips of all unique maps found so far
+        flipped_maps = {self._flip_datamap_horizontal(m) for m in maps}
+        maps.update(flipped_maps)
+
+        # Calculate fingerprint for each of the unique variations
+        fingerprints = set()
+        for m in maps:
+            _, fingerprint, _ = self._create_normalized_fingerprint(m)
+            if fingerprint is not None:
+                fingerprints.add(fingerprint)
+
+        # The canonical signature is the smallest fingerprint value
+        return min(fingerprints) if fingerprints else None
+
     def _find_static_candidates_by_color(self, color: int, grid_data: list) -> list[dict]:
         """Scans the entire grid to find and describe all objects of a specific color."""
         if not grid_data or not grid_data[0]:
@@ -1327,11 +1393,14 @@ class AGI3(Agent):
 
                         data_map = tuple(tuple(grid_data[r][p] if (r, p) in component_points else None for p in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
                         base_shape, fingerprint, norm_map = self._create_normalized_fingerprint(data_map)
+                        canonical_signature = self._get_canonical_signature(data_map)
 
                         candidates.append({
                             'height': height, 'width': width, 'top_row': min_row,
                             'left_index': min_idx, 'color': color,
-                            'data_map': data_map, 'fingerprint': fingerprint, 'base_shape': base_shape, 'normalized_map': norm_map
+                            'data_map': data_map, 'fingerprint': fingerprint,
+                            'canonical_signature': canonical_signature,
+                            'base_shape': base_shape, 'normalized_map': norm_map
                         })
         return candidates
 
@@ -1524,7 +1593,9 @@ class AGI3(Agent):
                 background_color = border_colors[0]
 
             data_map = tuple(tuple(grid[r][p] if (r, p) in obj_points else None for p in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
+
             base_shape, fingerprint, norm_map = self._create_normalized_fingerprint(data_map)
+            canonical_signature = self._get_canonical_signature(data_map)
 
             original_color = from_color_map.get(sample_point) # Get original color from our map
 
@@ -1534,7 +1605,8 @@ class AGI3(Agent):
                 'original_color': original_color,
                 'data_map': data_map,
                 'background_color': background_color,
-                'fingerprint': fingerprint, 
+                'fingerprint': fingerprint,
+                'canonical_signature': canonical_signature,
                 'base_shape': base_shape,
                 'normalized_map': norm_map
             })
