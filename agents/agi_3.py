@@ -1795,7 +1795,16 @@ class AGI3(Agent):
                                 if self.tile_size != new_magnitude:
                                     self.tile_size = new_magnitude
                                     print(f"📏 Tile Size Re-evaluated: Now {self.tile_size}px based on new movement.")
-
+                                    log_messages.append("🗺️ Tile size changed. Wiping all level-specific map and interaction data.")
+                                    self.tile_map.clear()
+                                    self.reachable_floor_area.clear()
+                                    self.interaction_hypotheses.clear()
+                                    self.consumed_tiles_this_life.clear()
+                                    self.exploration_plan.clear()
+                                    self.exploration_target = None
+                                    self.observing_interaction_for_tile = None
+                                    self.exploration_phase = ExplorationPhase.INACTIVE
+                                    
                                 # --- Generalize this new magnitude to all other move actions ---
                                 log_messages.append(f" -> Generalizing new magnitude of {new_magnitude}px to all other move actions.")
                                 for other_action, effect in self.world_model['action_map'].items():
