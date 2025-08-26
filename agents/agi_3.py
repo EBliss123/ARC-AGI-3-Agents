@@ -908,7 +908,7 @@ class AGI3(Agent):
         # First, calculate the visible "display area," just as the debug map does.
         display_area = set(self.reachable_floor_area)
         for r_tile, c_tile in self.reachable_floor_area:
-            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
                 neighbor = (r_tile + dr, c_tile + dc)
                 if neighbor in self.tile_map:
                     display_area.add(neighbor)
@@ -1804,7 +1804,7 @@ class AGI3(Agent):
                                     self.exploration_target = None
                                     self.observing_interaction_for_tile = None
                                     self.exploration_phase = ExplorationPhase.INACTIVE
-                                    
+
                                 # --- Generalize this new magnitude to all other move actions ---
                                 log_messages.append(f" -> Generalizing new magnitude of {new_magnitude}px to all other move actions.")
                                 for other_action, effect in self.world_model['action_map'].items():
@@ -2313,7 +2313,7 @@ class AGI3(Agent):
         # The "playable area" includes reachable tiles and their immediate neighbors.
         display_area = set(self.reachable_floor_area)
         for r_tile, c_tile in self.reachable_floor_area:
-            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
                 neighbor = (r_tile + dr, c_tile + dc)
                 if neighbor in self.tile_map:
                     display_area.add(neighbor)
