@@ -32,6 +32,7 @@ class CellType(Enum):
     PLAYER = 4
     CONFIRMED_INTERACTABLE = 5
     RESOURCE = 6
+    RECOGNIZED_UNCONFIRMED = 7
 
 class ExplorationPhase(Enum):
     """Manages the agent's goal-oriented exploration strategy."""
@@ -663,19 +664,28 @@ class AGI3(Agent):
                     self._print_debug_map()
                     if self.exploration_target and self.tile_size:
                         target_tile = (self.exploration_target[0] // self.tile_size, self.exploration_target[1] // self.tile_size)
-                        if self.tile_map.get(target_tile) == CellType.POTENTIALLY_INTERACTABLE:
+                        original_type = self.tile_map.get(target_tile)
+
+                        # Check if the target was a '?' or a '~'
+                        if original_type in [CellType.POTENTIALLY_INTERACTABLE, CellType.RECOGNIZED_UNCONFIRMED]:
                             self.tile_map[target_tile] = CellType.CONFIRMED_INTERACTABLE
-                            print(f"✅ Target at {target_tile} confirmed as interactable.")
-                            # Learn the visual signature of this newly confirmed interactable.
-                            if self.previous_frame:
-                                interactable_obj = self._find_object_on_tile(target_tile, self.previous_frame)
-                                if interactable_obj and interactable_obj.get('canonical_signature') is not None:
-                                    obj_sig = interactable_obj['canonical_signature']
-                                    # Don't add if it's already known as a resource.
-                                    if obj_sig not in self.world_model['resource_canonical_signatures']:
-                                        if obj_sig not in self.world_model['confirmed_interactable_canonical_signatures']:
-                                            self.world_model['confirmed_interactable_canonical_signatures'].add(obj_sig)
-                                            print(f"✅ [INTERACTABLE] Learned new canonical signature: {obj_sig}")
+                            
+                            if original_type == CellType.POTENTIALLY_INTERACTABLE:
+                                # This was the first time we've seen this object type.
+                                print(f"✅ Target at {target_tile} confirmed as interactable.")
+                                # Learn its signature now.
+                                if self.previous_frame:
+                                    interactable_obj = self._find_object_on_tile(target_tile, self.previous_frame)
+                                    if interactable_obj and interactable_obj.get('canonical_signature') is not None:
+                                        obj_sig = interactable_obj['canonical_signature']
+                                        if obj_sig not in self.world_model['resource_canonical_signatures']:
+                                            if obj_sig not in self.world_model['confirmed_interactable_canonical_signatures']:
+                                                self.world_model['confirmed_interactable_canonical_signatures'].add(obj_sig)
+                                                print(f"✅ [INTERACTABLE] Learned new canonical signature: {obj_sig}")
+                            else: # Was RECOGNIZED_UNCONFIRMED
+                                # We've seen this signature before; we were just verifying its function.
+                                print(f"✅ Target at {target_tile} re-confirmed. Function is consistent.")
+
                         self.observing_interaction_for_tile = target_tile
                         self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect', latest_frame.frame, self.last_known_objects, agent_part_fingerprints)
                     self.exploration_phase = ExplorationPhase.BUILDING_MAP
@@ -917,6 +927,7 @@ class AGI3(Agent):
         Finds the best interactable tile by pathfinding to all available targets
         and picking the one with the shortest path.
         """
+        self.reachable_floor_area = self._find_reachable_floor_tiles()
 
         self.exploration_target = None
         self.exploration_plan = []
@@ -952,27 +963,31 @@ class AGI3(Agent):
         # Remove the now-known interactables from the list of potential targets.
         potential_targets = [p for p in potential_targets if p not in known_interactables]
 
-        # Before planning, check for known resources or interactables using canonical signatures.
+        #Step 1: Run recognition on any unknown interactables ('?') to see if we've seen their signature before.
+        unknowns_to_check = [pos for pos, type in self.tile_map.items() if type == CellType.POTENTIALLY_INTERACTABLE and pos in display_area]
+        
         resource_sigs = self.world_model.get('resource_canonical_signatures', set())
         interactable_sigs = self.world_model.get('confirmed_interactable_canonical_signatures', set())
 
         if (resource_sigs or interactable_sigs) and self.previous_frame:
             grid_data = self.previous_frame
-            for tile_pos in list(potential_targets):
+            for tile_pos in unknowns_to_check:
                 obj_on_tile = self._find_object_on_tile(tile_pos, grid_data)
                 if obj_on_tile and obj_on_tile.get('canonical_signature') is not None:
                     signature = obj_on_tile['canonical_signature']
-                    
-                    # Prioritize resource classification
                     if signature in resource_sigs:
-                        print(f"🧠 Pre-existing knowledge found for tile {tile_pos}. Reclassifying as RESOURCE.")
+                        # Resources are trusted immediately and don't need re-confirmation.
                         self.tile_map[tile_pos] = CellType.RESOURCE
-                        potential_targets.remove(tile_pos)
+                        print(f"🧠 Pre-existing knowledge found for tile {tile_pos}. Reclassifying as RESOURCE.")
                     elif signature in interactable_sigs:
-                        print(f"🧠 Pre-existing knowledge found for tile {tile_pos}. Reclassifying as CONFIRMED_INTERACTABLE.")
-                        self.tile_map[tile_pos] = CellType.CONFIRMED_INTERACTABLE
-                        potential_targets.remove(tile_pos)
-        
+                        # Other interactables are marked for re-confirmation.
+                        self.tile_map[tile_pos] = CellType.RECOGNIZED_UNCONFIRMED
+                        print(f"🧠 Pre-existing knowledge found for tile {tile_pos}. Reclassifying as RECOGNIZED_UNCONFIRMED (~)")
+
+        # Step 2: Now, build the final list of targets for this turn.
+        # This includes any remaining '?' tiles AND any newly marked '~' tiles. They have equal priority.
+        potential_targets = [pos for pos, type in self.tile_map.items() 
+                             if type in [CellType.POTENTIALLY_INTERACTABLE, CellType.RECOGNIZED_UNCONFIRMED] and pos in display_area]
         # --- End of Priority 1 Logic ---
 
         if not potential_targets:
@@ -1146,7 +1161,7 @@ class AGI3(Agent):
                 neighbor_tile = (current_tile[0] + tile_vec[0], current_tile[1] + tile_vec[1])
 
                 tile_type = self.tile_map.get(neighbor_tile)
-                can_move_to = tile_type in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE]
+                can_move_to = tile_type in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE, CellType.RECOGNIZED_UNCONFIRMED]
 
                 if not can_move_to:
                     continue
@@ -1186,7 +1201,7 @@ class AGI3(Agent):
 
         # The player might be on an interactable tile, which is also a valid starting point.
         start_tile_type = self.tile_map.get(start_tile)
-        if start_tile_type not in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE]:
+        if start_tile_type not in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE, CellType.RECOGNIZED_UNCONFIRMED]:
             print(f"⚠️ Player starting tile {start_tile} is not on a known FLOOR, INTERACTABLE, or RESOURCE. Aborting flood fill.")
             return set()
         # 2. Initialize BFS data structures.
@@ -1202,7 +1217,7 @@ class AGI3(Agent):
                 neighbor_tile = (current_tile[0] + dr, current_tile[1] + dc)
 
                 # We can only traverse through tiles classified as FLOOR.
-                if self.tile_map.get(neighbor_tile) in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE] and neighbor_tile not in visited:
+                if self.tile_map.get(neighbor_tile) in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE, CellType.RECOGNIZED_UNCONFIRMED] and neighbor_tile not in visited:
                     visited.add(neighbor_tile)
                     q.append(neighbor_tile)
         
@@ -2498,10 +2513,12 @@ class AGI3(Agent):
                         row_str += " ! "
                     elif cell == CellType.RESOURCE:
                         row_str += " R "
+                    elif cell == CellType.RECOGNIZED_UNCONFIRMED:
+                        row_str += " ~ "
                     else: # UNKNOWN
                         row_str += "   "
             print(row_str)
-        print("--- Key: P=Player, T=Target, .=Floor, #=Wall, ?=Potential, !=Confirmed ---\n")
+        print("--- Key: P=Player, T=Target, .=Floor, #=Wall, ?=Potential, !=Confirmed, ~=Recognized, R=Resource ---\n")
 
     def _review_and_summarize_interactions(self):
         """Reviews all interactable tiles and summarizes their learned properties."""
