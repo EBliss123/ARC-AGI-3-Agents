@@ -1053,7 +1053,7 @@ class AGI3(Agent):
                 print("🎯 Activating PRIORITY 3: No patterns active. Seeking interactables with a known function.")
 
                 interactables_with_known_function = []
-                all_confirmed_interactables = [pos for pos, type in self.tile_map.items() if type == CellType.CONFIRMED_INTERACTABLE]
+                all_confirmed_interactables = [pos for pos, type in self.tile_map.items() if type in [CellType.CONFIRMED_INTERACTABLE, CellType.POTENTIAL_MATCH]]
 
                 for tile_pos in all_confirmed_interactables:
                     if tile_pos in self.consumed_tiles_this_life:
