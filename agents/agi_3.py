@@ -121,6 +121,7 @@ class AGI3(Agent):
 
         # --- Interaction Learning ---
         self.observing_interaction_for_tile = None # Stores the coords of the tile being observed
+        self.tile_to_log_on_aftermath = None # Stores data for delayed logging
         self.interaction_hypotheses = {} # signature -> {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
         self.interactable_object_characteristics = {} # Stores visual characteristics of confirmed interactables.
         self.static_level_objects = []
@@ -414,6 +415,15 @@ class AGI3(Agent):
                 print("-> Stepped away from observed tile. Analyzing aftermath...")
                 self._analyze_consumable_aftermath(latest_frame.frame)
 
+                # --- NEW: Trigger the delayed characteristic logging ---
+                if self.tile_to_log_on_aftermath:
+                    # We log the tile we started observing, using the CURRENT frame to see the aftermath state.
+                    if self.tile_to_log_on_aftermath == self.observing_interaction_for_tile:
+                        self._log_object_characteristics(self.tile_to_log_on_aftermath, latest_frame.frame)
+
+                    # Reset the flag
+                    self.tile_to_log_on_aftermath = None
+
                 # End the full observation cycle and return to normal exploration.
                 self.observing_interaction_for_tile = None
                 self.exploration_phase = ExplorationPhase.BUILDING_MAP # Resume normal exploration
@@ -665,10 +675,21 @@ class AGI3(Agent):
                         if self.tile_map.get(target_tile) == CellType.POTENTIALLY_INTERACTABLE:
                             self.tile_map[target_tile] = CellType.CONFIRMED_INTERACTABLE
                             print(f"✅ Target at {target_tile} confirmed as interactable.")
-                            self._log_object_characteristics(target_tile, latest_frame.frame)
+
+                            # --- NEW: Save data for delayed logging instead of logging immediately ---
+                            print(f"-> Queuing characteristics log for tile {target_tile} after aftermath analysis.")
+                            self.tile_to_log_on_aftermath = target_tile
+                            self.frame_for_logging = copy.deepcopy(latest_frame.frame)
                         self.observing_interaction_for_tile = target_tile
                         self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect', latest_frame.frame, self.last_known_objects, agent_part_fingerprints)
+                    # Set the phase for the *next* turn, then explicitly wait.
                     self.exploration_phase = ExplorationPhase.BUILDING_MAP
+
+                    # --- NEW: Explicitly wait one turn to observe the interaction before moving away. ---
+                    print("-> Pausing for one turn to observe interaction.")
+                    self.last_action = self.wait_action
+                    self.last_grid_tuple = grid_tuple
+                    return self.wait_action
 
             if self.exploration_phase == ExplorationPhase.BUILDING_MAP:
                 print("🗺️ Building/updating the level map...")
@@ -2111,6 +2132,81 @@ class AGI3(Agent):
                 }
                 print(f"🤔 New resource candidate found at row {row_idx}.")
 
+    def _find_all_objects_on_tile(self, tile_coords: tuple, grid: list) -> list:
+        """Finds and describes all non-background objects that exist on a given tile."""
+        if not self.tile_size or not grid or not grid[0]:
+            return []
+
+        grid_data = grid[0]
+        grid_height = len(grid_data)
+        grid_width = len(grid_data[0]) if grid_height > 0 else 0
+
+        # Get known background colors to avoid starting searches on them.
+        background_colors = {self.world_model.get('floor_color')} | self.world_model.get('wall_colors', set())
+        background_colors.discard(None)
+
+        found_objects = []
+        # Use a grid-wide visited set to ensure we describe each object only once.
+        pixels_in_found_objects = set()
+
+        # Define the pixel boundaries of the target tile.
+        start_row = tile_coords[0] * self.tile_size
+        end_row = start_row + self.tile_size
+        start_col = tile_coords[1] * self.tile_size
+        end_col = start_col + self.tile_size
+
+        # Iterate only through the pixels *within the specified tile*.
+        for r in range(start_row, end_row):
+            for c in range(start_col, end_col):
+                if not (0 <= r < grid_height and 0 <= c < grid_width):
+                    continue
+
+                coord = (r, c)
+                pixel_color = grid_data[r][c]
+
+                if coord in pixels_in_found_objects or pixel_color in background_colors:
+                    continue
+
+                # This is a new, non-background pixel. Find the entire object it belongs to.
+                component_points = set()
+                q = [coord]
+                visited_for_this_object = {coord}
+
+                while q:
+                    p = q.pop(0)
+                    component_points.add(p)
+                    row, col = p
+
+                    for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                        neighbor = (row + dr, col + dc)
+                        if (0 <= neighbor[0] < grid_height and 
+                            0 <= neighbor[1] < grid_width and 
+                            neighbor not in visited_for_this_object and 
+                            grid_data[neighbor[0]][neighbor[1]] == pixel_color):
+
+                            visited_for_this_object.add(neighbor)
+                            q.append(neighbor)
+
+                if component_points:
+                    min_r_obj = min(r_obj for r_obj, _ in component_points)
+                    max_r_obj = max(r_obj for r_obj, _ in component_points)
+                    min_c_obj = min(c_obj for _, c_obj in component_points)
+                    max_c_obj = max(c_obj for _, c_obj in component_points)
+                    height, width = max_r_obj - min_r_obj + 1, max_c_obj - min_c_obj + 1
+
+                    data_map = tuple(tuple(grid_data[row][col] if (row, col) in component_points else None for col in range(min_c_obj, max_c_obj + 1)) for row in range(min_r_obj, max_r_obj + 1))
+                    base_shape, fingerprint, norm_map = self._create_normalized_fingerprint(data_map)
+
+                    found_objects.append({
+                        'height': height, 'width': width, 'top_row': min_r_obj,
+                        'left_index': min_c_obj, 'color': pixel_color,
+                        'data_map': data_map, 'fingerprint': fingerprint, 'base_shape': base_shape
+                    })
+
+                    pixels_in_found_objects.update(component_points)
+
+        return found_objects
+
     def _find_object_on_tile(self, tile_coords: tuple, grid: list) -> dict | None:
         """Finds and describes the first non-background object found on a given tile."""
         if not self.tile_size or not grid or not grid[0]:
@@ -2283,21 +2379,52 @@ class AGI3(Agent):
         print(f"💡 EFFECT LEARNED: The '{effect_type}' of interacting with '{object_signature}' has been recorded.")
     
     def _log_object_characteristics(self, tile_coords: tuple, grid: list):
-        """Finds the object on a tile and logs its key characteristics."""
+        """Finds all objects on a tile, groups them by color, and logs their characteristics."""
         if tile_coords in self.interactable_object_characteristics:
             # Already logged, no need to do it again.
             return
 
-        obj = self._find_object_on_tile(tile_coords, grid)
-        if obj:
+        all_objects_on_tile = self._find_all_objects_on_tile(tile_coords, grid)
+        if not all_objects_on_tile:
+            return
+
+        # Get known background/resource info for filtering
+        background_colors = {self.world_model.get('floor_color')} | self.world_model.get('wall_colors', set())
+        background_colors.discard(None)
+        resource_signatures = self.world_model.get('resource_signatures', set())
+
+        characteristics_by_color = {}
+        for obj in all_objects_on_tile:
+            obj_color = obj.get('color')
+            obj_fingerprint = obj.get('fingerprint')
+
+            # Filter out background and resource objects
+            if obj_color in background_colors:
+                continue
+            if obj_fingerprint in resource_signatures:
+                continue
+
+            if obj_color not in characteristics_by_color:
+                characteristics_by_color[obj_color] = []
+
             characteristics = {
-                'color': obj.get('color'),
                 'size': (obj.get('height'), obj.get('width')),
-                'shape_fingerprint': obj.get('fingerprint'),
-                'location': tile_coords
+                'shape_fingerprint': obj_fingerprint,
+                'location': (obj.get('top_row'), obj.get('left_index'))
             }
-            self.interactable_object_characteristics[tile_coords] = characteristics
-            print(f"🔬 Characteristics logged for object at {tile_coords}: Size={characteristics['size']}, Color={characteristics['color']}")
+            characteristics_by_color[obj_color].append(characteristics)
+
+        if characteristics_by_color:
+            self.interactable_object_characteristics[tile_coords] = characteristics_by_color
+            summary_str = ", ".join([f"{len(objs)} object(s) of color {color}" for color, objs in characteristics_by_color.items()])
+            print(f"🔬 Characteristics logged for tile {tile_coords}: {summary_str}")
+            for color, objects in characteristics_by_color.items():
+                print(f"  - Color {color}:")
+                for i, char in enumerate(objects):
+                    size_str = f"{char['size'][0]}x{char['size'][1]}"
+                    loc_str = char['location']
+                    fingerprint = char['shape_fingerprint']
+                    print(f"    - Object {i+1}: Size={size_str}, Location={loc_str}, Fingerprint={fingerprint}")
 
     def _analyze_consumable_aftermath(self, latest_grid: list):
         """Checks if the interacted-with object was consumed (i.e., turned to floor)."""
