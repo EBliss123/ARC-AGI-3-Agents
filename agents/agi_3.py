@@ -32,6 +32,7 @@ class CellType(Enum):
     PLAYER = 4
     CONFIRMED_INTERACTABLE = 5
     RESOURCE = 6
+    POTENTIAL_MATCH = 7
 
 class ExplorationPhase(Enum):
     """Manages the agent's goal-oriented exploration strategy."""
@@ -96,10 +97,11 @@ class AGI3(Agent):
         self.world_model = {
             'player_signature': None,
             'floor_color': None,
-            'wall_colors': set(), # Use a set for multiple possible wall colors
-            'action_map': {}, # Will store confirmed action -> effect mappings
+            'wall_colors': set(),
+            'action_map': {},
             'resource_signatures': set()
         }
+        self.cross_level_fingerprints = set() # Stores object fingerprints seen in previous levels.
         self.world_model['life_indicator_object'] = None
         self.player_floor_hypothesis = {}
         self.agent_move_hypothesis = {} # Tracks how many times a shape has moved
@@ -121,6 +123,8 @@ class AGI3(Agent):
 
         # --- Interaction Learning ---
         self.observing_interaction_for_tile = None # Stores the coords of the tile being observed
+        self.tile_for_aftermath_analysis = None # NEW NAME: Stores tile for delayed analysis
+        self.frame_at_arrival = None # NEW: Stores the frame from the moment of arrival
         self.tile_to_log_on_aftermath = None # Stores data for delayed logging
         self.interaction_hypotheses = {} # signature -> {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
         self.interactable_object_characteristics = {} # Stores visual characteristics of confirmed interactables.
@@ -415,14 +419,37 @@ class AGI3(Agent):
                 print("-> Stepped away from observed tile. Analyzing aftermath...")
                 self._analyze_consumable_aftermath(latest_frame.frame)
 
-                # --- NEW: Trigger the delayed characteristic logging ---
-                if self.tile_to_log_on_aftermath:
-                    # We log the tile we started observing, using the CURRENT frame to see the aftermath state.
-                    if self.tile_to_log_on_aftermath == self.observing_interaction_for_tile:
-                        self._log_object_characteristics(self.tile_to_log_on_aftermath, latest_frame.frame)
+                # --- NEW: Full aftermath analysis, including classification and logging ---
+                if self.tile_for_aftermath_analysis and self.frame_at_arrival:
+                    tile_to_analyze = self.tile_for_aftermath_analysis
 
-                    # Reset the flag
-                    self.tile_to_log_on_aftermath = None
+                    # Ensure we are analyzing the correct tile for the current interaction cycle.
+                    if tile_to_analyze == self.observing_interaction_for_tile:
+                        # --- NEW: Add debug print ---
+                        print(f"🧠 Checking for match. Long-term memory contains: {self.cross_level_fingerprints}")
+
+                        # 1. Perform the cross-level match check using the pre-interaction frame.
+                        is_match = False
+                        objects_on_tile = self._find_all_objects_on_tile(tile_to_analyze, self.frame_at_arrival)
+                        for obj in objects_on_tile:
+                            if obj.get('fingerprint') in self.cross_level_fingerprints:
+                                is_match = True
+                                break
+
+                        # 2. Reclassify the tile on the map based on the check.
+                        if is_match:
+                            self.tile_map[tile_to_analyze] = CellType.POTENTIAL_MATCH
+                            print(f"✅ Aftermath classification: Tile {tile_to_analyze} is a potential match '~'.")
+                        else:
+                            self.tile_map[tile_to_analyze] = CellType.CONFIRMED_INTERACTABLE
+                            print(f"✅ Aftermath classification: Tile {tile_to_analyze} is a new interactable '!'.")
+
+                        # 3. Log the characteristics of the tile's AFTERMATH state.
+                        self._log_object_characteristics(tile_to_analyze, latest_frame.frame)
+
+                    # 4. Reset the flags for the next interaction cycle.
+                    self.tile_for_aftermath_analysis = None
+                    self.frame_at_arrival = None
 
                 # End the full observation cycle and return to normal exploration.
                 self.observing_interaction_for_tile = None
@@ -673,12 +700,10 @@ class AGI3(Agent):
                     if self.exploration_target and self.tile_size:
                         target_tile = (self.exploration_target[0] // self.tile_size, self.exploration_target[1] // self.tile_size)
                         if self.tile_map.get(target_tile) == CellType.POTENTIALLY_INTERACTABLE:
-                            self.tile_map[target_tile] = CellType.CONFIRMED_INTERACTABLE
-                            print(f"✅ Target at {target_tile} confirmed as interactable.")
-
-                            # --- NEW: Save data for delayed logging instead of logging immediately ---
-                            print(f"-> Queuing characteristics log for tile {target_tile} after aftermath analysis.")
-                            self.tile_to_log_on_aftermath = target_tile
+                            # --- NEW: Queue the tile for full analysis in the aftermath phase ---
+                            print(f"-> Queuing tile {target_tile} for classification and logging after aftermath.")
+                            self.tile_for_aftermath_analysis = target_tile
+                            self.frame_at_arrival = copy.deepcopy(frame_before_perception)
                             self.frame_for_logging = copy.deepcopy(latest_frame.frame)
                         self.observing_interaction_for_tile = target_tile
                         self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect', latest_frame.frame, self.last_known_objects, agent_part_fingerprints)
@@ -958,8 +983,21 @@ class AGI3(Agent):
         for tile_pos in potential_targets:
             signature = f"tile_pos_{tile_pos}"
             if signature in self.interaction_hypotheses:
-                print(f"🧠 Pre-existing knowledge found for tile {tile_pos}. Reclassifying as CONFIRMED_INTERACTABLE.")
-                self.tile_map[tile_pos] = CellType.CONFIRMED_INTERACTABLE
+                # --- NEW: Check for cross-level match before confirming ---
+                is_match = False
+                if self.previous_frame:
+                    objects_on_tile = self._find_all_objects_on_tile(tile_pos, self.previous_frame)
+                    for obj in objects_on_tile:
+                        if obj.get('fingerprint') in self.cross_level_fingerprints:
+                            is_match = True
+                            break
+
+                if is_match:
+                    self.tile_map[tile_pos] = CellType.POTENTIAL_MATCH
+                    print(f"🧠 Pre-existing knowledge for tile {tile_pos}. Reclassifying as POTENTIAL_MATCH '~'.")
+                else:
+                    self.tile_map[tile_pos] = CellType.CONFIRMED_INTERACTABLE
+                    print(f"🧠 Pre-existing knowledge for tile {tile_pos}. Reclassifying as CONFIRMED_INTERACTABLE '!'.")
                 if self.previous_frame:
                     self._log_object_characteristics(tile_pos, self.previous_frame)
                 known_interactables.append(tile_pos)
@@ -2576,10 +2614,12 @@ class AGI3(Agent):
                         row_str += " ! "
                     elif cell == CellType.RESOURCE:
                         row_str += " R "
+                    elif cell == CellType.POTENTIAL_MATCH:
+                        row_str += " ~ "
                     else: # UNKNOWN
                         row_str += "   "
             print(row_str)
-        print("--- Key: P=Player, T=Target, .=Floor, #=Wall, ?=Potential, !=Confirmed ---\n")
+        print("--- Key: P=Player, T=Target, .=Floor, #=Wall, ?=Potential, !=Confirmed, ~=Match ---\n")
 
     def _review_and_summarize_interactions(self):
         """Reviews all interactable tiles and summarizes their learned properties."""
@@ -2641,6 +2681,19 @@ class AGI3(Agent):
             
             print(f"  - Type: {type_desc}")
         
+        # --- NEW: Save all unique fingerprints to cross-level memory ---
+        fingerprints_found = set()
+        for tile_data in self.interactable_object_characteristics.values():
+            for color_data in tile_data.values():
+                for obj_char in color_data:
+                    fingerprints_found.add(obj_char['shape_fingerprint'])
+
+        if fingerprints_found:
+            original_size = len(self.cross_level_fingerprints)
+            self.cross_level_fingerprints.update(fingerprints_found)
+            new_size = len(self.cross_level_fingerprints)
+            print(f"🧠 Added {new_size - original_size} new unique fingerprints to long-term memory ({new_size} total).")
+
         print("-----------------------------------------\n")
         self.has_summarized_interactions = True
 
