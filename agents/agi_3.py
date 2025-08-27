@@ -839,7 +839,7 @@ class AGI3(Agent):
                 # If we already have a confirmed interaction for this tile,
                 # preserve its type and don't re-evaluate it based on color.
                 existing_type = self.tile_map.get(tile_coords)
-                if existing_type in [CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE]:
+                if existing_type in [CellType.CONFIRMED_INTERACTABLE, CellType.POTENTIAL_MATCH, CellType.RESOURCE]:
                     temp_tile_map[tile_coords] = existing_type
                     continue
                 
@@ -884,7 +884,7 @@ class AGI3(Agent):
             # --- FIX: Preserve any tile that has a known function ---
             # This prevents the refinement logic below from overwriting this knowledge.
             existing_type = self.tile_map.get(tile_coords)
-            if existing_type in [CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE]:
+            if existing_type in [CellType.CONFIRMED_INTERACTABLE, CellType.POTENTIAL_MATCH, CellType.RESOURCE]:
                 refined_tile_map[tile_coords] = existing_type
                 continue
 
@@ -1029,7 +1029,7 @@ class AGI3(Agent):
                 print("🎯 Activating PRIORITY 2: Pattern is active. Seeking interactables with no known effect.")
                 
                 interactables_with_no_effect = []
-                all_confirmed_interactables = [pos for pos, type in self.tile_map.items() if type == CellType.CONFIRMED_INTERACTABLE]
+                all_confirmed_interactables = [pos for pos, type in self.tile_map.items() if type in [CellType.CONFIRMED_INTERACTABLE, CellType.POTENTIAL_MATCH]]
 
                 for tile_pos in all_confirmed_interactables:
                     if tile_pos in self.consumed_tiles_this_life:
@@ -1189,7 +1189,7 @@ class AGI3(Agent):
                 neighbor_tile = (current_tile[0] + tile_vec[0], current_tile[1] + tile_vec[1])
 
                 tile_type = self.tile_map.get(neighbor_tile)
-                can_move_to = tile_type in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE]
+                can_move_to = tile_type in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.POTENTIAL_MATCH, CellType.RESOURCE]
 
                 if not can_move_to:
                     continue
@@ -1245,7 +1245,7 @@ class AGI3(Agent):
                 neighbor_tile = (current_tile[0] + dr, current_tile[1] + dc)
 
                 # We can only traverse through tiles classified as FLOOR.
-                if self.tile_map.get(neighbor_tile) in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE] and neighbor_tile not in visited:
+                if self.tile_map.get(neighbor_tile) in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.POTENTIAL_MATCH, CellType.RESOURCE] and neighbor_tile not in visited:
                     visited.add(neighbor_tile)
                     q.append(neighbor_tile)
         
@@ -2310,7 +2310,7 @@ class AGI3(Agent):
             current_tile = q.pop(0)
             for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
                 neighbor = (current_tile[0] + dr, current_tile[1] + dc)
-                if self.tile_map.get(neighbor) in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE] and neighbor not in visited_tiles:
+                if self.tile_map.get(neighbor) in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.POTENTIAL_MATCH] and neighbor not in visited_tiles:
                     visited_tiles.add(neighbor)
                     object_tiles.add(neighbor)
                     q.append(neighbor)
@@ -2627,7 +2627,7 @@ class AGI3(Agent):
         
         interactable_tiles = [
             pos for pos, cell_type in self.tile_map.items() 
-            if cell_type in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE]
+            if cell_type in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.POTENTIAL_MATCH, CellType.RESOURCE]
             and pos in self.reachable_floor_area
         ]
 
@@ -2639,49 +2639,67 @@ class AGI3(Agent):
         for tile_pos in sorted(interactable_tiles):
             signature = f"tile_pos_{tile_pos}"
             hypothesis = self.interaction_hypotheses.get(signature)
+            cell_type = self.tile_map.get(tile_pos)
 
-            print(f"Tile {tile_pos}:")
+            print(f"Tile {tile_pos} (Type: {cell_type.name}):")
 
             # --- NEW: Special handling for the goal tile ---
             if tile_pos == self.final_tile_of_level:
                 print(f"  - Function: Causes new level when interacted with.")
                 print(f"  - Type: Unknown (Level Ended Before Aftermath Observed).")
-                continue # Skip the normal summary for this tile.
-
-            if not hypothesis:
-                print(f"  - Function: Untested.")
-                print(f"  - Type: Unknown.")
                 continue
 
-            # 1. Report the learned function/effect
-            effect_desc = "No effect observed."
-            if hypothesis.get('provides_resource'):
-                effect_desc = "Resource (fills resource bar)."
+            # --- NEW: Prioritize known tile type for summary ---
+            if cell_type == CellType.RESOURCE:
+                print(f"  - Function: Resource (fills resource bar).")
+                print(f"  - Type: Consumable (disappears after use).")
+            
+            elif not hypothesis:
+                print(f"  - Function: Untested.")
+                print(f"  - Type: Unknown.")
+            
             else:
-                immediate_effect_objects = hypothesis.get('immediate_effect', [])
-                if immediate_effect_objects:
-                    # Describe the first object from the effect for a concise summary.
-                    obj = immediate_effect_objects[0]
-                    size = (obj['height'], obj['width'])
-                    pos = (obj['top_row'], obj['left_index'])
-                    tile_pos_effect = (pos[0] // self.tile_size, pos[1] // self.tile_size) if self.tile_size else pos
-                    effect_desc = f"Causes a {size[0]}x{size[1]} object to appear/change at tile {tile_pos_effect}."
-                    if len(immediate_effect_objects) > 1:
-                        effect_desc += f" (+{len(immediate_effect_objects) - 1} other effects)."
-            
-            print(f"  - Function: {effect_desc}")
+                # 1. Report the learned function/effect from the hypothesis
+                effect_desc = "No effect observed."
+                if hypothesis.get('provides_resource'):
+                    effect_desc = "Resource (fills resource bar)."
+                else:
+                    immediate_effect_objects = hypothesis.get('immediate_effect', [])
+                    if immediate_effect_objects:
+                        obj = immediate_effect_objects[0]
+                        size = (obj['height'], obj['width'])
+                        pos = (obj['top_row'], obj['left_index'])
+                        tile_pos_effect = (pos[0] // self.tile_size, pos[1] // self.tile_size) if self.tile_size else pos
+                        effect_desc = f"Causes a {size[0]}x{size[1]} object to appear/change at tile {tile_pos_effect}."
+                        if len(immediate_effect_objects) > 1:
+                            effect_desc += f" (+{len(immediate_effect_objects) - 1} other effects)."
+                
+                print(f"  - Function: {effect_desc}")
 
-            # 2. Report the Type (persistence)
-            type_desc = "Unknown (aftermath not observed)."
-            is_consumable = hypothesis.get('is_consumable')
-            if is_consumable is True:
-                type_desc = "Consumable (disappears after use)."
-            elif is_consumable is False:
-                type_desc = "Persistent (remains after use)."
-            
-            print(f"  - Type: {type_desc}")
+                # 2. Report the Type (persistence) from the hypothesis
+                type_desc = "Unknown (aftermath not observed)."
+                is_consumable = hypothesis.get('is_consumable')
+                if is_consumable is True:
+                    type_desc = "Consumable (disappears after use)."
+                elif is_consumable is False:
+                    type_desc = "Persistent (remains after use)."
+                
+                print(f"  - Type: {type_desc}")
+
+            # --- NEW: Report on the object's observed characteristics for ALL types ---
+            characteristics_data = self.interactable_object_characteristics.get(tile_pos)
+            if characteristics_data:
+                print(f"  - Characteristics:")
+                for color, objects in characteristics_data.items():
+                    print(f"    - Color {color}:")
+                    for i, char in enumerate(objects):
+                        size_str = f"{char['size'][0]}x{char['size'][1]}"
+                        fingerprint = char['shape_fingerprint']
+                        print(f"      - Object {i+1}: Size={size_str}, Fingerprint={fingerprint}")
+            else:
+                print(f"  - Characteristics: Not logged.")
         
-        # --- NEW: Save all unique fingerprints to cross-level memory ---
+        # --- Fingerprint learning logic (remains the same) ---
         fingerprints_found = set()
         for tile_data in self.interactable_object_characteristics.values():
             for color_data in tile_data.values():
