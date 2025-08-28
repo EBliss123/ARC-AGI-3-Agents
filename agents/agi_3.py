@@ -101,7 +101,8 @@ class AGI3(Agent):
             'action_map': {},
             'resource_signatures': set()
         }
-        self.cross_level_fingerprints = set() # Stores object fingerprints seen in previous levels.
+        self.cross_level_characteristics = {} # Stores full profiles of objects from previous levels.
+        self.level_count = 1
         self.world_model['life_indicator_object'] = None
         self.player_floor_hypothesis = {}
         self.agent_move_hypothesis = {} # Tracks how many times a shape has moved
@@ -260,6 +261,9 @@ class AGI3(Agent):
 
     def _reset_for_new_level(self):
         """Resets all level-specific knowledge for a new level, preserving core learned concepts."""
+        # --- NEW: Increment level counter ---
+        self.level_count += 1
+
         # Record the agent's last position to correctly label the summary.
         if self.last_known_player_obj and self.tile_size:
             self.final_tile_of_level = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
@@ -426,13 +430,13 @@ class AGI3(Agent):
                     # Ensure we are analyzing the correct tile for the current interaction cycle.
                     if tile_to_analyze == self.observing_interaction_for_tile:
                         # --- NEW: Add debug print ---
-                        print(f"🧠 Checking for match. Long-term memory contains: {self.cross_level_fingerprints}")
+                        print(f"🧠 Checking for match. Long-term memory contains: {list(self.cross_level_characteristics.keys())}")
 
                         # 1. Perform the cross-level match check using the pre-interaction frame.
                         is_match = False
                         objects_on_tile = self._find_all_objects_on_tile(tile_to_analyze, self.frame_at_arrival)
                         for obj in objects_on_tile:
-                            if obj.get('fingerprint') in self.cross_level_fingerprints:
+                            if obj.get('fingerprint') in self.cross_level_characteristics:
                                 is_match = True
                                 break
 
@@ -993,7 +997,7 @@ class AGI3(Agent):
                 if self.previous_frame:
                     objects_on_tile = self._find_all_objects_on_tile(tile_pos, self.previous_frame)
                     for obj in objects_on_tile:
-                        if obj.get('fingerprint') in self.cross_level_fingerprints:
+                        if obj.get('fingerprint') in self.cross_level_characteristics:
                             is_match = True
                             break
 
@@ -2689,6 +2693,43 @@ class AGI3(Agent):
                 
                 print(f"  - Type: {type_desc}")
 
+                # --- NEW: Add Match Analysis for Potential Matches ---
+                if cell_type == CellType.POTENTIAL_MATCH:
+                    print(f"  - Match Analysis:")
+                    current_characteristics = self.interactable_object_characteristics.get(tile_pos)
+                    if current_characteristics:
+                        for color, object_list in current_characteristics.items():
+                            for obj_char in object_list:
+                                fp = obj_char['shape_fingerprint']
+                                remembered_profiles = self.cross_level_characteristics.get(fp, [])
+                                if not remembered_profiles:
+                                    print(f"      - Part (Fingerprint: {fp}): No detailed profile in memory.")
+                                    continue
+
+                                # Find the best match from memory
+                                best_match = remembered_profiles[0] # Default to first
+                                perfect_match_found = False
+                                for rem_prof in remembered_profiles:
+                                    if rem_prof['color'] == color and rem_prof['size'] == obj_char['size']:
+                                        best_match = rem_prof
+                                        perfect_match_found = True
+                                        break
+
+                                details = []
+                                if perfect_match_found:
+                                    match_type = "Perfect Match"
+                                else:
+                                    match_type = "Partial Match"
+                                    if best_match['color'] != color:
+                                        details.append(f"color differs (current: {color}, remembered: {best_match['color']})")
+                                    if best_match['size'] != obj_char['size']:
+                                        details.append(f"size differs (current: {obj_char['size']}, remembered: {best_match['size']})")
+
+                                detail_str = f" ({', '.join(details)})" if details else ""
+                                print(f"      - Part (Color {color}): {match_type} with object from Level {best_match['level_source']}{detail_str}.")
+                    else:
+                        print(f"      - Could not perform analysis: Characteristics not logged.")
+
             # --- Step 2: Print Characteristics for ALL tiles ---
             characteristics_data = self.interactable_object_characteristics.get(tile_pos)
             if characteristics_data:
@@ -2702,18 +2743,33 @@ class AGI3(Agent):
             else:
                 print(f"  - Characteristics: Not logged.")
         
-        # --- Fingerprint learning logic (remains the same) ---
-        fingerprints_found = set()
-        for tile_data in self.interactable_object_characteristics.values():
-            for color_data in tile_data.values():
-                for obj_char in color_data:
-                    fingerprints_found.add(obj_char['shape_fingerprint'])
+        # --- NEW: Richer long-term memory learning logic ---
+        profiles_added = 0
+        # We learn from the level that just finished, so subtract 1 from the current count.
+        level_learned_from = self.level_count - 1
+        if level_learned_from < 1: level_learned_from = 1
 
-        if fingerprints_found:
-            original_size = len(self.cross_level_fingerprints)
-            self.cross_level_fingerprints.update(fingerprints_found)
-            new_size = len(self.cross_level_fingerprints)
-            print(f"🧠 Added {new_size - original_size} new unique fingerprints to long-term memory ({new_size} total).")
+        for tile_pos, tile_data in self.interactable_object_characteristics.items():
+            for color, object_list in tile_data.items():
+                for obj_char in object_list:
+                    fp = obj_char['shape_fingerprint']
+                    if fp not in self.cross_level_characteristics:
+                        self.cross_level_characteristics[fp] = []
+
+                    profile_to_store = {
+                        'color': color,
+                        'size': obj_char['size'],
+                        'level_source': level_learned_from
+                    }
+
+                    # Add only if an identical profile isn't already present for this fingerprint.
+                    if profile_to_store not in self.cross_level_characteristics[fp]:
+                        self.cross_level_characteristics[fp].append(profile_to_store)
+                        profiles_added += 1
+
+        if profiles_added > 0:
+            total_profiles = sum(len(v) for v in self.cross_level_characteristics.values())
+            print(f"🧠 Added {profiles_added} new unique object profiles to long-term memory ({total_profiles} total).")
 
         print("-----------------------------------------\n")
         self.has_summarized_interactions = True
