@@ -457,7 +457,7 @@ class AGI3(Agent):
             
 
         # --- Trigger queued summary AFTER aftermath is processed ---
-        if self.awaiting_final_summary:
+        if self.awaiting_final_summary and self.observing_interaction_for_tile is None:
             self._review_and_summarize_interactions()
             self.awaiting_final_summary = False # Reset flag
             self.exploration_phase = ExplorationPhase.INACTIVE # Officially end exploration
@@ -660,13 +660,18 @@ class AGI3(Agent):
             print(f"--- New Level Detected (Score Increased)! Analyzing final move before reset. ---")
             
             # --- Manually trigger interaction analysis for the goal tile ---
-            # This ensures we learn from the winning move before the summary is printed.
             if self.last_known_player_obj and self.tile_size:
                 goal_tile = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
                 print(f"-> Analyzing winning interaction with tile {goal_tile}...")
                 self.observing_interaction_for_tile = goal_tile
                 self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect', latest_frame.frame, self.last_known_objects, agent_part_fingerprints)
                 self.observing_interaction_for_tile = None # Clear immediately after use.
+
+                # --- NEW: Special case to log characteristics for the goal tile ---
+                # This must use the frame from *before* the agent moved onto the tile.
+                print(f"-> Logging characteristics for goal tile {goal_tile} before level reset.")
+                if frame_before_perception:
+                    self._log_object_characteristics(goal_tile, frame_before_perception)
 
             # Now that the final interaction is logged, proceed with the reset.
             self.level_start_frame = copy.deepcopy(latest_frame.frame)
@@ -2643,14 +2648,12 @@ class AGI3(Agent):
 
             print(f"Tile {tile_pos} (Type: {cell_type.name}):")
 
-            # --- NEW: Special handling for the goal tile ---
+            # --- Step 1: Determine and Print Function & Type ---
             if tile_pos == self.final_tile_of_level:
                 print(f"  - Function: Causes new level when interacted with.")
                 print(f"  - Type: Unknown (Level Ended Before Aftermath Observed).")
-                continue
-
-            # --- NEW: Prioritize known tile type for summary ---
-            if cell_type == CellType.RESOURCE:
+            
+            elif cell_type == CellType.RESOURCE:
                 print(f"  - Function: Resource (fills resource bar).")
                 print(f"  - Type: Consumable (disappears after use).")
             
@@ -2659,7 +2662,7 @@ class AGI3(Agent):
                 print(f"  - Type: Unknown.")
             
             else:
-                # 1. Report the learned function/effect from the hypothesis
+                # Report the learned function/effect from the hypothesis
                 effect_desc = "No effect observed."
                 if hypothesis.get('provides_resource'):
                     effect_desc = "Resource (fills resource bar)."
@@ -2676,7 +2679,7 @@ class AGI3(Agent):
                 
                 print(f"  - Function: {effect_desc}")
 
-                # 2. Report the Type (persistence) from the hypothesis
+                # Report the Type (persistence) from the hypothesis
                 type_desc = "Unknown (aftermath not observed)."
                 is_consumable = hypothesis.get('is_consumable')
                 if is_consumable is True:
@@ -2686,7 +2689,7 @@ class AGI3(Agent):
                 
                 print(f"  - Type: {type_desc}")
 
-            # --- NEW: Report on the object's observed characteristics for ALL types ---
+            # --- Step 2: Print Characteristics for ALL tiles ---
             characteristics_data = self.interactable_object_characteristics.get(tile_pos)
             if characteristics_data:
                 print(f"  - Characteristics:")
