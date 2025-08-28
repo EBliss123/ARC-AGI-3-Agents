@@ -972,6 +972,19 @@ class AGI3(Agent):
 
         player_pixel_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
         player_tile_pos = (player_pixel_pos[0] // self.tile_size, player_pixel_pos[1] // self.tile_size)
+
+        # --- NEW: PRIORITY 0 - SURVIVAL ---
+        # If moves are low, survival is the only priority.
+        nearest_resource_info = self._find_nearest_resource(player_tile_pos)
+        if nearest_resource_info:
+            distance_to_resource = len(nearest_resource_info['path'])
+            safety_buffer = 1 # Extra moves needed to be "safe"
+            if self.current_moves <= distance_to_resource + safety_buffer:
+                print(f"⚠️ Activating PRIORITY 0 (SURVIVAL): Low on moves ({self.current_moves})! Resource is {distance_to_resource} steps away.")
+                self.exploration_target = (nearest_resource_info['pos'][0] * self.tile_size, nearest_resource_info['pos'][1] * self.tile_size)
+                self.exploration_plan = nearest_resource_info['path']
+                self._print_debug_map()
+                return True # Exit immediately with a plan to get resources.
         
         # --- PRIORITY 1: Explore all potentially interactable objects ---
         print("🎯 Activating PRIORITY 1: Seeking all potentially interactable tiles.")
@@ -1103,22 +1116,6 @@ class AGI3(Agent):
 
         # 3. From the list of reachable targets, select the one with the shortest path.
         best_target = min(reachable_targets, key=lambda t: len(t['path']))
-        
-        # --- NEW: Resource Safety Check ---
-        # Before committing to the plan, check if we need to get resources first.
-        nearest_resource_info = self._find_nearest_resource(player_tile_pos)
-        if nearest_resource_info:
-            distance_to_resource = len(nearest_resource_info['path'])
-            # Add a small safety buffer. If current moves are just enough to get there (or less),
-            # the agent must prioritize survival.
-            safety_buffer = 1
-            if self.current_moves <= distance_to_resource + safety_buffer:
-                print(f"⚠️ Low on moves ({self.current_moves})! Resource is {distance_to_resource} steps away. Prioritizing survival.")
-                # Override the original plan with the resource-gathering plan.
-                best_target = nearest_resource_info
-            else:
-                print(f"-> Moves ({self.current_moves}) sufficient. Nearest resource is {distance_to_resource} steps away.")
-        # --- End of Safety Check ---
 
         # 4. Set the exploration plan based on the best target found.
         self.exploration_target = (best_target['pos'][0] * self.tile_size, best_target['pos'][1] * self.tile_size)
