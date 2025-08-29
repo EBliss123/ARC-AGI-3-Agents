@@ -102,6 +102,7 @@ class AGI3(Agent):
             'resource_signatures': set()
         }
         self.cross_level_characteristics = {} # Stores full profiles of objects from previous levels.
+        self.world_objects = {} # The new, non-tile-based world model.
         self.level_count = 1
         self.world_model['life_indicator_object'] = None
         self.player_floor_hypothesis = {}
@@ -615,6 +616,26 @@ class AGI3(Agent):
                     sk_tile = (sk['top_row'] // self.tile_size, sk['left_index'] // self.tile_size) if self.tile_size else (sk['top_row'], sk['left_index'])
                     print(f"  - Pattern {i+1}: Dynamic object at {dk_tile} matches static object at {sk_tile}.")
            
+            # --- (PHASE 1) Populate World Object Database ---
+            if current_objects:
+                print("--- Populating World Object Database ---")
+                for obj in current_objects:
+                    fingerprint = obj.get('fingerprint')
+                    if fingerprint:
+                        # This new line adds the detailed printout for each object
+                        pos = (obj.get('top_row'), obj.get('left_index'))
+                        size = (obj.get('height'), obj.get('width'))
+                        color = obj.get('color')
+                        pixel_count = obj.get('pixel_count', 0)
+                        print(f"  -> Storing object {fingerprint}: A {size[0]}x{size[1]} object ({pixel_count} pixels) of color {color} at {pos}.")
+
+                        # Update the database with the latest known state of this object.
+                        self.world_objects[fingerprint] = {
+                            'profile': obj,
+                            'last_seen_frame': self.debug_counter
+                        }
+                print(f"-> World database now tracking {len(self.world_objects)} unique objects.")
+
             # 5. Update memory for the next turn.
             self.last_known_objects = current_objects
 
@@ -1601,6 +1622,8 @@ class AGI3(Agent):
 
             final_objects.append({
                 'height': height, 'width': width, 'top_row': min_row,
+                'pixel_count': len(obj_points), 
+                'top_row': min_row,
                 'left_index': min_idx, 'color': obj_color,
                 'original_color': original_color,
                 'data_map': data_map,
