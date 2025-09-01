@@ -2677,6 +2677,7 @@ class AGI3(Agent):
             self.has_summarized_interactions = True
             return
 
+        # --- Main Tile-by-Tile Summary ---
         for tile_pos in sorted(interactable_tiles):
             signature = f"tile_pos_{tile_pos}"
             hypothesis = self.interaction_hypotheses.get(signature)
@@ -2684,29 +2685,21 @@ class AGI3(Agent):
 
             print(f"Tile {tile_pos} (Type: {cell_type.name}):")
 
-            # --- Step 1: Determine and Print Function & Type ---
             if tile_pos == self.final_tile_of_level:
                 print(f"  - Function: Causes new level when interacted with.")
                 print(f"  - Type: Unknown (Level Ended Before Aftermath Observed).")
-            
             elif cell_type == CellType.RESOURCE:
                 print(f"  - Function: Resource (fills resource bar).")
                 print(f"  - Type: Consumable (disappears after use).")
-            
             elif not hypothesis:
                 print(f"  - Function: Untested.")
                 print(f"  - Type: Unknown.")
-            
             else:
-                # --- DETAILED FUNCTION/EFFECT REPORTING ---
                 has_any_effect = False
-
-                # 1. Report Resource Provision
                 if hypothesis.get('provides_resource'):
                     print(f"  - Function: Resource (fills resource bar).")
                     has_any_effect = True
                 
-                # 2. Report Immediate Effects
                 immediate_effects = hypothesis.get('immediate_effect', [])
                 if immediate_effects:
                     if not has_any_effect: print(f"  - Function:")
@@ -2715,7 +2708,6 @@ class AGI3(Agent):
                         print(f"      - {self._get_object_summary_string(obj)}")
                     has_any_effect = True
 
-                # 3. Report Aftermath Effects
                 aftermath_effects = hypothesis.get('aftermath_effect', [])
                 if aftermath_effects:
                     if not has_any_effect: print(f"  - Function:")
@@ -2724,21 +2716,15 @@ class AGI3(Agent):
                         print(f"      - {self._get_object_summary_string(obj)}")
                     has_any_effect = True
                 
-                # 4. Report if no effects were found at all
                 if not has_any_effect:
                     print(f"  - Function: No effect observed.")
 
-                # Report the Type (persistence) from the hypothesis
                 type_desc = "Unknown (aftermath not observed)."
                 is_consumable = hypothesis.get('is_consumable')
-                if is_consumable is True:
-                    type_desc = "Consumable (disappears after use)."
-                elif is_consumable is False:
-                    type_desc = "Persistent (remains after use)."
-                
+                if is_consumable is True: type_desc = "Consumable (disappears after use)."
+                elif is_consumable is False: type_desc = "Persistent (remains after use)."
                 print(f"  - Type: {type_desc}")
 
-                # --- NEW: Add Match Analysis for Potential Matches ---
                 if cell_type == CellType.POTENTIAL_MATCH:
                     print(f"  - Match Analysis:")
                     current_characteristics = self.interactable_object_characteristics.get(tile_pos)
@@ -2750,32 +2736,24 @@ class AGI3(Agent):
                                 if not remembered_profiles:
                                     print(f"      - Part (Fingerprint: {fp}): No detailed profile in memory.")
                                     continue
-
-                                # Find the best match from memory
-                                best_match = remembered_profiles[0] # Default to first
+                                best_match = remembered_profiles[0]
                                 perfect_match_found = False
                                 for rem_prof in remembered_profiles:
                                     if rem_prof['color'] == color and rem_prof['size'] == obj_char['size']:
                                         best_match = rem_prof
                                         perfect_match_found = True
                                         break
-
                                 details = []
-                                if perfect_match_found:
-                                    match_type = "Perfect Match"
+                                if perfect_match_found: match_type = "Perfect Match"
                                 else:
                                     match_type = "Partial Match"
-                                    if best_match['color'] != color:
-                                        details.append(f"color differs (current: {color}, remembered: {best_match['color']})")
-                                    if best_match['size'] != obj_char['size']:
-                                        details.append(f"size differs (current: {obj_char['size']}, remembered: {best_match['size']})")
-
+                                    if best_match['color'] != color: details.append(f"color differs (current: {color}, remembered: {best_match['color']})")
+                                    if best_match['size'] != obj_char['size']: details.append(f"size differs (current: {obj_char['size']}, remembered: {best_match['size']})")
                                 detail_str = f" ({', '.join(details)})" if details else ""
                                 print(f"      - Part (Color {color}): {match_type} with object from Level {best_match['level_source']}{detail_str}.")
                     else:
                         print(f"      - Could not perform analysis: Characteristics not logged.")
 
-            # --- Step 2: Print Characteristics for ALL tiles ---
             characteristics_data = self.interactable_object_characteristics.get(tile_pos)
             if characteristics_data:
                 print(f"  - Characteristics:")
@@ -2787,34 +2765,46 @@ class AGI3(Agent):
                         print(f"      - Object {i+1}: Size={size_str}, Fingerprint={fingerprint}")
             else:
                 print(f"  - Characteristics: Not logged.")
-        
-        # --- NEW: Richer long-term memory learning logic ---
-        profiles_added = 0
-        # We learn from the level that just finished, so subtract 1 from the current count.
-        level_learned_from = self.level_count - 1
-        if level_learned_from < 1: level_learned_from = 1
 
+        # --- Off-Grid Effects Summary ---
+        unique_off_grid_effects = set()
+        if self.tile_size:
+            display_area = set(self.reachable_floor_area)
+            for r_tile, c_tile in self.reachable_floor_area:
+                for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                    neighbor = (r_tile + dr, c_tile + dc)
+                    if neighbor in self.tile_map:
+                        display_area.add(neighbor)
+            
+            for hypothesis in self.interaction_hypotheses.values():
+                all_effects = hypothesis.get('immediate_effect', []) + hypothesis.get('aftermath_effect', [])
+                for obj in all_effects:
+                    obj_tile_pos = (obj['top_row'] // self.tile_size, obj['left_index'] // self.tile_size)
+                    if obj_tile_pos not in display_area:
+                        summary_str = self._get_object_summary_string(obj)
+                        unique_off_grid_effects.add(summary_str)
+        
+        if unique_off_grid_effects:
+            print("\n--- Off-Grid Effects Summary ---")
+            print("The following unique off-grid object changes were observed:")
+            for effect_str in sorted(list(unique_off_grid_effects)):
+                print(f"  - {effect_str}")
+
+        # --- Cross-Level Learning Logic ---
+        profiles_added = 0
+        level_learned_from = self.level_count - 1 if self.level_count > 1 else 1
         for tile_pos, tile_data in self.interactable_object_characteristics.items():
             for color, object_list in tile_data.items():
                 for obj_char in object_list:
                     fp = obj_char['shape_fingerprint']
-                    if fp not in self.cross_level_characteristics:
-                        self.cross_level_characteristics[fp] = []
-
-                    profile_to_store = {
-                        'color': color,
-                        'size': obj_char['size'],
-                        'level_source': level_learned_from
-                    }
-
-                    # Add only if an identical profile isn't already present for this fingerprint.
-                    if profile_to_store not in self.cross_level_characteristics[fp]:
-                        self.cross_level_characteristics[fp].append(profile_to_store)
+                    if fp not in self.cross_level_characteristics: self.cross_level_characteristics[fp] = []
+                    profile = {'color': color, 'size': obj_char['size'], 'level_source': level_learned_from}
+                    if profile not in self.cross_level_characteristics[fp]:
+                        self.cross_level_characteristics[fp].append(profile)
                         profiles_added += 1
-
         if profiles_added > 0:
             total_profiles = sum(len(v) for v in self.cross_level_characteristics.values())
-            print(f"🧠 Added {profiles_added} new unique object profiles to long-term memory ({total_profiles} total).")
+            print(f"\n🧠 Added {profiles_added} new unique object profiles to long-term memory ({total_profiles} total).")
 
         print("-----------------------------------------\n")
         self.has_summarized_interactions = True
