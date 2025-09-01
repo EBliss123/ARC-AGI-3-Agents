@@ -2830,42 +2830,41 @@ class AGI3(Agent):
                     print(f"  - Match Analysis:")
                     current_characteristics = self.interactable_object_characteristics.get(tile_pos)
                     if current_characteristics:
-                        # --- Consolidate perfect matches to avoid redundant analysis ---
-                        first_perfect_match_profile = None
-
+                        # Iterate through each distinct part of the object on the current tile
                         for color, object_list in current_characteristics.items():
                             for obj_char in object_list:
                                 fp = obj_char['shape_fingerprint']
                                 remembered_profiles = self.cross_level_characteristics.get(fp, [])
                                 
                                 if not remembered_profiles:
-                                    print(f"      - Part (Fingerprint: {fp}): No detailed profile in memory.")
+                                    print(f"      - Part (Color {color}, FP {fp}): No profile in memory.")
                                     continue
-                                
-                                best_match = remembered_profiles[0]
-                                perfect_match_found = False
+
+                                print(f"      --- Comparing Part (Color {color}) ---")
+                                any_perfect_match_found_for_part = False
+
+                                # Iterate through ALL remembered profiles from ALL previous levels for this part
                                 for rem_prof in remembered_profiles:
-                                    if rem_prof['color'] == color and rem_prof['size'] == obj_char['size']:
-                                        best_match = rem_prof
-                                        perfect_match_found = True
-                                        break
+                                    # Check for a perfect match (same shape, color, and size)
+                                    is_perfect_match = (rem_prof['color'] == color and rem_prof['size'] == obj_char['size'])
+                                    
+                                    if is_perfect_match:
+                                        any_perfect_match_found_for_part = True
+                                        print(f"        - ✅ Perfect Match found with object from Level {rem_prof['level_source']}.")
+                                        
+                                        # Perform the detailed comparison for this specific historical match
+                                        remembered_hypothesis = rem_prof.get('hypothesis')
+                                        level_source = rem_prof.get('level_source')
+                                        if remembered_hypothesis:
+                                            self._compare_and_print_hypothesis_details(signature, remembered_hypothesis, level_source)
+                                        else:
+                                            print("          -> No remembered function to compare against for this match.")
                                 
-                                match_type = "Perfect Match" if perfect_match_found else "Partial Match"
-                                print(f"      - Part (Color {color}): {match_type} with object from Level {best_match['level_source']}.")
-
-                                # Store the first perfect match we find for this tile for comparison
-                                if perfect_match_found and first_perfect_match_profile is None:
-                                    first_perfect_match_profile = best_match
-
-                        # --- Perform the detailed comparison only ONCE for the whole tile ---
-                        if first_perfect_match_profile:
-                            remembered_hypothesis = first_perfect_match_profile.get('hypothesis')
-                            level_source = first_perfect_match_profile.get('level_source')
-                            
-                            if remembered_hypothesis:
-                                self._compare_and_print_hypothesis_details(signature, remembered_hypothesis, level_source)
-                            else:
-                                print("        -> No remembered function to compare against.")
+                                # After checking all levels, if no perfect matches were found, report it.
+                                if not any_perfect_match_found_for_part:
+                                    # Use the first profile as a representative for the partial match message
+                                    best_partial_match = remembered_profiles[0]
+                                    print(f"        - ⚠️ No Perfect Match found. Best partial match is from Level {best_partial_match['level_source']}.")
                     else:
                         print(f"      - Could not perform analysis: Characteristics not logged.")
 
