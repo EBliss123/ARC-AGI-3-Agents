@@ -318,6 +318,26 @@ class AGI3(Agent):
         if updated_pixels > 0:
             print(f"🗺️ Map updated: Identified {updated_pixels} NAVIGABLE floor pixels.")
     
+    def _update_obstacle_pixels(self, grid_data: list, wall_color: int):
+        """Updates the pixel_knowledge_map by marking all pixels of a given wall color as OBSTACLE."""
+        if self.pixel_knowledge_map is None:
+            return
+
+        height = len(self.pixel_knowledge_map)
+        width = len(self.pixel_knowledge_map[0])
+        
+        updated_pixels = 0
+        for r in range(height):
+            for c in range(width):
+                if grid_data[r][c] == wall_color:
+                    if self.pixel_knowledge_map[r][c] != PixelKnowledge.OBSTACLE:
+                        self.pixel_knowledge_map[r][c] = PixelKnowledge.OBSTACLE
+                        updated_pixels += 1
+        
+        if updated_pixels > 0:
+            wall_name = "Out of Bounds" if wall_color == -1 else f"Color {wall_color}"
+            print(f"🗺️ Map updated: Identified {updated_pixels} OBSTACLE pixels for wall {wall_name}.")
+
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
         frame_before_perception = copy.deepcopy(self.previous_frame)
@@ -2092,39 +2112,19 @@ class AGI3(Agent):
             print(f"🧱 Wall Hypothesis: {wall_name} blocked movement (Confidence: {confidence}).")
 
             # --- 5. Confirm Hypothesis if Threshold is Met ---
+            # Inside _learn_from_interaction_failure
             if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
                 # Add the color to the set of confirmed walls.
                 self.world_model['wall_colors'].add(wall_candidate_color)
                 print(f"✅ [WALL] Confirmed: {wall_name} is a wall.")
 
-                # --- Map Cleanup Logic ---
-                # This logic now runs for each newly confirmed wall color.
-                if self.tile_size:
-                    reclassified_count = 0
-                    for tile_coords, cell_type in list(self.tile_map.items()):
-                        # We only need to check tiles that are not already walls or floors.
-                        if cell_type not in [CellType.WALL, CellType.FLOOR]:
-                            # Use a full-tile check to see if it's a uniform wall.
-                            tile_row_start, tile_col_start = tile_coords[0] * self.tile_size, tile_coords[1] * self.tile_size
-                            tile_pixels = [
-                                last_grid[0][r][c]
-                                for r in range(tile_row_start, tile_row_start + self.tile_size)
-                                for c in range(tile_col_start, tile_col_start + self.tile_size)
-                                if 0 <= r < grid_height and 0 <= c < grid_width
-                            ]
-                            
-                            # If the tile is made up of only this newly confirmed wall color, reclassify it.
-                            if tile_pixels and all(p == wall_candidate_color for p in tile_pixels):
-                                self.tile_map[tile_coords] = CellType.WALL
-                                reclassified_count += 1
-                    
-                    if reclassified_count > 0:
-                        print(f"🧹 Map Cleanup: Reclassified {reclassified_count} tile(s) as newly confirmed wall ({wall_name}).")
+                # --- NEW: Call our pixel map update function ---
+                self._update_obstacle_pixels(last_grid[0], wall_candidate_color)
                 
                 # Once confirmed, we can remove it from the hypothesis tracker.
                 if wall_candidate_color in self.wall_hypothesis:
                     del self.wall_hypothesis[wall_candidate_color]
-    
+                
     def _update_resource_indicator_tracking(self, structured_changes: list, action: GameAction):
         """Analyzes changes to find a resource indicator, which depletes on any action."""
         if self.confirmed_resource_indicator or not action:
