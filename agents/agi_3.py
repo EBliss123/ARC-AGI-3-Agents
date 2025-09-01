@@ -34,13 +34,6 @@ class CellType(Enum):
     RESOURCE = 6
     POTENTIAL_MATCH = 7
 
-class PixelKnowledge(Enum):
-    """Represents the agent's knowledge about a single pixel."""
-    UNKNOWN = 0
-    NAVIGABLE = 1  # Represents floor or other walkable space
-    OBSTACLE = 2   # Represents a wall or other impassable barrier
-    INTERESTING = 3 # A non-obstacle pixel that isn't floor (potential item/goal)
-
 class ExplorationPhase(Enum):
     """Manages the agent's goal-oriented exploration strategy."""
     INACTIVE = 0
@@ -69,7 +62,6 @@ class AGI3(Agent):
         self.ignored_areas = []
         self.state_graph = {} # Stores stateA -> action -> stateB
         self.last_grid_tuple = None
-        self.pixel_knowledge_map = None
 
         # --- State Management ---
         self.agent_state = AgentState.DISCOVERY
@@ -295,49 +287,6 @@ class AGI3(Agent):
         print("🧠 Knowledge preserved. Skipping discovery and entering action state.")
         self.agent_state = AgentState.RANDOM_ACTION
 
-    def _update_navigable_pixels(self, grid_data: list):
-        """Updates the pixel_knowledge_map with the location of all floor pixels."""
-        if self.pixel_knowledge_map is None:
-            return # Map hasn't been initialized yet
-
-        floor_color = self.world_model.get('floor_color')
-        if floor_color is None:
-            return # We don't know the floor color yet
-
-        height = len(self.pixel_knowledge_map)
-        width = len(self.pixel_knowledge_map[0])
-        
-        updated_pixels = 0
-        for r in range(height):
-            for c in range(width):
-                if grid_data[r][c] == floor_color:
-                    if self.pixel_knowledge_map[r][c] == PixelKnowledge.UNKNOWN:
-                        self.pixel_knowledge_map[r][c] = PixelKnowledge.NAVIGABLE
-                        updated_pixels += 1
-        
-        if updated_pixels > 0:
-            print(f"🗺️ Map updated: Identified {updated_pixels} NAVIGABLE floor pixels.")
-    
-    def _update_obstacle_pixels(self, grid_data: list, wall_color: int):
-        """Updates the pixel_knowledge_map by marking all pixels of a given wall color as OBSTACLE."""
-        if self.pixel_knowledge_map is None:
-            return
-
-        height = len(self.pixel_knowledge_map)
-        width = len(self.pixel_knowledge_map[0])
-        
-        updated_pixels = 0
-        for r in range(height):
-            for c in range(width):
-                if grid_data[r][c] == wall_color:
-                    if self.pixel_knowledge_map[r][c] != PixelKnowledge.OBSTACLE:
-                        self.pixel_knowledge_map[r][c] = PixelKnowledge.OBSTACLE
-                        updated_pixels += 1
-        
-        if updated_pixels > 0:
-            wall_name = "Out of Bounds" if wall_color == -1 else f"Color {wall_color}"
-            print(f"🗺️ Map updated: Identified {updated_pixels} OBSTACLE pixels for wall {wall_name}.")
-
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
         frame_before_perception = copy.deepcopy(self.previous_frame)
@@ -358,14 +307,7 @@ class AGI3(Agent):
                 # preventing the VALIDATION_ERROR. We'll try to store the frame
                 # again on the next turn.
                 print("--- Ignoring blank starting frame. Waiting for a valid one... ---")
-       
-        if self.pixel_knowledge_map is None and latest_frame.frame:
-            grid_height = len(latest_frame.frame[0])
-            grid_width = len(latest_frame.frame[0][0])
-            # Create the map, initializing every pixel as UNKNOWN
-            self.pixel_knowledge_map = [[PixelKnowledge.UNKNOWN for _ in range(grid_width)] for _ in range(grid_height)]
-            print(f"🗺️ Pixel knowledge map initialized with dimensions {grid_height}x{grid_width}.")
-
+        
         # --- Handle screen transitions before any other logic ---
         if self.agent_state == AgentState.AWAITING_STABILITY:
             # We perceive here to check if the screen has stopped changing.
@@ -1030,6 +972,19 @@ class AGI3(Agent):
 
         player_pixel_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
         player_tile_pos = (player_pixel_pos[0] // self.tile_size, player_pixel_pos[1] // self.tile_size)
+
+        # --- NEW: PRIORITY 0 - SURVIVAL ---
+        # If moves are low, survival is the only priority.
+        nearest_resource_info = self._find_nearest_resource(player_tile_pos)
+        if nearest_resource_info:
+            distance_to_resource = len(nearest_resource_info['path'])
+            safety_buffer = 1 # Extra moves needed to be "safe"
+            if self.current_moves <= distance_to_resource + safety_buffer:
+                print(f"⚠️ Activating PRIORITY 0 (SURVIVAL): Low on moves ({self.current_moves})! Resource is {distance_to_resource} steps away.")
+                self.exploration_target = (nearest_resource_info['pos'][0] * self.tile_size, nearest_resource_info['pos'][1] * self.tile_size)
+                self.exploration_plan = nearest_resource_info['path']
+                self._print_debug_map()
+                return True # Exit immediately with a plan to get resources.
         
         # --- PRIORITY 1: Explore all potentially interactable objects ---
         print("🎯 Activating PRIORITY 1: Seeking all potentially interactable tiles.")
@@ -1161,22 +1116,6 @@ class AGI3(Agent):
 
         # 3. From the list of reachable targets, select the one with the shortest path.
         best_target = min(reachable_targets, key=lambda t: len(t['path']))
-        
-        # --- NEW: Resource Safety Check ---
-        # Before committing to the plan, check if we need to get resources first.
-        nearest_resource_info = self._find_nearest_resource(player_tile_pos)
-        if nearest_resource_info:
-            distance_to_resource = len(nearest_resource_info['path'])
-            # Add a small safety buffer. If current moves are just enough to get there (or less),
-            # the agent must prioritize survival.
-            safety_buffer = 1
-            if self.current_moves <= distance_to_resource + safety_buffer:
-                print(f"⚠️ Low on moves ({self.current_moves})! Resource is {distance_to_resource} steps away. Prioritizing survival.")
-                # Override the original plan with the resource-gathering plan.
-                best_target = nearest_resource_info
-            else:
-                print(f"-> Moves ({self.current_moves}) sufficient. Nearest resource is {distance_to_resource} steps away.")
-        # --- End of Safety Check ---
 
         # 4. Set the exploration plan based on the best target found.
         self.exploration_target = (best_target['pos'][0] * self.tile_size, best_target['pos'][1] * self.tile_size)
@@ -1619,7 +1558,6 @@ class AGI3(Agent):
                     if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
                         self.world_model['floor_color'] = obj_color
                         print(f"✅ [FLOOR] Confirmed: Color {obj_color} is the floor.")
-                        self._update_navigable_pixels(latest_frame[0])
                         # Future improvement: could add map cleanup logic here.
 
                     # While learning what the floor is, we skip creating an object from background reveals.
@@ -1811,8 +1749,8 @@ class AGI3(Agent):
                     else:
                         log_messages.append(f"🧠 COMPOSITE MOVE: Object [{comp_h}x{comp_w}] with fingerprint {signature} moved by vector {vector}.")
                 
-                true_moves.append({'type': 'composite', 'signature': signature, 'dimensions': (comp_h, comp_w), 'parts': cluster, 'vector': vector})
-                for pair in cluster: processed_pairs.append(pair)
+                    true_moves.append({'type': 'composite', 'signature': signature, 'dimensions': (comp_h, comp_w), 'parts': cluster, 'vector': vector})
+                    for pair in cluster: processed_pairs.append(pair)
 
         # Log individual moves and collect their structured info.
         for curr, last in move_matched_pairs:
@@ -1873,7 +1811,6 @@ class AGI3(Agent):
                         if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
                             self.world_model['floor_color'] = floor_candidate
                             log_messages.append(f"✅ Confirmed Floor Color: {floor_candidate}.")
-                            self._update_navigable_pixels(latest_grid[0])
 
                             # --- Map Cleanup Logic ---
                             if self.tile_size:
@@ -2112,19 +2049,39 @@ class AGI3(Agent):
             print(f"🧱 Wall Hypothesis: {wall_name} blocked movement (Confidence: {confidence}).")
 
             # --- 5. Confirm Hypothesis if Threshold is Met ---
-            # Inside _learn_from_interaction_failure
             if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
                 # Add the color to the set of confirmed walls.
                 self.world_model['wall_colors'].add(wall_candidate_color)
                 print(f"✅ [WALL] Confirmed: {wall_name} is a wall.")
 
-                # --- NEW: Call our pixel map update function ---
-                self._update_obstacle_pixels(last_grid[0], wall_candidate_color)
+                # --- Map Cleanup Logic ---
+                # This logic now runs for each newly confirmed wall color.
+                if self.tile_size:
+                    reclassified_count = 0
+                    for tile_coords, cell_type in list(self.tile_map.items()):
+                        # We only need to check tiles that are not already walls or floors.
+                        if cell_type not in [CellType.WALL, CellType.FLOOR]:
+                            # Use a full-tile check to see if it's a uniform wall.
+                            tile_row_start, tile_col_start = tile_coords[0] * self.tile_size, tile_coords[1] * self.tile_size
+                            tile_pixels = [
+                                last_grid[0][r][c]
+                                for r in range(tile_row_start, tile_row_start + self.tile_size)
+                                for c in range(tile_col_start, tile_col_start + self.tile_size)
+                                if 0 <= r < grid_height and 0 <= c < grid_width
+                            ]
+                            
+                            # If the tile is made up of only this newly confirmed wall color, reclassify it.
+                            if tile_pixels and all(p == wall_candidate_color for p in tile_pixels):
+                                self.tile_map[tile_coords] = CellType.WALL
+                                reclassified_count += 1
+                    
+                    if reclassified_count > 0:
+                        print(f"🧹 Map Cleanup: Reclassified {reclassified_count} tile(s) as newly confirmed wall ({wall_name}).")
                 
                 # Once confirmed, we can remove it from the hypothesis tracker.
                 if wall_candidate_color in self.wall_hypothesis:
                     del self.wall_hypothesis[wall_candidate_color]
-                
+    
     def _update_resource_indicator_tracking(self, structured_changes: list, action: GameAction):
         """Analyzes changes to find a resource indicator, which depletes on any action."""
         if self.confirmed_resource_indicator or not action:
@@ -2842,8 +2799,8 @@ class AGI3(Agent):
             for i, pattern in enumerate(self.active_patterns):
                 dk = pattern['dynamic_key']
                 sk = pattern['static_key']
-                dk_tile = (dk['top_row'] // self.tile_size, dk['left_index'] // self.tile_size)
-                sk_tile = (sk['top_row'] // self.tile_size, sk['left_index'] // self.tile_size)
+                dk_tile = (dk['top_row'] // self.tile_size, dk['left_index'] // self.tile_size) if self.tile_size else (dk['top_row'], dk['left_index'])
+                sk_tile = (sk['top_row'] // self.tile_size, sk['left_index'] // self.tile_size) if self.tile_size else (sk['top_row'], sk['left_index'])
                 print(f"  - Pattern {i+1}: Dynamic object at {dk_tile} matched Static object at {sk_tile}.")
                 # Future: Could print more detailed characteristics here.
         else:
