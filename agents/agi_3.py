@@ -1312,6 +1312,43 @@ class AGI3(Agent):
         self.previous_frame = copy.deepcopy(current_frame)
         return novel_changes_found, known_changes_found, novel_change_descriptions, all_structured_changes
 
+    def _get_object_summary_string(self, obj: dict) -> str:
+        """Creates a standardized, detailed summary string for an object dictionary."""
+        if not obj:
+            return "Invalid object."
+
+        # Part 1: Format location (Tile vs. Pixel)
+        location_str = ""
+        pos = (obj.get('top_row', 0), obj.get('left_index', 0))
+        if self.tile_size:
+            tile_pos = (pos[0] // self.tile_size, pos[1] // self.tile_size)
+            
+            # Determine the "playable area" to see if tile coordinates are relevant.
+            display_area = set(self.reachable_floor_area)
+            for r_tile, c_tile in self.reachable_floor_area:
+                for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                    neighbor = (r_tile + dr, c_tile + dc)
+                    if neighbor in self.tile_map:
+                        display_area.add(neighbor)
+            
+            if display_area and tile_pos in display_area:
+                location_str = f"at tile {tile_pos}"
+            else:
+                location_str = f"at pixel {pos}"
+        else:
+            location_str = f"at pixel {pos}"
+
+        # Part 2: Format object details
+        size = (obj.get('height', 0), obj.get('width', 0))
+        details = []
+        if obj.get('original_color') is not None:
+            details.append(f"Color {obj['original_color']}->{obj['color']}")
+        else:
+            details.append(f"Color {obj.get('color')}")
+        details.append(f"FP:{obj.get('fingerprint')}")
+        
+        return f"A {size[0]}x{size[1]} object {location_str} ({', '.join(details)})."
+
     def _create_normalized_fingerprint(self, obj_datamap: tuple) -> tuple:
         """
         Creates a scale-invariant fingerprint of an object's data map.
@@ -2411,18 +2448,8 @@ class AGI3(Agent):
         # 5. Log the results and synthesize rules.
         print(f"-> Found {len(effect_objects)} object(s) as a result of the '{effect_type}':")
         for i, obj in enumerate(effect_objects):
-            pos = (obj['top_row'], obj['left_index'])
-            size = (obj['height'], obj['width'])
-            tile_pos = (pos[0] // self.tile_size, pos[1] // self.tile_size) if self.tile_size else pos
-            
-            details = []
-            if obj.get('original_color') is not None:
-                details.append(f"Color {obj['original_color']}->{obj['color']}")
-            else:
-                details.append(f"Color {obj['color']}")
-            details.append(f"FP:{obj.get('fingerprint')}")
-
-            print(f"  - Object {i+1}: A {size[0]}x{size[1]} object at tile {tile_pos} ({', '.join(details)}).")
+            summary_str = self._get_object_summary_string(obj)
+            print(f"  - Object {i+1}: {summary_str}")
 
         if object_signature not in self.interaction_hypotheses:
             self.interaction_hypotheses[object_signature] = {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
@@ -2685,16 +2712,7 @@ class AGI3(Agent):
                     if not has_any_effect: print(f"  - Function:")
                     print(f"    - Immediate Effect: Spawns/changes {len(immediate_effects)} object(s):")
                     for obj in immediate_effects:
-                        size = (obj['height'], obj['width'])
-                        pos = (obj['top_row'], obj['left_index'])
-                        tile_pos_effect = (pos[0] // self.tile_size, pos[1] // self.tile_size) if self.tile_size else pos
-                        details = [f"{size[0]}x{size[1]}"]
-                        if obj.get('original_color') is not None:
-                            details.append(f"Color {obj['original_color']}->{obj['color']}")
-                        else:
-                            details.append(f"Color {obj['color']}")
-                        details.append(f"FP:{obj.get('fingerprint')}")
-                        print(f"      - At tile {tile_pos_effect}: {', '.join(details)}")
+                        print(f"      - {self._get_object_summary_string(obj)}")
                     has_any_effect = True
 
                 # 3. Report Aftermath Effects
@@ -2703,16 +2721,7 @@ class AGI3(Agent):
                     if not has_any_effect: print(f"  - Function:")
                     print(f"    - Aftermath Effect: Spawns/changes {len(aftermath_effects)} object(s):")
                     for obj in aftermath_effects:
-                        size = (obj['height'], obj['width'])
-                        pos = (obj['top_row'], obj['left_index'])
-                        tile_pos_effect = (pos[0] // self.tile_size, pos[1] // self.tile_size) if self.tile_size else pos
-                        details = [f"{size[0]}x{size[1]}"]
-                        if obj.get('original_color') is not None:
-                            details.append(f"Color {obj['original_color']}->{obj['color']}")
-                        else:
-                            details.append(f"Color {obj['color']}")
-                        details.append(f"FP:{obj.get('fingerprint')}")
-                        print(f"      - At tile {tile_pos_effect}: {', '.join(details)}")
+                        print(f"      - {self._get_object_summary_string(obj)}")
                     has_any_effect = True
                 
                 # 4. Report if no effects were found at all
