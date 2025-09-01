@@ -2414,7 +2414,15 @@ class AGI3(Agent):
             pos = (obj['top_row'], obj['left_index'])
             size = (obj['height'], obj['width'])
             tile_pos = (pos[0] // self.tile_size, pos[1] // self.tile_size) if self.tile_size else pos
-            print(f"  - Object {i+1}: A {size[0]}x{size[1]} object at pixel {pos} (tile {tile_pos}).")
+            
+            details = []
+            if obj.get('original_color') is not None:
+                details.append(f"Color {obj['original_color']}->{obj['color']}")
+            else:
+                details.append(f"Color {obj['color']}")
+            details.append(f"FP:{obj.get('fingerprint')}")
+
+            print(f"  - Object {i+1}: A {size[0]}x{size[1]} object at tile {tile_pos} ({', '.join(details)}).")
 
         if object_signature not in self.interaction_hypotheses:
             self.interaction_hypotheses[object_signature] = {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
@@ -2663,22 +2671,53 @@ class AGI3(Agent):
                 print(f"  - Type: Unknown.")
             
             else:
-                # Report the learned function/effect from the hypothesis
-                effect_desc = "No effect observed."
+                # --- DETAILED FUNCTION/EFFECT REPORTING ---
+                has_any_effect = False
+
+                # 1. Report Resource Provision
                 if hypothesis.get('provides_resource'):
-                    effect_desc = "Resource (fills resource bar)."
-                else:
-                    immediate_effect_objects = hypothesis.get('immediate_effect', [])
-                    if immediate_effect_objects:
-                        obj = immediate_effect_objects[0]
+                    print(f"  - Function: Resource (fills resource bar).")
+                    has_any_effect = True
+                
+                # 2. Report Immediate Effects
+                immediate_effects = hypothesis.get('immediate_effect', [])
+                if immediate_effects:
+                    if not has_any_effect: print(f"  - Function:")
+                    print(f"    - Immediate Effect: Spawns/changes {len(immediate_effects)} object(s):")
+                    for obj in immediate_effects:
                         size = (obj['height'], obj['width'])
                         pos = (obj['top_row'], obj['left_index'])
                         tile_pos_effect = (pos[0] // self.tile_size, pos[1] // self.tile_size) if self.tile_size else pos
-                        effect_desc = f"Causes a {size[0]}x{size[1]} object to appear/change at tile {tile_pos_effect}."
-                        if len(immediate_effect_objects) > 1:
-                            effect_desc += f" (+{len(immediate_effect_objects) - 1} other effects)."
+                        details = [f"{size[0]}x{size[1]}"]
+                        if obj.get('original_color') is not None:
+                            details.append(f"Color {obj['original_color']}->{obj['color']}")
+                        else:
+                            details.append(f"Color {obj['color']}")
+                        details.append(f"FP:{obj.get('fingerprint')}")
+                        print(f"      - At tile {tile_pos_effect}: {', '.join(details)}")
+                    has_any_effect = True
+
+                # 3. Report Aftermath Effects
+                aftermath_effects = hypothesis.get('aftermath_effect', [])
+                if aftermath_effects:
+                    if not has_any_effect: print(f"  - Function:")
+                    print(f"    - Aftermath Effect: Spawns/changes {len(aftermath_effects)} object(s):")
+                    for obj in aftermath_effects:
+                        size = (obj['height'], obj['width'])
+                        pos = (obj['top_row'], obj['left_index'])
+                        tile_pos_effect = (pos[0] // self.tile_size, pos[1] // self.tile_size) if self.tile_size else pos
+                        details = [f"{size[0]}x{size[1]}"]
+                        if obj.get('original_color') is not None:
+                            details.append(f"Color {obj['original_color']}->{obj['color']}")
+                        else:
+                            details.append(f"Color {obj['color']}")
+                        details.append(f"FP:{obj.get('fingerprint')}")
+                        print(f"      - At tile {tile_pos_effect}: {', '.join(details)}")
+                    has_any_effect = True
                 
-                print(f"  - Function: {effect_desc}")
+                # 4. Report if no effects were found at all
+                if not has_any_effect:
+                    print(f"  - Function: No effect observed.")
 
                 # Report the Type (persistence) from the hypothesis
                 type_desc = "Unknown (aftermath not observed)."
