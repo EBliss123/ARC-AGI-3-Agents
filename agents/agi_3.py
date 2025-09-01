@@ -1312,6 +1312,107 @@ class AGI3(Agent):
         self.previous_frame = copy.deepcopy(current_frame)
         return novel_changes_found, known_changes_found, novel_change_descriptions, all_structured_changes
 
+    def _compare_and_print_hypothesis_details(self, signature: str, remembered_hypo: dict, level_source: int):
+        """
+        Performs a detailed, attribute-by-attribute comparison between the current and a 
+        remembered hypothesis, then prints a formatted report.
+        """
+        current_hypo = self.interaction_hypotheses.get(signature, {})
+        
+        consistent = []
+        inconsistent = []
+
+        # --- Base Attributes Comparison ---
+        # 1. Compare Persistence
+        current_persist = current_hypo.get('is_consumable')
+        rem_persist = remembered_hypo.get('is_consumable')
+        if current_persist == rem_persist:
+            val = "Consumable" if current_persist is True else "Persistent" if current_persist is False else "Unknown"
+            consistent.append(f"Persistence ({val})")
+        else:
+            p_curr = "Consumable" if current_persist is True else "Persistent" if current_persist is False else "Unknown"
+            p_rem = "Consumable" if rem_persist is True else "Persistent" if rem_persist is False else "Unknown"
+            inconsistent.append(f"Persistence (Current: {p_curr}, L{level_source}: {p_rem})")
+
+        # 2. Compare Resource Provision
+        current_res = current_hypo.get('provides_resource', False)
+        rem_res = remembered_hypo.get('provides_resource', False)
+        if current_res == rem_res:
+            if current_res: consistent.append("Provides resource")
+        else:
+            inconsistent.append(f"Resource provision (Current: {current_res}, L{level_source}: {rem_res})")
+        
+        # --- Granular Effects Comparison ---
+        for effect_type in ['immediate_effect', 'aftermath_effect']:
+            current_effects = current_hypo.get(effect_type, [])
+            rem_effects = remembered_hypo.get(effect_type, [])
+            
+            # High-level check on the number of objects created
+            if len(current_effects) != len(rem_effects):
+                inconsistent.append(f"{effect_type.replace('_', ' ').title()} has different object counts (Current: {len(current_effects)}, L{level_source}: {len(rem_effects)})")
+                continue # If counts differ, a granular comparison is not meaningful
+
+            if not current_effects: continue # Both are empty, nothing to compare
+
+            # --- Attribute-by-attribute comparison for the single-object case ---
+            if len(current_effects) == 1:
+                current_obj = current_effects[0]
+                rem_obj = rem_effects[0]
+                
+                effect_consistent = []
+                effect_inconsistent = []
+
+                # Compare Color
+                if current_obj.get('color') == rem_obj.get('color'):
+                    effect_consistent.append(f"Color ({current_obj.get('color')})")
+                else:
+                    effect_inconsistent.append(f"Color (Current: {current_obj.get('color')}, L{level_source}: {rem_obj.get('color')})")
+
+                # Compare Size
+                current_size = (current_obj.get('height'), current_obj.get('width'))
+                rem_size = (rem_obj.get('height'), rem_obj.get('width'))
+                if current_size == rem_size:
+                    effect_consistent.append(f"Size {current_size}")
+                else:
+                    effect_inconsistent.append(f"Size (Current: {current_size}, L{level_source}: {rem_size})")
+
+                # Compare Fingerprint (Shape)
+                if current_obj.get('fingerprint') == rem_obj.get('fingerprint'):
+                    effect_consistent.append("Shape")
+                else:
+                    effect_inconsistent.append("Shape")
+
+                # Always show location, as it is context-dependent and useful to see
+                current_loc_str = self._get_object_summary_string(current_obj).split('(')[0].strip()
+                rem_loc_str = self._get_object_summary_string(rem_obj).split('(')[0].strip()
+                effect_inconsistent.append(f"Location (Current: {current_loc_str}, L{level_source}: {rem_loc_str})")
+                
+                # Consolidate and add to the main inconsistent list
+                inconsistent.append(f"{effect_type.replace('_', ' ').title()} has inconsistencies:")
+                for item in effect_consistent:
+                    inconsistent.append(f"  - ✔️ Consistent: {item}")
+                for item in effect_inconsistent:
+                    inconsistent.append(f"  - ✖️ Inconsistent: {item}")
+            
+            # Fallback for multi-object effects
+            elif len(current_effects) > 1:
+                current_summaries = {self._get_object_summary_string(obj) for obj in current_effects}
+                rem_summaries = {self._get_object_summary_string(obj) for obj in rem_effects}
+                if current_summaries == rem_summaries:
+                    consistent.append(f"{effect_type.replace('_', ' ').title()} is consistent (multi-object)")
+                else:
+                    inconsistent.append(f"{effect_type.replace('_', ' ').title()} differs (multi-object)")
+        
+        # --- Final Print ---
+        if consistent:
+            print("        -> Consistent Attributes:")
+            for item in consistent:
+                print(f"           - {item}")
+        if inconsistent:
+            print("        -> ⚠️ Inconsistent Attributes:")
+            for item in inconsistent:
+                print(f"           - {item}")
+
     def _get_object_summary_string(self, obj: dict) -> str:
         """Creates a standardized, detailed summary string for an object dictionary."""
         if not obj:
@@ -2729,13 +2830,18 @@ class AGI3(Agent):
                     print(f"  - Match Analysis:")
                     current_characteristics = self.interactable_object_characteristics.get(tile_pos)
                     if current_characteristics:
+                        # --- Consolidate perfect matches to avoid redundant analysis ---
+                        first_perfect_match_profile = None
+
                         for color, object_list in current_characteristics.items():
                             for obj_char in object_list:
                                 fp = obj_char['shape_fingerprint']
                                 remembered_profiles = self.cross_level_characteristics.get(fp, [])
+                                
                                 if not remembered_profiles:
                                     print(f"      - Part (Fingerprint: {fp}): No detailed profile in memory.")
                                     continue
+                                
                                 best_match = remembered_profiles[0]
                                 perfect_match_found = False
                                 for rem_prof in remembered_profiles:
@@ -2743,14 +2849,23 @@ class AGI3(Agent):
                                         best_match = rem_prof
                                         perfect_match_found = True
                                         break
-                                details = []
-                                if perfect_match_found: match_type = "Perfect Match"
-                                else:
-                                    match_type = "Partial Match"
-                                    if best_match['color'] != color: details.append(f"color differs (current: {color}, remembered: {best_match['color']})")
-                                    if best_match['size'] != obj_char['size']: details.append(f"size differs (current: {obj_char['size']}, remembered: {best_match['size']})")
-                                detail_str = f" ({', '.join(details)})" if details else ""
-                                print(f"      - Part (Color {color}): {match_type} with object from Level {best_match['level_source']}{detail_str}.")
+                                
+                                match_type = "Perfect Match" if perfect_match_found else "Partial Match"
+                                print(f"      - Part (Color {color}): {match_type} with object from Level {best_match['level_source']}.")
+
+                                # Store the first perfect match we find for this tile for comparison
+                                if perfect_match_found and first_perfect_match_profile is None:
+                                    first_perfect_match_profile = best_match
+
+                        # --- Perform the detailed comparison only ONCE for the whole tile ---
+                        if first_perfect_match_profile:
+                            remembered_hypothesis = first_perfect_match_profile.get('hypothesis')
+                            level_source = first_perfect_match_profile.get('level_source')
+                            
+                            if remembered_hypothesis:
+                                self._compare_and_print_hypothesis_details(signature, remembered_hypothesis, level_source)
+                            else:
+                                print("        -> No remembered function to compare against.")
                     else:
                         print(f"      - Could not perform analysis: Characteristics not logged.")
 
@@ -2798,7 +2913,13 @@ class AGI3(Agent):
                 for obj_char in object_list:
                     fp = obj_char['shape_fingerprint']
                     if fp not in self.cross_level_characteristics: self.cross_level_characteristics[fp] = []
-                    profile = {'color': color, 'size': obj_char['size'], 'level_source': level_learned_from}
+                    hypothesis = self.interaction_hypotheses.get(f"tile_pos_{tile_pos}")
+                    profile = {
+                        'color': color, 
+                        'size': obj_char['size'], 
+                        'level_source': level_learned_from, 
+                        'hypothesis': copy.deepcopy(hypothesis) if hypothesis else None
+                    }
                     if profile not in self.cross_level_characteristics[fp]:
                         self.cross_level_characteristics[fp].append(profile)
                         profiles_added += 1
