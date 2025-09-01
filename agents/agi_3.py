@@ -34,6 +34,13 @@ class CellType(Enum):
     RESOURCE = 6
     POTENTIAL_MATCH = 7
 
+class PixelKnowledge(Enum):
+    """Represents the agent's knowledge about a single pixel."""
+    UNKNOWN = 0
+    NAVIGABLE = 1  # Represents floor or other walkable space
+    OBSTACLE = 2   # Represents a wall or other impassable barrier
+    INTERESTING = 3 # A non-obstacle pixel that isn't floor (potential item/goal)
+
 class ExplorationPhase(Enum):
     """Manages the agent's goal-oriented exploration strategy."""
     INACTIVE = 0
@@ -62,6 +69,7 @@ class AGI3(Agent):
         self.ignored_areas = []
         self.state_graph = {} # Stores stateA -> action -> stateB
         self.last_grid_tuple = None
+        self.pixel_knowledge_map = None
 
         # --- State Management ---
         self.agent_state = AgentState.DISCOVERY
@@ -102,7 +110,6 @@ class AGI3(Agent):
             'resource_signatures': set()
         }
         self.cross_level_characteristics = {} # Stores full profiles of objects from previous levels.
-        self.world_objects = {} # The new, non-tile-based world model.
         self.level_count = 1
         self.world_model['life_indicator_object'] = None
         self.player_floor_hypothesis = {}
@@ -288,6 +295,29 @@ class AGI3(Agent):
         print("🧠 Knowledge preserved. Skipping discovery and entering action state.")
         self.agent_state = AgentState.RANDOM_ACTION
 
+    def _update_navigable_pixels(self, grid_data: list):
+        """Updates the pixel_knowledge_map with the location of all floor pixels."""
+        if self.pixel_knowledge_map is None:
+            return # Map hasn't been initialized yet
+
+        floor_color = self.world_model.get('floor_color')
+        if floor_color is None:
+            return # We don't know the floor color yet
+
+        height = len(self.pixel_knowledge_map)
+        width = len(self.pixel_knowledge_map[0])
+        
+        updated_pixels = 0
+        for r in range(height):
+            for c in range(width):
+                if grid_data[r][c] == floor_color:
+                    if self.pixel_knowledge_map[r][c] == PixelKnowledge.UNKNOWN:
+                        self.pixel_knowledge_map[r][c] = PixelKnowledge.NAVIGABLE
+                        updated_pixels += 1
+        
+        if updated_pixels > 0:
+            print(f"🗺️ Map updated: Identified {updated_pixels} NAVIGABLE floor pixels.")
+    
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
         frame_before_perception = copy.deepcopy(self.previous_frame)
@@ -308,7 +338,14 @@ class AGI3(Agent):
                 # preventing the VALIDATION_ERROR. We'll try to store the frame
                 # again on the next turn.
                 print("--- Ignoring blank starting frame. Waiting for a valid one... ---")
-        
+       
+        if self.pixel_knowledge_map is None and latest_frame.frame:
+            grid_height = len(latest_frame.frame[0])
+            grid_width = len(latest_frame.frame[0][0])
+            # Create the map, initializing every pixel as UNKNOWN
+            self.pixel_knowledge_map = [[PixelKnowledge.UNKNOWN for _ in range(grid_width)] for _ in range(grid_height)]
+            print(f"🗺️ Pixel knowledge map initialized with dimensions {grid_height}x{grid_width}.")
+
         # --- Handle screen transitions before any other logic ---
         if self.agent_state == AgentState.AWAITING_STABILITY:
             # We perceive here to check if the screen has stopped changing.
@@ -616,38 +653,8 @@ class AGI3(Agent):
                     sk_tile = (sk['top_row'] // self.tile_size, sk['left_index'] // self.tile_size) if self.tile_size else (sk['top_row'], sk['left_index'])
                     print(f"  - Pattern {i+1}: Dynamic object at {dk_tile} matches static object at {sk_tile}.")
            
-            # --- (PHASE 1) Populate World Object Database ---
-            if current_objects:
-                print("--- Populating World Object Database ---")
-                for obj in current_objects:
-                    fingerprint = obj.get('fingerprint')
-                    if fingerprint:
-                        # This new line adds the detailed printout for each object
-                        pos = (obj.get('top_row'), obj.get('left_index'))
-                        size = (obj.get('height'), obj.get('width'))
-                        color = obj.get('color')
-                        pixel_count = obj.get('pixel_count', 0)
-                        print(f"  -> Storing object {fingerprint}: A {size[0]}x{size[1]} object ({pixel_count} pixels) of color {color} at {pos}.")
-
-                        # Update the database with the latest known state of this object.
-                        if fingerprint not in self.world_objects:
-                            # It's a new object, initialize with visited status
-                            self.world_objects[fingerprint] = {
-                                'profile': obj,
-                                'last_seen_frame': self.debug_counter,
-                                'visited': False 
-                            }
-                        else:
-                            # It's a known object, just update its profile and last seen time
-                            self.world_objects[fingerprint]['profile'] = obj
-                            self.world_objects[fingerprint]['last_seen_frame'] = self.debug_counter
-                print(f"-> World database now tracking {len(self.world_objects)} unique objects.")
-
             # 5. Update memory for the next turn.
             self.last_known_objects = current_objects
-
-            # --- NEW: Update visited status of nearby objects ---
-            self._update_visited_objects()
 
             # 6. Update the player object's known position for the next turn.
             if moved_agent_this_turn:
@@ -721,24 +728,6 @@ class AGI3(Agent):
                self.world_model.get('action_map') and
                self.last_known_player_obj and
                self.tile_size) 
-        
-        # --- (PHASE 2) Shadow Mode Test for New Exploration Logic ---
-        print("\n--- [Phase 2] Shadow Mode Test ---")
-        shadow_target = self._find_best_target_object()
-        
-        # Call the new summary printer, passing in the target we found
-        target_fp = shadow_target.get('fingerprint') if shadow_target else None
-        self._print_object_summary(target_fp)
-
-        if shadow_target:
-            shadow_action = self._get_best_action_for_target(shadow_target)
-            if shadow_action:
-                print(f"-> Suggestion: Move with {shadow_action.name}.")
-            else:
-                print(f"-> Suggestion: No clear move towards target.")
-        else:
-            print("-> Suggestion: No unvisited targets found.")
-        print("--- End Shadow Mode Test ---\n")
 
         if can_explore and self.exploration_phase == ExplorationPhase.INACTIVE:
             print("🤖 World model is sufficiently complete. Activating exploration phase.")
@@ -1021,19 +1010,6 @@ class AGI3(Agent):
 
         player_pixel_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
         player_tile_pos = (player_pixel_pos[0] // self.tile_size, player_pixel_pos[1] // self.tile_size)
-
-        # --- NEW: PRIORITY 0 - SURVIVAL ---
-        # If moves are low, survival is the only priority.
-        nearest_resource_info = self._find_nearest_resource(player_tile_pos)
-        if nearest_resource_info:
-            distance_to_resource = len(nearest_resource_info['path'])
-            safety_buffer = 1 # Extra moves needed to be "safe"
-            if self.current_moves <= distance_to_resource + safety_buffer:
-                print(f"⚠️ Activating PRIORITY 0 (SURVIVAL): Low on moves ({self.current_moves})! Resource is {distance_to_resource} steps away.")
-                self.exploration_target = (nearest_resource_info['pos'][0] * self.tile_size, nearest_resource_info['pos'][1] * self.tile_size)
-                self.exploration_plan = nearest_resource_info['path']
-                self._print_debug_map()
-                return True # Exit immediately with a plan to get resources.
         
         # --- PRIORITY 1: Explore all potentially interactable objects ---
         print("🎯 Activating PRIORITY 1: Seeking all potentially interactable tiles.")
@@ -1165,6 +1141,22 @@ class AGI3(Agent):
 
         # 3. From the list of reachable targets, select the one with the shortest path.
         best_target = min(reachable_targets, key=lambda t: len(t['path']))
+        
+        # --- NEW: Resource Safety Check ---
+        # Before committing to the plan, check if we need to get resources first.
+        nearest_resource_info = self._find_nearest_resource(player_tile_pos)
+        if nearest_resource_info:
+            distance_to_resource = len(nearest_resource_info['path'])
+            # Add a small safety buffer. If current moves are just enough to get there (or less),
+            # the agent must prioritize survival.
+            safety_buffer = 1
+            if self.current_moves <= distance_to_resource + safety_buffer:
+                print(f"⚠️ Low on moves ({self.current_moves})! Resource is {distance_to_resource} steps away. Prioritizing survival.")
+                # Override the original plan with the resource-gathering plan.
+                best_target = nearest_resource_info
+            else:
+                print(f"-> Moves ({self.current_moves}) sufficient. Nearest resource is {distance_to_resource} steps away.")
+        # --- End of Safety Check ---
 
         # 4. Set the exploration plan based on the best target found.
         self.exploration_target = (best_target['pos'][0] * self.tile_size, best_target['pos'][1] * self.tile_size)
@@ -1607,6 +1599,7 @@ class AGI3(Agent):
                     if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
                         self.world_model['floor_color'] = obj_color
                         print(f"✅ [FLOOR] Confirmed: Color {obj_color} is the floor.")
+                        self._update_navigable_pixels(latest_frame[0])
                         # Future improvement: could add map cleanup logic here.
 
                     # While learning what the floor is, we skip creating an object from background reveals.
@@ -1650,8 +1643,6 @@ class AGI3(Agent):
 
             final_objects.append({
                 'height': height, 'width': width, 'top_row': min_row,
-                'pixel_count': len(obj_points), 
-                'top_row': min_row,
                 'left_index': min_idx, 'color': obj_color,
                 'original_color': original_color,
                 'data_map': data_map,
@@ -1862,6 +1853,7 @@ class AGI3(Agent):
                         if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
                             self.world_model['floor_color'] = floor_candidate
                             log_messages.append(f"✅ Confirmed Floor Color: {floor_candidate}.")
+                            self._update_navigable_pixels(latest_grid[0])
 
                             # --- Map Cleanup Logic ---
                             if self.tile_size:
@@ -2677,138 +2669,6 @@ class AGI3(Agent):
                         row_str += "   "
             print(row_str)
         print("--- Key: P=Player, T=Target, .=Floor, #=Wall, ?=Potential, !=Confirmed, ~=Match ---\n")
-
-    def _print_object_summary(self, target_fingerprint: int | None):
-        """Prints a summary of the agent's object-centric world model."""
-        if not self.world_objects or not self.last_known_player_obj:
-            return
-
-        print("--- Object-Centric World Summary ---")
-        
-        player_profile = self.last_known_player_obj
-        player_cx = player_profile['left_index'] + player_profile['width'] / 2
-        player_cy = player_profile['top_row'] + player_profile['height'] / 2
-
-        summary_list = []
-        for fingerprint, data in self.world_objects.items():
-            obj_profile = data['profile']
-            obj_cx = obj_profile['left_index'] + obj_profile['width'] / 2
-            obj_cy = obj_profile['top_row'] + obj_profile['height'] / 2
-            distance = math.sqrt((player_cx - obj_cx)**2 + (player_cy - obj_cy)**2)
-            
-            summary_list.append({
-                'fingerprint': fingerprint,
-                'pos': (obj_profile['top_row'], obj_profile['left_index']),
-                'distance': distance,
-                'visited': data.get('visited', False)
-            })
-        
-        # Sort by distance to see the closest objects first
-        summary_list.sort(key=lambda x: x['distance'])
-
-        for item in summary_list:
-            fp_str = str(item['fingerprint'])[-6:] # Shorten for readability
-            visited_str = "VISITED" if item['visited'] else "UNVISITED"
-            target_str = ">>TARGET<<" if item['fingerprint'] == target_fingerprint else ""
-            print(f"  - Obj(...{fp_str}): Pos={item['pos']}, Dist={item['distance']:.1f}, Status={visited_str} {target_str}")
-
-    def _find_best_target_object(self) -> dict | None:
-        """Finds the nearest object in the world_objects database."""
-        if not self.last_known_player_obj or not self.world_objects:
-            return None
-
-        player_profile = self.last_known_player_obj
-        player_cx = player_profile['left_index'] + player_profile['width'] / 2
-        player_cy = player_profile['top_row'] + player_profile['height'] / 2
-        
-        player_fingerprints = {p.get('fingerprint') for p in player_profile.get('parts', [])}
-
-        potential_targets = []
-        for fingerprint, data in self.world_objects.items():
-            # --- NEW: Only consider targets that have not been visited ---
-            if data.get('visited') is True:
-                continue
-            # Exclude any object that is part of the player
-            if fingerprint in player_fingerprints:
-                continue
-
-            obj_profile = data['profile']
-            obj_cx = obj_profile['left_index'] + obj_profile['width'] / 2
-            obj_cy = obj_profile['top_row'] + obj_profile['height'] / 2
-            
-            distance = math.sqrt((player_cx - obj_cx)**2 + (player_cy - obj_cy)**2)
-            potential_targets.append({'distance': distance, 'profile': obj_profile})
-        
-        if not potential_targets:
-            return None
-            
-        # Return the profile of the object with the minimum distance
-        return min(potential_targets, key=lambda x: x['distance'])['profile']
-
-    def _get_best_action_for_target(self, target_object: dict) -> GameAction | None:
-        """Calculates the best move action to get closer to a target using vector math."""
-        if not self.last_known_player_obj or not target_object:
-            return None
-
-        player_profile = self.last_known_player_obj
-        player_cx = player_profile['left_index'] + player_profile['width'] / 2
-        player_cy = player_profile['top_row'] + player_profile['height'] / 2
-        
-        target_cx = target_object['left_index'] + target_object['width'] / 2
-        target_cy = target_object['top_row'] + target_object['height'] / 2
-
-        desired_vector = (target_cy - player_cy, target_cx - player_cx)
-        
-        # Normalize the desired_vector to focus only on direction
-        desired_mag = math.sqrt(desired_vector[0]**2 + desired_vector[1]**2)
-        if desired_mag == 0: return None
-        norm_desired = (desired_vector[0] / desired_mag, desired_vector[1] / desired_mag)
-
-        best_action = None
-        max_dot_product = -2 # Start lower than the lowest possible dot product (-1)
-
-        for action, effect in self.world_model['action_map'].items():
-            if 'move_vector' in effect:
-                move_vector = effect['move_vector']
-                
-                # Normalize the move_vector
-                move_mag = math.sqrt(move_vector[0]**2 + move_vector[1]**2)
-                if move_mag == 0: continue
-                norm_move = (move_vector[0] / move_mag, move_vector[1] / move_mag)
-                
-                # Dot product measures alignment. Higher is better.
-                dot_product = (norm_desired[0] * norm_move[0]) + (norm_desired[1] * norm_move[1])
-
-                if dot_product > max_dot_product:
-                    max_dot_product = dot_product
-                    best_action = action
-        
-        return best_action
-    
-    def _update_visited_objects(self):
-        """Checks for objects near the player and marks them as visited."""
-        if not self.last_known_player_obj:
-            return
-
-        player_profile = self.last_known_player_obj
-        player_cx = player_profile['left_index'] + player_profile['width'] / 2
-        player_cy = player_profile['top_row'] + player_profile['height'] / 2
-        
-        # Define the "visit radius" - using tile_size is a good proxy.
-        visit_radius = self.tile_size * 1.5 if self.tile_size else 12
-
-        for data in self.world_objects.values():
-            if data.get('visited') is False:
-                obj_profile = data['profile']
-                obj_cx = obj_profile['left_index'] + obj_profile['width'] / 2
-                obj_cy = obj_profile['top_row'] + obj_profile['height'] / 2
-                
-                distance = math.sqrt((player_cx - obj_cx)**2 + (player_cy - obj_cy)**2)
-
-                if distance <= visit_radius:
-                    data['visited'] = True
-                    fingerprint = obj_profile.get('fingerprint')
-                    print(f"✅ Object {fingerprint} is nearby and now marked as visited.")
 
     def _review_and_summarize_interactions(self):
         """Reviews all interactable tiles and summarizes their learned properties."""
