@@ -1342,9 +1342,6 @@ class AGI3(Agent):
                     continue
 
                 color = grid_data[r][c]
-                if color in background_colors:
-                    visited_coords.add((r, c))
-                    continue
 
                 component_points = set()
                 q = [(r, c)]
@@ -1379,10 +1376,18 @@ class AGI3(Agent):
                     data_map = tuple(tuple(grid_data[r][c] if (r, c) in component_points else None for c in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
                     _, fingerprint, _ = self._create_normalized_fingerprint(data_map)
 
-                    label = "Unknown Object"
-                    if fingerprint in self.world_model.get('player_part_fingerprints', set()):
+                    # --- Determine the object's label based on learned knowledge ---
+                    floor_color = self.world_model.get('floor_color')
+                    wall_colors = self.world_model.get('wall_colors', set())
+                    
+                    label = "Unknown Object" # Default label
+                    
+                    if color == floor_color:
+                        label = "Floor"
+                    elif color in wall_colors:
+                        label = "Wall"
+                    elif fingerprint in self.world_model.get('player_part_fingerprints', set()):
                         label = "Agent Component"
-                    # Check for indicator BEFORE checking for a generic resource.
                     elif self.confirmed_resource_indicator and self.resource_pixel_color is not None:
                         indicator_row = self.confirmed_resource_indicator['row_index']
                         if min_row == indicator_row and color == self.resource_pixel_color:
