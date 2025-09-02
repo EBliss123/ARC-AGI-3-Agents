@@ -2826,6 +2826,57 @@ class AGI3(Agent):
             print(row_str)
         print("--- Key: P=Player, T=Target, .=Floor, #=Wall, ?=Potential, !=Confirmed, ~=Match ---\n")
 
+    def _synthesize_and_print_function_hypothesis(self, hypothesis: dict):
+        """Analyzes outcomes in a hypothesis to generate a high-level summary of the object's function."""
+        if not hypothesis:
+            return
+
+        all_transform_events = []
+        for effect_type in ['immediate_effect', 'aftermath_effect']:
+            for event_list in hypothesis.get(effect_type, []):
+                for event in event_list:
+                    if event.get('type') == 'TRANSFORM':
+                        all_transform_events.append(event)
+        
+        if not all_transform_events:
+            return
+
+        # --- Analyze all "before" and "after" states to find invariants ---
+        before_colors, before_sizes = set(), set()
+        after_colors, after_sizes = set(), set()
+
+        for event in all_transform_events:
+            before_obj, after_obj = event.get('before', {}), event.get('after', {})
+            if before_obj:
+                before_colors.add(before_obj.get('color'))
+                before_sizes.add((before_obj.get('height'), before_obj.get('width')))
+            if after_obj:
+                after_colors.add(after_obj.get('color'))
+                after_sizes.add((after_obj.get('height'), after_obj.get('width')))
+
+        # --- Build the hypothesis string piece by piece ---
+        # 1. Describe the target of the transformation (the "before" state)
+        target_parts = []
+        if len(before_sizes) == 1 and next(iter(before_sizes)) is not None:
+            size = next(iter(before_sizes))
+            target_parts.append(f"a {size[0]}x{size[1]}")
+        else:
+            target_parts.append("an")
+        target_parts.append("object")
+        if len(before_colors) == 1 and next(iter(before_colors)) is not None:
+            target_parts.append(f"of Color {next(iter(before_colors))}")
+
+        # 2. Describe the result of the transformation (the "after" state)
+        result_parts = ["a new object"]
+        if len(after_colors) == 1 and next(iter(after_colors)) is not None:
+            result_parts.append(f"of Color {next(iter(after_colors))}")
+        
+        # 3. Assemble and print the final hypothesis
+        target_desc = " ".join(target_parts)
+        result_desc = " ".join(result_parts)
+        hypothesis_str = f"Transforms {target_desc} into {result_desc}."
+        print(f"  - Hypothesized Function: {hypothesis_str}")
+
     def _review_and_summarize_interactions(self):
         """Reviews all interactable tiles and summarizes their learned properties."""
         print("\n--- 🧠 Interaction Knowledge Summary 🧠 ---")
@@ -2919,6 +2970,7 @@ class AGI3(Agent):
                 if is_consumable is True: type_desc = "Consumable (disappears after use)."
                 elif is_consumable is False: type_desc = "Persistent (remains after use)."
                 print(f"  - Type: {type_desc}")
+                self._synthesize_and_print_function_hypothesis(hypothesis)
 
                 if cell_type == CellType.POTENTIAL_MATCH:
                     print(f"  - Match Analysis:")
