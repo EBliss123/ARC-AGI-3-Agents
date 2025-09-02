@@ -2864,17 +2864,17 @@ class AGI3(Agent):
                 return
             
             # Sanitize the set by removing any None values before analysis
-            sanitized_set = {item for item in data_set if item is not None}
+            sanitized_set = {item for item in data_set if item is not None and item != (None, None)}
             if not sanitized_set:
                 print(f"        - {label}: (No data)")
                 return
 
             if len(sanitized_set) == 1:
                 value = next(iter(sanitized_set))
-                # Special formatting for size tuples
-                if isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], int):
+                # Distinguish between size and location for correct formatting
+                if label == "Size":
                      print(f"        - {label}: {value[0]}x{value[1]} (Consistent)")
-                else:
+                else: # Handles Location and other tuples
                      print(f"        - {label}: {value} (Consistent)")
             else:
                 print(f"        - {label}: Varies")
