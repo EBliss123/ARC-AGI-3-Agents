@@ -609,11 +609,9 @@ class AGI3(Agent):
             if self.active_patterns:
                 print(f"--- {len(self.active_patterns)} Active Pattern(s) on Grid ---")
                 for i, pattern in enumerate(self.active_patterns):
-                    dk = pattern['dynamic_key']
-                    sk = pattern['static_key']
-                    dk_tile = (dk['top_row'] // self.tile_size, dk['left_index'] // self.tile_size) if self.tile_size else (dk['top_row'], dk['left_index'])
-                    sk_tile = (sk['top_row'] // self.tile_size, sk['left_index'] // self.tile_size) if self.tile_size else (sk['top_row'], sk['left_index'])
-                    print(f"  - Pattern {i+1}: Dynamic object at {dk_tile} matches static object at {sk_tile}.")
+                    dk_pixel = (pattern['dynamic_key']['top_row'], pattern['dynamic_key']['left_index'])
+                    sk_pixel = (pattern['static_key']['top_row'], pattern['static_key']['left_index'])
+                    print(f"  - Pattern {i+1}: Dynamic object at {self._format_location_string(dk_pixel)} matches static object at {self._format_location_string(sk_pixel)}.")
            
             # 5. Update memory for the next turn.
             self.last_known_objects = current_objects
@@ -2750,9 +2748,9 @@ class AGI3(Agent):
                     pattern_fingerprint = (dk_fingerprint, static_obj.get('fingerprint'), sk_pos)
 
                     if pattern_fingerprint not in known_pattern_fingerprints:
-                        dk_tile = (dk_pos[0] // self.tile_size, dk_pos[1] // self.tile_size) if self.tile_size else dk_pos
-                        sk_tile = (sk_pos[0] // self.tile_size, sk_pos[1] // self.tile_size) if self.tile_size else sk_pos
-                        print(f"✅ NEW PATTERN DETECTED: Dynamic key at tile {dk_tile} matches static key at tile {sk_tile}!")
+                        dk_loc_str = self._format_location_string(dk_pos)
+                        sk_loc_str = self._format_location_string(sk_pos)
+                        print(f"✅ NEW PATTERN DETECTED: Dynamic key at {dk_loc_str} matches static key at {sk_loc_str}!")
 
                         new_pattern = {
                             'dynamic_key': dynamic_key_obj,
@@ -2825,6 +2823,25 @@ class AGI3(Agent):
                         row_str += "   "
             print(row_str)
         print("--- Key: P=Player, T=Target, .=Floor, #=Wall, ?=Potential, !=Confirmed, ~=Match ---\n")
+
+    def _format_location_string(self, pixel_pos: tuple) -> str:
+        """Formats a pixel position into a 'tile (r, c)' or 'pixel (r, c)' string."""
+        if not self.tile_size:
+            return f"pixel {pixel_pos}"
+
+        # Determine the "playable area" to see if tile coordinates are relevant.
+        display_area = set(self.reachable_floor_area)
+        for r_tile, c_tile in self.reachable_floor_area:
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                neighbor = (r_tile + dr, c_tile + dc)
+                if neighbor in self.tile_map:
+                    display_area.add(neighbor)
+        
+        tile_pos = (pixel_pos[0] // self.tile_size, pixel_pos[1] // self.tile_size)
+        if display_area and tile_pos in display_area:
+            return f"tile {tile_pos}"
+        else:
+            return f"pixel {pixel_pos}"
 
     def _synthesize_and_print_function_hypothesis(self, hypothesis: dict):
         """Analyzes all known outcomes for a tile to generate a detailed, rule-based hypothesis."""
