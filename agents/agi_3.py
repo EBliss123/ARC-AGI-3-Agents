@@ -1312,10 +1312,10 @@ class AGI3(Agent):
         self.previous_frame = copy.deepcopy(current_frame)
         return novel_changes_found, known_changes_found, novel_change_descriptions, all_structured_changes
 
-    def _compare_and_print_hypothesis_details(self, signature: str, remembered_hypo: dict, level_source: int):
+    def _compare_and_print_hypothesis_details(self, signature: str, remembered_hypo: dict):
         """
-        Performs a detailed, attribute-by-attribute comparison between the current and a 
-        remembered hypothesis, then prints a formatted report.
+        Performs a hybrid comparison: detailed for simple cases, high-level for complex ones.
+        Compares the current hypothesis against a synthesized historical one.
         """
         current_hypo = self.interaction_hypotheses.get(signature, {})
         
@@ -1323,86 +1323,105 @@ class AGI3(Agent):
         inconsistent = []
 
         # --- Base Attributes Comparison ---
-        # 1. Compare Persistence
+        # 1. Compare Persistence (is_consumable)
         current_persist = current_hypo.get('is_consumable')
-        rem_persist = remembered_hypo.get('is_consumable')
-        if current_persist == rem_persist:
-            val = "Consumable" if current_persist is True else "Persistent" if current_persist is False else "Unknown"
-            consistent.append(f"Persistence ({val})")
-        else:
+        rem_persist_set = remembered_hypo.get('is_consumable', set())
+        
+        if len(rem_persist_set) == 1:
+            rem_persist = next(iter(rem_persist_set)) if rem_persist_set else None
+            if current_persist == rem_persist:
+                val = "Consumable" if current_persist is True else "Persistent" if current_persist is False else "Unknown"
+                consistent.append(f"Persistence ({val})")
+            else:
+                p_curr = "Consumable" if current_persist is True else "Persistent" if current_persist is False else "Unknown"
+                p_rem = "Consumable" if rem_persist is True else "Persistent" if rem_persist is False else "Unknown"
+                inconsistent.append(f"Persistence (Current: {p_curr}, History: {p_rem})")
+        elif len(rem_persist_set) > 1:
             p_curr = "Consumable" if current_persist is True else "Persistent" if current_persist is False else "Unknown"
-            p_rem = "Consumable" if rem_persist is True else "Persistent" if rem_persist is False else "Unknown"
-            inconsistent.append(f"Persistence (Current: {p_curr}, L{level_source}: {p_rem})")
+            inconsistent.append(f"Persistence (Current: {p_curr}, History was inconsistent: {rem_persist_set})")
 
         # 2. Compare Resource Provision
         current_res = current_hypo.get('provides_resource', False)
-        rem_res = remembered_hypo.get('provides_resource', False)
-        if current_res == rem_res:
-            if current_res: consistent.append("Provides resource")
-        else:
-            inconsistent.append(f"Resource provision (Current: {current_res}, L{level_source}: {rem_res})")
-        
+        rem_res_set = remembered_hypo.get('provides_resource', {False})
+        if len(rem_res_set) == 1:
+             rem_res = next(iter(rem_res_set)) if rem_res_set else False
+             if current_res == rem_res:
+                 if current_res: consistent.append("Provides resource")
+             else:
+                 inconsistent.append(f"Resource provision (Current: {current_res}, History: {rem_res})")
+        elif len(rem_res_set) > 1:
+            inconsistent.append(f"Resource provision (Current: {current_res}, History was inconsistent: {rem_res_set})")
+
         # --- Granular Effects Comparison ---
         for effect_type in ['immediate_effect', 'aftermath_effect']:
-            current_effects = current_hypo.get(effect_type, [])
-            rem_effects = remembered_hypo.get(effect_type, [])
-            
-            # High-level check on the number of objects created
-            if len(current_effects) != len(rem_effects):
-                inconsistent.append(f"{effect_type.replace('_', ' ').title()} has different object counts (Current: {len(current_effects)}, L{level_source}: {len(rem_effects)})")
-                continue # If counts differ, a granular comparison is not meaningful
+            label = effect_type.replace('_', ' ').title()
+            current_outcomes = current_hypo.get(effect_type, [])
+            rem_outcomes = remembered_hypo.get(effect_type, [])
 
-            if not current_effects: continue # Both are empty, nothing to compare
+            # Special Case: If both have exactly one outcome with one object, do a detailed comparison.
+            is_simple_case = (len(current_outcomes) == 1 and len(current_outcomes[0]) == 1 and
+                              len(rem_outcomes) == 1 and len(rem_outcomes[0]) == 1)
 
-            # --- Attribute-by-attribute comparison for the single-object case ---
-            if len(current_effects) == 1:
-                current_obj = current_effects[0]
-                rem_obj = rem_effects[0]
+            if is_simple_case:
+                current_obj = current_outcomes[0][0]
+                rem_obj = rem_outcomes[0][0]
                 
                 effect_consistent = []
                 effect_inconsistent = []
 
-                # Compare Color
                 if current_obj.get('color') == rem_obj.get('color'):
                     effect_consistent.append(f"Color ({current_obj.get('color')})")
                 else:
-                    effect_inconsistent.append(f"Color (Current: {current_obj.get('color')}, L{level_source}: {rem_obj.get('color')})")
-
-                # Compare Size
+                    effect_inconsistent.append(f"Color (Current: {current_obj.get('color')}, History: {rem_obj.get('color')})")
+                
                 current_size = (current_obj.get('height'), current_obj.get('width'))
                 rem_size = (rem_obj.get('height'), rem_obj.get('width'))
                 if current_size == rem_size:
                     effect_consistent.append(f"Size {current_size}")
                 else:
-                    effect_inconsistent.append(f"Size (Current: {current_size}, L{level_source}: {rem_size})")
+                    effect_inconsistent.append(f"Size (Current: {current_size}, History: {rem_size})")
 
-                # Compare Fingerprint (Shape)
                 if current_obj.get('fingerprint') == rem_obj.get('fingerprint'):
                     effect_consistent.append("Shape")
                 else:
                     effect_inconsistent.append("Shape")
 
-                # Always show location, as it is context-dependent and useful to see
-                current_loc_str = self._get_object_summary_string(current_obj).split('(')[0].strip()
-                rem_loc_str = self._get_object_summary_string(rem_obj).split('(')[0].strip()
-                effect_inconsistent.append(f"Location (Current: {current_loc_str}, L{level_source}: {rem_loc_str})")
+                current_loc_str = self._get_object_summary_string(current_obj).split(' (')[0]
+                rem_loc_str = self._get_object_summary_string(rem_obj).split(' (')[0]
+                if current_loc_str != rem_loc_str:
+                     effect_inconsistent.append(f"Location (Current: {current_loc_str}, History: {rem_loc_str})")
                 
-                # Consolidate and add to the main inconsistent list
-                inconsistent.append(f"{effect_type.replace('_', ' ').title()} has inconsistencies:")
-                for item in effect_consistent:
-                    inconsistent.append(f"  - ✔️ Consistent: {item}")
-                for item in effect_inconsistent:
-                    inconsistent.append(f"  - ✖️ Inconsistent: {item}")
-            
-            # Fallback for multi-object effects
-            elif len(current_effects) > 1:
-                current_summaries = {self._get_object_summary_string(obj) for obj in current_effects}
-                rem_summaries = {self._get_object_summary_string(obj) for obj in rem_effects}
-                if current_summaries == rem_summaries:
-                    consistent.append(f"{effect_type.replace('_', ' ').title()} is consistent (multi-object)")
+                if effect_inconsistent:
+                    inconsistent.append(f"{label} has inconsistencies:")
+                    for item in effect_consistent:
+                        inconsistent.append(f"   - ✔️ Consistent: {item}")
+                    for item in effect_inconsistent:
+                        inconsistent.append(f"   - ✖️ Inconsistent: {item}")
                 else:
-                    inconsistent.append(f"{effect_type.replace('_', ' ').title()} differs (multi-object)")
-        
+                    consistent.append(f"{label} is consistent")
+
+            # General Case: Use high-level set comparison for complex interactions.
+            else:
+                if not current_outcomes and not rem_outcomes: continue
+
+                get_canonical = lambda outcomes: {
+                    tuple(sorted([self._get_object_summary_string(obj) for obj in outcome]))
+                    for outcome in outcomes
+                }
+                current_set = get_canonical(current_outcomes)
+                rem_set = get_canonical(rem_outcomes)
+
+                if current_set == rem_set:
+                    consistent.append(f"{label} (has {len(current_set)} outcome(s))")
+                else:
+                    inconsistent.append(f"{label}")
+                    added = current_set - rem_set
+                    removed = rem_set - current_set
+                    if added:
+                        inconsistent.append(f"  - Gained {len(added)} outcome(s) in current level.")
+                    if removed:
+                        inconsistent.append(f"  - Lost {len(removed)} outcome(s) from history.")
+
         # --- Final Print ---
         if consistent:
             print("        -> Consistent Attributes:")
@@ -2552,28 +2571,33 @@ class AGI3(Agent):
             summary_str = self._get_object_summary_string(obj)
             print(f"  - Object {i+1}: {summary_str}")
 
+        # Initialize the hypothesis for this tile if it's the first time we've seen it.
         if object_signature not in self.interaction_hypotheses:
             self.interaction_hypotheses[object_signature] = {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
+        
+        # An "outcome" is the list of all objects generated by a single interaction event.
+        if not effect_objects:
+            return
 
-        # Get the list of effects we've already recorded for this interaction.
-        existing_effects = self.interaction_hypotheses[object_signature].get(effect_type, [])
-        # Create a set of summary strings for existing effects for a robust uniqueness check.
-        existing_summaries = {self._get_object_summary_string(obj) for obj in existing_effects}
+        # Get the list of previously observed outcomes.
+        known_outcomes = self.interaction_hypotheses[object_signature].get(effect_type, [])
 
-        newly_added_count = 0
-        for new_obj in effect_objects:
-            new_summary = self._get_object_summary_string(new_obj)
-            # Only add the new object if its unique summary string isn't already known.
-            if new_summary not in existing_summaries:
-                existing_effects.append(new_obj)
-                existing_summaries.add(new_summary) # Keep the set of summaries in sync
-                newly_added_count += 1
+        # To check for duplicates, create a canonical, hashable representation of the new outcome.
+        current_outcome_summary = tuple(sorted([self._get_object_summary_string(obj) for obj in effect_objects]))
+        
+        # Create a set of summaries for all previously known outcomes.
+        known_outcome_summaries = {
+            tuple(sorted([self._get_object_summary_string(obj) for obj in outcome]))
+            for outcome in known_outcomes
+        }
 
-        if newly_added_count > 0:
-            print(f"💡 EFFECT LEARNED: Added {newly_added_count} new unique '{effect_type}' outcome(s) for '{object_signature}'.")
+        # If this specific outcome hasn't been seen before, add it as a new list.
+        if current_outcome_summary not in known_outcome_summaries:
+            known_outcomes.append(effect_objects)
+            print(f"💡 NEW OUTCOME LEARNED: A new '{effect_type}' event for '{object_signature}' has been recorded.")
         else:
-            print(f"-> The observed '{effect_type}' for '{object_signature}' was already known.")
-    
+            print(f"-> The observed '{effect_type}' outcome for '{object_signature}' was already known.")
+
     def _log_object_characteristics(self, tile_coords: tuple, grid: list):
         """Finds all objects on a tile, groups them by color, and logs their characteristics."""
         if tile_coords in self.interactable_object_characteristics:
@@ -2812,29 +2836,38 @@ class AGI3(Agent):
                 print(f"  - Function: Untested.")
                 print(f"  - Type: Unknown.")
             else:
-                has_any_effect = False
-                if hypothesis.get('provides_resource'):
-                    print(f"  - Function: Resource (fills resource bar).")
-                    has_any_effect = True
-                
-                immediate_effects = hypothesis.get('immediate_effect', [])
-                if immediate_effects:
-                    if not has_any_effect: print(f"  - Function:")
-                    print(f"    - Immediate Effect: Spawns/changes {len(immediate_effects)} object(s):")
-                    for obj in immediate_effects:
-                        print(f"      - {self._get_object_summary_string(obj)}")
-                    has_any_effect = True
+                # Helper to print outcomes for a given effect type
+                def print_outcomes(outcomes: list, label: str):
+                    if not outcomes:
+                        return
+                    
+                    print(f"    - {label}: Can result in {len(outcomes)} unique outcome(s).")
+                    # If there's only one outcome, don't number it.
+                    if len(outcomes) == 1:
+                        outcome = outcomes[0]
+                        print(f"      - Spawns {len(outcome)} object(s):")
+                        for obj in outcome:
+                            print(f"        - {self._get_object_summary_string(obj)}")
+                    else: # If multiple outcomes, number them
+                        for i, outcome in enumerate(outcomes):
+                            print(f"      - Outcome {i+1} (spawns {len(outcome)} object(s)):")
+                            for obj in outcome:
+                                print(f"        - {self._get_object_summary_string(obj)}")
 
-                aftermath_effects = hypothesis.get('aftermath_effect', [])
-                if aftermath_effects:
-                    if not has_any_effect: print(f"  - Function:")
-                    print(f"    - Aftermath Effect: Spawns/changes {len(aftermath_effects)} object(s):")
-                    for obj in aftermath_effects:
-                        print(f"      - {self._get_object_summary_string(obj)}")
-                    has_any_effect = True
-                
+                # Check for all possible functions
+                is_resource = hypothesis.get('provides_resource', False)
+                immediate_outcomes = hypothesis.get('immediate_effect', [])
+                aftermath_outcomes = hypothesis.get('aftermath_effect', [])
+                has_any_effect = is_resource or immediate_outcomes or aftermath_outcomes
+
+                print(f"  - Function:")
                 if not has_any_effect:
-                    print(f"  - Function: No effect observed.")
+                    print(f"    - No effect observed.")
+                else:
+                    if is_resource:
+                        print(f"    - Resource (fills resource bar).")
+                    print_outcomes(immediate_outcomes, "Immediate Effect")
+                    print_outcomes(aftermath_outcomes, "Aftermath Effect")
 
                 type_desc = "Unknown (aftermath not observed)."
                 is_consumable = hypothesis.get('is_consumable')
@@ -2859,28 +2892,51 @@ class AGI3(Agent):
                                 print(f"      --- Comparing Part (Color {color}) ---")
                                 any_perfect_match_found_for_part = False
 
-                                # Iterate through ALL remembered profiles from ALL previous levels for this part
-                                for rem_prof in remembered_profiles:
-                                    # Check for a perfect match (same shape, color, and size)
-                                    is_perfect_match = (rem_prof['color'] == color and rem_prof['size'] == obj_char['size'])
-                                    
-                                    if is_perfect_match:
-                                        any_perfect_match_found_for_part = True
-                                        print(f"        - ✅ Perfect Match found with object from Level {rem_prof['level_source']}.")
+                                # --- NEW: Synthesis Logic ---
+                                # 1. Find all perfect matches from memory.
+                                perfect_matches = [
+                                    p for p in remembered_profiles 
+                                    if p['color'] == color and p['size'] == obj_char['size']
+                                ]
+
+                                if not perfect_matches:
+                                    best_partial = remembered_profiles[0]
+                                    print(f"        - ⚠️ No Perfect Match found. Best partial match is from Level {best_partial['level_source']}.")
+                                    continue # Go to the next object part
+
+                                print(f"        - ✅ Found {len(perfect_matches)} perfect match(es) in memory (from levels {[p['level_source'] for p in perfect_matches]}).")
+
+                                # 2. Synthesize a single historical profile from all matches.
+                                synthesized_hypo = {
+                                    'is_consumable': set(),
+                                    'provides_resource': set(),
+                                    'immediate_effect': [],
+                                    'aftermath_effect': []
+                                }
+                                unique_rem_outcomes = {'immediate_effect': set(), 'aftermath_effect': set()}
+
+                                for match in perfect_matches:
+                                    hypo = match.get('hypothesis')
+                                    if not hypo: continue
+
+                                    synthesized_hypo['is_consumable'].add(hypo.get('is_consumable'))
+                                    synthesized_hypo['provides_resource'].add(hypo.get('provides_resource', False))
+
+                                    for effect_type in ['immediate_effect', 'aftermath_effect']:
+                                        outcomes = hypo.get(effect_type, [])
+                                        # Handle legacy format where effects was a flat list
+                                        if outcomes and not isinstance(outcomes[0], list):
+                                            outcomes = [outcomes]
                                         
-                                        # Perform the detailed comparison for this specific historical match
-                                        remembered_hypothesis = rem_prof.get('hypothesis')
-                                        level_source = rem_prof.get('level_source')
-                                        if remembered_hypothesis:
-                                            self._compare_and_print_hypothesis_details(signature, remembered_hypothesis, level_source)
-                                        else:
-                                            print("          -> No remembered function to compare against for this match.")
-                                
-                                # After checking all levels, if no perfect matches were found, report it.
-                                if not any_perfect_match_found_for_part:
-                                    # Use the first profile as a representative for the partial match message
-                                    best_partial_match = remembered_profiles[0]
-                                    print(f"        - ⚠️ No Perfect Match found. Best partial match is from Level {best_partial_match['level_source']}.")
+                                        for outcome in outcomes:
+                                            # Create a canonical summary to check for uniqueness
+                                            canonical_outcome = tuple(sorted([self._get_object_summary_string(obj) for obj in outcome]))
+                                            if canonical_outcome not in unique_rem_outcomes[effect_type]:
+                                                unique_rem_outcomes[effect_type].add(canonical_outcome)
+                                                synthesized_hypo[effect_type].append(outcome)
+
+                                # 3. Perform a single, detailed comparison against the synthesized profile.
+                                self._compare_and_print_hypothesis_details(signature, synthesized_hypo)
                     else:
                         print(f"      - Could not perform analysis: Characteristics not logged.")
 
@@ -2907,12 +2963,13 @@ class AGI3(Agent):
                         display_area.add(neighbor)
             
             for hypothesis in self.interaction_hypotheses.values():
-                all_effects = hypothesis.get('immediate_effect', []) + hypothesis.get('aftermath_effect', [])
-                for obj in all_effects:
-                    obj_tile_pos = (obj['top_row'] // self.tile_size, obj['left_index'] // self.tile_size)
-                    if obj_tile_pos not in display_area:
-                        summary_str = self._get_object_summary_string(obj)
-                        unique_off_grid_effects.add(summary_str)
+                all_outcomes = hypothesis.get('immediate_effect', []) + hypothesis.get('aftermath_effect', [])
+                for outcome in all_outcomes:
+                    for obj in outcome:
+                        obj_tile_pos = (obj['top_row'] // self.tile_size, obj['left_index'] // self.tile_size)
+                        if obj_tile_pos not in display_area:
+                            summary_str = self._get_object_summary_string(obj)
+                            unique_off_grid_effects.add(summary_str)
         
         if unique_off_grid_effects:
             print("\n--- Off-Grid Effects Summary ---")
