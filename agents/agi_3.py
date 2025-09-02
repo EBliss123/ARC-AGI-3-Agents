@@ -3161,6 +3161,16 @@ class AGI3(Agent):
         """Analyzes and stores the state of the game at the moment a level is won."""
         print("\n--- 🎯 Post-Level Goal Hypothesis ---")
 
+        # Determine the "playable area" to correctly format locations
+        display_area = set()
+        if self.tile_size:
+            display_area = set(self.reachable_floor_area)
+            for r_tile, c_tile in self.reachable_floor_area:
+                for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                    neighbor = (r_tile + dr, c_tile + dc)
+                    if neighbor in self.tile_map:
+                        display_area.add(neighbor)
+
         goal_hypothesis = {
             'goal_tile_interaction': None,
             'active_patterns_at_win': None
@@ -3183,11 +3193,18 @@ class AGI3(Agent):
             goal_hypothesis['active_patterns_at_win'] = copy.deepcopy(self.active_patterns)
             print(f"Active Pattern at Win-Time:")
             for i, pattern in enumerate(self.active_patterns):
-                dk = pattern['dynamic_key']
-                sk = pattern['static_key']
-                dk_tile = (dk['top_row'] // self.tile_size, dk['left_index'] // self.tile_size) if self.tile_size else (dk['top_row'], dk['left_index'])
-                sk_tile = (sk['top_row'] // self.tile_size, sk['left_index'] // self.tile_size) if self.tile_size else (sk['top_row'], sk['left_index'])
-                print(f"  - Pattern {i+1}: Dynamic object at {dk_tile} matched Static object at {sk_tile}.")
+                dk, sk = pattern['dynamic_key'], pattern['static_key']
+                dk_pixel, sk_pixel = (dk['top_row'], dk['left_index']), (sk['top_row'], sk['left_index'])
+
+                # Helper to format location string based on whether it's on the grid
+                def format_loc(pixel_pos):
+                    if self.tile_size:
+                        tile_pos = (pixel_pos[0] // self.tile_size, pixel_pos[1] // self.tile_size)
+                        if tile_pos in display_area:
+                            return f"tile {tile_pos}"
+                    return f"pixel {pixel_pos}"
+
+                print(f"  - Pattern {i+1}: Dynamic object at {format_loc(dk_pixel)} matches Static object at {format_loc(sk_pixel)}.")
                 # Future: Could print more detailed characteristics here.
         else:
             print("No active patterns were present at the end of the level.")
