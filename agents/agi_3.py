@@ -2555,8 +2555,24 @@ class AGI3(Agent):
         if object_signature not in self.interaction_hypotheses:
             self.interaction_hypotheses[object_signature] = {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
 
-        self.interaction_hypotheses[object_signature][effect_type] = effect_objects
-        print(f"💡 EFFECT LEARNED: The '{effect_type}' of interacting with '{object_signature}' has been recorded.")
+        # Get the list of effects we've already recorded for this interaction.
+        existing_effects = self.interaction_hypotheses[object_signature].get(effect_type, [])
+        # Create a set of summary strings for existing effects for a robust uniqueness check.
+        existing_summaries = {self._get_object_summary_string(obj) for obj in existing_effects}
+
+        newly_added_count = 0
+        for new_obj in effect_objects:
+            new_summary = self._get_object_summary_string(new_obj)
+            # Only add the new object if its unique summary string isn't already known.
+            if new_summary not in existing_summaries:
+                existing_effects.append(new_obj)
+                existing_summaries.add(new_summary) # Keep the set of summaries in sync
+                newly_added_count += 1
+
+        if newly_added_count > 0:
+            print(f"💡 EFFECT LEARNED: Added {newly_added_count} new unique '{effect_type}' outcome(s) for '{object_signature}'.")
+        else:
+            print(f"-> The observed '{effect_type}' for '{object_signature}' was already known.")
     
     def _log_object_characteristics(self, tile_coords: tuple, grid: list):
         """Finds all objects on a tile, groups them by color, and logs their characteristics."""
