@@ -297,6 +297,7 @@ class AGI3(Agent):
                 print("--- New Level Detected. Storing initial valid frame and score. ---")
                 self.level_start_frame = copy.deepcopy(latest_frame.frame)
                 self.level_start_score = latest_frame.score
+                self._describe_initial_objects(latest_frame.frame[0])
                 if self.confirmed_resource_indicator:
                     indicator_row_index = self.confirmed_resource_indicator['row_index']
                     self.resource_bar_full_state = copy.deepcopy(latest_frame.frame[0][indicator_row_index])
@@ -1309,6 +1310,76 @@ class AGI3(Agent):
 
         self.previous_frame = copy.deepcopy(current_frame)
         return novel_changes_found, known_changes_found, novel_change_descriptions, all_structured_changes
+
+    def _describe_initial_objects(self, grid_data: list):
+        """
+        Scans the initial grid, finds all distinct objects using 8-directional
+        connectivity, and prints a description of each.
+        """
+        if not grid_data or not grid_data[0]:
+            print("Initial object description skipped: No grid data.")
+            return
+
+        print("\n--- Initial Object Analysis ---")
+        grid_height = len(grid_data)
+        grid_width = len(grid_data[0])
+        visited_coords = set()
+
+        background_colors = {self.world_model.get('floor_color')} | self.world_model.get('wall_colors', set())
+        background_colors.discard(None)
+
+        for r in range(grid_height):
+            for c in range(grid_width):
+                if (r, c) in visited_coords:
+                    continue
+
+                color = grid_data[r][c]
+                if color in background_colors:
+                    visited_coords.add((r, c))
+                    continue
+
+                # Found a new, non-background pixel. Start a flood-fill.
+                component_points = set()
+                q = [(r, c)]
+                visited_coords.add((r, c))
+                
+                while q:
+                    p = q.pop(0)
+                    component_points.add(p)
+                    row, col = p
+                    
+                    # 8-directional check
+                    for dr in [-1, 0, 1]:
+                        for dc in [-1, 0, 1]:
+                            if dr == 0 and dc == 0:
+                                continue
+                            
+                            neighbor = (row + dr, col + dc)
+                            
+                            if (0 <= neighbor[0] < grid_height and 
+                                0 <= neighbor[1] < grid_width and 
+                                neighbor not in visited_coords and 
+                                grid_data[neighbor[0]][neighbor[1]] == color):
+                                
+                                visited_coords.add(neighbor)
+                                q.append(neighbor)
+                
+                if component_points:
+                    min_row = min(r_ for r_, _ in component_points)
+                    max_row = max(r_ for r_, _ in component_points)
+                    min_idx = min(p_idx for _, p_idx in component_points)
+                    max_idx = max(p_idx for _, p_idx in component_points)
+                    height, width = max_row - min_row + 1, max_idx - min_idx + 1
+
+                    # Create the data map from the component points
+                    data_map = tuple(tuple(grid_data[r][c] if (r, c) in component_points else None for c in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
+                    
+                    # Generate the fingerprint
+                    _, fingerprint, _ = self._create_normalized_fingerprint(data_map)
+
+                    print(f"- Found a {height}x{width} object of color {color} at pixel ({min_row}, {min_idx}) with fingerprint {fingerprint}.")
+
+        print("--- End of Initial Analysis ---\n")
 
     def _compare_and_print_hypothesis_details(self, signature: str, remembered_hypo: dict):
         """
