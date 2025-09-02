@@ -99,7 +99,8 @@ class AGI3(Agent):
             'floor_color': None,
             'wall_colors': set(),
             'action_map': {},
-            'resource_signatures': set()
+            'resource_signatures': set(),
+            'player_part_fingerprints': set()
         }
         self.cross_level_characteristics = {} # Stores full profiles of objects from previous levels.
         self.level_count = 1
@@ -374,7 +375,8 @@ class AGI3(Agent):
                                                 # Immediately confirm the concept and store it.
                                                 self.world_model['life_indicator_object'] = signature
                                                 print(f"✅ [LIFE INDICATOR] Confirmed: A color change from {signature[2]} to {signature[3]} on a ({signature[0]}x{signature[1]}) object is the life indicator.")
-                                                
+                                                self._scan_and_label_all_objects(latest_frame.frame[0], "Life Indicator Confirmed")
+
                                                 # Add the object's specific rectangle to the ignore list.
                                                 new_area = {
                                                     'top_row': obj['top_row'],
@@ -567,7 +569,7 @@ class AGI3(Agent):
             # Still run indicator tracking if ANY change happened, to keep it updated.
             if novel_changes_found or known_changes_found:
                 # We pass `structured_changes` here, which contains ALL changes (novel and known).
-                self._update_resource_indicator_tracking(structured_changes, self.last_action)
+                self._update_resource_indicator_tracking(structured_changes, self.last_action, latest_frame.frame)
 
         # --- Object Finding and Tracking ---
         if novel_changes_found:
@@ -1313,14 +1315,20 @@ class AGI3(Agent):
 
     def _describe_initial_objects(self, grid_data: list):
         """
-        Scans the initial grid, finds all distinct objects using 8-directional
-        connectivity, and prints a description of each.
+        Scans the initial grid at the start of a level to label all objects.
+        """
+        self._scan_and_label_all_objects(grid_data, "Initial Level Analysis")
+
+    def _scan_and_label_all_objects(self, grid_data: list, reason: str):
+        """
+        Scans the entire grid, finds all objects, labels them based on
+        current knowledge, and prints a summary.
         """
         if not grid_data or not grid_data[0]:
-            print("Initial object description skipped: No grid data.")
+            print(f"Object scan skipped for '{reason}': No grid data.")
             return
 
-        print("\n--- Initial Object Analysis ---")
+        print(f"\n--- Full Object Scan (Reason: {reason}) ---")
         grid_height = len(grid_data)
         grid_width = len(grid_data[0])
         visited_coords = set()
@@ -1338,7 +1346,6 @@ class AGI3(Agent):
                     visited_coords.add((r, c))
                     continue
 
-                # Found a new, non-background pixel. Start a flood-fill.
                 component_points = set()
                 q = [(r, c)]
                 visited_coords.add((r, c))
@@ -1348,14 +1355,12 @@ class AGI3(Agent):
                     component_points.add(p)
                     row, col = p
                     
-                    # 8-directional check
                     for dr in [-1, 0, 1]:
                         for dc in [-1, 0, 1]:
                             if dr == 0 and dc == 0:
                                 continue
                             
                             neighbor = (row + dr, col + dc)
-                            
                             if (0 <= neighbor[0] < grid_height and 
                                 0 <= neighbor[1] < grid_width and 
                                 neighbor not in visited_coords and 
@@ -1371,15 +1376,23 @@ class AGI3(Agent):
                     max_idx = max(p_idx for _, p_idx in component_points)
                     height, width = max_row - min_row + 1, max_idx - min_idx + 1
 
-                    # Create the data map from the component points
                     data_map = tuple(tuple(grid_data[r][c] if (r, c) in component_points else None for c in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
-                    
-                    # Generate the fingerprint
                     _, fingerprint, _ = self._create_normalized_fingerprint(data_map)
 
-                    print(f"- Found a {height}x{width} object of color {color} at pixel ({min_row}, {min_idx}) with fingerprint {fingerprint}.")
+                    label = "Unknown Object"
+                    if fingerprint in self.world_model.get('player_part_fingerprints', set()):
+                        label = "Agent Component"
+                    # Check for indicator BEFORE checking for a generic resource.
+                    elif self.confirmed_resource_indicator and self.resource_pixel_color is not None:
+                        indicator_row = self.confirmed_resource_indicator['row_index']
+                        if min_row == indicator_row and color == self.resource_pixel_color:
+                            label = "Resource Indicator"
+                    elif fingerprint in self.world_model.get('resource_signatures', set()):
+                        label = "Resource"
+                    
+                    print(f"- Found a {height}x{width} object of color {color} at pixel ({min_row}, {min_idx}) with fingerprint {fingerprint}. [{label}]")
 
-        print("--- End of Initial Analysis ---\n")
+        print("--- End of Scan ---\n")
 
     def _compare_and_print_hypothesis_details(self, signature: str, remembered_hypo: dict):
         """
@@ -2011,6 +2024,23 @@ class AGI3(Agent):
                 if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
                     self.world_model['player_signature'] = signature
                     log_messages.append(f"✅ Confirmed Agent Signature: {signature}.")
+
+                    # --- Store the fingerprints of the agent's component parts ---
+                    agent_parts_to_store = []
+                    if move['type'] == 'composite':
+                        # The 'parts' in a move are tuples of (curr_obj, last_obj). We need the current one.
+                        agent_parts_to_store = [p[0] for p in move['parts']]
+                    elif move['type'] == 'individual':
+                        agent_parts_to_store = [move['curr_obj']]
+                    
+                    # Add each part's fingerprint to the set
+                    for part in agent_parts_to_store:
+                        if 'fingerprint' in part:
+                            self.world_model['player_part_fingerprints'].add(part['fingerprint'])
+                    
+                    log_messages.append(f"-> Stored {len(self.world_model['player_part_fingerprints'])} unique agent part fingerprint(s).")
+                    self._scan_and_label_all_objects(latest_grid[0], "Agent Confirmed")
+                    
                     break # Stop after confirming.
 
         # 2. Identify the Floor (can only happen after agent is known)
@@ -2037,6 +2067,7 @@ class AGI3(Agent):
                         if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
                             self.world_model['floor_color'] = floor_candidate
                             log_messages.append(f"✅ Confirmed Floor Color: {floor_candidate}.")
+                            self._scan_and_label_all_objects(latest_grid[0], "Floor Color Confirmed")
 
                             # --- Map Cleanup Logic ---
                             if self.tile_size:
@@ -2279,6 +2310,7 @@ class AGI3(Agent):
                 # Add the color to the set of confirmed walls.
                 self.world_model['wall_colors'].add(wall_candidate_color)
                 print(f"✅ [WALL] Confirmed: {wall_name} is a wall.")
+                self._scan_and_label_all_objects(last_grid[0], f"Wall Confirmed ({wall_name})")
 
                 # --- Map Cleanup Logic ---
                 # This logic now runs for each newly confirmed wall color.
@@ -2308,7 +2340,7 @@ class AGI3(Agent):
                 if wall_candidate_color in self.wall_hypothesis:
                     del self.wall_hypothesis[wall_candidate_color]
     
-    def _update_resource_indicator_tracking(self, structured_changes: list, action: GameAction):
+    def _update_resource_indicator_tracking(self, structured_changes: list, action: GameAction, latest_grid: list):
         """Analyzes changes to find a resource indicator, which depletes on any action."""
         if self.confirmed_resource_indicator or not action:
             return
@@ -2366,7 +2398,8 @@ class AGI3(Agent):
                             'height': 1, 'width': grid_width
                         })
                         print(f"✅ Confirmed resource indicator at row {row_idx}! It will now be ignored for state uniqueness checks.")
-                        
+                        self._scan_and_label_all_objects(latest_grid[0], "Resource Indicator Confirmed")
+
                         # --- NEW: Re-check active patterns to filter out the new indicator ---
                         if self.active_patterns:
                             print(f"🕵️‍♀️ Re-checking {len(self.active_patterns)} active pattern(s) against the new resource indicator...")
