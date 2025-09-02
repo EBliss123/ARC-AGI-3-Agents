@@ -2827,7 +2827,7 @@ class AGI3(Agent):
         print("--- Key: P=Player, T=Target, .=Floor, #=Wall, ?=Potential, !=Confirmed, ~=Match ---\n")
 
     def _synthesize_and_print_function_hypothesis(self, hypothesis: dict):
-        """Analyzes outcomes in a hypothesis to generate a high-level summary of the object's function."""
+        """Analyzes all known outcomes for a tile to generate a detailed, rule-based hypothesis."""
         if not hypothesis:
             return
 
@@ -2841,41 +2841,90 @@ class AGI3(Agent):
         if not all_transform_events:
             return
 
-        # --- Analyze all "before" and "after" states to find invariants ---
-        before_colors, before_sizes = set(), set()
-        after_colors, after_sizes = set(), set()
+        # --- 1. Collect all details from every transformation event ---
+        locations = set()
+        color_transitions = set()
+        size_transitions = set()
+        shape_transitions = set()
 
         for event in all_transform_events:
             before_obj, after_obj = event.get('before', {}), event.get('after', {})
             if before_obj:
-                before_colors.add(before_obj.get('color'))
-                before_sizes.add((before_obj.get('height'), before_obj.get('width')))
-            if after_obj:
-                after_colors.add(after_obj.get('color'))
-                after_sizes.add((after_obj.get('height'), after_obj.get('width')))
+                locations.add((before_obj.get('top_row'), before_obj.get('left_index')))
+                if after_obj:
+                    color_transitions.add((before_obj.get('color'), after_obj.get('color')))
+                    size_transitions.add(((before_obj.get('height'), before_obj.get('width')),
+                                          (after_obj.get('height'), after_obj.get('width'))))
+                    shape_transitions.add((before_obj.get('fingerprint'), after_obj.get('fingerprint')))
 
-        # --- Build the hypothesis string piece by piece ---
-        # 1. Describe the target of the transformation (the "before" state)
-        target_parts = []
-        if len(before_sizes) == 1 and next(iter(before_sizes)) is not None:
-            size = next(iter(before_sizes))
-            target_parts.append(f"a {size[0]}x{size[1]}")
-        else:
-            target_parts.append("an")
-        target_parts.append("object")
-        if len(before_colors) == 1 and next(iter(before_colors)) is not None:
-            target_parts.append(f"of Color {next(iter(before_colors))}")
+        # --- 2. Define a helper for printing properties ---
+        def print_prop(label, data_set):
+            if not data_set:
+                print(f"        - {label}: (No data)")
+                return
+            
+            # Sanitize the set by removing any None values before analysis
+            sanitized_set = {item for item in data_set if item is not None}
+            if not sanitized_set:
+                print(f"        - {label}: (No data)")
+                return
 
-        # 2. Describe the result of the transformation (the "after" state)
-        result_parts = ["a new object"]
-        if len(after_colors) == 1 and next(iter(after_colors)) is not None:
-            result_parts.append(f"of Color {next(iter(after_colors))}")
+            if len(sanitized_set) == 1:
+                value = next(iter(sanitized_set))
+                # Special formatting for size tuples
+                if isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], int):
+                     print(f"        - {label}: {value[0]}x{value[1]} (Consistent)")
+                else:
+                     print(f"        - {label}: {value} (Consistent)")
+            else:
+                print(f"        - {label}: Varies")
+
+        # --- 3. Print the detailed, structured hypothesis ---
+        print("  - Hypothesized Function: Transforms a target object according to the following rules:")
         
-        # 3. Assemble and print the final hypothesis
-        target_desc = " ".join(target_parts)
-        result_desc = " ".join(result_parts)
-        hypothesis_str = f"Transforms {target_desc} into {result_desc}."
-        print(f"  - Hypothesized Function: {hypothesis_str}")
+        # Extract unique "before" and "after" properties for analysis
+        before_shapes = {t[0] for t in shape_transitions}
+        before_sizes = {t[0] for t in size_transitions}
+        before_colors = {t[0] for t in color_transitions}
+        after_shapes = {t[1] for t in shape_transitions}
+        after_sizes = {t[1] for t in size_transitions}
+        after_colors = {t[1] for t in color_transitions}
+
+        print("      - Target Properties:")
+        print_prop("Shape (FP)", before_shapes)
+        print_prop("Size", before_sizes)
+        print_prop("Color", before_colors)
+        print_prop("Location", locations)
+
+        print("      - Resulting Properties:")
+        print_prop("Shape (FP)", after_shapes)
+        print_prop("Size", after_sizes)
+        print_prop("Color", after_colors)
+
+        print("      - Transformation Rules:")
+        if len(color_transitions) == 1:
+            b_col, a_col = next(iter(color_transitions))
+            print(f"        - Color consistently changes from {b_col} to {a_col}.")
+        else:
+            print("        - Color change rule varies.")
+
+        if len(size_transitions) == 1:
+            b_size, a_size = next(iter(size_transitions))
+            print(f"        - Size consistently changes from {b_size[0]}x{b_size[1]} to {a_size[0]}x{a_size[1]}.")
+        elif len(before_sizes) == 1:
+            b_size = next(iter(before_sizes))
+            print(f"        - Size changes from {b_size[0]}x{b_size[1]} to a new, variable size.")
+        else:
+            print("        - Size change rule varies.")
+
+        if len(shape_transitions) == 1:
+            b_fp, a_fp = next(iter(shape_transitions))
+            print(f"        - Shape consistently changes from FP {b_fp} to {a_fp}.")
+        elif len(before_shapes) == 1:
+            b_fp = next(iter(before_shapes))
+            print(f"        - Shape changes from FP {b_fp} to a new, variable shape.")
+        else:
+            print("        - Shape change rule varies.")
 
     def _review_and_summarize_interactions(self):
         """Reviews all interactable tiles and summarizes their learned properties."""
