@@ -1382,7 +1382,17 @@ class AGI3(Agent):
                     
                     label = "Unknown Object" # Default label
                     
+                    # Check for Floor, but only if it's connected to the main walkable area.
+                    is_truly_floor = False
                     if color == floor_color:
+                        if self.tile_size and self.reachable_floor_area:
+                            for r_pixel, c_pixel in component_points:
+                                pixel_tile = (r_pixel // self.tile_size, c_pixel // self.tile_size)
+                                if pixel_tile in self.reachable_floor_area:
+                                    is_truly_floor = True
+                                    break
+                    
+                    if is_truly_floor:
                         label = "Floor"
                     elif color in wall_colors:
                         label = "Wall"
