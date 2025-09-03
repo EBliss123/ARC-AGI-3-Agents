@@ -652,6 +652,8 @@ class AGI3(Agent):
                         if res_fingerprint not in self.world_model['resource_signatures']:
                             self.world_model['resource_signatures'].add(res_fingerprint)
                             print(f"✅ [RESOURCE] Learned new resource signature: {res_fingerprint}")
+                    
+                    self._log_object_characteristics(player_tile, frame_before_perception)
 
                     # Update interaction hypothesis for this tile
                     signature = f"tile_pos_{player_tile}"
@@ -2761,8 +2763,6 @@ class AGI3(Agent):
             # Filter out background and resource objects
             if obj_color in background_colors:
                 continue
-            if obj_fingerprint in resource_signatures:
-                continue
 
             if obj_color not in characteristics_by_color:
                 characteristics_by_color[obj_color] = []
@@ -2806,7 +2806,6 @@ class AGI3(Agent):
 
         if current_tile_color == floor_color:
             print(f"✅ Aftermath: Object at tile {interacted_tile} was consumed (turned to floor).")
-            self.tile_map[interacted_tile] = CellType.FLOOR
             if object_signature in self.interaction_hypotheses:
                 self.interaction_hypotheses[object_signature]['is_consumable'] = True
             self.consumed_tiles_this_life.add(interacted_tile)
