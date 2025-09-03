@@ -1336,6 +1336,10 @@ class AGI3(Agent):
         Scans the entire grid, finds all objects, labels them based on
         current knowledge, and prints a summary.
         """
+        print(f"--- 🔍 DEBUG SCAN KNOWLEDGE (Reason: {reason}) 🔍 ---")
+        print(f"    - Wall Colors in Memory: {self.world_model.get('wall_colors')}")
+        print(f"    - Floor Color in Memory: {self.world_model.get('floor_color')}")
+
         if not grid_data or not grid_data[0]:
             print(f"Object scan skipped for '{reason}': No grid data.")
             return
@@ -1394,17 +1398,26 @@ class AGI3(Agent):
                     
                     label = "Unknown Object" # Default label
                     
-                    # Check for Floor, but only if it's connected to the main walkable area.
+                    # --- NEW: Smarter Floor Check ---
+                    # If we don't have a reachable map yet (e.g., at level start), trust the color.
+                    # Otherwise, perform the strict check against the reachable area.
                     is_truly_floor = False
                     if color == floor_color:
-                        if self.tile_size and self.reachable_floor_area:
+                        if not self.reachable_floor_area:
+                            is_truly_floor = True
+                        elif self.tile_size:
                             for r_pixel, c_pixel in component_points:
                                 pixel_tile = (r_pixel // self.tile_size, c_pixel // self.tile_size)
                                 if pixel_tile in self.reachable_floor_area:
                                     is_truly_floor = True
                                     break
                     
-                    if fingerprint in self.world_model.get('player_part_fingerprints', set()):
+                    # --- NEW: Re-ordered Logic to Prioritize Walls/Floors ---
+                    if is_truly_floor:
+                        label = "Floor"
+                    elif color in wall_colors:
+                        label = "Wall"
+                    elif fingerprint in self.world_model.get('player_part_fingerprints', set()):
                         label = "Agent Component"
                     elif (fingerprint, (height, width), color) in self.world_model.get('resource_signatures', set()):
                         label = "Resource"
@@ -1412,10 +1425,6 @@ class AGI3(Agent):
                         indicator_row = self.confirmed_resource_indicator['row_index']
                         if min_row == indicator_row and color == self.resource_pixel_color:
                             label = "Resource Indicator"
-                    elif is_truly_floor:
-                        label = "Floor"
-                    elif color in wall_colors:
-                        label = "Wall"
                     
                     print(f"- Found a {height}x{width} object of color {color} at pixel ({min_row}, {min_idx}) with fingerprint {fingerprint}. [{label}]")
 
