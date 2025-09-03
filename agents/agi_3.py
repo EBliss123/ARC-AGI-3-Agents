@@ -647,11 +647,15 @@ class AGI3(Agent):
                     # --- NEW: Learn the visual signature of the resource object ---
                     # Find the object that was on this tile in the frame *before* the move.
                     resource_obj = self._find_object_on_tile(player_tile, frame_before_perception)
-                    if resource_obj and resource_obj.get('fingerprint'):
+                    if resource_obj and resource_obj.get('fingerprint') is not None:
                         res_fingerprint = resource_obj['fingerprint']
-                        if res_fingerprint not in self.world_model['resource_signatures']:
-                            self.world_model['resource_signatures'].add(res_fingerprint)
-                            print(f"✅ [RESOURCE] Learned new resource signature: {res_fingerprint}")
+                        res_size = (resource_obj['height'], resource_obj['width'])
+                        res_color = resource_obj['color']
+                        composite_signature = (res_fingerprint, res_size, res_color)
+
+                        if composite_signature not in self.world_model['resource_signatures']:
+                            self.world_model['resource_signatures'].add(composite_signature)
+                            print(f"✅ [RESOURCE] Learned new composite resource signature: {composite_signature}")
                     
                     self._log_object_characteristics(player_tile, frame_before_perception)
 
@@ -1033,13 +1037,19 @@ class AGI3(Agent):
         # Before planning, check if any potential targets are known resources.
         resource_signatures = self.world_model.get('resource_signatures', set())
         if resource_signatures and self.previous_frame:
-            grid_data = self.previous_frame # Use the most recent static frame for analysis
+            grid_data = self.previous_frame
             for tile_pos in list(potential_targets): # Iterate over a copy
                 obj_on_tile = self._find_object_on_tile(tile_pos, grid_data)
-                if obj_on_tile and obj_on_tile.get('fingerprint') in resource_signatures:
-                    print(f"🧠 Pre-existing knowledge found for tile {tile_pos}. Reclassifying as RESOURCE.")
-                    self.tile_map[tile_pos] = CellType.RESOURCE
-                    potential_targets.remove(tile_pos) # No longer a 'potential' target
+                if obj_on_tile:
+                    obj_fingerprint = obj_on_tile.get('fingerprint')
+                    obj_size = (obj_on_tile.get('height'), obj_on_tile.get('width'))
+                    obj_color = obj_on_tile.get('color')
+                    composite_signature = (obj_fingerprint, obj_size, obj_color)
+                    
+                    if composite_signature in resource_signatures:
+                        print(f"🧠 Pre-existing knowledge found for tile {tile_pos}. Reclassifying as RESOURCE.")
+                        self.tile_map[tile_pos] = CellType.RESOURCE
+                        potential_targets.remove(tile_pos)
         
         # --- End of Priority 1 Logic ---
 
@@ -1396,7 +1406,7 @@ class AGI3(Agent):
                     
                     if fingerprint in self.world_model.get('player_part_fingerprints', set()):
                         label = "Agent Component"
-                    elif fingerprint in self.world_model.get('resource_signatures', set()):
+                    elif (fingerprint, (height, width), color) in self.world_model.get('resource_signatures', set()):
                         label = "Resource"
                     elif self.confirmed_resource_indicator and self.resource_pixel_color is not None:
                         indicator_row = self.confirmed_resource_indicator['row_index']
