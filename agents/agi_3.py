@@ -1394,18 +1394,18 @@ class AGI3(Agent):
                                     is_truly_floor = True
                                     break
                     
-                    if is_truly_floor:
-                        label = "Floor"
-                    elif color in wall_colors:
-                        label = "Wall"
-                    elif fingerprint in self.world_model.get('player_part_fingerprints', set()):
+                    if fingerprint in self.world_model.get('player_part_fingerprints', set()):
                         label = "Agent Component"
+                    elif fingerprint in self.world_model.get('resource_signatures', set()):
+                        label = "Resource"
                     elif self.confirmed_resource_indicator and self.resource_pixel_color is not None:
                         indicator_row = self.confirmed_resource_indicator['row_index']
                         if min_row == indicator_row and color == self.resource_pixel_color:
                             label = "Resource Indicator"
-                    elif fingerprint in self.world_model.get('resource_signatures', set()):
-                        label = "Resource"
+                    elif is_truly_floor:
+                        label = "Floor"
+                    elif color in wall_colors:
+                        label = "Wall"
                     
                     print(f"- Found a {height}x{width} object of color {color} at pixel ({min_row}, {min_idx}) with fingerprint {fingerprint}. [{label}]")
 
