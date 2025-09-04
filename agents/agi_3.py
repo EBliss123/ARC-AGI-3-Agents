@@ -3397,6 +3397,7 @@ class AGI3(Agent):
 
         print("-----------------------------------------\n")
         self.has_summarized_interactions = True
+        self._synthesize_level_plan_hypothesis()
 
     def _summarize_level_goal(self):
         """Analyzes and stores the state of the game at the moment a level is won."""
@@ -3424,6 +3425,7 @@ class AGI3(Agent):
             signature = f"tile_pos_{goal_tile}"
             interaction_summary = self.interaction_hypotheses.get(signature)
             goal_hypothesis['goal_tile_interaction'] = interaction_summary
+            goal_hypothesis['final_tile_of_level'] = goal_tile
 
             print(f"Final Interaction: Stepped on tile {goal_tile}.")
             if not interaction_summary:
@@ -3454,6 +3456,70 @@ class AGI3(Agent):
         self.level_goal_hypotheses.append(goal_hypothesis)
         print(f"Hypothesis stored. Total goal hypotheses: {len(self.level_goal_hypotheses)}")
         print("-------------------------------------\n")
+
+    def _synthesize_level_plan_hypothesis(self):
+        """Analyzes all learned data to form a high-level hypothesis about the sequence of actions needed to win."""
+        print("\n--- 📜 Synthesizing Level Plan Hypothesis 📜 ---")
+
+        if not self.level_goal_hypotheses:
+            print("-> No goal hypotheses to analyze.")
+            return
+
+        # For now, we'll synthesize a plan based on the most recent win.
+        latest_goal = self.level_goal_hypotheses[-1]
+        
+        # 1. Identify all potential preconditions from the win state.
+        preconditions = []
+        patterns_at_win = latest_goal.get('active_patterns_at_win')
+        if patterns_at_win:
+            preconditions.append(f"An 'Active Pattern' must be present on the grid (matched {len(patterns_at_win)} time(s)).")
+
+        # 2. Identify the final action.
+        final_tile = latest_goal.get('final_tile_of_level')
+        if not final_tile:
+            print("-> Could not determine final action. Cannot synthesize plan.")
+            return
+            
+        final_action_desc = f"Interact with the object at tile {final_tile}."
+
+        # 3. Print the generalized hypothesis.
+        print("Based on the last successful level, the hypothesized plan is:")
+        if preconditions:
+            print("  - Precondition(s):")
+            for pre in preconditions:
+                print(f"    - {pre}")
+        else:
+            print("  - Precondition(s): None identified.")
+        print(f"  - Final Action: {final_action_desc}")
+
+        # 4. If a pattern was a precondition, create a detailed sub-plan for it.
+        if patterns_at_win:
+            print("\n  - Detailed Plan to meet 'Active Pattern' precondition:")
+            plan_steps = []
+            for pattern in patterns_at_win:
+                required_object = pattern['dynamic_key']
+                required_fingerprint = required_object.get('fingerprint')
+                tool_found = False
+                for signature, hypothesis in self.interaction_hypotheses.items():
+                    all_outcomes = hypothesis.get('immediate_effect', []) + hypothesis.get('aftermath_effect', [])
+                    for outcome in all_outcomes:
+                        for event in outcome:
+                            if event.get('type') == 'TRANSFORM':
+                                resulting_obj = event.get('after', {})
+                                if resulting_obj.get('fingerprint') == required_fingerprint:
+                                    tool_tile_str = signature.replace("tile_pos_", "")
+                                    step_desc = f"Use the tool at {tool_tile_str} to create the required pattern component (Shape FP: {required_fingerprint})."
+                                    plan_steps.append(step_desc)
+                                    tool_found = True
+                                    break
+                        if tool_found: break
+                    if tool_found: break
+            
+            if plan_steps:
+                for i, step in enumerate(plan_steps):
+                    print(f"    - Step {i+1}: {step}")
+            else:
+                print("    - Could not identify the specific tool needed from learned interactions.")
 
     def _analyze_and_update_moves(self, latest_frame: FrameData):
         """Analyzes the resource bar to determine max and current moves."""
