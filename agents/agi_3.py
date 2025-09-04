@@ -2743,12 +2743,23 @@ class AGI3(Agent):
                         min_dist = dist
                         best_match = vanished
                 
-                # A distance threshold of ~3 tiles is a reasonable guess for a "local" transformation.
-                threshold = (self.tile_size * 3) if self.tile_size else 24
-                if best_match and min_dist < threshold:
-                    transform_pairs.append({'before': best_match, 'after': appeared})
-                    unmatched_appeared.remove(appeared)
-                    unmatched_vanished.remove(best_match)
+                if best_match:
+                    # --- DYNAMIC THRESHOLD LOGIC ---
+                    # The max distance for a match is proportional to the size of the objects.
+                    # We use the sum of their largest dimensions (height or width) as a baseline.
+                    appeared_max_dim = max(appeared['height'], appeared['width'])
+                    vanished_max_dim = max(best_match['height'], best_match['width'])
+                    
+                    # A generous threshold is twice the sum of their max dimensions,
+                    # plus one tile_size as a minimum buffer for very small objects.
+                    base_threshold = (appeared_max_dim + vanished_max_dim) * 2
+                    min_buffer = self.tile_size if self.tile_size else 8
+                    dynamic_threshold = base_threshold + min_buffer
+
+                    if min_dist < dynamic_threshold:
+                        transform_pairs.append({'before': best_match, 'after': appeared})
+                        unmatched_appeared.remove(appeared)
+                        unmatched_vanished.remove(best_match)
             
             # 3. Build the final event list from the matched pairs.
             for pair in transform_pairs:
