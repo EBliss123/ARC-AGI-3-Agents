@@ -373,6 +373,7 @@ class AGI3(Agent):
                                     self.ignored_areas.append(new_area)
 
                             if learned_new_sig:
+                                print(f"DEBUG: Rescanning with life indicator signatures: {self.world_model.get('life_indicator_signatures', set())}")
                                 self._scan_and_label_all_objects(latest_frame.frame[0], "Life Indicator Confirmed")
                         else:
                             print("-> No object transformations were isolated.")
@@ -1397,6 +1398,9 @@ class AGI3(Agent):
                                 if pixel_tile in self.reachable_floor_area:
                                     is_truly_floor = True
                                     break
+
+                    current_labeling_sig = (height, width, color)
+                    print(f"DEBUG: Attempting to label object with signature {current_labeling_sig}")
                     
                     # --- NEW: Re-ordered Logic to Prioritize Walls/Floors ---
                     if is_truly_floor:
@@ -1405,6 +1409,8 @@ class AGI3(Agent):
                         label = "Wall"
                     elif fingerprint in self.world_model.get('player_part_fingerprints', set()):
                         label = "Agent Component"
+                    elif (height, width, color) in self.world_model.get('life_indicator_signatures', set()):
+                        label = "Life Indicator"
                     elif (self.confirmed_resource_indicator and self.resource_pixel_color is not None and
                           min_row == self.confirmed_resource_indicator['row_index'] and
                           color == self.resource_pixel_color):
