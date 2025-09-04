@@ -1336,10 +1336,6 @@ class AGI3(Agent):
         Scans the entire grid, finds all objects, labels them based on
         current knowledge, and prints a summary.
         """
-        print(f"--- 🔍 DEBUG SCAN KNOWLEDGE (Reason: {reason}) 🔍 ---")
-        print(f"    - Wall Colors in Memory: {self.world_model.get('wall_colors')}")
-        print(f"    - Floor Color in Memory: {self.world_model.get('floor_color')}")
-
         if not grid_data or not grid_data[0]:
             print(f"Object scan skipped for '{reason}': No grid data.")
             return
@@ -2997,6 +2993,7 @@ class AGI3(Agent):
 
         # --- 1. Collect all details from every transformation event ---
         locations = set()
+        result_locations = set()
         color_transitions = set()
         size_transitions = set()
         shape_transitions = set()
@@ -3006,6 +3003,7 @@ class AGI3(Agent):
             if before_obj:
                 locations.add((before_obj.get('top_row'), before_obj.get('left_index')))
                 if after_obj:
+                    result_locations.add((after_obj.get('top_row'), after_obj.get('left_index')))
                     color_transitions.add((before_obj.get('color'), after_obj.get('color')))
                     size_transitions.add(((before_obj.get('height'), before_obj.get('width')),
                                           (after_obj.get('height'), after_obj.get('width'))))
@@ -3025,11 +3023,10 @@ class AGI3(Agent):
 
             if len(sanitized_set) == 1:
                 value = next(iter(sanitized_set))
-                # Distinguish between size and location for correct formatting
                 if label == "Size":
-                     print(f"        - {label}: {value[0]}x{value[1]} (Consistent)")
-                else: # Handles Location and other tuples
-                     print(f"        - {label}: {value} (Consistent)")
+                     print(f"        - {label}: {value[0]}x{value[1]}")
+                else:
+                     print(f"        - {label}: {value}")
             else:
                 print(f"        - {label}: Varies")
 
@@ -3054,6 +3051,7 @@ class AGI3(Agent):
         print_prop("Shape (FP)", after_shapes)
         print_prop("Size", after_sizes)
         print_prop("Color", after_colors)
+        print_prop("Location", result_locations)
 
         print("      - Transformation Rules:")
         if len(color_transitions) == 1:
