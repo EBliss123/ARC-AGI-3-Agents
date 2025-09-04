@@ -3097,13 +3097,19 @@ class AGI3(Agent):
         print("      - Transformation Rules:")
         if len(color_transitions) == 1:
             b_col, a_col = next(iter(color_transitions))
-            print(f"        - Color consistently changes from {b_col} to {a_col}.")
+            if b_col == a_col:
+                print(f"        - Color {b_col} is consistently maintained.")
+            else:
+                print(f"        - Color consistently changes from {b_col} to {a_col}.")
         else:
             print("        - Color change rule varies.")
 
         if len(size_transitions) == 1:
             b_size, a_size = next(iter(size_transitions))
-            print(f"        - Size consistently changes from {b_size[0]}x{b_size[1]} to {a_size[0]}x{a_size[1]}.")
+            if b_size == a_size:
+                print(f"        - Size {b_size[0]}x{b_size[1]} is consistently maintained.")
+            else:
+                print(f"        - Size consistently changes from {b_size[0]}x{b_size[1]} to {a_size[0]}x{a_size[1]}.")
         elif len(before_sizes) == 1:
             b_size = next(iter(before_sizes))
             print(f"        - Size changes from {b_size[0]}x{b_size[1]} to a new, variable size.")
@@ -3112,8 +3118,10 @@ class AGI3(Agent):
 
         if len(shape_transitions) == 1:
             b_fp, a_fp = next(iter(shape_transitions))
-            print(f"        - Shape consistently changes from FP {b_fp} to {a_fp}.")
-        elif len(before_shapes) == 1:
+            if b_fp == a_fp:
+                print(f"        - Shape is consistently maintained (FP {b_fp}).")
+            else:
+                print(f"        - Shape consistently changes from FP {b_fp} to {a_fp}.")
             b_fp = next(iter(before_shapes))
             print(f"        - Shape changes from FP {b_fp} to a new, variable shape.")
         else:
