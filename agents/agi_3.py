@@ -1398,9 +1398,6 @@ class AGI3(Agent):
                                 if pixel_tile in self.reachable_floor_area:
                                     is_truly_floor = True
                                     break
-
-                    current_labeling_sig = (height, width, color)
-                    print(f"DEBUG: Attempting to label object with signature {current_labeling_sig}")
                     
                     # --- NEW: Re-ordered Logic to Prioritize Walls/Floors ---
                     if is_truly_floor:
@@ -1411,9 +1408,11 @@ class AGI3(Agent):
                         label = "Agent Component"
                     elif (height, width, color) in self.world_model.get('life_indicator_signatures', set()):
                         label = "Life Indicator"
-                    elif (self.confirmed_resource_indicator and self.resource_pixel_color is not None and
+                    elif (self.confirmed_resource_indicator and
+                          self.resource_pixel_color is not None and
+                          self.resource_empty_color is not None and
                           min_row == self.confirmed_resource_indicator['row_index'] and
-                          color == self.resource_pixel_color):
+                          color in [self.resource_pixel_color, self.resource_empty_color]):
                         label = "Resource Indicator"
                     elif (fingerprint, (height, width), color) in self.world_model.get('resource_signatures', set()):
                         label = "Resource"
