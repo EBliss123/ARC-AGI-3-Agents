@@ -100,7 +100,8 @@ class AGI3(Agent):
             'wall_colors': set(),
             'action_map': {},
             'resource_signatures': set(),
-            'player_part_fingerprints': set()
+            'player_part_fingerprints': set(),
+            'known_transform_subjects': set(),
         }
         self.cross_level_characteristics = {} # Stores full profiles of objects from previous levels.
         self.level_count = 1
@@ -1393,7 +1394,7 @@ class AGI3(Agent):
                     wall_colors = self.world_model.get('wall_colors', set())
                     
                     label = "Unknown Object" # Default label
-                    
+
                     # --- NEW: Smarter Floor Check ---
                     # If we don't have a reachable map yet (e.g., at level start), trust the color.
                     # Otherwise, perform the strict check against the reachable area.
@@ -1415,13 +1416,15 @@ class AGI3(Agent):
                         label = "Wall"
                     elif fingerprint in self.world_model.get('player_part_fingerprints', set()):
                         label = "Agent Component"
-                    elif (fingerprint, (height, width), color) in self.world_model.get('resource_signatures', set()):
-                        label = "Resource"
                     elif self.confirmed_resource_indicator and self.resource_pixel_color is not None:
                         indicator_row = self.confirmed_resource_indicator['row_index']
                         if min_row == indicator_row and color == self.resource_pixel_color:
                             label = "Resource Indicator"
-                    
+                    elif (fingerprint, (height, width), color) in self.world_model.get('resource_signatures', set()):
+                        label = "Resource"
+                    elif fingerprint in self.world_model.get('known_transform_subjects', set()):
+                        label = "Known Object"
+
                     print(f"- Found a {height}x{width} object of color {color} at pixel ({min_row}, {min_idx}) with fingerprint {fingerprint}. [{label}]")
 
         print("--- End of Scan ---\n")
@@ -2759,6 +2762,11 @@ class AGI3(Agent):
 
                     if min_dist < dynamic_threshold:
                         transform_pairs.append({'before': best_match, 'after': appeared})
+                        # --- NEW: Log fingerprints of transformed objects ---
+                        if 'fingerprint' in best_match:
+                            self.world_model['known_transform_subjects'].add(best_match['fingerprint'])
+                        if 'fingerprint' in appeared:
+                            self.world_model['known_transform_subjects'].add(appeared['fingerprint'])
                         unmatched_appeared.remove(appeared)
                         unmatched_vanished.remove(best_match)
             
@@ -2794,6 +2802,9 @@ class AGI3(Agent):
         if not is_known:
             known_outcomes.append(interaction_events)
             print(f"💡 NEW OUTCOME LEARNED: A new '{effect_type}' interaction for '{object_signature}' has been recorded.")
+            # --- NEW: Re-scan the environment with updated knowledge ---
+            print("-> Knowledge about transformable objects has updated. Re-scanning environment.")
+            self._scan_and_label_all_objects(latest_grid[0], "New Transformation Learned")
         else:
             print(f"-> The observed '{effect_type}' interaction for '{object_signature}' was already known.")
 
