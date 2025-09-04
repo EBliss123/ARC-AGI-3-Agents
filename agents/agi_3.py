@@ -675,7 +675,7 @@ class AGI3(Agent):
                 goal_tile = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
                 print(f"-> Analyzing winning interaction with tile {goal_tile}...")
                 self.observing_interaction_for_tile = goal_tile
-                self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect', latest_frame.frame, frame_before_perception, self.last_known_objects, agent_part_fingerprints)
+                self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect', latest_frame.frame, frame_before_perception, self.last_known_objects, self.world_model['player_part_fingerprints'])
                 self.observing_interaction_for_tile = None # Clear immediately after use.
 
                 # --- NEW: Special case to log characteristics for the goal tile ---
@@ -722,7 +722,7 @@ class AGI3(Agent):
                             self.frame_at_arrival = copy.deepcopy(frame_before_perception)
                             self.frame_for_logging = copy.deepcopy(latest_frame.frame)
                         self.observing_interaction_for_tile = target_tile
-                        self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect', latest_frame.frame, frame_before_perception, self.last_known_objects, agent_part_fingerprints)
+                        self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect', latest_frame.frame, frame_before_perception, self.last_known_objects, self.world_model['player_part_fingerprints'])
                     # Set the phase for the *next* turn, then explicitly wait.
                     self.exploration_phase = ExplorationPhase.BUILDING_MAP
 
@@ -1613,6 +1613,7 @@ class AGI3(Agent):
                 original_row = r * scale_h
                 original_col = c * scale_w
                 sampled_pixel = obj_datamap[original_row][original_col]
+                if sampled_pixel is not None: sampled_pixel = 1
                 new_row.append(sampled_pixel)
             normalized_map_list.append(tuple(new_row))
         
@@ -3022,14 +3023,23 @@ class AGI3(Agent):
         if not hypothesis:
             return
 
-        all_transform_events = []
+        all_outcomes = []
         for effect_type in ['immediate_effect', 'aftermath_effect']:
-            for event_list in hypothesis.get(effect_type, []):
-                for event in event_list:
-                    if event.get('type') == 'TRANSFORM':
-                        all_transform_events.append(event)
+            outcomes = hypothesis.get(effect_type, [])
+            if outcomes:
+                all_outcomes.extend(outcomes)
         
-        if not all_transform_events:
+        outcomes_with_transforms = [
+            outcome for outcome in all_outcomes 
+            if any(event.get('type') == 'TRANSFORM' for event in outcome)
+        ]
+
+        # Flatten the list of outcomes into the single list the rest of the function expects.
+        all_transform_events = []
+        for outcome in outcomes_with_transforms:
+            all_transform_events.extend(outcome)
+
+        if not outcomes_with_transforms:
             return
 
         # --- 1. Collect all details from every transformation event ---
@@ -3072,60 +3082,90 @@ class AGI3(Agent):
                 print(f"        - {label}: Varies")
 
         # --- 3. Print the detailed, structured hypothesis ---
-        print("  - Hypothesized Function: Transforms a target object according to the following rules:")
-        
-        # Extract unique "before" and "after" properties for analysis
-        before_shapes = {t[0] for t in shape_transitions}
-        before_sizes = {t[0] for t in size_transitions}
-        before_colors = {t[0] for t in color_transitions}
-        after_shapes = {t[1] for t in shape_transitions}
-        after_sizes = {t[1] for t in size_transitions}
-        after_colors = {t[1] for t in color_transitions}
+        print("  - Hypothesized Function: Can have multiple effects based on the target:")
+    
+        def print_rules_for_outcome(transform_events, outcome_index, total_outcomes):
+            if not transform_events:
+                return
 
-        print("      - Target Properties:")
-        print_prop("Shape (FP)", before_shapes)
-        print_prop("Size", before_sizes)
-        print_prop("Color", before_colors)
-        print_prop("Location", locations)
+            outcome_title = f"    - For Outcome {outcome_index}:" if total_outcomes > 1 else "    - For This Outcome:"
+            print(outcome_title)
+            
+            def print_prop(label, data_set):
+                if not data_set:
+                    print(f"        - {label}: (No data)")
+                    return
+                sanitized_set = {item for item in data_set if item is not None and item != (None, None)}
+                if not sanitized_set:
+                    print(f"        - {label}: (No data)")
+                    return
+                if len(sanitized_set) == 1:
+                    value = next(iter(sanitized_set))
+                    if label == "Size": print(f"        - {label}: {value[0]}x{value[1]}")
+                    else: print(f"        - {label}: {value}")
+                else:
+                    print(f"        - {label}: Varies")
 
-        print("      - Resulting Properties:")
-        print_prop("Shape (FP)", after_shapes)
-        print_prop("Size", after_sizes)
-        print_prop("Color", after_colors)
-        print_prop("Location", result_locations)
+            locations, result_locations = set(), set()
+            color_transitions, size_transitions, shape_transitions = set(), set(), set()
 
-        print("      - Transformation Rules:")
-        if len(color_transitions) == 1:
-            b_col, a_col = next(iter(color_transitions))
-            if b_col == a_col:
-                print(f"        - Color {b_col} is consistently maintained.")
-            else:
-                print(f"        - Color consistently changes from {b_col} to {a_col}.")
-        else:
-            print("        - Color change rule varies.")
+            for event in transform_events:
+                before_obj, after_obj = event.get('before', {}), event.get('after', {})
+                if before_obj:
+                    locations.add((before_obj.get('top_row'), before_obj.get('left_index')))
+                    if after_obj:
+                        result_locations.add((after_obj.get('top_row'), after_obj.get('left_index')))
+                        color_transitions.add((before_obj.get('color'), after_obj.get('color')))
+                        size_transitions.add(((before_obj.get('height'), before_obj.get('width')), (after_obj.get('height'), after_obj.get('width'))))
+                        shape_transitions.add((before_obj.get('fingerprint'), after_obj.get('fingerprint')))
 
-        if len(size_transitions) == 1:
-            b_size, a_size = next(iter(size_transitions))
-            if b_size == a_size:
-                print(f"        - Size {b_size[0]}x{b_size[1]} is consistently maintained.")
-            else:
-                print(f"        - Size consistently changes from {b_size[0]}x{b_size[1]} to {a_size[0]}x{a_size[1]}.")
-        elif len(before_sizes) == 1:
-            b_size = next(iter(before_sizes))
-            print(f"        - Size changes from {b_size[0]}x{b_size[1]} to a new, variable size.")
-        else:
-            print("        - Size change rule varies.")
+            before_shapes = {t[0] for t in shape_transitions}
+            before_sizes = {t[0] for t in size_transitions}
+            before_colors = {t[0] for t in color_transitions}
+            after_shapes = {t[1] for t in shape_transitions}
+            after_sizes = {t[1] for t in size_transitions}
+            after_colors = {t[1] for t in color_transitions}
 
-        if len(shape_transitions) == 1:
-            b_fp, a_fp = next(iter(shape_transitions))
-            if b_fp == a_fp:
-                print(f"        - Shape is consistently maintained (FP {b_fp}).")
-            else:
-                print(f"        - Shape consistently changes from FP {b_fp} to {a_fp}.")
-            b_fp = next(iter(before_shapes))
-            print(f"        - Shape changes from FP {b_fp} to a new, variable shape.")
-        else:
-            print("        - Shape change rule varies.")
+            print("        - Target Properties:")
+            print_prop("Shape (FP)", before_shapes)
+            print_prop("Size", before_sizes)
+            print_prop("Color", before_colors)
+            print_prop("Location", locations)
+
+            print("        - Resulting Properties:")
+            print_prop("Shape (FP)", after_shapes)
+            print_prop("Size", after_sizes)
+            print_prop("Color", after_colors)
+            print_prop("Location", result_locations)
+            
+            print("        - Transformation Rules:")
+            if len(color_transitions) == 1:
+                b_col, a_col = next(iter(color_transitions))
+                if b_col == a_col: print(f"          - Color {b_col} is consistently maintained.")
+                else: print(f"          - Color consistently changes from {b_col} to {a_col}.")
+            else: print("          - Color change rule varies.")
+
+            if len(size_transitions) == 1:
+                b_size, a_size = next(iter(size_transitions))
+                if b_size == a_size: print(f"          - Size {b_size[0]}x{b_size[1]} is consistently maintained.")
+                else: print(f"          - Size consistently changes from {b_size[0]}x{b_size[1]} to {a_size[0]}x{a_size[1]}.")
+            elif len(before_sizes) == 1:
+                b_size = next(iter(before_sizes))
+                print(f"          - Size changes from {b_size[0]}x{b_size[1]} to a new, variable size.")
+            else: print("          - Size change rule varies.")
+
+            if len(shape_transitions) == 1:
+                b_fp, a_fp = next(iter(shape_transitions))
+                if b_fp == a_fp: print(f"          - Shape is consistently maintained (FP {b_fp}).")
+                else: print(f"          - Shape consistently changes from FP {b_fp} to {a_fp}.")
+            elif len(before_shapes) == 1:
+                b_fp = next(iter(before_shapes))
+                print(f"          - Shape changes from FP {b_fp} to a new, variable shape.")
+            else: print("          - Shape change rule varies.")
+
+        for i, outcome in enumerate(outcomes_with_transforms):
+            transform_events = [event for event in outcome if event.get('type') == 'TRANSFORM']
+            print_rules_for_outcome(transform_events, i + 1, len(outcomes_with_transforms))
 
     def _review_and_summarize_interactions(self):
         """Reviews all interactable tiles and summarizes their learned properties."""
