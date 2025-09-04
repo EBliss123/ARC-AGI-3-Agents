@@ -1389,6 +1389,12 @@ class AGI3(Agent):
                     data_map = tuple(tuple(grid_data[r][c] if (r, c) in component_points else None for c in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
                     _, fingerprint, _ = self._create_normalized_fingerprint(data_map)
 
+                    # --- NEW, COMBINED DEBUG STEP ---
+                    is_known_subject = False
+                    if fingerprint != 0: # Avoid checking the background
+                        known_set = self.world_model.get('known_transform_subjects', set())
+                        is_known_subject = fingerprint in known_set
+                    
                     # --- Determine the object's label based on learned knowledge ---
                     floor_color = self.world_model.get('floor_color')
                     wall_colors = self.world_model.get('wall_colors', set())
@@ -1416,13 +1422,13 @@ class AGI3(Agent):
                         label = "Wall"
                     elif fingerprint in self.world_model.get('player_part_fingerprints', set()):
                         label = "Agent Component"
-                    elif self.confirmed_resource_indicator and self.resource_pixel_color is not None:
-                        indicator_row = self.confirmed_resource_indicator['row_index']
-                        if min_row == indicator_row and color == self.resource_pixel_color:
-                            label = "Resource Indicator"
+                    elif (self.confirmed_resource_indicator and self.resource_pixel_color is not None and
+                          min_row == self.confirmed_resource_indicator['row_index'] and
+                          color == self.resource_pixel_color):
+                        label = "Resource Indicator"
                     elif (fingerprint, (height, width), color) in self.world_model.get('resource_signatures', set()):
                         label = "Resource"
-                    elif fingerprint in self.world_model.get('known_transform_subjects', set()):
+                    elif is_known_subject:
                         label = "Known Object"
 
                     print(f"- Found a {height}x{width} object of color {color} at pixel ({min_row}, {min_idx}) with fingerprint {fingerprint}. [{label}]")
@@ -2777,6 +2783,9 @@ class AGI3(Agent):
         # 4. Any remaining appeared objects are classified as spawns.
         for obj in unmatched_appeared:
             interaction_events.append({'type': 'SPAWN', 'object': obj})
+            # --- FIX & DEBUG: Log fingerprints of spawned objects as well ---
+            if 'fingerprint' in obj:
+                self.world_model['known_transform_subjects'].add(obj['fingerprint'])
 
         # An "outcome" is a list of all events (spawns/transforms) from a single interaction.
         if not interaction_events:
