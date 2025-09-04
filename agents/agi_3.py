@@ -2711,22 +2711,52 @@ class AGI3(Agent):
         
         # --- NEW: Re-analyze results to identify transformations vs. spawns. ---
         interaction_events = []
-        # We can only detect transformations if we have the 'before' frame and tile size context.
-        if grid_before_interaction and self.tile_size:
-            for new_obj in effect_objects:
-                # To find the 'before' object, we check the tile(s) its top-left corner occupies.
-                obj_tile_pos = (new_obj['top_row'] // self.tile_size, new_obj['left_index'] // self.tile_size)
-                obj_before = self._find_object_on_tile(obj_tile_pos, grid_before_interaction)
+        unmatched_appeared = list(effect_objects)
+        
+        if grid_before_interaction:
+            # 1. Find objects that vanished by inverting the change data.
+            disappearance_pixels = []
+            for change in interaction_effects_pixels:
+                swapped_changes = []
+                for px in change['changes']:
+                    swapped_changes.append({'index': px['index'], 'from': px['to'], 'to': px['from']})
+                disappearance_pixels.append({'row_index': change['row_index'], 'changes': swapped_changes})
+            
+            vanished_objects = self._find_and_describe_objects(disappearance_pixels, grid_before_interaction, is_interaction_analysis=True)
+            unmatched_vanished = list(vanished_objects)
+            transform_pairs = []
 
-                if obj_before:
-                    # An object existed before in the same tile area, so this is a transformation.
-                    interaction_events.append({'type': 'TRANSFORM', 'before': obj_before, 'after': new_obj})
-                else:
-                    # No object was there, so it's a new spawn.
-                    interaction_events.append({'type': 'SPAWN', 'object': new_obj})
-        else:
-            # Fallback: If we can't do a proper check, assume everything is a spawn.
-            interaction_events.extend([{'type': 'SPAWN', 'object': new_obj} for new_obj in effect_objects])
+            # 2. Match appeared objects to vanished objects based on proximity.
+            for appeared in list(unmatched_appeared):
+                best_match = None
+                min_dist = float('inf')
+
+                app_x = appeared['left_index'] + appeared['width'] / 2
+                app_y = appeared['top_row'] + appeared['height'] / 2
+
+                for vanished in unmatched_vanished:
+                    van_x = vanished['left_index'] + vanished['width'] / 2
+                    van_y = vanished['top_row'] + vanished['height'] / 2
+                    dist = math.sqrt((app_x - van_x)**2 + (app_y - van_y)**2)
+                    
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_match = vanished
+                
+                # A distance threshold of ~3 tiles is a reasonable guess for a "local" transformation.
+                threshold = (self.tile_size * 3) if self.tile_size else 24
+                if best_match and min_dist < threshold:
+                    transform_pairs.append({'before': best_match, 'after': appeared})
+                    unmatched_appeared.remove(appeared)
+                    unmatched_vanished.remove(best_match)
+            
+            # 3. Build the final event list from the matched pairs.
+            for pair in transform_pairs:
+                interaction_events.append({'type': 'TRANSFORM', **pair})
+        
+        # 4. Any remaining appeared objects are classified as spawns.
+        for obj in unmatched_appeared:
+            interaction_events.append({'type': 'SPAWN', 'object': obj})
 
         # An "outcome" is a list of all events (spawns/transforms) from a single interaction.
         if not interaction_events:
