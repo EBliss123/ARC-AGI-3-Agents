@@ -80,6 +80,7 @@ class AGI3(Agent):
         self.RESOURCE_CONFIDENCE_THRESHOLD = 3 # Actions in a row to confirm
         self.level_knowledge_is_learned = False
         self.wait_action = GameAction.ACTION6 # Use a secondary action for waiting
+        self.frame_before_transition = None
 
         # --- Move Tracking ---
         self.max_moves = 0
@@ -105,7 +106,7 @@ class AGI3(Agent):
         }
         self.cross_level_characteristics = {} # Stores full profiles of objects from previous levels.
         self.level_count = 1
-        self.world_model['life_indicator_object'] = None
+        self.world_model['life_indicator_signatures'] = set()
         self.player_floor_hypothesis = {}
         self.agent_move_hypothesis = {} # Tracks how many times a shape has moved
         self.floor_hypothesis = {} # Tracks how many times a color has been identified as floor
@@ -329,72 +330,49 @@ class AGI3(Agent):
                     return self.wait_action
                 else:
                     print("--- Lost a Life (Score did not increase). Analyzing reset state... ---")
-                    if self.level_start_frame is not None:
-                        print("-> Comparing current grid with the grid from the start of the level...")
+                    if self.frame_before_transition:
+                        print("-> Comparing object states immediately before and after life was lost...")
+                        objects_before = self._get_all_objects_from_grid(self.frame_before_transition[0])
+                        objects_after = self._get_all_objects_from_grid(latest_frame.frame[0])
 
-                        # Safety check to prevent crashing on an empty frame
-                        if not self.level_start_frame or not latest_frame.frame:
-                            print("-> Analysis skipped: A frame needed for comparison is empty.")
+                        map_before = {(obj['top_row'], obj['left_index']): obj for obj in objects_before}
+                        map_after = {(obj['top_row'], obj['left_index']): obj for obj in objects_after}
+                        
+                        changed_objects = []
+                        for pos, obj_before in map_before.items():
+                            obj_after = map_after.get(pos)
+                            # A change is the same fingerprint but a different color at the same location.
+                            if (obj_after and
+                                obj_before.get('fingerprint') == obj_after.get('fingerprint') and
+                                obj_before.get('color') != obj_after.get('color')):
+                                changed_objects.append({'before': obj_before, 'after': obj_after})
+
+                        if changed_objects:
+                            print(f"-> Found {len(changed_objects)} transformed object(s). Learning as life indicator(s).")
+                            learned_new_sig = False
+                            for change in changed_objects:
+                                after_obj = change['after']
+                                # The signature for labeling only needs the final state's properties.
+                                labeling_sig = (after_obj['height'], after_obj['width'], after_obj['color'])
+
+                                if labeling_sig not in self.world_model.get('life_indicator_signatures', set()):
+                                    self.world_model.setdefault('life_indicator_signatures', set()).add(labeling_sig)
+                                    print(f"✅ [LIFE INDICATOR] Learned new signature: {labeling_sig} from object at ({after_obj['top_row']}, {after_obj['left_index']}).")
+                                    learned_new_sig = True
+
+                                # Add the area to the ignore list for uniqueness checks.
+                                new_area = {'top_row': after_obj['top_row'], 'left_index': after_obj['left_index'], 'height': after_obj['height'], 'width': after_obj['width']}
+                                if new_area not in self.ignored_areas:
+                                    self.ignored_areas.append(new_area)
+
+                            if learned_new_sig:
+                                self._scan_and_label_all_objects(latest_frame.frame[0], "Life Indicator Confirmed")
                         else:
-                            # This logic is now protected from the crash
-                            grid_start = self.level_start_frame[0]
-                            grid_current = latest_frame.frame[0]
-                            
-                            # Step 1: Collect all pixel changes into a structured format.
-                            structured_life_changes = []
-                            if len(grid_start) == len(grid_current):
-                                for i in range(len(grid_start)):
-                                    row_start, row_current = grid_start[i], grid_current[i]
-                                    if row_start != row_current and len(row_start) == len(row_current):
-                                        pixel_changes = [{'index': j, 'from': row_start[j], 'to': row_current[j]} for j in range(len(row_start)) if row_start[j] != row_current[j]]
-                                        if pixel_changes:
-                                            structured_life_changes.append({'row_index': i, 'changes': pixel_changes})
+                            print("-> No object transformations were isolated.")
 
-                            # Step 2: Use the agent's own object finder on these changes.
-                            if structured_life_changes:
-                                print("-> Analysis result: Found differences from the level start.")
-                                life_indicator_objects = self._find_and_describe_objects(structured_life_changes, latest_frame.frame)
-                                
-                                if life_indicator_objects:
-                                    print("-> These changes form the following object(s):")
-                                    for i, obj in enumerate(life_indicator_objects):
-                                        pos = (obj['top_row'], obj['left_index'])
-                                        size = (obj['height'], obj['width'])
-                                        tile_pos = (pos[0] // self.tile_size, pos[1] // self.tile_size)
-                                        print(f"  - Object {i+1}: A {size[0]}x{size[1]} object at pixel {pos} (tile {tile_pos}).")
-
-                                        # --- Life Indicator Learning Logic ---
-                                        # If the indicator isn't known, learn it from this first observation.
-                                        if not self.world_model.get('life_indicator_object'):
-                                            old_color = obj.get('original_color')
-                                            new_color = obj['color']
-                                            
-                                            if old_color is not None:
-                                                # The signature includes the full color transition.
-                                                signature = (obj['height'], obj['width'], old_color, new_color)
-                                                
-                                                # Immediately confirm the concept and store it.
-                                                self.world_model['life_indicator_object'] = signature
-                                                print(f"✅ [LIFE INDICATOR] Confirmed: A color change from {signature[2]} to {signature[3]} on a ({signature[0]}x{signature[1]}) object is the life indicator.")
-                                                self._scan_and_label_all_objects(latest_frame.frame[0], "Life Indicator Confirmed")
-
-                                                # Add the object's specific rectangle to the ignore list.
-                                                new_area = {
-                                                    'top_row': obj['top_row'],
-                                                    'left_index': obj['left_index'],
-                                                    'height': obj['height'],
-                                                    'width': obj['width']
-                                                }
-                                                self.ignored_areas.append(new_area)
-                                                print(f"-> Ignoring the {new_area['height']}x{new_area['width']} area at ({new_area['top_row']}, {new_area['left_index']}) for uniqueness checks.")
-                                                    
-                                else:
-                                    print("-> The changes did not form a distinct object (likely a background reveal).")
-                            else:
-                                print("-> Analysis result: The grid has returned to the exact visual state as the start of the level.")
-
+                        self.frame_before_transition = None # Clear after use
                     else:
-                        print("-> Could not perform analysis: The start-of-level frame was not stored.")
+                        print("-> Could not perform analysis: Frame before transition was not captured.")
                     
                     self._reset_for_new_attempt()
                     # After handling the transition, wait for the next turn to act.
@@ -511,6 +489,7 @@ class AGI3(Agent):
             is_dimension_change = "Frame dimensions changed" in change_descriptions
             if len(change_descriptions) > self.MASSIVE_CHANGE_THRESHOLD or is_dimension_change:
                 print(f"💥 Massive change detected ({len(change_descriptions)} changes). Likely a level transition.")
+                self.frame_before_transition = copy.deepcopy(frame_before_perception)
 
                 # --- Capture the frame BEFORE the massive change as the potential 'empty' state ---
                 if self.confirmed_resource_indicator and frame_before_perception:
@@ -1434,6 +1413,66 @@ class AGI3(Agent):
                     print(f"- Found a {height}x{width} object of color {color} at pixel ({min_row}, {min_idx}) with fingerprint {fingerprint}. [{label}]")
 
         print("--- End of Scan ---\n")
+
+    def _get_all_objects_from_grid(self, grid_data: list) -> list[dict]:
+        """Scans a grid and returns a list of all found objects without printing or labeling."""
+        if not grid_data or not grid_data[0]:
+            return []
+
+        final_objects = []
+        grid_height = len(grid_data)
+        grid_width = len(grid_data[0])
+        visited_coords = set()
+
+        for r in range(grid_height):
+            for c in range(grid_width):
+                if (r, c) in visited_coords:
+                    continue
+
+                color = grid_data[r][c]
+                
+                # The floor/background check from the main scanner is not needed here,
+                # as we want to capture ALL objects for a direct comparison.
+
+                component_points = set()
+                q = [(r, c)]
+                visited_coords.add((r, c))
+                
+                while q:
+                    p = q.pop(0)
+                    component_points.add(p)
+                    row, col = p
+                    
+                    for dr in [-1, 0, 1]:
+                        for dc in [-1, 0, 1]:
+                            if dr == 0 and dc == 0:
+                                continue
+                            
+                            neighbor = (row + dr, col + dc)
+                            if (0 <= neighbor[0] < grid_height and 
+                                0 <= neighbor[1] < grid_width and 
+                                neighbor not in visited_coords and 
+                                grid_data[neighbor[0]][neighbor[1]] == color):
+                                
+                                visited_coords.add(neighbor)
+                                q.append(neighbor)
+                
+                if component_points:
+                    min_row = min(r_ for r_, _ in component_points)
+                    max_row = max(r_ for r_, _ in component_points)
+                    min_idx = min(p_idx for _, p_idx in component_points)
+                    max_idx = max(p_idx for _, p_idx in component_points)
+                    height, width = max_row - min_row + 1, max_idx - min_idx + 1
+
+                    data_map = tuple(tuple(grid_data[r][c] if (r, c) in component_points else None for c in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
+                    _, fingerprint, _ = self._create_normalized_fingerprint(data_map)
+
+                    final_objects.append({
+                        'height': height, 'width': width, 'top_row': min_row,
+                        'left_index': min_idx, 'color': color,
+                        'fingerprint': fingerprint
+                    })
+        return final_objects
 
     def _compare_and_print_hypothesis_details(self, signature: str, remembered_hypo: dict):
         """
