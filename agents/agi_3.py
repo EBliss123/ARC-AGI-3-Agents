@@ -350,18 +350,24 @@ class AGI3(Agent):
                             print(f"-> Found {len(changed_objects)} transformed object(s). Learning as life indicator(s).")
                             learned_new_sig = False
                             for change in changed_objects:
+                                before_obj = change['before']
                                 after_obj = change['after']
-                                labeling_sig = (after_obj['height'], after_obj['width'], after_obj['color'])
-                                log_sig_str = f"{labeling_sig[0]}x{labeling_sig[1]}, color: {labeling_sig[2]}"
 
-                                if labeling_sig not in self.world_model.get('life_indicator_signatures', set()):
-                                    self.world_model.setdefault('life_indicator_signatures', set()).add(labeling_sig)
-                                    print(f"✅ [LIFE INDICATOR] Learned new signature: {log_sig_str} from object at ({after_obj['top_row']}, {after_obj['left_index']}).")
-                                    learned_new_sig = True
-                                else:
-                                    print(f"-> Signature {log_sig_str} from object at ({after_obj['top_row']}, {after_obj['left_index']}) was already known.")
-                                
+                                before_sig = (before_obj['height'], before_obj['width'], before_obj['color'])
+                                after_sig = (after_obj['height'], after_obj['width'], after_obj['color'])
 
+                                # Process both the 'before' (full) and 'after' (empty) states of the indicator
+                                for sig_tuple, obj_ref, state_name in [(before_sig, before_obj, "'before'"), (after_sig, after_obj, "'after'")]:
+                                    log_sig_str = f"{sig_tuple[0]}x{sig_tuple[1]}, color: {sig_tuple[2]}"
+                                    
+                                    if sig_tuple not in self.world_model.get('life_indicator_signatures', set()):
+                                        self.world_model.setdefault('life_indicator_signatures', set()).add(sig_tuple)
+                                        print(f"✅ [LIFE INDICATOR] Learned new signature (from {state_name} state): {log_sig_str} at ({obj_ref['top_row']}, {obj_ref['left_index']}).")
+                                        learned_new_sig = True
+                                    else:
+                                        print(f"-> Signature (from {state_name} state) {log_sig_str} at ({obj_ref['top_row']}, {obj_ref['left_index']}) was already known.")
+
+                                # The ignored area logic only applies to the 'after' object's final position
                                 new_area = {'top_row': after_obj['top_row'], 'left_index': after_obj['left_index'], 'height': after_obj['height'], 'width': after_obj['width']}
                                 if new_area not in self.ignored_areas:
                                     self.ignored_areas.append(new_area)
