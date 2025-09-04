@@ -80,7 +80,6 @@ class AGI3(Agent):
         self.RESOURCE_CONFIDENCE_THRESHOLD = 3 # Actions in a row to confirm
         self.level_knowledge_is_learned = False
         self.wait_action = GameAction.ACTION6 # Use a secondary action for waiting
-        self.frame_before_transition = None
 
         # --- Move Tracking ---
         self.max_moves = 0
@@ -330,9 +329,9 @@ class AGI3(Agent):
                     return self.wait_action
                 else:
                     print("--- Lost a Life (Score did not increase). Analyzing reset state... ---")
-                    if self.frame_before_transition:
-                        print("-> Comparing object states immediately before and after life was lost...")
-                        objects_before = self._get_all_objects_from_grid(self.frame_before_transition[0])
+                    if self.level_start_frame:
+                        print("-> Comparing object states from level start to after life was lost...")
+                        objects_before = self._get_all_objects_from_grid(self.level_start_frame[0])
                         objects_after = self._get_all_objects_from_grid(latest_frame.frame[0])
 
                         map_before = {(obj['top_row'], obj['left_index']): obj for obj in objects_before}
@@ -352,15 +351,17 @@ class AGI3(Agent):
                             learned_new_sig = False
                             for change in changed_objects:
                                 after_obj = change['after']
-                                # The signature for labeling only needs the final state's properties.
                                 labeling_sig = (after_obj['height'], after_obj['width'], after_obj['color'])
+                                log_sig_str = f"{labeling_sig[0]}x{labeling_sig[1]}, color: {labeling_sig[2]}"
 
                                 if labeling_sig not in self.world_model.get('life_indicator_signatures', set()):
                                     self.world_model.setdefault('life_indicator_signatures', set()).add(labeling_sig)
-                                    print(f"✅ [LIFE INDICATOR] Learned new signature: {labeling_sig} from object at ({after_obj['top_row']}, {after_obj['left_index']}).")
+                                    print(f"✅ [LIFE INDICATOR] Learned new signature: {log_sig_str} from object at ({after_obj['top_row']}, {after_obj['left_index']}).")
                                     learned_new_sig = True
+                                else:
+                                    print(f"-> Signature {log_sig_str} from object at ({after_obj['top_row']}, {after_obj['left_index']}) was already known.")
+                                
 
-                                # Add the area to the ignore list for uniqueness checks.
                                 new_area = {'top_row': after_obj['top_row'], 'left_index': after_obj['left_index'], 'height': after_obj['height'], 'width': after_obj['width']}
                                 if new_area not in self.ignored_areas:
                                     self.ignored_areas.append(new_area)
@@ -369,10 +370,8 @@ class AGI3(Agent):
                                 self._scan_and_label_all_objects(latest_frame.frame[0], "Life Indicator Confirmed")
                         else:
                             print("-> No object transformations were isolated.")
-
-                        self.frame_before_transition = None # Clear after use
                     else:
-                        print("-> Could not perform analysis: Frame before transition was not captured.")
+                        print("-> Could not perform analysis: Level start frame was not captured.")
                     
                     self._reset_for_new_attempt()
                     # After handling the transition, wait for the next turn to act.
@@ -489,7 +488,6 @@ class AGI3(Agent):
             is_dimension_change = "Frame dimensions changed" in change_descriptions
             if len(change_descriptions) > self.MASSIVE_CHANGE_THRESHOLD or is_dimension_change:
                 print(f"💥 Massive change detected ({len(change_descriptions)} changes). Likely a level transition.")
-                self.frame_before_transition = copy.deepcopy(frame_before_perception)
 
                 # --- Capture the frame BEFORE the massive change as the potential 'empty' state ---
                 if self.confirmed_resource_indicator and frame_before_perception:
