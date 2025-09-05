@@ -107,6 +107,8 @@ class AGI3(Agent):
         self.cross_level_characteristics = {} # Stores full profiles of objects from previous levels.
         self.level_count = 1
         self.world_model['life_indicator_signatures'] = set()
+        self.world_model['level_indicator_signatures'] = set()
+        self.static_object_memory = []
         self.player_floor_hypothesis = {}
         self.agent_move_hypothesis = {} # Tracks how many times a shape has moved
         self.floor_hypothesis = {} # Tracks how many times a color has been identified as floor
@@ -264,6 +266,10 @@ class AGI3(Agent):
 
     def _reset_for_new_level(self):
         """Resets all level-specific knowledge for a new level, preserving core learned concepts."""
+        if self.previous_frame:
+            print("-> Capturing static object state from end of previous level...")
+            self.static_object_memory = self._get_all_objects_from_grid(self.previous_frame[0])
+        
         # --- NEW: Increment level counter ---
         self.level_count += 1
 
@@ -300,6 +306,7 @@ class AGI3(Agent):
                 print("--- New Level Detected. Storing initial valid frame and score. ---")
                 self.level_start_frame = copy.deepcopy(latest_frame.frame)
                 self.level_start_score = latest_frame.score
+                self._find_level_indicator(latest_frame.frame)
                 self._describe_initial_objects(latest_frame.frame[0])
                 if self.confirmed_resource_indicator:
                     indicator_row_index = self.confirmed_resource_indicator['row_index']
@@ -1409,6 +1416,8 @@ class AGI3(Agent):
                         label = "Agent Component"
                     elif (height, width, color) in self.world_model.get('life_indicator_signatures', set()):
                         label = "Life Indicator"
+                    elif (height, width, color) in self.world_model.get('level_indicator_signatures', set()):
+                        label = "Level Indicator"
                     elif (self.confirmed_resource_indicator and
                           self.resource_pixel_color is not None and
                           self.resource_empty_color is not None and
@@ -3528,6 +3537,56 @@ class AGI3(Agent):
         self.level_goal_hypotheses.append(goal_hypothesis)
         print(f"Hypothesis stored. Total goal hypotheses: {len(self.level_goal_hypotheses)}")
         print("-------------------------------------\n")
+
+    def _find_level_indicator(self, new_level_frame: list):
+        """Compares static objects from the end of the last level to the start of the new one."""
+        if not self.static_object_memory:
+            print("-> Skipping level indicator check: No memory of previous level's objects.")
+            return
+
+        print("🔬 Analyzing for level indicators by comparing to previous level...")
+        objects_now = self._get_all_objects_from_grid(new_level_frame[0])
+        map_before = {(obj['top_row'], obj['left_index']): obj for obj in self.static_object_memory}
+        
+        found_count = 0
+        for obj_now in objects_now:
+            # --- Optimization: Only check objects that are currently unknown ---
+            h, w, c, fp = obj_now['height'], obj_now['width'], obj_now['color'], obj_now['fingerprint']
+            is_already_known = (
+                c == self.world_model.get('floor_color') or
+                c in self.world_model.get('wall_colors', set()) or
+                (fp, (h, w), c) in self.world_model.get('player_part_signatures', set()) or
+                (h, w, c) in self.world_model.get('life_indicator_signatures', set()) or
+                (self.confirmed_resource_indicator and
+                 c in [self.resource_pixel_color, self.resource_empty_color] and
+                 obj_now['top_row'] == self.confirmed_resource_indicator['row_index'])
+            )
+            if is_already_known:
+                continue
+            # --- End Optimization ---
+
+            pos = (obj_now['top_row'], obj_now['left_index'])
+            obj_before = map_before.get(pos)
+
+            # Heuristic: Same position, shape, and size, but different color.
+            if (obj_before and
+                obj_before.get('fingerprint') == fp and
+                obj_before.get('height') == h and
+                obj_before.get('width') == w and
+                obj_before.get('color') != c):
+                
+                before_sig = (h, w, obj_before['color'])
+                now_sig = (h, w, c)
+                
+                self.world_model.setdefault('level_indicator_signatures', set()).add(before_sig)
+                self.world_model.setdefault('level_indicator_signatures', set()).add(now_sig)
+                found_count += 1
+                print(f"✅ [LEVEL INDICATOR] Found indicator at {pos}. Learned signatures: {before_sig} and {now_sig}.")
+
+        if found_count > 0:
+            print(f"-> Found {found_count} total level indicator(s).")
+        else:
+            print("-> No level indicators found matching the heuristic.")
 
     def _synthesize_level_plan_hypothesis(self):
         """Analyzes all learned data to form a high-level hypothesis about the sequence of actions needed to win."""
