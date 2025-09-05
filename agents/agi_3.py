@@ -701,8 +701,7 @@ class AGI3(Agent):
         can_explore = (self.world_model.get('player_signature') and
                self.world_model.get('floor_color') and
                self.world_model.get('action_map') and
-               self.last_known_player_obj and
-               self.tile_size) 
+               self.last_known_player_obj)
 
         if can_explore and self.exploration_phase == ExplorationPhase.INACTIVE:
             print("🤖 World model is sufficiently complete. Activating exploration phase.")
@@ -718,7 +717,6 @@ class AGI3(Agent):
                     return action
                 else:
                     print("✅ Plan complete. Beginning interaction observation.")
-                    self._print_debug_map()
                     if self.exploration_target and self.tile_size:
                         target_tile = (self.exploration_target[0] // self.tile_size, self.exploration_target[1] // self.tile_size)
                         if self.tile_map.get(target_tile) == CellType.POTENTIALLY_INTERACTABLE:
@@ -747,8 +745,7 @@ class AGI3(Agent):
                 print("🗺️ Seeking a new exploration target...")
                 target_found = self._find_target_and_plan()
                 if target_found:
-                    target_tile_coords = (self.exploration_target[0] // self.tile_size, self.exploration_target[1] // self.tile_size)
-                    print(f"🎯 New target acquired at pixel {self.exploration_target} (tile {target_tile_coords}). Plan created with {len(self.exploration_plan)} steps.")
+                    # The printout for this is now handled inside _find_target_and_plan.
                     self.exploration_phase = ExplorationPhase.EXECUTING_PLAN
                     # Execute the first step of the new plan immediately.
                     if self.exploration_plan:
@@ -839,15 +836,14 @@ class AGI3(Agent):
 
         self.exploration_target = None
         self.exploration_plan = []
-        if not self.last_known_player_obj or not self.tile_size:
+        if not self.last_known_player_obj:
             return False
 
         player_pixel_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
-        player_tile_pos = (player_pixel_pos[0] // self.tile_size, player_pixel_pos[1] // self.tile_size)
 
-        # --- NEW: PRIORITY 0 - SURVIVAL ---
+        # --- PRIORITY 0: SURVIVAL ---
         # If moves are low, survival is the only priority.
-        nearest_resource_info = self._find_nearest_resource(player_tile_pos)
+        nearest_resource_info = self._find_nearest_resource(player_pixel_pos)
         if nearest_resource_info:
             distance_to_resource = len(nearest_resource_info['path'])
             safety_buffer = 1 # Extra moves needed to be "safe"
@@ -855,7 +851,6 @@ class AGI3(Agent):
                 print(f"⚠️ Activating PRIORITY 0 (SURVIVAL): Low on moves ({self.current_moves})! Resource is {distance_to_resource} steps away.")
                 self.exploration_target = (nearest_resource_info['pos'][0] * self.tile_size, nearest_resource_info['pos'][1] * self.tile_size)
                 self.exploration_plan = nearest_resource_info['path']
-                self._print_debug_map()
                 return True # Exit immediately with a plan to get resources.
         
         # --- NEW: Get a master list of all potential interactable OBJECTS ---
@@ -879,6 +874,13 @@ class AGI3(Agent):
             if self.confirmed_resource_indicator and obj['top_row'] == self.confirmed_resource_indicator['row_index']: continue
             candidate_objects.append(obj)
 
+        # --- Debug print to list all identified potential targets ---
+        print(f"\n--- Found {len(candidate_objects)} Potentially Interactable Object(s) ---")
+        for i, obj in enumerate(candidate_objects):
+            summary = self._get_object_summary_string(obj)
+            print(f"  - Candidate {i+1}: {summary}")
+        print("----------------------------------------------------------")
+
         # --- Filter these candidate_objects based on priorities ---
         potential_target_objects = []
         
@@ -886,8 +888,8 @@ class AGI3(Agent):
         print("🎯 Activating PRIORITY 1: Seeking all untested objects.")
         untested_objects = []
         for obj in candidate_objects:
-            obj_tile = (obj['top_row'] // self.tile_size, obj['left_index'] // self.tile_size)
-            signature = f"tile_pos_{obj_tile}"
+            # The new signature is based on the object's unique properties, not its tile.
+            signature = f"obj_{obj['fingerprint']}_{obj['top_row']}_{obj['left_index']}"
             if signature not in self.interaction_hypotheses:
                 untested_objects.append(obj)
         
@@ -899,24 +901,24 @@ class AGI3(Agent):
                 print("🎯 Activating PRIORITY 2: Pattern is active. Seeking interactables with no known effect.")
                 mysterious_objects = []
                 for obj in candidate_objects:
-                    obj_tile = (obj['top_row'] // self.tile_size, obj['left_index'] // self.tile_size)
-                    signature = f"tile_pos_{obj_tile}"
+                    signature = f"obj_{obj['fingerprint']}_{obj['top_row']}_{obj['left_index']}"
                     hypothesis = self.interaction_hypotheses.get(signature)
                     if hypothesis and not hypothesis.get('immediate_effect') and not hypothesis.get('aftermath_effect') and not hypothesis.get('provides_resource'):
-                        if obj_tile not in self.consumed_tiles_this_life:
-                            mysterious_objects.append(obj)
+                        # Note: The check for 'consumed' objects needs to be updated to use the new signature system.
+                        # This logic will be restored in a future step.
+                        mysterious_objects.append(obj)
                 potential_target_objects = mysterious_objects
             else:
                 # PRIORITY 3: Use known tools if no pattern is active
                 print("🎯 Activating PRIORITY 3: No patterns active. Seeking interactables with a known function.")
                 known_tool_objects = []
                 for obj in candidate_objects:
-                    obj_tile = (obj['top_row'] // self.tile_size, obj['left_index'] // self.tile_size)
-                    signature = f"tile_pos_{obj_tile}"
+                    signature = f"obj_{obj['fingerprint']}_{obj['top_row']}_{obj['left_index']}"
                     hypothesis = self.interaction_hypotheses.get(signature)
                     if hypothesis and (hypothesis.get('immediate_effect') or hypothesis.get('aftermath_effect')):
-                        if obj_tile not in self.consumed_tiles_this_life:
-                            known_tool_objects.append(obj)
+                        # Note: The check for 'consumed' objects needs to be updated to use the new signature system.
+                        # This logic will be restored in a future step.
+                        known_tool_objects.append(obj)
                 potential_target_objects = known_tool_objects
         
         if not potential_target_objects:
@@ -951,7 +953,6 @@ class AGI3(Agent):
 
         if not reachable_targets:
             print("🧐 All potential object targets are currently unreachable.")
-            self._print_debug_map()
             return False
 
         # 3. From the list of reachable targets, select the one with the shortest path.
@@ -966,25 +967,35 @@ class AGI3(Agent):
         
         print(f"🎯 New object target acquired at pixel {self.exploration_target}. Plan to stand at {target_pixel_to_stand_on} created with {len(self.exploration_plan)} steps.")
         
-        self._print_debug_map()
         return True
 
-    def _find_nearest_resource(self, player_tile_pos: tuple) -> dict | None:
-        """Finds the closest reachable resource tile."""
-        resource_tiles = [pos for pos, type in self.tile_map.items() if type == CellType.RESOURCE and pos not in self.consumed_tiles_this_life]
-        if not resource_tiles:
+    def _find_nearest_resource(self, player_pixel_pos: tuple) -> dict | None:
+        """Finds the closest reachable resource object using the new pathfinder."""
+        if not self.previous_frame: return None
+
+        all_objects = self._get_all_objects_from_grid(self.previous_frame[0])
+        resource_signatures = self.world_model.get('resource_signatures', set())
+        resource_objects = [obj for obj in all_objects if (obj.get('fingerprint'), (obj.get('height'), obj.get('width')), obj.get('color')) in resource_signatures]
+
+        if not resource_objects:
             return None
 
         reachable_resources = []
-        for resource_pos in resource_tiles:
-            path = self._find_path_to_target(player_tile_pos, resource_pos, ignore_move_cost=True)
-            if path:
-                reachable_resources.append({'pos': resource_pos, 'path': path})
+        for resource_obj in resource_objects:
+            adjacent_positions = self._get_adjacent_pixel_positions(resource_obj)
+            shortest_path = None
+
+            for pos in adjacent_positions:
+                path = self._find_path_to_position(player_pixel_pos, pos)
+                if path and (shortest_path is None or len(path) < len(shortest_path)):
+                    shortest_path = path
+            
+            if shortest_path:
+                reachable_resources.append({'object': resource_obj, 'path': shortest_path, 'target_pos': pos})
 
         if not reachable_resources:
             return None
 
-        # Return the resource with the shortest path
         return min(reachable_resources, key=lambda r: len(r['path']))
 
     def _find_path_to_position(self, start_pos: tuple, target_pos: tuple) -> list | None:
@@ -1036,10 +1047,18 @@ class AGI3(Agent):
         
         g_scores = {start_pos: 0}
         
+        iterations = 0
+        max_iterations = 5000  # Safety break for the pathfinder
+
         while open_set:
+            iterations += 1
+            if iterations > max_iterations:
+                print(f"⚠️ Pathfinding to {target_pos} timed out after {max_iterations} iterations.")
+                return None  # Path not found within a reasonable time
+
             _, g, current_pos, path = heapq.heappop(open_set)
 
-            if heuristic(current_pos, target_pos) < 8: # Use a tolerance of 8 pixels
+            if heuristic(current_pos, target_pos) < 8:  # Use a tolerance of 8 pixels
                 return [vector_to_action[vec] for vec in path]
 
             for vector in vector_to_action.keys():
@@ -1448,28 +1467,11 @@ class AGI3(Agent):
         if not obj:
             return "Invalid object."
 
-        # Part 1: Format location (Tile vs. Pixel)
-        location_str = ""
+        # Part 1: Format location using only pixel coordinates for consistency.
         pos = (obj.get('top_row', 0), obj.get('left_index', 0))
-        if self.tile_size:
-            tile_pos = (pos[0] // self.tile_size, pos[1] // self.tile_size)
-            
-            # Determine the "playable area" to see if tile coordinates are relevant.
-            display_area = set(self.reachable_floor_area)
-            for r_tile, c_tile in self.reachable_floor_area:
-                for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                    neighbor = (r_tile + dr, c_tile + dc)
-                    if neighbor in self.tile_map:
-                        display_area.add(neighbor)
-            
-            if display_area and tile_pos in display_area:
-                location_str = f"at tile {tile_pos}"
-            else:
-                location_str = f"at pixel {pos}"
-        else:
-            location_str = f"at pixel {pos}"
+        location_str = f"at pixel {pos}"
 
-        # Part 2: Format object details
+        # Part 2: Format object details.
         size = (obj.get('height', 0), obj.get('width', 0))
         details = []
         if obj.get('original_color') is not None:
