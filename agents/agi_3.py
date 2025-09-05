@@ -80,6 +80,7 @@ class AGI3(Agent):
         self.RESOURCE_CONFIDENCE_THRESHOLD = 3 # Actions in a row to confirm
         self.level_knowledge_is_learned = False
         self.wait_action = GameAction.ACTION6 # Use a secondary action for waiting
+        self.initial_level_patterns = set()
 
         # --- Move Tracking ---
         self.max_moves = 0
@@ -217,6 +218,7 @@ class AGI3(Agent):
         self.last_action = None
         self.last_known_objects = []
         self.last_known_player_obj = None # Crucial: Force agent to re-find itself.
+        self.initial_level_patterns.clear()
 
         # --- Reset Level-Specific Layout and Plans ---
         self.has_summarized_interactions = False
@@ -266,6 +268,8 @@ class AGI3(Agent):
 
     def _reset_for_new_level(self):
         """Resets all level-specific knowledge for a new level, preserving core learned concepts."""
+        self.initial_level_patterns.clear()
+        
         if self.previous_frame:
             print("-> Capturing static object state from end of previous level...")
             self.static_object_memory = self._get_all_objects_from_grid(self.previous_frame[0])
@@ -310,6 +314,19 @@ class AGI3(Agent):
                 self.level_start_score = latest_frame.score
                 self._find_level_indicator(latest_frame.frame)
                 self._describe_initial_objects(latest_frame.frame[0])
+                
+                # --- NEW: Capture and store initial patterns to ignore during the level ---
+                print("-> Capturing initial patterns to ignore...")
+                initial_objects = self._get_all_objects_from_grid(latest_frame.frame[0])
+                self._scan_for_fingerprint_patterns(initial_objects)
+                
+                # Store the IDs of any patterns found and then clear the active list for the turn.
+                self.initial_level_patterns = {p.get('id') for p in self.active_patterns if p.get('id')}
+                self.active_patterns.clear()
+                
+                if self.initial_level_patterns:
+                    print(f"-> Stored {len(self.initial_level_patterns)} initial pattern(s).")
+                
                 if self.confirmed_resource_indicator:
                     indicator_row_index = self.confirmed_resource_indicator['row_index']
                     self.resource_bar_full_state = copy.deepcopy(latest_frame.frame[0][indicator_row_index])
@@ -578,42 +595,35 @@ class AGI3(Agent):
             else:
                 object_logic_changes = structured_changes
 
-            # 1. Find all new objects based on pixel changes.
-            current_objects = self._find_and_describe_objects(object_logic_changes, latest_frame.frame)
-
-            # NEW: Store the tile the agent is on before tracking its move.
+            # 1. Get a reliable list of all objects from the current frame.
+            all_objects_on_grid = self._get_all_objects_from_grid(latest_frame.frame[0])
+            
+            # 2. Store the tile the agent might be leaving, for context in other functions.
             self.just_vacated_tile = None
             if self.last_known_player_obj and self.tile_size:
                 self.just_vacated_tile = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
 
             moved_agent_this_turn = None
             
-            # 2. Track objects and identify the agent's parts FIRST.
-            if self.last_known_objects:
-                tracking_logs, moved_agent_this_turn, agent_part_fingerprints = self._track_objects(current_objects, self.last_known_objects, latest_frame.frame, object_logic_changes, self.last_action)
-                if tracking_logs:
-                    print(f"--- Object Tracking Report (Action: {self.last_action.name}) ---")
-                    for log in tracking_logs:
-                        print(log)
+            # 3. Track objects using the full, reliable list to find the agent and its parts.
+            tracking_logs, moved_agent_this_turn, agent_part_fingerprints = self._track_objects(all_objects_on_grid, self.last_known_objects, latest_frame.frame, object_logic_changes, self.last_action)
+            if tracking_logs:
+                print(f"--- Object Tracking Report (Action: {self.last_action.name}) ---")
+                for log in tracking_logs:
+                    print(log)
 
-            # 3. Filter out agent parts to get a list of true environmental changes.
-            non_agent_objects = [obj for obj in current_objects if obj.get('fingerprint') not in agent_part_fingerprints]
-            if len(current_objects) != len(non_agent_objects):
-                print(f"🕵️‍♂️ Goal check is ignoring {len(current_objects) - len(non_agent_objects)} object(s) identified as agent parts.")
-
-            # 4. Check for goal patterns on the REMAINING non-agent objects.
-            if non_agent_objects:
-                all_objects_on_grid = self._get_all_objects_from_grid(latest_frame.frame[0])
-                self._find_and_update_patterns(non_agent_objects, all_objects_on_grid)
+            # 4. Scan the complete grid for fingerprint-based patterns.
+            self._scan_for_fingerprint_patterns(all_objects_on_grid)
+            
             if self.active_patterns:
-                print(f"--- {len(self.active_patterns)} Active Pattern(s) on Grid ---")
+                print(f"--- {len(self.active_patterns)} Active Pattern Instance(s) on Grid ---")
                 for i, pattern in enumerate(self.active_patterns):
-                    dk_pixel = (pattern['dynamic_key']['top_row'], pattern['dynamic_key']['left_index'])
-                    sk_pixel = (pattern['static_key']['top_row'], pattern['static_key']['left_index'])
-                    print(f"  - Pattern {i+1}: Dynamic object at {self._format_location_string(dk_pixel)} matches static object at {self._format_location_string(sk_pixel)}.")
+                    obj1_pixel = (pattern['object_1']['top_row'], pattern['object_1']['left_index'])
+                    obj2_pixel = (pattern['object_2']['top_row'], pattern['object_2']['left_index'])
+                    print(f"  - Pattern {i+1}: Object at pixel {obj1_pixel} matches object at pixel {obj2_pixel} (FP: {pattern['fingerprint']}).")
            
-            # 5. Update memory for the next turn.
-            self.last_known_objects = current_objects
+            # 5. Update memory for the next turn with the reliable, full-scan list.
+            self.last_known_objects = all_objects_on_grid
 
             # 6. Update the player object's known position for the next turn.
             if moved_agent_this_turn:
@@ -1492,7 +1502,8 @@ class AGI3(Agent):
                     final_objects.append({
                         'height': height, 'width': width, 'top_row': min_row,
                         'left_index': min_idx, 'color': color,
-                        'fingerprint': fingerprint
+                        'fingerprint': fingerprint,
+                        'data_map': data_map
                     })
         return final_objects
 
@@ -2506,20 +2517,23 @@ class AGI3(Agent):
                         print(f"✅ Confirmed resource indicator at row {row_idx}! It will now be ignored for state uniqueness checks.")
                         self._scan_and_label_all_objects(latest_grid[0], "Resource Indicator Confirmed")
 
-                        # --- NEW: Re-check active patterns to filter out the new indicator ---
+                        # --- Re-check active patterns to filter out the new indicator ---
                         if self.active_patterns:
                             print(f"🕵️‍♀️ Re-checking {len(self.active_patterns)} active pattern(s) against the new resource indicator...")
                             
                             valid_patterns = []
                             removed_count = 0
                             for pattern in self.active_patterns:
-                                dk = pattern['dynamic_key']
-                                # Check if the dynamic key's vertical span overlaps with the indicator row
-                                obj_top = dk['top_row']
-                                obj_bottom = obj_top + dk['height']
+                                # Get both objects from the new pattern structure
+                                obj1 = pattern['object_1']
+                                obj2 = pattern['object_2']
                                 
-                                if obj_top <= row_idx < obj_bottom:
-                                    # This pattern's dynamic key is on the indicator row. It's invalid.
+                                # Check if either object's vertical span overlaps with the indicator row
+                                obj1_on_indicator = (obj1['top_row'] <= row_idx < obj1['top_row'] + obj1['height'])
+                                obj2_on_indicator = (obj2['top_row'] <= row_idx < obj2['top_row'] + obj2['height'])
+                                
+                                if obj1_on_indicator or obj2_on_indicator:
+                                    # This pattern involves an object on the indicator row, so it's invalid.
                                     removed_count += 1
                                 else:
                                     valid_patterns.append(pattern)
@@ -2955,64 +2969,82 @@ class AGI3(Agent):
             if object_signature in self.interaction_hypotheses:
                 self.interaction_hypotheses[object_signature]['is_consumable'] = False
 
-    def _find_and_update_patterns(self, dynamic_objects: list, all_grid_objects: list):
+    def _scan_for_fingerprint_patterns(self, all_grid_objects: list):
         """
-        Scans for patterns by matching dynamic objects to the full set of objects on the grid.
-        A pattern is a match in shape fingerprint between two distinct objects.
+        Scans all objects on the grid to find patterns based on matching fingerprints.
+        A pattern is defined as two or more non-UI, non-agent objects sharing the same shape fingerprint.
+        This scan ignores patterns that were present at the start of the level.
         """
-        if not dynamic_objects or not all_grid_objects:
+        if not all_grid_objects:
             return
 
-        print(f"🔬 Checking for patterns based on {len(dynamic_objects)} new object(s)...")
+        print("🔬 Scanning for fingerprint-based patterns across all objects...")
 
-        # Get fingerprints of patterns already known to be active to avoid adding duplicates.
-        known_pattern_fingerprints = {p['fingerprint'] for p in self.active_patterns}
+        # 1. Filter for candidate objects (e.g., [Unknown Object] or [Known Object])
+        candidate_objects = []
+        agent_part_signatures = self.world_model.get('player_part_signatures', set())
+        life_indicator_signatures = self.world_model.get('life_indicator_signatures', set())
+        level_indicator_signatures = self.world_model.get('level_indicator_signatures', set())
+        resource_signatures = self.world_model.get('resource_signatures', set())
+        
+        for obj in all_grid_objects:
+            h, w, c, fp = obj['height'], obj['width'], obj['color'], obj['fingerprint']
+            
+            part_sig = (fp, (h, w), c)
+            indicator_sig = (h, w, c)
 
-        for dynamic_key_obj in dynamic_objects:
-            # If this object appeared on the tile the agent just left, it's a static
-            # object being revealed, not a true dynamic key. Ignore it for pattern matching.
-            if self.just_vacated_tile and self.tile_size:
-                obj_tile = (dynamic_key_obj['top_row'] // self.tile_size, dynamic_key_obj['left_index'] // self.tile_size)
-                if obj_tile == self.just_vacated_tile:
-                    print(f"🕵️‍♀️ Ignoring pattern check for object at {obj_tile} (revealed by agent movement).")
-                    continue
+            # Skip known background, agent, or UI elements
+            if c == self.world_model.get('floor_color'): continue
+            if c in self.world_model.get('wall_colors', set()): continue
+            if part_sig in agent_part_signatures: continue
+            if indicator_sig in life_indicator_signatures: continue
+            if indicator_sig in level_indicator_signatures: continue
+            if part_sig in resource_signatures: continue
+            if self.confirmed_resource_indicator and obj['top_row'] == self.confirmed_resource_indicator['row_index']: continue
 
-            # --- NEW: Explicitly ignore objects on the resource indicator row ---
-            if self.confirmed_resource_indicator:
-                indicator_row = self.confirmed_resource_indicator['row_index']
-                # Check if the object's vertical span overlaps with the indicator row
-                obj_top = dynamic_key_obj['top_row']
-                obj_bottom = obj_top + dynamic_key_obj['height']
-                if obj_top <= indicator_row < obj_bottom:
-                    continue # Skip this object, it's part of the UI.
+            candidate_objects.append(obj)
 
-            dk_fingerprint = dynamic_key_obj.get('fingerprint')
-            if dk_fingerprint is None: continue
+        # 2. Group candidate objects by fingerprint
+        objects_by_fingerprint = {}
+        for obj in candidate_objects:
+            fp = obj.get('fingerprint')
+            if fp is None or fp == 0: continue
+            if fp not in objects_by_fingerprint:
+                objects_by_fingerprint[fp] = []
+            objects_by_fingerprint[fp].append(obj)
 
-            for static_obj in all_grid_objects:
-                if dk_fingerprint == static_obj.get('fingerprint'):
-                    dk_size = (dynamic_key_obj['height'], dynamic_key_obj['width'])
-                    dk_pos = (dynamic_key_obj['top_row'], dynamic_key_obj['left_index'])
-                    sk_size = (static_obj['height'], static_obj['width'])
-                    sk_pos = (static_obj['top_row'], static_obj['left_index'])
+        # 3. Clear existing patterns and build the new list from identified pairs
+        self.active_patterns.clear()
+        
+        for fingerprint, objects in objects_by_fingerprint.items():
+            if len(objects) > 1:
+                for i in range(len(objects)):
+                    for j in range(i + 1, len(objects)):
+                        obj1 = objects[i]
+                        obj2 = objects[j]
+                        
+                        pattern_id = tuple(sorted((
+                            (obj1['top_row'], obj1['left_index']),
+                            (obj2['top_row'], obj2['left_index'])
+                        )))
 
-                    if dk_pos == sk_pos and dk_size == sk_size: continue
-
-                    # Create a unique ID for this specific pattern instance to avoid duplicates.
-                    pattern_fingerprint = (dk_fingerprint, sk_pos)
-
-                    if pattern_fingerprint not in known_pattern_fingerprints:
-                        dk_loc_str = self._format_location_string(dk_pos)
-                        sk_loc_str = self._format_location_string(sk_pos)
-                        print(f"✅ NEW PATTERN DETECTED: Dynamic object at {dk_loc_str} matches static object at {sk_loc_str}!")
+                        # --- NEW: Check against initial level patterns ---
+                        if pattern_id in self.initial_level_patterns:
+                            continue # Ignore this pattern, it was there at the start.
 
                         new_pattern = {
-                            'dynamic_key': dynamic_key_obj,
-                            'static_key': static_obj,
-                            'fingerprint': pattern_fingerprint
+                            'object_1': obj1,
+                            'object_2': obj2,
+                            'fingerprint': fingerprint, 
+                            'id': pattern_id
                         }
                         self.active_patterns.append(new_pattern)
-                        known_pattern_fingerprints.add(pattern_fingerprint)
+        
+        unique_patterns = {p['id']: p for p in self.active_patterns}
+        self.active_patterns = list(unique_patterns.values())
+
+        if self.active_patterns:
+            print(f"✅ Found {len(self.active_patterns)} new pattern instance(s) based on matching fingerprints.")
 
     def _print_debug_map(self):
         """Prints a human-readable version of the agent's tile_map to the console."""
@@ -3079,8 +3111,9 @@ class AGI3(Agent):
         print("--- Key: P=Player, T=Target, .=Floor, #=Wall, ?=Potential, !=Confirmed, ~=Match ---\n")
 
     def _format_location_string(self, pixel_pos: tuple) -> str:
-        """Formats a pixel position into a 'pixel (r, c)' string for consistency."""
-        return f"pixel {pixel_pos}"
+        """Formats a pixel position into a 'tile (r, c)' or 'pixel (r, c)' string."""
+        if not self.tile_size:
+            return f"pixel {pixel_pos}"
 
         # Determine the "playable area" to see if tile coordinates are relevant.
         display_area = set(self.reachable_floor_area)
