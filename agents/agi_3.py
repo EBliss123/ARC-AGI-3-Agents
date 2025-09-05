@@ -3362,53 +3362,61 @@ class AGI3(Agent):
                                 print(f"      --- Comparing Part (Color {color}) ---")
                                 any_perfect_match_found_for_part = False
 
-                                # --- NEW: Synthesis Logic ---
-                                # 1. Find all perfect matches from memory.
-                                perfect_matches = [
-                                    p for p in remembered_profiles 
-                                    if p['color'] == color and p['size'] == obj_char['size']
-                                ]
+                                # --- NEW: Tiered Matching Logic ---
+                                perfect_matches = []
+                                characteristic_matches = []
+                                
+                                for p in remembered_profiles:
+                                    is_color_match = (p['color'] == color)
+                                    is_size_match = (p['size'] == obj_char['size'])
 
-                                if not perfect_matches:
-                                    best_partial = remembered_profiles[0]
-                                    print(f"        - ⚠️ No Perfect Match found. Best partial match is from Level {best_partial['level_source']}.")
-                                    continue # Go to the next object part
+                                    if is_color_match and is_size_match:
+                                        perfect_matches.append(p)
+                                    elif is_color_match and not is_size_match:
+                                        characteristic_matches.append(p)
+                                
+                                matches_to_analyze = []
+                                match_type_str = ""
 
-                                print(f"        - ✅ Found {len(perfect_matches)} perfect match(es) in memory (from levels {[p['level_source'] for p in perfect_matches]}).")
+                                if perfect_matches:
+                                    matches_to_analyze = perfect_matches
+                                    match_type_str = "perfect"
+                                elif characteristic_matches:
+                                    matches_to_analyze = characteristic_matches
+                                    match_type_str = "characteristic (same color, different size)"
+                                
+                                if matches_to_analyze:
+                                    print(f"        - ✅ Found {len(matches_to_analyze)} {match_type_str} match(es) in memory (from levels {[p['level_source'] for p in matches_to_analyze]}).")
+                                    
+                                    # Synthesize a single historical profile from all found matches.
+                                    synthesized_hypo = {
+                                        'is_consumable': set(), 'provides_resource': set(),
+                                        'immediate_effect': [], 'aftermath_effect': []
+                                    }
+                                    unique_rem_outcomes = {'immediate_effect': set(), 'aftermath_effect': set()}
 
-                                # 2. Synthesize a single historical profile from all matches.
-                                synthesized_hypo = {
-                                    'is_consumable': set(),
-                                    'provides_resource': set(),
-                                    'immediate_effect': [],
-                                    'aftermath_effect': []
-                                }
-                                unique_rem_outcomes = {'immediate_effect': set(), 'aftermath_effect': set()}
-
-                                for match in perfect_matches:
-                                    hypo = match.get('hypothesis')
-                                    if not hypo: continue
-
-                                    synthesized_hypo['is_consumable'].add(hypo.get('is_consumable'))
-                                    synthesized_hypo['provides_resource'].add(hypo.get('provides_resource', False))
-
-                                    for effect_type in ['immediate_effect', 'aftermath_effect']:
-                                        outcomes = hypo.get(effect_type, [])
-                                        # Handle legacy format where effects was a flat list
-                                        if outcomes and not isinstance(outcomes[0], list):
-                                            outcomes = [outcomes]
+                                    for match in matches_to_analyze:
+                                        hypo = match.get('hypothesis')
+                                        if not hypo: continue
                                         
-                                        for outcome in outcomes:
-                                            # Create a canonical summary to check for uniqueness
-                                            canonical_outcome = tuple(sorted([self._get_object_summary_string(obj) for obj in outcome]))
-                                            if canonical_outcome not in unique_rem_outcomes[effect_type]:
-                                                unique_rem_outcomes[effect_type].add(canonical_outcome)
-                                                synthesized_hypo[effect_type].append(outcome)
+                                        persistence_value = hypo.get('is_consumable')
+                                        if persistence_value is not None:
+                                            synthesized_hypo['is_consumable'].add(persistence_value)
+                                        synthesized_hypo['provides_resource'].add(hypo.get('provides_resource', False))
+                                        for effect_type in ['immediate_effect', 'aftermath_effect']:
+                                            outcomes = hypo.get(effect_type, [])
+                                            for outcome in outcomes:
+                                                canonical_outcome = tuple(sorted([self._get_object_summary_string(obj) for obj in outcome]))
+                                                if canonical_outcome not in unique_rem_outcomes[effect_type]:
+                                                    unique_rem_outcomes[effect_type].add(canonical_outcome)
+                                                    synthesized_hypo[effect_type].append(outcome)
 
-                                # 3. Perform a single, detailed comparison against the synthesized profile.
-                                self._compare_and_print_hypothesis_details(signature, synthesized_hypo)
-                    else:
-                        print(f"      - Could not perform analysis: Characteristics not logged.")
+                                    # Perform a single, detailed comparison against the synthesized profile.
+                                    self._compare_and_print_hypothesis_details(signature, synthesized_hypo)
+                                else:
+                                    # This is the fallback if no perfect or characteristic matches were found.
+                                    best_partial = remembered_profiles[0]
+                                    print(f"        - ⚠️ No strong match found. Best partial (shape) match is from Level {best_partial['level_source']}.")
 
             characteristics_data = self.interactable_object_characteristics.get(tile_pos)
             if characteristics_data:
