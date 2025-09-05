@@ -698,15 +698,6 @@ class AGI3(Agent):
             return self.wait_action
 
         # --- Intelligent Exploration Logic ---
-        # --- Debug print for exploration prerequisites ---
-        print("\n--- Exploration Prerequisites Check ---")
-        print(f"  - 1. Player Signature Learned: {bool(self.world_model.get('player_signature'))}")
-        print(f"  - 2. Floor Color Learned:      {bool(self.world_model.get('floor_color'))}")
-        print(f"  - 3. Action Map Learned:       {bool(self.world_model.get('action_map'))}")
-        print(f"  - 4. Agent Position Known:     {bool(self.last_known_player_obj)}")
-        print(f"  - 5. Tile Size Known:          {self.tile_size is not None} (Value: {self.tile_size})")
-        print("------------------------------------")
-        
         can_explore = (self.world_model.get('player_signature') and
                self.world_model.get('floor_color') and
                self.world_model.get('action_map') and
@@ -1137,145 +1128,76 @@ class AGI3(Agent):
         # Return the resource with the shortest path
         return min(reachable_resources, key=lambda r: len(r['path']))
 
-    def _find_path_to_target(self, start_tile: tuple, target_tile: tuple, ignore_move_cost: bool = False) -> list:
+    def _find_path_to_position(self, start_pos: tuple, target_pos: tuple) -> list | None:
         """
-        Finds the shortest, resource-aware path to a target using the A* algorithm.
-        This path considers the agent's current moves and potential resource pickups.
+        Finds a path from a start pixel position to a target pixel position using A*.
+        Navigation is done in "steps" based on learned action vectors, and it avoids
+        colliding with known Wall objects.
         """
-        # 1. Build a fresh map from TILE vectors to actions.
-        tile_vector_to_action = {}
-        if self.tile_size and self.world_model.get('action_map'):
-            for action, effect in self.world_model['action_map'].items():
-                if 'move_vector' in effect:
-                    px_vec = effect['move_vector']
-                    tile_vec = (px_vec[0] // self.tile_size, px_vec[1] // self.tile_size)
-                    if tile_vec != (0, 0):
-                        tile_vector_to_action[tile_vec] = action
+        if not self.world_model.get('action_map') or not self.last_known_player_obj or not self.previous_frame:
+            return None
 
-        if not tile_vector_to_action:
-            return []
+        # 1. Define agent's footprint and identify obstacles.
+        player_footprint = (self.last_known_player_obj['height'], self.last_known_player_obj['width'])
+        
+        all_objects = self._get_all_objects_from_grid(self.previous_frame[0])
+        wall_objects = [obj for obj in all_objects if obj['color'] in self.world_model.get('wall_colors', set())]
 
-        # 2. A* Implementation
+        # --- Helper for Collision Detection ---
+        def is_valid_position(pos: tuple) -> bool:
+            """Checks if placing the agent at `pos` would cause a collision with a wall."""
+            agent_left = pos[1]
+            agent_right = pos[1] + player_footprint[1]
+            agent_top = pos[0]
+            agent_bottom = pos[0] + player_footprint[0]
+
+            for wall in wall_objects:
+                wall_left = wall['left_index']
+                wall_right = wall['left_index'] + wall['width']
+                wall_top = wall['top_row']
+                wall_bottom = wall['top_row'] + wall['height']
+
+                # Bounding box collision check
+                if not (agent_right <= wall_left or agent_left >= wall_right or
+                        agent_bottom <= wall_top or agent_top >= wall_bottom):
+                    return False # Collision detected
+            return True # No collisions
+
+        # 2. A* Implementation on Pixel Coordinates
+        action_map = self.world_model['action_map']
+        vector_to_action = {tuple(v['move_vector']): k for k, v in action_map.items() if 'move_vector' in v and tuple(v['move_vector']) != (0,0)}
+
+        if not vector_to_action: return None # No movement actions learned
+
         def heuristic(a, b):
-            """Manhattan distance heuristic for A*."""
-            return abs(a[0] - b[0]) + abs(a[1] - b[1])
+            return abs(a[0] - b[0]) + abs(a[1] - b[1]) # Manhattan distance in pixels
 
-        # The priority queue stores: (f_score, g_score, tile, remaining_moves, path)
         open_set = []
-        initial_f_score = heuristic(start_tile, target_tile)
-        heapq.heappush(open_set, (initial_f_score, 0, start_tile, self.current_moves, []))
-
-        # g_scores tracks the cost to reach a state: g_scores[(tile, moves)] = cost
-        g_scores = {(start_tile, self.current_moves): 0}
-
-        # Visited set to avoid re-processing states
-        visited_states = set()
-
+        heapq.heappush(open_set, (heuristic(start_pos, target_pos), 0, start_pos, []))
+        
+        g_scores = {start_pos: 0}
+        
         while open_set:
-            _, g, current_tile, current_moves, path = heapq.heappop(open_set)
+            _, g, current_pos, path = heapq.heappop(open_set)
 
-            if current_tile == target_tile:
-                return path  # Path found!
+            if heuristic(current_pos, target_pos) < 8: # Use a tolerance of 8 pixels
+                return [vector_to_action[vec] for vec in path]
 
-            state = (current_tile, current_moves)
-            if state in visited_states:
-                continue
-            visited_states.add(state)
+            for vector in vector_to_action.keys():
+                neighbor_pos = (current_pos[0] + vector[0], current_pos[1] + vector[1])
 
-            for tile_vec, action in tile_vector_to_action.items():
-                neighbor_tile = (current_tile[0] + tile_vec[0], current_tile[1] + tile_vec[1])
-
-                tile_type = self.tile_map.get(neighbor_tile)
-                can_move_to = tile_type in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.POTENTIAL_MATCH, CellType.RESOURCE]
-
-                if not can_move_to:
+                if not is_valid_position(neighbor_pos):
                     continue
 
-                # Calculate the state for the next step in the path
-                next_moves = current_moves - 1
-                if not ignore_move_cost and next_moves < 0:
-                    continue  # This path ran out of resources
-
-                # If the neighbor is a resource, refill the moves for the next state
-                if self.tile_map.get(neighbor_tile) == CellType.RESOURCE:
-                    next_moves = self.max_moves
-
-                tentative_g_score = g + 1
-                neighbor_state = (neighbor_tile, next_moves)
-
-                # Check if this new path to the neighbor is better than any previous one
-                if tentative_g_score < g_scores.get(neighbor_state, float('inf')):
-                    g_scores[neighbor_state] = tentative_g_score
-                    f_score = tentative_g_score + heuristic(neighbor_tile, target_tile)
-                    heapq.heappush(open_set, (f_score, tentative_g_score, neighbor_tile, next_moves, path + [action]))
-
-        return []  # No path found
-
-    def _get_adjacent_floor_tiles(self, obj: dict) -> set:
-        """Finds all reachable floor tiles that are adjacent to any tile an object occupies."""
-        if not self.tile_size: return set()
-
-        object_tiles = set()
-        # Find all tiles this object's actual pixels are on (ignores empty space in bounding box)
-        for r_pixel in range(obj['top_row'], obj['top_row'] + obj['height']):
-            for c_pixel in range(obj['left_index'], obj['left_index'] + obj['width']):
-                relative_r = r_pixel - obj['top_row']
-                relative_c = c_pixel - obj['left_index']
-                if obj['data_map'][relative_r][relative_c] is not None:
-                    object_tiles.add((r_pixel // self.tile_size, c_pixel // self.tile_size))
-        
-        adjacent_floor_tiles = set()
-        # For each tile the object is on, find its valid neighbors
-        for r_tile, c_tile in object_tiles:
-            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]: # N, S, E, W neighbors
-                neighbor_tile = (r_tile + dr, c_tile + dc)
+                tentative_g_score = g + 1 
                 
-                # A valid interaction tile must be reachable floor and not part of the object itself.
-                if (neighbor_tile not in object_tiles and
-                    self.tile_map.get(neighbor_tile) == CellType.FLOOR and
-                    neighbor_tile in self.reachable_floor_area):
-                    adjacent_floor_tiles.add(neighbor_tile)
+                if tentative_g_score < g_scores.get(neighbor_pos, float('inf')):
+                    g_scores[neighbor_pos] = tentative_g_score
+                    f_score = tentative_g_score + heuristic(neighbor_pos, target_pos)
+                    heapq.heappush(open_set, (f_score, tentative_g_score, neighbor_pos, path + [vector]))
 
-        return adjacent_floor_tiles
+        return None # No path found
     
-    def _calculate_nav_mesh(self) -> set:
-        """
-        Performs a BFS/flood-fill from the player's position to build a NavMesh
-        representing all connected, walkable space.
-        """
-        # Ensure we have the necessary information to start.
-        if not self.last_known_player_obj or not self.tile_size or not self.tile_map:
-            print("⚠️ Cannot find reachable floor tiles: Missing player, tile size, or map.")
-            return set()
-
-        # 1. Get the player's starting position in tile coordinates.
-        player_pixel_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
-        start_tile = (player_pixel_pos[0] // self.tile_size, player_pixel_pos[1] // self.tile_size)
-
-        # The player might be on an interactable tile, which is also a valid starting point.
-        start_tile_type = self.tile_map.get(start_tile)
-        if start_tile_type not in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.RESOURCE]:
-            print(f"⚠️ Player starting tile {start_tile} is not on a known FLOOR, INTERACTABLE, or RESOURCE. Aborting flood fill.")
-            return set()
-        # 2. Initialize BFS data structures.
-        q = [start_tile]
-        visited = {start_tile}
-
-        # 3. Perform the flood-fill.
-        while q:
-            current_tile = q.pop(0)
-
-            # Explore neighbors (up, down, left, right in tile space).
-            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                neighbor_tile = (current_tile[0] + dr, current_tile[1] + dc)
-
-                # We can only traverse through tiles classified as FLOOR.
-                if self.tile_map.get(neighbor_tile) in [CellType.FLOOR, CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.POTENTIAL_MATCH, CellType.RESOURCE] and neighbor_tile not in visited:
-                    visited.add(neighbor_tile)
-                    q.append(neighbor_tile)
-        
-        print(f"🗺️ Found {len(visited)} reachable tiles connected to the player.")
-        return visited
     
     def perceive(self, latest_frame: FrameData) -> tuple[bool, bool, list[str], list]:
         """Compares frames, separating novel changes from known indicator changes."""
