@@ -295,6 +295,8 @@ class AGI3(Agent):
         # Since the world model is preserved, we can skip discovery.
         print("🧠 Knowledge preserved. Skipping discovery and entering action state.")
         self.agent_state = AgentState.RANDOM_ACTION
+        # --- NEW: Always synthesize a plan after a level is complete. ---
+        self._synthesize_level_plan_hypothesis()
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
@@ -3478,7 +3480,6 @@ class AGI3(Agent):
 
         print("-----------------------------------------\n")
         self.has_summarized_interactions = True
-        self._synthesize_level_plan_hypothesis()
 
     def _summarize_level_goal(self):
         """Analyzes and stores the state of the game at the moment a level is won."""
@@ -3589,68 +3590,99 @@ class AGI3(Agent):
             print("-> No level indicators found matching the heuristic.")
 
     def _synthesize_level_plan_hypothesis(self):
-        """Analyzes all learned data to form a high-level hypothesis about the sequence of actions needed to win."""
+        """Analyzes all learned data to form a high-level, multi-step hypothesis about how to win."""
         print("\n--- 📜 Synthesizing Level Plan Hypothesis 📜 ---")
 
         if not self.level_goal_hypotheses:
             print("-> No goal hypotheses to analyze.")
             return
 
-        # For now, we'll synthesize a plan based on the most recent win.
         latest_goal = self.level_goal_hypotheses[-1]
-        
-        # 1. Identify all potential preconditions from the win state.
-        preconditions = []
-        patterns_at_win = latest_goal.get('active_patterns_at_win')
-        if patterns_at_win:
-            preconditions.append(f"An 'Active Pattern' must be present on the grid (matched {len(patterns_at_win)} time(s)).")
+        plan_steps_reversed = []
 
-        # 2. Identify the final action.
+        def get_loc_str_from_tile(tile_coords_tuple: tuple) -> str:
+            """Helper to find an object's pixel coordinates from its tile coordinates."""
+            characteristics = self.interactable_object_characteristics.get(tile_coords_tuple)
+            if characteristics:
+                # An object on a tile can have multiple parts. Just get the location of the first one found.
+                first_color = next(iter(characteristics))
+                first_object_char = characteristics[first_color][0]
+                pixel_loc = first_object_char.get('location')
+                if pixel_loc:
+                    return f"pixel {pixel_loc}"
+            # Fallback if pixel coordinates can't be found
+            return f"tile {tile_coords_tuple}"
+
+        # 1. Start with the final action.
         final_tile = latest_goal.get('final_tile_of_level')
         if not final_tile:
             print("-> Could not determine final action. Cannot synthesize plan.")
             return
-            
-        final_action_desc = f"Interact with the object at tile {final_tile}."
+        final_loc_str = get_loc_str_from_tile(final_tile)
+        plan_steps_reversed.append(f"Interact with the object at {final_loc_str} to complete the level.")
 
-        # 3. Print the generalized hypothesis.
-        print("Based on the last successful level, the hypothesized plan is:")
-        if preconditions:
-            print("  - Precondition(s):")
-            for pre in preconditions:
-                print(f"    - {pre}")
-        else:
-            print("  - Precondition(s): None identified.")
-        print(f"  - Final Action: {final_action_desc}")
-
-        # 4. If a pattern was a precondition, create a detailed sub-plan for it.
+        # 2. Identify preconditions for the final action.
+        required_preconditions = []
+        patterns_at_win = latest_goal.get('active_patterns_at_win')
         if patterns_at_win:
-            print("\n  - Detailed Plan to meet 'Active Pattern' precondition:")
-            plan_steps = []
             for pattern in patterns_at_win:
-                required_object = pattern['dynamic_key']
+                required_preconditions.append({'type': 'PATTERN', 'pattern': pattern})
+
+        # 3. Backtrack to solve for the preconditions.
+        current_preconditions = list(required_preconditions)
+        solved_preconditions = set()
+        max_steps = 5
+
+        while current_preconditions and len(plan_steps_reversed) < max_steps:
+            precondition = current_preconditions.pop(0)
+            precondition_id = str(precondition['pattern']['fingerprint'])
+            if precondition_id in solved_preconditions:
+                continue
+            solved_preconditions.add(precondition_id)
+            
+            if precondition['type'] == 'PATTERN':
+                required_object = precondition['pattern']['dynamic_key']
                 required_fingerprint = required_object.get('fingerprint')
-                tool_found = False
+                required_color = required_object.get('color')
+                required_size = (required_object.get('height'), required_object.get('width'))
+
+                producer_found = False
                 for signature, hypothesis in self.interaction_hypotheses.items():
                     all_outcomes = hypothesis.get('immediate_effect', []) + hypothesis.get('aftermath_effect', [])
                     for outcome in all_outcomes:
                         for event in outcome:
-                            if event.get('type') == 'TRANSFORM':
-                                resulting_obj = event.get('after', {})
-                                if resulting_obj.get('fingerprint') == required_fingerprint:
-                                    tool_tile_str = signature.replace("tile_pos_", "")
-                                    step_desc = f"Use the tool at {tool_tile_str} to create the required pattern component (Shape FP: {required_fingerprint})."
-                                    plan_steps.append(step_desc)
-                                    tool_found = True
+                            resulting_obj = None
+                            if event.get('type') in ['SPAWN', 'TRANSFORM']:
+                                resulting_obj = event.get('after') or event.get('object')
+                            if resulting_obj:
+                                if (resulting_obj.get('fingerprint') == required_fingerprint and
+                                    resulting_obj.get('color') == required_color and
+                                    (resulting_obj.get('height'), resulting_obj.get('width')) == required_size):
+                                    
+                                    try:
+                                        # Parse tile coordinates like "(4, 4)" from the signature key "tile_pos_(4, 4)"
+                                        producer_tile_str = signature.replace("tile_pos_", "")
+                                        producer_tile_tuple = tuple(map(int, producer_tile_str.strip('()').split(',')))
+                                        producer_loc_str = get_loc_str_from_tile(producer_tile_tuple)
+                                    except:
+                                        producer_loc_str = f"tile {producer_tile_str}" # Fallback
+                                    
+                                    plan_steps_reversed.append(f"Interact with the object at {producer_loc_str} to create the required pattern component.")
+                                    producer_found = True
                                     break
-                        if tool_found: break
-                    if tool_found: break
+                        if producer_found: break
+                    if producer_found: break
             
-            if plan_steps:
-                for i, step in enumerate(plan_steps):
-                    print(f"    - Step {i+1}: {step}")
-            else:
-                print("    - Could not identify the specific tool needed from learned interactions.")
+                if not producer_found:
+                    plan_steps_reversed.append(f"Obtain the required pattern component (source unknown).")
+
+        # 4. Print the final plan in the correct, sequential order.
+        print("Based on the last successful level, the hypothesized plan is:")
+        if not plan_steps_reversed:
+            print("-> No steps could be determined.")
+        else:
+            for i, step_text in enumerate(reversed(plan_steps_reversed)):
+                print(f"  - Step {i+1}: {step_text}")
 
     def _analyze_and_update_moves(self, latest_frame: FrameData):
         """Analyzes the resource bar to determine max and current moves."""
