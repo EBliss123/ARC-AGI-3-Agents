@@ -3250,6 +3250,51 @@ class AGI3(Agent):
             transform_events = [event for event in outcome if event.get('type') == 'TRANSFORM']
             print_rules_for_outcome(transform_events, i + 1, len(outcomes_with_transforms))
 
+        # --- NEW: Synthesize an overall rule if there are multiple outcomes ---
+        if len(outcomes_with_transforms) > 1:
+            print("    - Overall Transformation Rule:")
+            
+            all_color_transitions = set()
+            all_size_transitions = set()
+            all_shape_transitions = set()
+
+            for outcome in outcomes_with_transforms:
+                for event in outcome:
+                    if event.get('type') == 'TRANSFORM':
+                        before_obj, after_obj = event.get('before', {}), event.get('after', {})
+                        if before_obj and after_obj:
+                            all_color_transitions.add((before_obj.get('color'), after_obj.get('color')))
+                            all_size_transitions.add(((before_obj.get('height'), before_obj.get('width')),
+                                                      (after_obj.get('height'), after_obj.get('width'))))
+                            all_shape_transitions.add((before_obj.get('fingerprint'), after_obj.get('fingerprint')))
+            
+            # Helper function to analyze a set of transitions (before, after)
+            def analyze_transitions(transitions: set, label: str):
+                if not transitions: return
+
+                # Case 1: The attribute is always maintained (before == after).
+                if all(b == a for b, a in transitions):
+                    before_values = {b for b, a in transitions}
+                    if len(before_values) == 1:
+                        val = next(iter(before_values))
+                        val_str = f"{val[0]}x{val[1]}" if isinstance(val, tuple) else val
+                        print(f"        - {label} {val_str} was always maintained.")
+                    else:
+                        print(f"        - {label} was always maintained (but the specific value varied).")
+                # Case 2: There is one single, consistent change rule (e.g., always 8 -> 3).
+                elif len(transitions) > 0 and all(t == next(iter(transitions)) for t in transitions):
+                    b, a = next(iter(transitions))
+                    b_str = f"{b[0]}x{b[1]}" if isinstance(b, tuple) else b
+                    a_str = f"{a[0]}x{a[1]}" if isinstance(a, tuple) else a
+                    print(f"        - {label} consistently changed from {b_str} to {a_str}.")
+                # Case 3: The rule is variable.
+                else:
+                    print(f"        - {label} transformation rule is variable across outcomes.")
+
+            # Analyze and print the overall rules
+            analyze_transitions(all_color_transitions, "Color")
+            analyze_transitions(all_size_transitions, "Size")
+            analyze_transitions(all_shape_transitions, "Shape")
     def _review_and_summarize_interactions(self):
         """Reviews all interactable tiles and summarizes their learned properties."""
         print("\n--- 🧠 Interaction Knowledge Summary 🧠 ---")
