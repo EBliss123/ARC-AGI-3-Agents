@@ -286,17 +286,17 @@ class AGI3(Agent):
         # A new level is a more thorough version of a new attempt.
         self._reset_for_new_attempt()
 
-        # Additionally, reset knowledge that is strictly tied to a level's design.
-        print("🧹 Wiping interaction hypotheses and active patterns for the new level.")
-        self.interaction_hypotheses.clear()
-        self.active_patterns.clear()
-        self.has_summarized_interactions = False
-
         # Since the world model is preserved, we can skip discovery.
         print("🧠 Knowledge preserved. Skipping discovery and entering action state.")
         self.agent_state = AgentState.RANDOM_ACTION
         # --- NEW: Always synthesize a plan after a level is complete. ---
         self._synthesize_level_plan_hypothesis()
+
+        # Additionally, reset knowledge that is strictly tied to a level's design.
+        print("🧹 Wiping interaction hypotheses and active patterns for the new level.")
+        self.interaction_hypotheses.clear()
+        self.active_patterns.clear()
+        self.has_summarized_interactions = False
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """This is the main decision-making method for the AGI."""
@@ -3654,18 +3654,18 @@ class AGI3(Agent):
                             resulting_obj = None
                             if event.get('type') in ['SPAWN', 'TRANSFORM']:
                                 resulting_obj = event.get('after') or event.get('object')
+                            
                             if resulting_obj:
                                 if (resulting_obj.get('fingerprint') == required_fingerprint and
                                     resulting_obj.get('color') == required_color and
                                     (resulting_obj.get('height'), resulting_obj.get('width')) == required_size):
                                     
                                     try:
-                                        # Parse tile coordinates like "(4, 4)" from the signature key "tile_pos_(4, 4)"
                                         producer_tile_str = signature.replace("tile_pos_", "")
                                         producer_tile_tuple = tuple(map(int, producer_tile_str.strip('()').split(',')))
                                         producer_loc_str = get_loc_str_from_tile(producer_tile_tuple)
                                     except:
-                                        producer_loc_str = f"tile {producer_tile_str}" # Fallback
+                                        producer_loc_str = f"tile {producer_tile_str}"
                                     
                                     plan_steps_reversed.append(f"Interact with the object at {producer_loc_str} to create the required pattern component.")
                                     producer_found = True
