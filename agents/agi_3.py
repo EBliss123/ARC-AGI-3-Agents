@@ -740,7 +740,6 @@ class AGI3(Agent):
 
             if self.exploration_phase == ExplorationPhase.BUILDING_MAP:
                 print("🗺️ Building/updating the level map...")
-                self._build_level_map(latest_frame.frame)
                 self.just_vacated_tile = None # Clear the one-time flag after use.
                 self.exploration_phase = ExplorationPhase.SEEKING_TARGET
 
@@ -832,146 +831,6 @@ class AGI3(Agent):
         self.last_action = action
         return action
 
-    def _build_level_map(self, grid: list):
-        """
-        Creates a refined tile-based map, aware of the player's current and previous positions.
-        """
-        if not self.tile_size or not grid:
-            return
-        
-        confirmed_interactables = {pos for pos, cell_type in self.tile_map.items() if cell_type == CellType.CONFIRMED_INTERACTABLE}
-
-        temp_tile_map = {}
-        grid_data = grid[0]
-        grid_height = len(grid_data)
-        grid_width = len(grid_data[0]) if grid_height > 0 else 0
-        floor_color = self.world_model['floor_color']
-        wall_colors = self.world_model['wall_colors']
-
-        player_tile_coords = None
-        if self.last_known_player_obj and self.tile_size:
-            player_pixel_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
-            player_tile_coords = (player_pixel_pos[0] // self.tile_size, player_pixel_pos[1] // self.tile_size)
-
-        for r in range(0, grid_height, self.tile_size):
-            for c in range(0, grid_width, self.tile_size):
-                tile_coords = (r // self.tile_size, c // self.tile_size)
-
-                # --- NEW: Preserve confirmed knowledge ---
-                # If we already have a confirmed interaction for this tile,
-                # preserve its type and don't re-evaluate it based on color.
-                existing_type = self.tile_map.get(tile_coords)
-                if existing_type in [CellType.CONFIRMED_INTERACTABLE, CellType.POTENTIAL_MATCH, CellType.RESOURCE]:
-                    temp_tile_map[tile_coords] = existing_type
-                    continue
-                
-                if tile_coords == player_tile_coords or tile_coords == self.just_vacated_tile:
-                    if self.tile_map.get(tile_coords) == CellType.CONFIRMED_INTERACTABLE:
-                        temp_tile_map[tile_coords] = CellType.CONFIRMED_INTERACTABLE
-                    else:
-                        temp_tile_map[tile_coords] = CellType.FLOOR
-                    continue
-
-               # Get all unique colors within the tile's bounds
-                tile_pixels = [
-                    grid_data[row][col]
-                    for row in range(r, r + self.tile_size)
-                    for col in range(c, c + self.tile_size)
-                    if 0 <= row < grid_height and 0 <= col < grid_width
-                ]
-                
-                unique_colors = set(tile_pixels)
-
-                # A tile is only one type if all its pixels are that one color.
-                if len(unique_colors) == 1:
-                    single_color = unique_colors.pop()
-                    if single_color == floor_color:
-                        temp_tile_map[tile_coords] = CellType.FLOOR
-                    elif single_color in wall_colors:
-                        temp_tile_map[tile_coords] = CellType.WALL
-                    else:
-                        # It's a uniform tile of an unknown type
-                        temp_tile_map[tile_coords] = CellType.POTENTIALLY_INTERACTABLE
-                else:
-                    # Mixed pixels mean it's definitely something to investigate
-                    temp_tile_map[tile_coords] = CellType.POTENTIALLY_INTERACTABLE
-        
-        self.tile_map.update(temp_tile_map)
-
-        if not self.reachable_floor_area:
-            print("🗺️ No reachable area found. Map will not be refined.")
-
-        refined_tile_map = {}
-        for tile_coords in self.tile_map.keys():
-            # --- FIX: Preserve any tile that has a known function ---
-            # This prevents the refinement logic below from overwriting this knowledge.
-            existing_type = self.tile_map.get(tile_coords)
-            if existing_type in [CellType.CONFIRMED_INTERACTABLE, CellType.POTENTIAL_MATCH, CellType.RESOURCE]:
-                refined_tile_map[tile_coords] = existing_type
-                continue
-
-            is_in_or_adjacent_to_reachable = tile_coords in self.reachable_floor_area or any((tile_coords[0] + dr, tile_coords[1] + dc) in self.reachable_floor_area for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)])
-            if is_in_or_adjacent_to_reachable:
-                # Trust the initial, more thorough classification for adjacent tiles.
-                # This prevents single-pixel errors during refinement.
-                initial_type = temp_tile_map.get(tile_coords)
-                if initial_type is not None:
-                    refined_tile_map[tile_coords] = initial_type
-            else:
-                # Preserve the tile's existing type if it's not near the reachable area.
-                # This prevents erasing memory of explored but currently unreachable parts of the map.
-                if self.tile_map.get(tile_coords) is not None:
-                    refined_tile_map[tile_coords] = self.tile_map.get(tile_coords)
-
-        for tile_coords, cell_type in list(refined_tile_map.items()):
-            if cell_type in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE]:
-                # --- HYBRID CLEANUP LOGIC ---
-                # 1. Use a robust, full-tile check for Floors.
-                tile_pixels = [
-                    grid_data[row][col]
-                    for row in range(tile_coords[0] * self.tile_size, (tile_coords[0] + 1) * self.tile_size)
-                    for col in range(tile_coords[1] * self.tile_size, (tile_coords[1] + 1) * self.tile_size)
-                    if 0 <= row < grid_height and 0 <= col < grid_width
-                ]
-                unique_colors = set(tile_pixels)
-                is_uniform_floor = (len(unique_colors) == 1 and floor_color in unique_colors)
-
-                if is_uniform_floor:
-                    refined_tile_map[tile_coords] = CellType.FLOOR
-                else:
-                    # 2. If not floor, use the original, single-pixel check for Walls.
-                    sample_color = grid_data[tile_coords[0] * self.tile_size][tile_coords[1] * self.tile_size]
-                    if wall_colors and sample_color in wall_colors:
-                        refined_tile_map[tile_coords] = CellType.WALL
-
-        self.tile_map = refined_tile_map
-
-        self.reachable_floor_area = self._calculate_nav_mesh()
-
-        # For the log, summarize the composition of the *reachable* area for consistency.
-        reachable_tile_types = [self.tile_map[tile] for tile in self.reachable_floor_area if tile in self.tile_map]
-        counts = Counter(reachable_tile_types)
-        total_reachable_tiles = len(self.reachable_floor_area)
-
-        # Build a dynamic string for the counts to avoid printing zero-count categories.
-        counts_parts = []
-        if counts[CellType.FLOOR]:
-            counts_parts.append(f"{counts[CellType.FLOOR]} floor")
-        if counts[CellType.POTENTIALLY_INTERACTABLE]:
-            counts_parts.append(f"{counts[CellType.POTENTIALLY_INTERACTABLE]} potential")
-        if counts[CellType.CONFIRMED_INTERACTABLE]:
-            counts_parts.append(f"{counts[CellType.CONFIRMED_INTERACTABLE]} interactable")
-        if counts[CellType.RESOURCE]:
-            counts_parts.append(f"{counts[CellType.RESOURCE]} resource")
-        # Note: Walls should not be in the reachable area, but include as a safety check.
-        if counts[CellType.WALL]:
-            counts_parts.append(f"{counts[CellType.WALL]} wall")
-            
-        counts_str = ", ".join(counts_parts)
-        
-        # This new print statement is for our test.
-        print(f"✅ TEST LOG ({total_reachable_tiles} reachable tiles): {counts_str}.")
-    
     def _find_target_and_plan(self) -> bool:
         """
         Finds the best interactable tile by pathfinding to all available targets
@@ -1066,48 +925,48 @@ class AGI3(Agent):
                 self.awaiting_final_summary = True
             return False
 
-        # 2. Find paths to all potential targets and store the ones that are reachable.
+        # 2. Find the shortest path to each potential target object.
         reachable_targets = []
         for obj in potential_target_objects:
-            adjacent_floor_tiles = self._get_adjacent_floor_tiles(obj)
-            if not adjacent_floor_tiles:
+            adjacent_positions = self._get_adjacent_pixel_positions(obj)
+            if not adjacent_positions:
                 continue
                 
             shortest_path_for_obj = None
-            best_target_tile_for_obj = None
+            best_target_pos_for_obj = None
 
-            for target_tile in adjacent_floor_tiles:
-                path = self._find_path_to_target(player_tile_pos, target_tile)
+            for target_pos in adjacent_positions:
+                path = self._find_path_to_position(player_pixel_pos, target_pos)
                 if path:
                     if shortest_path_for_obj is None or len(path) < len(shortest_path_for_obj):
                         shortest_path_for_obj = path
-                        best_target_tile_for_obj = target_tile
+                        best_target_pos_for_obj = target_pos
 
             if shortest_path_for_obj:
                 reachable_targets.append({
                     'object': obj, 
                     'path': shortest_path_for_obj,
-                    'target_tile': best_target_tile_for_obj
+                    'target_pos': best_target_pos_for_obj
                 })
 
         if not reachable_targets:
             print("🧐 All potential object targets are currently unreachable.")
+            self._print_debug_map()
             return False
 
         # 3. From the list of reachable targets, select the one with the shortest path.
         best_target = min(reachable_targets, key=lambda t: len(t['path']))
         
         target_obj = best_target['object']
-        target_tile_to_stand_on = best_target['target_tile']
+        target_pixel_to_stand_on = best_target['target_pos']
 
         # 4. Set the exploration plan and target.
         self.exploration_target = (target_obj['top_row'], target_obj['left_index'])
         self.exploration_plan = best_target['path']
         
-        print(f"🎯 New object target acquired at pixel {self.exploration_target}. Plan to reach adjacent tile {target_tile_to_stand_on} created with {len(self.exploration_plan)} steps.")
+        print(f"🎯 New object target acquired at pixel {self.exploration_target}. Plan to stand at {target_pixel_to_stand_on} created with {len(self.exploration_plan)} steps.")
         
         self._print_debug_map()
-
         return True
 
     def _find_nearest_resource(self, player_tile_pos: tuple) -> dict | None:
@@ -1367,6 +1226,25 @@ class AGI3(Agent):
                     print(f"- Found a {height}x{width} object of color {color} at pixel ({min_row}, {min_idx}) with fingerprint {fingerprint}. [{label}]")
 
         print("--- End of Scan ---\n")
+
+    def _get_adjacent_pixel_positions(self, target_obj: dict) -> list:
+        """Calculates ideal pixel positions for the agent to stand adjacent to a target object."""
+        if not self.last_known_player_obj: return []
+        
+        agent_h, agent_w = self.last_known_player_obj['height'], self.last_known_player_obj['width']
+        
+        # Positions to the TOP, BOTTOM, LEFT, and RIGHT of the target object
+        positions = [
+            # Top: Agent's bottom edge touches target's top edge, centered horizontally
+            (target_obj['top_row'] - agent_h, target_obj['left_index'] + (target_obj['width'] // 2) - (agent_w // 2)),
+            # Bottom: Agent's top edge touches target's bottom edge, centered horizontally
+            (target_obj['top_row'] + target_obj['height'], target_obj['left_index'] + (target_obj['width'] // 2) - (agent_w // 2)),
+            # Left: Agent's right edge touches target's left edge, centered vertically
+            (target_obj['top_row'] + (target_obj['height'] // 2) - (agent_h // 2), target_obj['left_index'] - agent_w),
+            # Right: Agent's left edge touches target's right edge, centered vertically
+            (target_obj['top_row'] + (target_obj['height'] // 2) - (agent_h // 2), target_obj['left_index'] + target_obj['width'])
+        ]
+        return positions
 
     def _get_all_objects_from_grid(self, grid_data: list) -> list[dict]:
         """Scans a grid and returns a list of all found objects without printing or labeling."""
