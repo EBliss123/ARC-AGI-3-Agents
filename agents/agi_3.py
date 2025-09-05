@@ -96,6 +96,7 @@ class AGI3(Agent):
         self.last_known_objects = [] # Stores full object descriptions from the last frame
         self.world_model = {
             'player_signature': None,
+            'player_part_signatures': set(),
             'floor_color': None,
             'wall_colors': set(),
             'action_map': {},
@@ -1404,7 +1405,7 @@ class AGI3(Agent):
                         label = "Floor"
                     elif color in wall_colors:
                         label = "Wall"
-                    elif fingerprint in self.world_model.get('player_part_fingerprints', set()):
+                    elif (fingerprint, (height, width), color) in self.world_model.get('player_part_signatures', set()):
                         label = "Agent Component"
                     elif (height, width, color) in self.world_model.get('life_indicator_signatures', set()):
                         label = "Life Indicator"
@@ -2127,6 +2128,9 @@ class AGI3(Agent):
                     for part in agent_parts_to_store:
                         if 'fingerprint' in part:
                             self.world_model['player_part_fingerprints'].add(part['fingerprint'])
+                            # --- NEW: Store the detailed signature for more accurate labeling ---
+                            part_sig = (part['fingerprint'], (part['height'], part['width']), part['color'])
+                            self.world_model['player_part_signatures'].add(part_sig)
                     
                     log_messages.append(f"-> Stored {len(self.world_model['player_part_fingerprints'])} unique agent part fingerprint(s).")
                     self._scan_and_label_all_objects(latest_grid[0], "Agent Confirmed")
