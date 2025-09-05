@@ -955,7 +955,7 @@ class AGI3(Agent):
 
         self.tile_map = refined_tile_map
 
-        self.reachable_floor_area = self._find_reachable_floor_tiles()
+        self.reachable_floor_area = self._calculate_nav_mesh()
 
         # For the log, summarize the composition of the *reachable* area for consistency.
         reachable_tile_types = [self.tile_map[tile] for tile in self.reachable_floor_area if tile in self.tile_map]
@@ -1238,9 +1238,10 @@ class AGI3(Agent):
 
         return adjacent_floor_tiles
     
-    def _find_reachable_floor_tiles(self) -> set:
+    def _calculate_nav_mesh(self) -> set:
         """
-        Performs a BFS/flood-fill from the player's position to find all connected floor tiles.
+        Performs a BFS/flood-fill from the player's position to build a NavMesh
+        representing all connected, walkable space.
         """
         # Ensure we have the necessary information to start.
         if not self.last_known_player_obj or not self.tile_size or not self.tile_map:
@@ -2289,43 +2290,7 @@ class AGI3(Agent):
                             self.world_model['action_map'][action] = {'move_vector': effect_vector}
                             log_messages.append(f"✅ UPDATED Action Effect: {action.name} now moves agent by vector {effect_vector}.")
                             
-                            # Re-calculate tile size and generalize the new magnitude.
-                            new_magnitude = abs(effect_vector[0]) + abs(effect_vector[1])
-                            if new_magnitude > 1: # A move of 1 is ambiguous
-                                if self.tile_size != new_magnitude:
-                                    self.tile_size = new_magnitude
-                                    print(f"📏 Tile Size Re-evaluated: Now {self.tile_size}px based on new movement.")
-                                    log_messages.append("🗺️ Tile size changed. Wiping all level-specific map and interaction data.")
-                                    self.tile_map.clear()
-                                    self.reachable_floor_area.clear()
-                                    self.interaction_hypotheses.clear()
-                                    self.consumed_tiles_this_life.clear()
-                                    self.exploration_plan.clear()
-                                    self.exploration_target = None
-                                    self.observing_interaction_for_tile = None
-                                    self.exploration_phase = ExplorationPhase.INACTIVE
-
-                                # --- Generalize this new magnitude to all other move actions ---
-                                log_messages.append(f" -> Generalizing new magnitude of {new_magnitude}px to all other move actions.")
-                                for other_action, effect in self.world_model['action_map'].items():
-                                    if other_action == action: continue # Skip the action we just updated
-                                    
-                                    if 'move_vector' in effect:
-                                        old_vec = effect['move_vector']
-                                        old_mag = abs(old_vec[0]) + abs(old_vec[1])
-                                        if old_mag == 0: continue # Skip zero vectors
-                                        
-                                        # Integer division works here for axis-aligned unit vectors
-                                        unit_vec = (old_vec[0] // old_mag, old_vec[1] // old_mag)
-                                        
-                                        # Create the new vector using the new magnitude
-                                        new_vec = (unit_vec[0] * new_magnitude, unit_vec[1] * new_magnitude)
-                                        
-                                        if old_vec != new_vec:
-                                            self.world_model['action_map'][other_action]['move_vector'] = new_vec
-                                            log_messages.append(f"    -> Updated {other_action.name} move vector to {new_vec}.")
-                            
-                            # This hypothesis is now confirmed, clear it to start fresh for the next change.
+                            # The hypothesis is confirmed, clear it to learn the next one.
                             if action in self.action_effect_hypothesis:
                                 del self.action_effect_hypothesis[action]
 
