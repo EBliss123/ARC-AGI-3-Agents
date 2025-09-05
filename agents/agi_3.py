@@ -603,7 +603,8 @@ class AGI3(Agent):
 
             # 4. Check for goal patterns on the REMAINING non-agent objects.
             if non_agent_objects:
-                self._find_and_update_patterns(non_agent_objects, latest_frame.frame)
+                all_objects_on_grid = self._get_all_objects_from_grid(latest_frame.frame[0])
+                self._find_and_update_patterns(non_agent_objects, all_objects_on_grid)
             if self.active_patterns:
                 print(f"--- {len(self.active_patterns)} Active Pattern(s) on Grid ---")
                 for i, pattern in enumerate(self.active_patterns):
@@ -2954,16 +2955,15 @@ class AGI3(Agent):
             if object_signature in self.interaction_hypotheses:
                 self.interaction_hypotheses[object_signature]['is_consumable'] = False
 
-    def _find_and_update_patterns(self, dynamic_objects: list, current_grid: list):
+    def _find_and_update_patterns(self, dynamic_objects: list, all_grid_objects: list):
         """
-        Scans for patterns by matching dynamic objects to static ones and updates the
-        agent's list of currently active patterns.
+        Scans for patterns by matching dynamic objects to the full set of objects on the grid.
+        A pattern is a match in shape fingerprint between two distinct objects.
         """
-        if not dynamic_objects or not current_grid:
+        if not dynamic_objects or not all_grid_objects:
             return
 
         print(f"🔬 Checking for patterns based on {len(dynamic_objects)} new object(s)...")
-        grid_data = current_grid[0]
 
         # Get fingerprints of patterns already known to be active to avoid adding duplicates.
         known_pattern_fingerprints = {p['fingerprint'] for p in self.active_patterns}
@@ -2987,13 +2987,9 @@ class AGI3(Agent):
                     continue # Skip this object, it's part of the UI.
 
             dk_fingerprint = dynamic_key_obj.get('fingerprint')
-            dk_color = dynamic_key_obj.get('color')
-            if dk_fingerprint is None or dk_color is None: continue
+            if dk_fingerprint is None: continue
 
-            static_candidates = self._find_static_candidates_by_color(dk_color, grid_data)
-            if not static_candidates: continue
-
-            for static_obj in static_candidates:
+            for static_obj in all_grid_objects:
                 if dk_fingerprint == static_obj.get('fingerprint'):
                     dk_size = (dynamic_key_obj['height'], dynamic_key_obj['width'])
                     dk_pos = (dynamic_key_obj['top_row'], dynamic_key_obj['left_index'])
@@ -3003,12 +2999,12 @@ class AGI3(Agent):
                     if dk_pos == sk_pos and dk_size == sk_size: continue
 
                     # Create a unique ID for this specific pattern instance to avoid duplicates.
-                    pattern_fingerprint = (dk_fingerprint, static_obj.get('fingerprint'), sk_pos)
+                    pattern_fingerprint = (dk_fingerprint, sk_pos)
 
                     if pattern_fingerprint not in known_pattern_fingerprints:
                         dk_loc_str = self._format_location_string(dk_pos)
                         sk_loc_str = self._format_location_string(sk_pos)
-                        print(f"✅ NEW PATTERN DETECTED: Dynamic key at {dk_loc_str} matches static key at {sk_loc_str}!")
+                        print(f"✅ NEW PATTERN DETECTED: Dynamic object at {dk_loc_str} matches static object at {sk_loc_str}!")
 
                         new_pattern = {
                             'dynamic_key': dynamic_key_obj,
@@ -3083,9 +3079,8 @@ class AGI3(Agent):
         print("--- Key: P=Player, T=Target, .=Floor, #=Wall, ?=Potential, !=Confirmed, ~=Match ---\n")
 
     def _format_location_string(self, pixel_pos: tuple) -> str:
-        """Formats a pixel position into a 'tile (r, c)' or 'pixel (r, c)' string."""
-        if not self.tile_size:
-            return f"pixel {pixel_pos}"
+        """Formats a pixel position into a 'pixel (r, c)' string for consistency."""
+        return f"pixel {pixel_pos}"
 
         # Determine the "playable area" to see if tile coordinates are relevant.
         display_area = set(self.reachable_floor_area)
