@@ -698,6 +698,15 @@ class AGI3(Agent):
             return self.wait_action
 
         # --- Intelligent Exploration Logic ---
+        # --- Debug print for exploration prerequisites ---
+        print("\n--- Exploration Prerequisites Check ---")
+        print(f"  - 1. Player Signature Learned: {bool(self.world_model.get('player_signature'))}")
+        print(f"  - 2. Floor Color Learned:      {bool(self.world_model.get('floor_color'))}")
+        print(f"  - 3. Action Map Learned:       {bool(self.world_model.get('action_map'))}")
+        print(f"  - 4. Agent Position Known:     {bool(self.last_known_player_obj)}")
+        print(f"  - 5. Tile Size Known:          {self.tile_size is not None} (Value: {self.tile_size})")
+        print("------------------------------------")
+        
         can_explore = (self.world_model.get('player_signature') and
                self.world_model.get('floor_color') and
                self.world_model.get('action_map') and
@@ -999,150 +1008,113 @@ class AGI3(Agent):
                 self._print_debug_map()
                 return True # Exit immediately with a plan to get resources.
         
-        # --- PRIORITY 1: Explore all potentially interactable objects ---
-        print("🎯 Activating PRIORITY 1: Seeking all potentially interactable tiles.")
-        # First, calculate the visible "display area," just as the debug map does.
-        display_area = set(self.reachable_floor_area)
-        for r_tile, c_tile in self.reachable_floor_area:
-            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                neighbor = (r_tile + dr, c_tile + dc)
-                if neighbor in self.tile_map:
-                    display_area.add(neighbor)
-
-        # Now, search for targets ONLY within this visible area.
-        potential_targets = [pos for pos, type in self.tile_map.items() 
-                            if type == CellType.POTENTIALLY_INTERACTABLE and pos in display_area]
-        
-        # Before planning, review potential targets for any pre-existing knowledge.
-        known_interactables = []
-        for tile_pos in potential_targets:
-            signature = f"tile_pos_{tile_pos}"
-            if signature in self.interaction_hypotheses:
-                # --- NEW: Check for cross-level match before confirming ---
-                is_match = False
-                if self.previous_frame:
-                    objects_on_tile = self._find_all_objects_on_tile(tile_pos, self.previous_frame)
-                    for obj in objects_on_tile:
-                        if obj.get('fingerprint') in self.cross_level_characteristics:
-                            is_match = True
-                            break
-
-                if is_match:
-                    self.tile_map[tile_pos] = CellType.POTENTIAL_MATCH
-                    print(f"🧠 Pre-existing knowledge for tile {tile_pos}. Reclassifying as POTENTIAL_MATCH '~'.")
-                else:
-                    self.tile_map[tile_pos] = CellType.CONFIRMED_INTERACTABLE
-                    print(f"🧠 Pre-existing knowledge for tile {tile_pos}. Reclassifying as CONFIRMED_INTERACTABLE '!'.")
-                if self.previous_frame:
-                    self._log_object_characteristics(tile_pos, self.previous_frame)
-                known_interactables.append(tile_pos)
-        
-        # Remove the now-known interactables from the list of potential targets.
-        potential_targets = [p for p in potential_targets if p not in known_interactables]
-
-        # Before planning, check if any potential targets are known resources.
+        # --- NEW: Get a master list of all potential interactable OBJECTS ---
+        all_objects = self._get_all_objects_from_grid(self.previous_frame[0])
+        candidate_objects = []
+        agent_part_signatures = self.world_model.get('player_part_signatures', set())
+        life_indicator_signatures = self.world_model.get('life_indicator_signatures', set())
+        level_indicator_signatures = self.world_model.get('level_indicator_signatures', set())
         resource_signatures = self.world_model.get('resource_signatures', set())
-        if resource_signatures and self.previous_frame:
-            grid_data = self.previous_frame
-            for tile_pos in list(potential_targets): # Iterate over a copy
-                obj_on_tile = self._find_object_on_tile(tile_pos, grid_data)
-                if obj_on_tile:
-                    obj_fingerprint = obj_on_tile.get('fingerprint')
-                    obj_size = (obj_on_tile.get('height'), obj_on_tile.get('width'))
-                    obj_color = obj_on_tile.get('color')
-                    composite_signature = (obj_fingerprint, obj_size, obj_color)
-                    
-                    if composite_signature in resource_signatures:
-                        print(f"🧠 Pre-existing knowledge found for tile {tile_pos}. Reclassifying as RESOURCE.")
-                        self.tile_map[tile_pos] = CellType.RESOURCE
-                        potential_targets.remove(tile_pos)
         
-        # --- End of Priority 1 Logic ---
+        for obj in all_objects:
+            h, w, c, fp = obj['height'], obj['width'], obj['color'], obj['fingerprint']
+            part_sig = (fp, (h, w), c)
+            indicator_sig = (h, w, c)
+            if c == self.world_model.get('floor_color'): continue
+            if c in self.world_model.get('wall_colors', set()): continue
+            if part_sig in agent_part_signatures: continue
+            if indicator_sig in life_indicator_signatures: continue
+            if indicator_sig in level_indicator_signatures: continue
+            if part_sig in resource_signatures: continue
+            if self.confirmed_resource_indicator and obj['top_row'] == self.confirmed_resource_indicator['row_index']: continue
+            candidate_objects.append(obj)
 
-        if not potential_targets:
-            # If there are no more potentially interactable tiles, queue the summary immediately.
-            if not self.has_summarized_interactions and not self.awaiting_final_summary:
-                    print("✅ All potential interactables discovered. Queuing knowledge summary for the next turn.")
-                    self.awaiting_final_summary = True
-            
-            # --- PRIORITY 2: Test mysterious objects while a pattern is active ---
+        # --- Filter these candidate_objects based on priorities ---
+        potential_target_objects = []
+        
+        # PRIORITY 1: Untested Objects
+        print("🎯 Activating PRIORITY 1: Seeking all untested objects.")
+        untested_objects = []
+        for obj in candidate_objects:
+            obj_tile = (obj['top_row'] // self.tile_size, obj['left_index'] // self.tile_size)
+            signature = f"tile_pos_{obj_tile}"
+            if signature not in self.interaction_hypotheses:
+                untested_objects.append(obj)
+        
+        if untested_objects:
+            potential_target_objects = untested_objects
+        else:
             if self.active_patterns:
+                # PRIORITY 2: Test mysterious objects if a pattern is active
                 print("🎯 Activating PRIORITY 2: Pattern is active. Seeking interactables with no known effect.")
-                
-                interactables_with_no_effect = []
-                all_confirmed_interactables = [pos for pos, type in self.tile_map.items() if type in [CellType.CONFIRMED_INTERACTABLE, CellType.POTENTIAL_MATCH]]
-
-                for tile_pos in all_confirmed_interactables:
-                    if tile_pos in self.consumed_tiles_this_life:
-                        continue
-                    signature = f"tile_pos_{tile_pos}"
+                mysterious_objects = []
+                for obj in candidate_objects:
+                    obj_tile = (obj['top_row'] // self.tile_size, obj['left_index'] // self.tile_size)
+                    signature = f"tile_pos_{obj_tile}"
                     hypothesis = self.interaction_hypotheses.get(signature)
-                    # "No effect observed" means a hypothesis exists, but it recorded no effects.
                     if hypothesis and not hypothesis.get('immediate_effect') and not hypothesis.get('aftermath_effect') and not hypothesis.get('provides_resource'):
-                        interactables_with_no_effect.append(tile_pos)
-
-                if interactables_with_no_effect:
-                    print(f"-> Found {len(interactables_with_no_effect)} interactable(s) with no effect to re-test.")
-                    # If we found some, they become our new potential targets for this turn.
-                    potential_targets = interactables_with_no_effect
-                else:
-                    print("-> No mysterious objects to test. All interactables have an observed effect.")
-            # --- End of Priority 2 Logic ---
-
+                        if obj_tile not in self.consumed_tiles_this_life:
+                            mysterious_objects.append(obj)
+                potential_target_objects = mysterious_objects
             else:
-                # --- PRIORITY 3: Use known tools to create a pattern ---
+                # PRIORITY 3: Use known tools if no pattern is active
                 print("🎯 Activating PRIORITY 3: No patterns active. Seeking interactables with a known function.")
-
-                interactables_with_known_function = []
-                all_confirmed_interactables = [pos for pos, type in self.tile_map.items() if type in [CellType.CONFIRMED_INTERACTABLE, CellType.POTENTIAL_MATCH]]
-
-                for tile_pos in all_confirmed_interactables:
-                    if tile_pos in self.consumed_tiles_this_life:
-                        continue
-                    signature = f"tile_pos_{tile_pos}"
+                known_tool_objects = []
+                for obj in candidate_objects:
+                    obj_tile = (obj['top_row'] // self.tile_size, obj['left_index'] // self.tile_size)
+                    signature = f"tile_pos_{obj_tile}"
                     hypothesis = self.interaction_hypotheses.get(signature)
-                    # "Known function" means a hypothesis exists and it recorded some kind of effect.
                     if hypothesis and (hypothesis.get('immediate_effect') or hypothesis.get('aftermath_effect')):
-                        interactables_with_known_function.append(tile_pos)
-                
-                if interactables_with_known_function:
-                    print(f"-> Found {len(interactables_with_known_function)} interactable(s) with known functions to test.")
-                    potential_targets = interactables_with_known_function
-                else:
-                    print("-> No interactable objects with known functions found.")
-            # --- End of Priority 3 Logic ---
-
-            # If we still have no targets after P1 and P2, then exploration is complete for now.
-            if not potential_targets:
-                return False
+                        if obj_tile not in self.consumed_tiles_this_life:
+                            known_tool_objects.append(obj)
+                potential_target_objects = known_tool_objects
+        
+        if not potential_target_objects:
+            if not self.has_summarized_interactions and not self.awaiting_final_summary:
+                print("✅ All potential interactables discovered. Queuing knowledge summary for the next turn.")
+                self.awaiting_final_summary = True
+            return False
 
         # 2. Find paths to all potential targets and store the ones that are reachable.
         reachable_targets = []
-        for target_pos in potential_targets:
-            if target_pos == player_tile_pos:
+        for obj in potential_target_objects:
+            adjacent_floor_tiles = self._get_adjacent_floor_tiles(obj)
+            if not adjacent_floor_tiles:
                 continue
                 
-            path = self._find_path_to_target(player_tile_pos, target_pos)
-            if path:
-                reachable_targets.append({'pos': target_pos, 'path': path})
+            shortest_path_for_obj = None
+            best_target_tile_for_obj = None
+
+            for target_tile in adjacent_floor_tiles:
+                path = self._find_path_to_target(player_tile_pos, target_tile)
+                if path:
+                    if shortest_path_for_obj is None or len(path) < len(shortest_path_for_obj):
+                        shortest_path_for_obj = path
+                        best_target_tile_for_obj = target_tile
+
+            if shortest_path_for_obj:
+                reachable_targets.append({
+                    'object': obj, 
+                    'path': shortest_path_for_obj,
+                    'target_tile': best_target_tile_for_obj
+                })
 
         if not reachable_targets:
-            print("🧐 All interactable targets are currently unreachable.")
-            potential_targets = []
-
-            if not reachable_targets:
-                return False # If we still have no reachable targets after all checks, now we can exit.
+            print("🧐 All potential object targets are currently unreachable.")
+            return False
 
         # 3. From the list of reachable targets, select the one with the shortest path.
         best_target = min(reachable_targets, key=lambda t: len(t['path']))
-
-        # 4. Set the exploration plan based on the best target found.
-        self.exploration_target = (best_target['pos'][0] * self.tile_size, best_target['pos'][1] * self.tile_size)
-        self.exploration_plan = best_target['path']
-        print(f"🎯 New target acquired at {best_target['pos']}. Plan created with {len(self.exploration_plan)} steps.")
         
-        # Calculate the reachable area just before printing the map to give the most current view.
-        self.reachable_floor_area = self._find_reachable_floor_tiles()
+        target_obj = best_target['object']
+        target_tile_to_stand_on = best_target['target_tile']
+
+        # 4. Set the exploration plan and target.
+        self.exploration_target = (target_obj['top_row'], target_obj['left_index'])
+        self.exploration_plan = best_target['path']
+        
+        print(f"🎯 New object target acquired at pixel {self.exploration_target}. Plan to reach adjacent tile {target_tile_to_stand_on} created with {len(self.exploration_plan)} steps.")
+        
         self._print_debug_map()
 
         return True
@@ -1238,6 +1210,33 @@ class AGI3(Agent):
                     heapq.heappush(open_set, (f_score, tentative_g_score, neighbor_tile, next_moves, path + [action]))
 
         return []  # No path found
+
+    def _get_adjacent_floor_tiles(self, obj: dict) -> set:
+        """Finds all reachable floor tiles that are adjacent to any tile an object occupies."""
+        if not self.tile_size: return set()
+
+        object_tiles = set()
+        # Find all tiles this object's actual pixels are on (ignores empty space in bounding box)
+        for r_pixel in range(obj['top_row'], obj['top_row'] + obj['height']):
+            for c_pixel in range(obj['left_index'], obj['left_index'] + obj['width']):
+                relative_r = r_pixel - obj['top_row']
+                relative_c = c_pixel - obj['left_index']
+                if obj['data_map'][relative_r][relative_c] is not None:
+                    object_tiles.add((r_pixel // self.tile_size, c_pixel // self.tile_size))
+        
+        adjacent_floor_tiles = set()
+        # For each tile the object is on, find its valid neighbors
+        for r_tile, c_tile in object_tiles:
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]: # N, S, E, W neighbors
+                neighbor_tile = (r_tile + dr, c_tile + dc)
+                
+                # A valid interaction tile must be reachable floor and not part of the object itself.
+                if (neighbor_tile not in object_tiles and
+                    self.tile_map.get(neighbor_tile) == CellType.FLOOR and
+                    neighbor_tile in self.reachable_floor_area):
+                    adjacent_floor_tiles.add(neighbor_tile)
+
+        return adjacent_floor_tiles
     
     def _find_reachable_floor_tiles(self) -> set:
         """
@@ -1495,6 +1494,22 @@ class AGI3(Agent):
                     min_idx = min(p_idx for _, p_idx in component_points)
                     max_idx = max(p_idx for _, p_idx in component_points)
                     height, width = max_row - min_row + 1, max_idx - min_idx + 1
+
+                    background_color = None
+                    border_min_row = max(0, min_row - 1)
+                    border_max_row = min(grid_height - 1, max_row + 1)
+                    border_min_idx = max(0, min_idx - 1)
+                    border_max_idx = min(grid_width - 1, max_idx + 1)
+                    
+                    border_colors = []
+                    for r_ in range(border_min_row, border_max_row + 1):
+                        for c_ in range(border_min_idx, border_max_idx + 1):
+                            is_on_border = (r_ < min_row or r_ > max_row or c_ < min_idx or c_ > max_idx)
+                            if is_on_border:
+                                border_colors.append(grid_data[r_][c_])
+                    
+                    if border_colors and all(c__ == border_colors[0] for c__ in border_colors):
+                        background_color = border_colors[0]
 
                     data_map = tuple(tuple(grid_data[r][c] if (r, c) in component_points else None for c in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
                     _, fingerprint, _ = self._create_normalized_fingerprint(data_map)
@@ -2162,24 +2177,44 @@ class AGI3(Agent):
 
         # 2. Identify the Floor (can only happen after agent is known)
         if self.world_model['player_signature'] is not None and self.world_model['floor_color'] is None:
+            agent_move = None
             for move in true_moves:
                 if move['signature'] == self.world_model['player_signature']:
-                    # The agent moved. Find the color of the ground it was on.
-                    background_colors = set()
-                    if move['type'] == 'individual':
-                        color = move['last_obj'].get('background_color')
-                        if color is not None: background_colors.add(color)
-                    else: # Composite move
-                        for _, last_part in move['parts']:
-                            color = last_part.get('background_color')
-                            if color is not None: background_colors.add(color)
-
-                    # If we found one consistent background color for all parts, it's a candidate.
-                    if len(background_colors) == 1:
-                        floor_candidate = background_colors.pop()
+                    agent_move = move
+                    break
+            
+            if agent_move:
+                # The agent moved. Find the color of the ground it revealed by looking
+                # at the pixel changes that occurred within its previous bounding box.
+                last_pos_parts = []
+                if agent_move['type'] == 'individual':
+                    last_pos_parts = [agent_move['last_obj']]
+                else: # composite
+                    last_pos_parts = [p[1] for p in agent_move['parts']] # p[1] is the last_obj
+                
+                if last_pos_parts:
+                    min_r = min(p['top_row'] for p in last_pos_parts)
+                    max_r = max(p['top_row'] + p['height'] for p in last_pos_parts)
+                    min_c = min(p['left_index'] for p in last_pos_parts)
+                    max_c = max(p['left_index'] + p['width'] for p in last_pos_parts)
+                    
+                    revealed_colors = Counter()
+                    # Check structured_changes for pixels that changed TO a new color within this box
+                    for change in structured_changes:
+                        row_idx = change['row_index']
+                        if min_r <= row_idx < max_r:
+                            for px_change in change['changes']:
+                                col_idx = px_change['index']
+                                if min_c <= col_idx < max_c:
+                                    revealed_colors[px_change['to']] += 1
+                    
+                    if revealed_colors:
+                        # The most common color revealed is our best candidate for the floor.
+                        floor_candidate, _ = revealed_colors.most_common(1)[0]
+                        
                         self.floor_hypothesis[floor_candidate] = self.floor_hypothesis.get(floor_candidate, 0) + 1
                         confidence = self.floor_hypothesis[floor_candidate]
-                        log_messages.append(f"🕵️‍♀️ Floor Hypothesis: Color {floor_candidate} is a candidate (Confidence: {confidence}).")
+                        log_messages.append(f"🕵️‍♀️ Floor Hypothesis: Agent movement revealed color {floor_candidate} (Confidence: {confidence}).")
 
                         if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
                             self.world_model['floor_color'] = floor_candidate
@@ -2201,8 +2236,6 @@ class AGI3(Agent):
                                                 reclassified_count += 1
                                 if reclassified_count > 0:
                                     log_messages.append(f"🧹 Map Cleanup: Reclassified {reclassified_count} tile(s) as newly confirmed floor.")
-
-                            break # Stop after confirming.
 
         # --- Action Effect Learning ---
         # Learn how actions affect the agent.
