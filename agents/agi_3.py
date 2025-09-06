@@ -868,6 +868,20 @@ class AGI3(Agent):
                     current_floor_object = obj
                     break # Found the floor we're on
 
+        # --- Debug print to verify the identified floor area ---
+        print("\n--- Verifying Playable Floor Area ---")
+        if current_floor_object:
+            floor_top_left = (current_floor_object['top_row'], current_floor_object['left_index'])
+            floor_bottom_right = (
+                current_floor_object['top_row'] + current_floor_object['height'] - 1,
+                current_floor_object['left_index'] + current_floor_object['width'] - 1
+            )
+            print(f"-> Agent believes the floor is a {current_floor_object['height']}x{current_floor_object['width']} object of color {current_floor_object['color']}.")
+            print(f"-> Playable Coordinates (Bounding Box): ({floor_top_left[0]},{floor_top_left[1]}) through ({floor_bottom_right[0]},{floor_bottom_right[1]})")
+        else:
+            print("-> ⚠️ CRITICAL: Agent could not identify the floor object it is standing on.")
+        print("-------------------------------------")
+
         # --- Now, filter all objects to find valid candidates ---
         candidate_objects = []
         agent_part_signatures = self.world_model.get('player_part_signatures', set())
@@ -968,7 +982,7 @@ class AGI3(Agent):
             best_target_pos_for_obj = None
 
             for target_pos in adjacent_positions:
-                path = self._find_path_to_position(player_pixel_pos, target_pos)
+                path = self._find_path_to_position(player_pixel_pos, target_pos, current_floor_object)
                 if path:
                     if shortest_path_for_obj is None or len(path) < len(shortest_path_for_obj):
                         shortest_path_for_obj = path
@@ -1004,107 +1018,126 @@ class AGI3(Agent):
         if not self.previous_frame: return None
 
         all_objects = self._get_all_objects_from_grid(self.previous_frame[0])
+        
+        # Find the current floor object to pass to the pathfinder
+        current_floor_object = None
+        floor_color = self.world_model.get('floor_color')
+        for obj in all_objects:
+            if obj['color'] == floor_color:
+                if (obj['top_row'] <= player_pixel_pos[0] < obj['top_row'] + obj['height'] and
+                    obj['left_index'] <= player_pixel_pos[1] < obj['left_index'] + obj['width']):
+                    current_floor_object = obj
+                    break
+
         resource_signatures = self.world_model.get('resource_signatures', set())
         resource_objects = [obj for obj in all_objects if (obj.get('fingerprint'), (obj.get('height'), obj.get('width')), obj.get('color')) in resource_signatures]
 
-        if not resource_objects:
-            return None
+        if not resource_objects: return None
 
         reachable_resources = []
         for resource_obj in resource_objects:
             adjacent_positions = self._get_interaction_pixel_positions(resource_obj)
             shortest_path = None
-
+            
+            # Find the best path to this specific resource
+            best_target_pos = None
             for pos in adjacent_positions:
-                path = self._find_path_to_position(player_pixel_pos, pos)
+                path = self._find_path_to_position(player_pixel_pos, pos, current_floor_object)
                 if path and (shortest_path is None or len(path) < len(shortest_path)):
                     shortest_path = path
+                    best_target_pos = pos
             
             if shortest_path:
-                reachable_resources.append({'object': resource_obj, 'path': shortest_path, 'target_pos': pos})
+                reachable_resources.append({'object': resource_obj, 'path': shortest_path, 'target_pos': best_target_pos})
 
-        if not reachable_resources:
-            return None
+        if not reachable_resources: return None
 
         return min(reachable_resources, key=lambda r: len(r['path']))
 
-    def _find_path_to_position(self, start_pos: tuple, target_pos: tuple) -> list | None:
+    def _find_path_to_position(self, start_pos: tuple, target_pos: tuple, floor_object: dict) -> list | None:
         """
         Finds a path from a start pixel position to a target pixel position using A*.
-        Navigation is done in "steps" based on learned action vectors, and it avoids
-        colliding with known Wall objects.
+        Navigation is constrained to the floor and avoids all static obstacles.
         """
         if not self.world_model.get('action_map') or not self.last_known_player_obj or not self.previous_frame:
             return None
 
-        # 1. Define agent's footprint and identify obstacles.
+        # 1. Define agent's footprint and identify ALL potential obstacles.
         player_footprint = (self.last_known_player_obj['height'], self.last_known_player_obj['width'])
-        
         all_objects = self._get_all_objects_from_grid(self.previous_frame[0])
-        wall_objects = [obj for obj in all_objects if obj['color'] in self.world_model.get('wall_colors', set())]
+        
+        # An obstacle is any object the agent has learned is a Wall.
+        wall_colors = self.world_model.get('wall_colors', set())
+        obstacle_objects = [
+            obj for obj in all_objects 
+            if obj['color'] in wall_colors
+        ]
 
-        # --- Helper for Collision Detection ---
+        # --- Helper for Collision and Bounds Detection ---
         def is_valid_position(pos: tuple) -> bool:
-            """Checks if placing the agent at `pos` would cause a collision with a wall."""
             agent_left = pos[1]
             agent_right = pos[1] + player_footprint[1]
             agent_top = pos[0]
             agent_bottom = pos[0] + player_footprint[0]
 
-            for wall in wall_objects:
-                wall_left = wall['left_index']
-                wall_right = wall['left_index'] + wall['width']
-                wall_top = wall['top_row']
-                wall_bottom = wall['top_row'] + wall['height']
+            # Rule 1: Agent's footprint must be entirely within the floor's boundaries.
+            if floor_object:
+                floor_left = floor_object['left_index']
+                floor_right = floor_object['left_index'] + floor_object['width']
+                floor_top = floor_object['top_row']
+                floor_bottom = floor_object['top_row'] + floor_object['height']
+                if (agent_left < floor_left or agent_right > floor_right or
+                    agent_top < floor_top or agent_bottom > floor_bottom):
+                    return False # Off the floor
 
-                # Bounding box collision check
-                if not (agent_right <= wall_left or agent_left >= wall_right or
-                        agent_bottom <= wall_top or agent_top >= wall_bottom):
+            # Rule 2: Agent must not collide with any obstacle.
+            for obstacle in obstacle_objects:
+                obs_left = obstacle['left_index']
+                obs_right = obstacle['left_index'] + obstacle['width']
+                obs_top = obstacle['top_row']
+                obs_bottom = obstacle['top_row'] + obstacle['height']
+
+                if not (agent_right <= obs_left or agent_left >= obs_right or
+                        agent_bottom <= obs_top or agent_top >= obs_bottom):
                     return False # Collision detected
-            return True # No collisions
+            return True # Position is valid
 
-        # 2. A* Implementation on Pixel Coordinates
+        # 2. A* Implementation (remains the same, but now uses the smarter helper)
         action_map = self.world_model['action_map']
         vector_to_action = {tuple(v['move_vector']): k for k, v in action_map.items() if 'move_vector' in v and tuple(v['move_vector']) != (0,0)}
+        if not vector_to_action: return None
 
-        if not vector_to_action: return None # No movement actions learned
-
-        def heuristic(a, b):
-            return abs(a[0] - b[0]) + abs(a[1] - b[1]) # Manhattan distance in pixels
+        def heuristic(a, b): return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
         open_set = []
         heapq.heappush(open_set, (heuristic(start_pos, target_pos), 0, start_pos, []))
-        
         g_scores = {start_pos: 0}
         
         iterations = 0
-        max_iterations = 5000  # Safety break for the pathfinder
+        max_iterations = 5000
 
         while open_set:
             iterations += 1
             if iterations > max_iterations:
-                print(f"⚠️ Pathfinding to {target_pos} timed out after {max_iterations} iterations.")
-                return None  # Path not found within a reasonable time
+                # print(f"⚠️ Pathfinding to {target_pos} timed out after {max_iterations} iterations.")
+                return None
 
             _, g, current_pos, path = heapq.heappop(open_set)
 
-            if heuristic(current_pos, target_pos) < 8:  # Use a tolerance of 8 pixels
+            if heuristic(current_pos, target_pos) < 8:
                 return [vector_to_action[vec] for vec in path]
 
             for vector in vector_to_action.keys():
                 neighbor_pos = (current_pos[0] + vector[0], current_pos[1] + vector[1])
+                if not is_valid_position(neighbor_pos): continue
 
-                if not is_valid_position(neighbor_pos):
-                    continue
-
-                tentative_g_score = g + 1 
-                
+                tentative_g_score = g + 1
                 if tentative_g_score < g_scores.get(neighbor_pos, float('inf')):
                     g_scores[neighbor_pos] = tentative_g_score
                     f_score = tentative_g_score + heuristic(neighbor_pos, target_pos)
                     heapq.heappush(open_set, (f_score, tentative_g_score, neighbor_pos, path + [vector]))
 
-        return None # No path found
+        return None
     
     
     def perceive(self, latest_frame: FrameData) -> tuple[bool, bool, list[str], list]:
