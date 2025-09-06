@@ -977,22 +977,20 @@ class AGI3(Agent):
                 self.awaiting_final_summary = True
             return False
 
-        # 2. Find the shortest path to each potential target object.
+        # 2. Get the pixel-perfect NavMesh and find paths to potential targets.
+        playable_area_pixels = self._get_playable_area_pixels(all_objects)
         reachable_targets = []
+
         for obj in potential_target_objects:
-            adjacent_positions = self._get_interaction_pixel_positions(obj)
-            if not adjacent_positions:
-                continue
-                
+            interaction_positions = self._get_interaction_pixel_positions(obj)
             shortest_path_for_obj = None
             best_target_pos_for_obj = None
 
-            for target_pos in adjacent_positions:
-                path = self._find_path_to_position(player_pixel_pos, target_pos, current_floor_object)
-                if path:
-                    if shortest_path_for_obj is None or len(path) < len(shortest_path_for_obj):
-                        shortest_path_for_obj = path
-                        best_target_pos_for_obj = target_pos
+            for target_pos in interaction_positions:
+                path = self._find_path_to_position(player_pixel_pos, target_pos, playable_area_pixels)
+                if path and (shortest_path_for_obj is None or len(path) < len(shortest_path_for_obj)):
+                    shortest_path_for_obj = path
+                    best_target_pos_for_obj = target_pos
 
             if shortest_path_for_obj:
                 reachable_targets.append({
@@ -1024,17 +1022,8 @@ class AGI3(Agent):
         if not self.previous_frame: return None
 
         all_objects = self._get_all_objects_from_grid(self.previous_frame[0])
+        playable_area_pixels = self._get_playable_area_pixels(all_objects)
         
-        # Find the current floor object to pass to the pathfinder
-        current_floor_object = None
-        floor_color = self.world_model.get('floor_color')
-        for obj in all_objects:
-            if obj['color'] == floor_color:
-                if (obj['top_row'] <= player_pixel_pos[0] < obj['top_row'] + obj['height'] and
-                    obj['left_index'] <= player_pixel_pos[1] < obj['left_index'] + obj['width']):
-                    current_floor_object = obj
-                    break
-
         resource_signatures = self.world_model.get('resource_signatures', set())
         resource_objects = [obj for obj in all_objects if (obj.get('fingerprint'), (obj.get('height'), obj.get('width')), obj.get('color')) in resource_signatures]
 
@@ -1042,13 +1031,12 @@ class AGI3(Agent):
 
         reachable_resources = []
         for resource_obj in resource_objects:
-            adjacent_positions = self._get_interaction_pixel_positions(resource_obj)
+            interaction_positions = self._get_interaction_pixel_positions(resource_obj)
             shortest_path = None
-            
-            # Find the best path to this specific resource
             best_target_pos = None
-            for pos in adjacent_positions:
-                path = self._find_path_to_position(player_pixel_pos, pos, current_floor_object)
+
+            for pos in interaction_positions:
+                path = self._find_path_to_position(player_pixel_pos, pos, playable_area_pixels)
                 if path and (shortest_path is None or len(path) < len(shortest_path)):
                     shortest_path = path
                     best_target_pos = pos
@@ -1060,55 +1048,31 @@ class AGI3(Agent):
 
         return min(reachable_resources, key=lambda r: len(r['path']))
 
-    def _find_path_to_position(self, start_pos: tuple, target_pos: tuple, floor_object: dict) -> list | None:
+    def _find_path_to_position(self, start_pos: tuple, target_pos: tuple, playable_pixels: set) -> list | None:
         """
-        Finds a path from a start pixel position to a target pixel position using A*.
-        Navigation is constrained to the floor and avoids all static obstacles.
+        Finds a path using A*, where a valid move is one where the agent's
+        entire footprint lands on the provided set of playable pixels.
         """
-        if not self.world_model.get('action_map') or not self.last_known_player_obj or not self.previous_frame:
+        if not self.world_model.get('action_map') or not self.last_known_player_obj or not playable_pixels:
             return None
 
-        # 1. Define agent's footprint and identify ALL potential obstacles.
-        player_footprint = (self.last_known_player_obj['height'], self.last_known_player_obj['width'])
-        all_objects = self._get_all_objects_from_grid(self.previous_frame[0])
-        
-        # An obstacle is a reasonably-sized object the agent has learned is a Wall.
-        wall_colors = self.world_model.get('wall_colors', set())
-        obstacle_objects = [
-            obj for obj in all_objects 
-            if obj['color'] in wall_colors and not (obj.get('height', 0) >= 64 and obj.get('width', 0) >= 64)
-        ]
+        player_h, player_w = self.last_known_player_obj['height'], self.last_known_player_obj['width']
 
-        # --- Helper for Collision and Bounds Detection ---
+        # --- Helper that checks if all 4 corners of the agent are on the floor ---
         def is_valid_position(pos: tuple) -> bool:
-            agent_left = pos[1]
-            agent_right = pos[1] + player_footprint[1]
-            agent_top = pos[0]
-            agent_bottom = pos[0] + player_footprint[0]
+            # Define the four corner points of the agent's footprint.
+            top_left = (pos[0], pos[1])
+            top_right = (pos[0], pos[1] + player_w - 1)
+            bottom_left = (pos[0] + player_h - 1, pos[1])
+            bottom_right = (pos[0] + player_h - 1, pos[1] + player_w - 1)
+            
+            # Check if all corner points are in the set of walkable floor pixels.
+            return (top_left in playable_pixels and
+                    top_right in playable_pixels and
+                    bottom_left in playable_pixels and
+                    bottom_right in playable_pixels)
 
-            # Rule 1: Agent's footprint must be entirely within the floor's boundaries.
-            if floor_object:
-                floor_left = floor_object['left_index']
-                floor_right = floor_object['left_index'] + floor_object['width']
-                floor_top = floor_object['top_row']
-                floor_bottom = floor_object['top_row'] + floor_object['height']
-                if (agent_left < floor_left or agent_right > floor_right or
-                    agent_top < floor_top or agent_bottom > floor_bottom):
-                    return False # Off the floor
-
-            # Rule 2: Agent must not collide with any obstacle.
-            for obstacle in obstacle_objects:
-                obs_left = obstacle['left_index']
-                obs_right = obstacle['left_index'] + obstacle['width']
-                obs_top = obstacle['top_row']
-                obs_bottom = obstacle['top_row'] + obstacle['height']
-
-                if not (agent_right <= obs_left or agent_left >= obs_right or
-                        agent_bottom <= obs_top or agent_top >= obs_bottom):
-                    return False # Collision detected
-            return True # Position is valid
-
-        # 2. A* Implementation (remains the same, but now uses the smarter helper)
+        # A* Implementation
         action_map = self.world_model['action_map']
         vector_to_action = {tuple(v['move_vector']): k for k, v in action_map.items() if 'move_vector' in v and tuple(v['move_vector']) != (0,0)}
         if not vector_to_action: return None
@@ -1125,26 +1089,62 @@ class AGI3(Agent):
         while open_set:
             iterations += 1
             if iterations > max_iterations:
-                # print(f"⚠️ Pathfinding to {target_pos} timed out after {max_iterations} iterations.")
-                return None
+                return None # Timeout
 
             _, g, current_pos, path = heapq.heappop(open_set)
 
-            if heuristic(current_pos, target_pos) < 8:
+            if heuristic(current_pos, target_pos) < max(player_h, player_w): # Use a tolerance related to agent size
                 return [vector_to_action[vec] for vec in path]
 
-            for vector in vector_to_action.keys():
+            for vector, action in vector_to_action.items():
+                if current_pos == start_pos and action in self.ineffective_actions:
+                    continue
+
                 neighbor_pos = (current_pos[0] + vector[0], current_pos[1] + vector[1])
-                if not is_valid_position(neighbor_pos): continue
+                if not is_valid_position(neighbor_pos):
+                    continue
 
                 tentative_g_score = g + 1
                 if tentative_g_score < g_scores.get(neighbor_pos, float('inf')):
                     g_scores[neighbor_pos] = tentative_g_score
                     f_score = tentative_g_score + heuristic(neighbor_pos, target_pos)
                     heapq.heappush(open_set, (f_score, tentative_g_score, neighbor_pos, path + [vector]))
-
         return None
     
+    def _get_playable_area_pixels(self, all_objects: list) -> set:
+        """
+        Finds the floor object the player is on and returns a set of all its pixel coordinates.
+        This set acts as a pixel-perfect NavMesh.
+        """
+        if not self.last_known_player_obj or not self.world_model.get('floor_color'):
+            return set()
+
+        player_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
+        floor_color = self.world_model.get('floor_color')
+        
+        # Find the specific floor object the player is currently on.
+        current_floor_object = None
+        for obj in all_objects:
+            if obj['color'] == floor_color:
+                if (obj['top_row'] <= player_pos[0] < obj['top_row'] + obj['height'] and
+                    obj['left_index'] <= player_pos[1] < obj['left_index'] + obj['width']):
+                    current_floor_object = obj
+                    break
+        
+        if not current_floor_object:
+            return set()
+
+        # Return a set of all pixel coordinates that are part of this floor object.
+        floor_pixels = set()
+        floor_map = current_floor_object['data_map']
+        for r_offset, row in enumerate(floor_map):
+            for c_offset, pixel_color in enumerate(row):
+                if pixel_color is not None:
+                    actual_r = current_floor_object['top_row'] + r_offset
+                    actual_c = current_floor_object['left_index'] + c_offset
+                    floor_pixels.add((actual_r, actual_c))
+        
+        return floor_pixels
     
     def perceive(self, latest_frame: FrameData) -> tuple[bool, bool, list[str], list]:
         """Compares frames, separating novel changes from known indicator changes."""
@@ -2214,25 +2214,21 @@ class AGI3(Agent):
         return log_messages, moved_agent_obj, agent_part_fingerprints
     
     def _learn_from_interaction_failure(self, action: GameAction, last_grid: list):
-        """Analyzes why a known action failed by checking the intended destination area."""
-        # --- 1. Check if we have enough information to analyze the failure ---
+        """Analyzes why a known action failed and scraps the current plan if a wall is hit."""
         player_sig = self.world_model.get('player_signature')
         action_effect = self.world_model['action_map'].get(action)
         
         if not (player_sig and self.last_known_player_obj and action_effect and 'move_vector' in action_effect):
             return
 
-        # --- 2. Calculate the intended destination bounding box ---
         move_vector = action_effect['move_vector']
         last_obj = self.last_known_player_obj
-        row_change, col_change = move_vector
-
-        final_top_row = last_obj['top_row'] + row_change
-        final_left_index = last_obj['left_index'] + col_change
+        
+        final_top_row = last_obj['top_row'] + move_vector[0]
+        final_left_index = last_obj['left_index'] + move_vector[1]
         final_bottom_row = final_top_row + last_obj['height']
         final_right_index = final_left_index + last_obj['width']
         
-        # --- 3. Investigate the destination area for obstacles ---
         grid_height = len(last_grid[0])
         grid_width = len(last_grid[0][0]) if grid_height > 0 else 0
         blocking_colors = Counter()
@@ -2242,64 +2238,41 @@ class AGI3(Agent):
             for p_idx in range(final_left_index, final_right_index):
                 if 0 <= r < grid_height and 0 <= p_idx < grid_width:
                     color = last_grid[0][r][p_idx]
-
-                    # --- EFFICIENT CHECK: Is this a pre-confirmed wall? ---
-                    if color in self.world_model['wall_colors']:
-                        print(f"🧱 [WALL] Collision with known wall (Color: {color}) detected.")
-                        return # Exit immediately, our job is done.
-
                     if color != floor_color:
                         blocking_colors[color] += 1
                 else:
-                    if -1 in self.world_model['wall_colors']:
-                        print("🧱 [WALL] Collision with known wall (Out of Bounds) detected.")
-                        return
                     blocking_colors[-1] += 1
                         
         if not blocking_colors:
             return
 
-        # --- 4. Process every color found in the collision area as a potential wall ---
+        a_wall_was_hit = False
         for wall_candidate_color in blocking_colors.keys():
+            wall_name = "Out of Bounds" if wall_candidate_color == -1 else f"Color {wall_candidate_color}"
+            
+            if wall_candidate_color in self.world_model['wall_colors']:
+                print(f"🧱 [WALL] Collision with known wall ({wall_name}) detected.")
+                a_wall_was_hit = True
+                continue
+
             self.wall_hypothesis[wall_candidate_color] = self.wall_hypothesis.get(wall_candidate_color, 0) + 1
             confidence = self.wall_hypothesis[wall_candidate_color]
-            wall_name = "Out of Bounds" if wall_candidate_color == -1 else f"Color {wall_candidate_color}"
             print(f"🧱 Wall Hypothesis: {wall_name} blocked movement (Confidence: {confidence}).")
 
-            # --- 5. Confirm Hypothesis if Threshold is Met ---
             if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
-                # Add the color to the set of confirmed walls.
                 self.world_model['wall_colors'].add(wall_candidate_color)
                 print(f"✅ [WALL] Confirmed: {wall_name} is a wall.")
                 self._scan_and_label_all_objects(last_grid[0], f"Wall Confirmed ({wall_name})")
-
-                # --- Map Cleanup Logic ---
-                # This logic now runs for each newly confirmed wall color.
-                if self.tile_size:
-                    reclassified_count = 0
-                    for tile_coords, cell_type in list(self.tile_map.items()):
-                        # We only need to check tiles that are not already walls or floors.
-                        if cell_type not in [CellType.WALL, CellType.FLOOR]:
-                            # Use a full-tile check to see if it's a uniform wall.
-                            tile_row_start, tile_col_start = tile_coords[0] * self.tile_size, tile_coords[1] * self.tile_size
-                            tile_pixels = [
-                                last_grid[0][r][c]
-                                for r in range(tile_row_start, tile_row_start + self.tile_size)
-                                for c in range(tile_col_start, tile_col_start + self.tile_size)
-                                if 0 <= r < grid_height and 0 <= c < grid_width
-                            ]
-                            
-                            # If the tile is made up of only this newly confirmed wall color, reclassify it.
-                            if tile_pixels and all(p == wall_candidate_color for p in tile_pixels):
-                                self.tile_map[tile_coords] = CellType.WALL
-                                reclassified_count += 1
-                    
-                    if reclassified_count > 0:
-                        print(f"🧹 Map Cleanup: Reclassified {reclassified_count} tile(s) as newly confirmed wall ({wall_name}).")
+                a_wall_was_hit = True
                 
-                # Once confirmed, we can remove it from the hypothesis tracker.
                 if wall_candidate_color in self.wall_hypothesis:
                     del self.wall_hypothesis[wall_candidate_color]
+
+        # --- NEW: Invalidate plan if ANY wall was hit (new or old) ---
+        if a_wall_was_hit and self.exploration_plan:
+            print(" Bumping into a wall has invalidated the current plan. Re-planning...")
+            self.exploration_plan.clear()
+            self.exploration_phase = ExplorationPhase.SEEKING_TARGET
     
     def _track_recoloring_ui_objects(self, current_objects: list, last_objects: list):
         """
