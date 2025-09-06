@@ -834,218 +834,134 @@ class AGI3(Agent):
 
     def _find_target_and_plan(self) -> bool:
         """
-        Finds the best interactable tile by pathfinding to all available targets
-        and picking the one with the shortest path.
+        Finds the best reachable, interactable OBJECT by filtering, prioritizing,
+        and then pathfinding to it using the pixel-based navigation system.
         """
-
         self.exploration_target = None
         self.exploration_plan = []
-        if not self.last_known_player_obj:
+        if not self.last_known_player_obj or not self.previous_frame:
             return False
 
         player_pixel_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
-
-        # --- PRIORITY 0: SURVIVAL ---
-        # If moves are low, survival is the only priority.
-        nearest_resource_info = self._find_nearest_resource(player_pixel_pos)
-        if nearest_resource_info:
-            distance_to_resource = len(nearest_resource_info['path'])
-            safety_buffer = 1 # Extra moves needed to be "safe"
-            if self.current_moves <= distance_to_resource + safety_buffer:
-                print(f"⚠️ Activating PRIORITY 0 (SURVIVAL): Low on moves ({self.current_moves})! Resource is {distance_to_resource} steps away.")
-                self.exploration_target = (nearest_resource_info['pos'][0] * self.tile_size, nearest_resource_info['pos'][1] * self.tile_size)
-                self.exploration_plan = nearest_resource_info['path']
-                return True # Exit immediately with a plan to get resources.
-        
-        # --- Get a master list of all potential interactable OBJECTS ---
         all_objects = self._get_all_objects_from_grid(self.previous_frame[0])
+        
+        # --- PRIORITY 0: SURVIVAL ---
+        if self.max_moves > 0: # Only check for resources if move counting is active
+            nearest_resource_info = self._find_nearest_resource(player_pixel_pos, all_objects)
+            if nearest_resource_info:
+                distance_to_resource = len(nearest_resource_info['path'])
+                safety_buffer = 1
+                if self.current_moves <= distance_to_resource + safety_buffer:
+                    print(f"⚠️ Activating PRIORITY 0 (SURVIVAL): Low on moves ({self.current_moves})! Resource is {distance_to_resource} steps away.")
+                    target_obj = nearest_resource_info['object']
+                    self.exploration_target = (target_obj['top_row'], target_obj['left_index'])
+                    self.exploration_plan = nearest_resource_info['path']
+                    return True
 
-        # --- NEW: First, find the specific floor object the player is standing on ---
-        player_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
-        current_floor_object = None
-        floor_color = self.world_model.get('floor_color')
-        for obj in all_objects:
-            if obj['color'] == floor_color:
-                # Check if the player's top-left pixel is inside this object's bounding box
-                if (obj['top_row'] <= player_pos[0] < obj['top_row'] + obj['height'] and
-                    obj['left_index'] <= player_pos[1] < obj['left_index'] + obj['width']):
-                    current_floor_object = obj
-                    break # Found the floor we're on
-
-        # --- Debug print to verify the identified floor area ---
-        print("\n--- Verifying Playable Floor Area ---")
-        if current_floor_object:
-            floor_top_left = (current_floor_object['top_row'], current_floor_object['left_index'])
-            floor_bottom_right = (
-                current_floor_object['top_row'] + current_floor_object['height'] - 1,
-                current_floor_object['left_index'] + current_floor_object['width'] - 1
-            )
-            print(f"-> Agent believes the floor is a {current_floor_object['height']}x{current_floor_object['width']} object of color {current_floor_object['color']}.")
-            print(f"-> Playable Coordinates (Bounding Box): ({floor_top_left[0]},{floor_top_left[1]}) through ({floor_bottom_right[0]},{floor_bottom_right[1]})")
-        else:
-            print("-> ⚠️ CRITICAL: Agent could not identify the floor object it is standing on.")
-        print("-------------------------------------")
-
-        # --- Now, filter all objects to find valid candidates ---
+        # --- Get and filter all potential interactable objects ---
+        current_floor_object = self._get_playable_area_pixels(all_objects, return_object=True)
         candidate_objects = []
         agent_part_signatures = self.world_model.get('player_part_signatures', set())
-        life_indicator_signatures = self.world_model.get('life_indicator_signatures', set())
-        level_indicator_signatures = self.world_model.get('level_indicator_signatures', set())
         resource_signatures = self.world_model.get('resource_signatures', set())
         
         for obj in all_objects:
             h, w, c, fp = obj['height'], obj['width'], obj['color'], obj['fingerprint']
-            
-            # --- NEW: Rule 1 - Ignore full-screen "canvas" objects ---
             if h >= 64 and w >= 64: continue
 
             part_sig = (fp, (h, w), c)
-            indicator_sig = (h, w, c)
+            ui_key = (obj.get('fingerprint'), obj.get('top_row'), obj.get('left_index'))
+            ui_type_key = (obj.get('fingerprint'), (obj.get('height'), obj.get('width')))
 
-            # --- Standard filtering for non-interactive objects ---
             if c == self.world_model.get('floor_color'): continue
             if c in self.world_model.get('wall_colors', set()): continue
             if part_sig in agent_part_signatures: continue
-            if indicator_sig in life_indicator_signatures: continue
-            if indicator_sig in level_indicator_signatures: continue
             if part_sig in resource_signatures: continue
-            ui_key = (obj.get('fingerprint'), obj.get('top_row'), obj.get('left_index'))
-            ui_type_key = (obj.get('fingerprint'), (obj.get('height'), obj.get('width')))
             if ui_key in self.confirmed_ui_signatures or ui_type_key in self.confirmed_ui_types: continue
 
-            # --- NEW: Rule 2 - Object must be within the current floor's boundaries ---
             if current_floor_object:
                 is_on_floor = (obj['top_row'] >= current_floor_object['top_row'] and
                                obj['left_index'] >= current_floor_object['left_index'] and
                                (obj['top_row'] + obj['height']) <= (current_floor_object['top_row'] + current_floor_object['height']) and
                                (obj['left_index'] + obj['width']) <= (current_floor_object['left_index'] + current_floor_object['width']))
                 if not is_on_floor:
-                    continue # Skip objects not on the main floor area
-
+                    continue
             candidate_objects.append(obj)
-
-        # --- Debug print to list all identified potential targets ---
-        print(f"\n--- Found {len(candidate_objects)} Potentially Interactable Object(s) ---")
-        for i, obj in enumerate(candidate_objects):
-            summary = self._get_object_summary_string(obj)
-            print(f"  - Candidate {i+1}: {summary}")
-        print("----------------------------------------------------------")
 
         # --- Filter these candidate_objects based on priorities ---
         potential_target_objects = []
-        
-        # PRIORITY 1: Untested Objects
-        print("🎯 Activating PRIORITY 1: Seeking all untested objects.")
-        untested_objects = []
-        for obj in candidate_objects:
-            # The new signature is based on the object's unique properties, not its tile.
-            signature = f"obj_{obj['fingerprint']}_{obj['top_row']}_{obj['left_index']}"
-            if signature not in self.interaction_hypotheses:
-                untested_objects.append(obj)
-        
+        untested_objects = [obj for obj in candidate_objects if f"obj_{obj['fingerprint']}_{obj['top_row']}_{obj['left_index']}" not in self.interaction_hypotheses]
+
         if untested_objects:
+            print("🎯 Activating PRIORITY 1: Seeking all untested objects.")
             potential_target_objects = untested_objects
         else:
             if self.active_patterns:
-                # PRIORITY 2: Test mysterious objects if a pattern is active
-                print("🎯 Activating PRIORITY 2: Pattern is active. Seeking interactables with no known effect.")
-                mysterious_objects = []
-                for obj in candidate_objects:
-                    signature = f"obj_{obj['fingerprint']}_{obj['top_row']}_{obj['left_index']}"
-                    hypothesis = self.interaction_hypotheses.get(signature)
-                    if hypothesis and not hypothesis.get('immediate_effect') and not hypothesis.get('aftermath_effect') and not hypothesis.get('provides_resource'):
-                        # Note: The check for 'consumed' objects needs to be updated to use the new signature system.
-                        # This logic will be restored in a future step.
-                        mysterious_objects.append(obj)
-                potential_target_objects = mysterious_objects
+                print("🎯 Activating PRIORITY 2: Pattern active. Seeking interactables with no known effect.")
+                potential_target_objects = [obj for obj in candidate_objects if self.interaction_hypotheses.get(f"obj_{obj['fingerprint']}_{obj['top_row']}_{obj['left_index']}", {}).get('has_effect') is False]
             else:
-                # PRIORITY 3: Use known tools if no pattern is active
                 print("🎯 Activating PRIORITY 3: No patterns active. Seeking interactables with a known function.")
-                known_tool_objects = []
-                for obj in candidate_objects:
-                    signature = f"obj_{obj['fingerprint']}_{obj['top_row']}_{obj['left_index']}"
-                    hypothesis = self.interaction_hypotheses.get(signature)
-                    if hypothesis and (hypothesis.get('immediate_effect') or hypothesis.get('aftermath_effect')):
-                        # Note: The check for 'consumed' objects needs to be updated to use the new signature system.
-                        # This logic will be restored in a future step.
-                        known_tool_objects.append(obj)
-                potential_target_objects = known_tool_objects
-        
+                potential_target_objects = [obj for obj in candidate_objects if self.interaction_hypotheses.get(f"obj_{obj['fingerprint']}_{obj['top_row']}_{obj['left_index']}", {}).get('has_effect') is True]
+
         if not potential_target_objects:
-            if not self.has_summarized_interactions and not self.awaiting_final_summary:
-                print("✅ All potential interactables discovered. Queuing knowledge summary for the next turn.")
-                self.awaiting_final_summary = True
+            print("🧐 No more targets found based on current priorities.")
             return False
 
-        # 2. Get the pixel-perfect NavMesh and find paths to potential targets.
-        playable_area_pixels = self._get_playable_area_pixels(all_objects)
+        # --- Pathfinding with the new "permission" logic ---
+        playable_area_pixels = self._get_playable_area_pixels(all_objects, return_object=False)
         reachable_targets = []
 
         for obj in potential_target_objects:
             interaction_positions = self._get_interaction_pixel_positions(obj)
+            target_object_pixels = self._get_object_pixels(obj)
+            walkable_for_this_target = playable_area_pixels.union(target_object_pixels)
+
             shortest_path_for_obj = None
             best_target_pos_for_obj = None
-
             for target_pos in interaction_positions:
-                path = self._find_path_to_position(player_pixel_pos, target_pos, playable_area_pixels)
+                path = self._find_path_to_position(player_pixel_pos, target_pos, walkable_for_this_target)
                 if path and (shortest_path_for_obj is None or len(path) < len(shortest_path_for_obj)):
                     shortest_path_for_obj = path
                     best_target_pos_for_obj = target_pos
 
             if shortest_path_for_obj:
-                reachable_targets.append({
-                    'object': obj, 
-                    'path': shortest_path_for_obj,
-                    'target_pos': best_target_pos_for_obj
-                })
+                reachable_targets.append({'object': obj, 'path': shortest_path_for_obj, 'target_pos': best_target_pos_for_obj})
 
         if not reachable_targets:
             print("🧐 All potential object targets are currently unreachable.")
             return False
 
-        # 3. From the list of reachable targets, select the one with the shortest path.
         best_target = min(reachable_targets, key=lambda t: len(t['path']))
-        
         target_obj = best_target['object']
         target_pixel_to_stand_on = best_target['target_pos']
-
-        # 4. Set the exploration plan and target.
         self.exploration_target = (target_obj['top_row'], target_obj['left_index'])
         self.exploration_plan = best_target['path']
-        
         print(f"🎯 New object target acquired at pixel {self.exploration_target}. Plan to stand at {target_pixel_to_stand_on} created with {len(self.exploration_plan)} steps.")
-        
         return True
 
-    def _find_nearest_resource(self, player_pixel_pos: tuple) -> dict | None:
+    def _find_nearest_resource(self, player_pixel_pos: tuple, all_objects: list) -> dict | None:
         """Finds the closest reachable resource object using the new pathfinder."""
-        if not self.previous_frame: return None
-
-        all_objects = self._get_all_objects_from_grid(self.previous_frame[0])
         playable_area_pixels = self._get_playable_area_pixels(all_objects)
-        
         resource_signatures = self.world_model.get('resource_signatures', set())
         resource_objects = [obj for obj in all_objects if (obj.get('fingerprint'), (obj.get('height'), obj.get('width')), obj.get('color')) in resource_signatures]
-
         if not resource_objects: return None
 
         reachable_resources = []
         for resource_obj in resource_objects:
             interaction_positions = self._get_interaction_pixel_positions(resource_obj)
+            target_object_pixels = self._get_object_pixels(resource_obj)
+            walkable_for_this_target = playable_area_pixels.union(target_object_pixels)
+            
             shortest_path = None
             best_target_pos = None
-
             for pos in interaction_positions:
-                path = self._find_path_to_position(player_pixel_pos, pos, playable_area_pixels)
+                path = self._find_path_to_position(player_pixel_pos, pos, walkable_for_this_target)
                 if path and (shortest_path is None or len(path) < len(shortest_path)):
                     shortest_path = path
                     best_target_pos = pos
-            
             if shortest_path:
                 reachable_resources.append({'object': resource_obj, 'path': shortest_path, 'target_pos': best_target_pos})
 
         if not reachable_resources: return None
-
         return min(reachable_resources, key=lambda r: len(r['path']))
 
     def _find_path_to_position(self, start_pos: tuple, target_pos: tuple, playable_pixels: set) -> list | None:
@@ -1058,19 +974,22 @@ class AGI3(Agent):
 
         player_h, player_w = self.last_known_player_obj['height'], self.last_known_player_obj['width']
 
-        # --- Helper that checks if all 4 corners of the agent are on the floor ---
+        # --- Helper that checks if the agent's ENTIRE footprint is on the floor ---
         def is_valid_position(pos: tuple) -> bool:
-            # Define the four corner points of the agent's footprint.
-            top_left = (pos[0], pos[1])
-            top_right = (pos[0], pos[1] + player_w - 1)
-            bottom_left = (pos[0] + player_h - 1, pos[1])
-            bottom_right = (pos[0] + player_h - 1, pos[1] + player_w - 1)
+            # Iterate through every pixel of the agent's bounding box at the new position.
+            for r_offset in range(player_h):
+                for c_offset in range(player_w):
+                    # Calculate the actual pixel coordinate on the grid.
+                    check_pixel = (pos[0] + r_offset, pos[1] + c_offset)
+                    
+                    # If any pixel of the agent's body is not on a valid floor pixel, the position is invalid.
+                    if check_pixel not in playable_pixels:
+                        # --- NEW: Debug print for a failed validity check ---
+                        # We only need to print the first pixel that fails.
+                        return False
             
-            # Check if all corner points are in the set of walkable floor pixels.
-            return (top_left in playable_pixels and
-                    top_right in playable_pixels and
-                    bottom_left in playable_pixels and
-                    bottom_right in playable_pixels)
+            # If all pixels are on the floor, the position is valid.
+            return True
 
         # A* Implementation
         action_map = self.world_model['action_map']
@@ -1093,7 +1012,7 @@ class AGI3(Agent):
 
             _, g, current_pos, path = heapq.heappop(open_set)
 
-            if heuristic(current_pos, target_pos) < max(player_h, player_w): # Use a tolerance related to agent size
+            if current_pos == target_pos: # Require an exact match
                 return [vector_to_action[vec] for vec in path]
 
             for vector, action in vector_to_action.items():
@@ -1110,19 +1029,33 @@ class AGI3(Agent):
                     f_score = tentative_g_score + heuristic(neighbor_pos, target_pos)
                     heapq.heappush(open_set, (f_score, tentative_g_score, neighbor_pos, path + [vector]))
         return None
+
+    def _get_object_pixels(self, obj: dict) -> set:
+        """Returns a set of all pixel coordinates for a given object."""
+        pixels = set()
+        if not obj or 'data_map' not in obj:
+            return pixels
+        
+        obj_map = obj['data_map']
+        for r_offset, row in enumerate(obj_map):
+            for c_offset, pixel_color in enumerate(row):
+                if pixel_color is not None:
+                    actual_r = obj['top_row'] + r_offset
+                    actual_c = obj['left_index'] + c_offset
+                    pixels.add((actual_r, actual_c))
+        return pixels
     
-    def _get_playable_area_pixels(self, all_objects: list) -> set:
+    def _get_playable_area_pixels(self, all_objects: list, return_object=False) -> set | dict:
         """
-        Finds the floor object the player is on and returns a set of all its pixel coordinates.
-        This set acts as a pixel-perfect NavMesh.
+        Finds the floor object the player is on and returns a set of all its pixel coordinates
+        or the object dictionary itself.
         """
         if not self.last_known_player_obj or not self.world_model.get('floor_color'):
-            return set()
+            return {} if return_object else set()
 
         player_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
         floor_color = self.world_model.get('floor_color')
         
-        # Find the specific floor object the player is currently on.
         current_floor_object = None
         for obj in all_objects:
             if obj['color'] == floor_color:
@@ -1131,10 +1064,12 @@ class AGI3(Agent):
                     current_floor_object = obj
                     break
         
+        if return_object:
+            return current_floor_object
+
         if not current_floor_object:
             return set()
 
-        # Return a set of all pixel coordinates that are part of this floor object.
         floor_pixels = set()
         floor_map = current_floor_object['data_map']
         for r_offset, row in enumerate(floor_map):
