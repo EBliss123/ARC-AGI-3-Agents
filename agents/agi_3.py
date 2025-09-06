@@ -853,8 +853,22 @@ class AGI3(Agent):
                 self.exploration_plan = nearest_resource_info['path']
                 return True # Exit immediately with a plan to get resources.
         
-        # --- NEW: Get a master list of all potential interactable OBJECTS ---
+        # --- Get a master list of all potential interactable OBJECTS ---
         all_objects = self._get_all_objects_from_grid(self.previous_frame[0])
+
+        # --- NEW: First, find the specific floor object the player is standing on ---
+        player_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
+        current_floor_object = None
+        floor_color = self.world_model.get('floor_color')
+        for obj in all_objects:
+            if obj['color'] == floor_color:
+                # Check if the player's top-left pixel is inside this object's bounding box
+                if (obj['top_row'] <= player_pos[0] < obj['top_row'] + obj['height'] and
+                    obj['left_index'] <= player_pos[1] < obj['left_index'] + obj['width']):
+                    current_floor_object = obj
+                    break # Found the floor we're on
+
+        # --- Now, filter all objects to find valid candidates ---
         candidate_objects = []
         agent_part_signatures = self.world_model.get('player_part_signatures', set())
         life_indicator_signatures = self.world_model.get('life_indicator_signatures', set())
@@ -863,8 +877,14 @@ class AGI3(Agent):
         
         for obj in all_objects:
             h, w, c, fp = obj['height'], obj['width'], obj['color'], obj['fingerprint']
+            
+            # --- NEW: Rule 1 - Ignore full-screen "canvas" objects ---
+            if h >= 64 and w >= 64: continue
+
             part_sig = (fp, (h, w), c)
             indicator_sig = (h, w, c)
+
+            # --- Standard filtering for non-interactive objects ---
             if c == self.world_model.get('floor_color'): continue
             if c in self.world_model.get('wall_colors', set()): continue
             if part_sig in agent_part_signatures: continue
@@ -872,6 +892,16 @@ class AGI3(Agent):
             if indicator_sig in level_indicator_signatures: continue
             if part_sig in resource_signatures: continue
             if self.confirmed_resource_indicator and obj['top_row'] == self.confirmed_resource_indicator['row_index']: continue
+
+            # --- NEW: Rule 2 - Object must be within the current floor's boundaries ---
+            if current_floor_object:
+                is_on_floor = (obj['top_row'] >= current_floor_object['top_row'] and
+                               obj['left_index'] >= current_floor_object['left_index'] and
+                               (obj['top_row'] + obj['height']) <= (current_floor_object['top_row'] + current_floor_object['height']) and
+                               (obj['left_index'] + obj['width']) <= (current_floor_object['left_index'] + current_floor_object['width']))
+                if not is_on_floor:
+                    continue # Skip objects not on the main floor area
+
             candidate_objects.append(obj)
 
         # --- Debug print to list all identified potential targets ---
@@ -930,7 +960,7 @@ class AGI3(Agent):
         # 2. Find the shortest path to each potential target object.
         reachable_targets = []
         for obj in potential_target_objects:
-            adjacent_positions = self._get_adjacent_pixel_positions(obj)
+            adjacent_positions = self._get_interaction_pixel_positions(obj)
             if not adjacent_positions:
                 continue
                 
@@ -982,7 +1012,7 @@ class AGI3(Agent):
 
         reachable_resources = []
         for resource_obj in resource_objects:
-            adjacent_positions = self._get_adjacent_pixel_positions(resource_obj)
+            adjacent_positions = self._get_interaction_pixel_positions(resource_obj)
             shortest_path = None
 
             for pos in adjacent_positions:
@@ -1246,24 +1276,11 @@ class AGI3(Agent):
 
         print("--- End of Scan ---\n")
 
-    def _get_adjacent_pixel_positions(self, target_obj: dict) -> list:
-        """Calculates ideal pixel positions for the agent to stand adjacent to a target object."""
-        if not self.last_known_player_obj: return []
-        
-        agent_h, agent_w = self.last_known_player_obj['height'], self.last_known_player_obj['width']
-        
-        # Positions to the TOP, BOTTOM, LEFT, and RIGHT of the target object
-        positions = [
-            # Top: Agent's bottom edge touches target's top edge, centered horizontally
-            (target_obj['top_row'] - agent_h, target_obj['left_index'] + (target_obj['width'] // 2) - (agent_w // 2)),
-            # Bottom: Agent's top edge touches target's bottom edge, centered horizontally
-            (target_obj['top_row'] + target_obj['height'], target_obj['left_index'] + (target_obj['width'] // 2) - (agent_w // 2)),
-            # Left: Agent's right edge touches target's left edge, centered vertically
-            (target_obj['top_row'] + (target_obj['height'] // 2) - (agent_h // 2), target_obj['left_index'] - agent_w),
-            # Right: Agent's left edge touches target's right edge, centered vertically
-            (target_obj['top_row'] + (target_obj['height'] // 2) - (agent_h // 2), target_obj['left_index'] + target_obj['width'])
-        ]
-        return positions
+    def _get_interaction_pixel_positions(self, target_obj: dict) -> list:
+        """Calculates the target pixel position(s) for interacting with an object."""
+        # For the "step on" model, the target is the object's own top-left corner.
+        target_pos = (target_obj['top_row'], target_obj['left_index'])
+        return [target_pos]
 
     def _get_all_objects_from_grid(self, grid_data: list) -> list[dict]:
         """Scans a grid and returns a list of all found objects without printing or labeling."""
