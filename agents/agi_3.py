@@ -83,6 +83,7 @@ class AGI3(Agent):
         self.initial_level_patterns = set()
         self.confirmed_ui_signatures = set()
         self.recoloring_object_candidates = {}
+        self.confirmed_ui_types = set()
 
         # --- Move Tracking ---
         self.max_moves = 0
@@ -221,8 +222,6 @@ class AGI3(Agent):
         self.last_known_objects = []
         self.last_known_player_obj = None # Crucial: Force agent to re-find itself.
         self.initial_level_patterns.clear()
-        self.confirmed_ui_signatures.clear()
-        self.recoloring_object_candidates.clear()
 
         # --- Reset Level-Specific Layout and Plans ---
         self.has_summarized_interactions = False
@@ -275,6 +274,7 @@ class AGI3(Agent):
         self.initial_level_patterns.clear()
         self.confirmed_ui_signatures.clear()
         self.recoloring_object_candidates.clear()
+        self.confirmed_ui_types.clear()
         
         if self.previous_frame:
             print("-> Capturing static object state from end of previous level...")
@@ -910,7 +910,8 @@ class AGI3(Agent):
             if indicator_sig in level_indicator_signatures: continue
             if part_sig in resource_signatures: continue
             ui_key = (obj.get('fingerprint'), obj.get('top_row'), obj.get('left_index'))
-            if ui_key in self.confirmed_ui_signatures: continue
+            ui_type_key = (obj.get('fingerprint'), (obj.get('height'), obj.get('width')))
+            if ui_key in self.confirmed_ui_signatures or ui_type_key in self.confirmed_ui_types: continue
 
             # --- NEW: Rule 2 - Object must be within the current floor's boundaries ---
             if current_floor_object:
@@ -1276,7 +1277,8 @@ class AGI3(Agent):
                     is_known_subject = fingerprint in self.world_model.get('known_transform_subjects', set())
 
                     # Highest priority: Is it a confirmed UI element?
-                    if ui_key in self.confirmed_ui_signatures:
+                    ui_type_key = (fingerprint, (height, width))
+                    if ui_key in self.confirmed_ui_signatures or ui_type_key in self.confirmed_ui_types:
                         label = "UI Element"
                     
                     # Is it the floor? A "true" floor is a large object of the floor color.
@@ -2301,47 +2303,69 @@ class AGI3(Agent):
     
     def _track_recoloring_ui_objects(self, current_objects: list, last_objects: list):
         """
-        Identifies UI elements by finding stagnant objects that change color.
-        It confirms individual UI signatures for precise filtering, and also identifies
-        the indicator row for move-counting purposes.
+        Identifies UI elements by finding stagnant objects that change color, then
+        groups all stagnant objects on that same row as part of the UI.
         """
-        # 1. Find all "recolor" events by matching objects on position and shape.
+        if self.confirmed_resource_indicator and self.confirmed_ui_signatures:
+            return
+
+        # 1. Find all stagnant (non-moving) and recolored objects simultaneously.
+        stagnant_keys = set()
         recolored_keys = set()
         last_obj_map = {(obj.get('fingerprint'), obj.get('top_row'), obj.get('left_index')): obj for obj in last_objects}
 
         for curr_obj in current_objects:
             key = (curr_obj.get('fingerprint'), curr_obj.get('top_row'), curr_obj.get('left_index'))
             last_obj = last_obj_map.get(key)
-            if last_obj and last_obj.get('color') != curr_obj.get('color'):
-                recolored_keys.add(key)
+            if last_obj:
+                stagnant_keys.add(key)
+                if last_obj.get('color') != curr_obj.get('color'):
+                    recolored_keys.add(key)
 
-        # 2. Update confidence for candidates that were recolored this turn.
-        for key in recolored_keys:
+        # 2. The "Grouping" Heuristic: If any objects were recolored, assume all stagnant
+        #    objects on those same rows are also part of the UI.
+        ui_candidate_keys = set()
+        if recolored_keys:
+            active_ui_rows = {key[1] for key in recolored_keys}  # Get the row_index from the keys
+            for key in stagnant_keys:
+                if key[1] in active_ui_rows:  # Check if this stagnant object is on an active row
+                    ui_candidate_keys.add(key)
+        
+        # 3. Update confidence for all identified UI candidates.
+        for key in ui_candidate_keys:
             self.recoloring_object_candidates[key] = self.recoloring_object_candidates.get(key, 0) + 1
 
-        # 3. Prune candidates that were not recolored this turn.
-        stale_candidates = set(self.recoloring_object_candidates.keys()) - recolored_keys
+        # 4. Prune candidates that are no longer stagnant (i.e., they disappeared).
+        stale_candidates = set(self.recoloring_object_candidates.keys()) - stagnant_keys
         for key in list(stale_candidates):
             if key in self.recoloring_object_candidates:
                 del self.recoloring_object_candidates[key]
         
-        # 4. Check for newly confirmed individual UI signatures.
-        newly_confirmed_count = 0
+        # 5. Check for newly confirmed individual UI signatures.
+        newly_confirmed_keys = set()
         for key, confidence in self.recoloring_object_candidates.items():
             if confidence >= self.RESOURCE_CONFIDENCE_THRESHOLD:
                 if key not in self.confirmed_ui_signatures:
                     self.confirmed_ui_signatures.add(key)
-                    newly_confirmed_count += 1
+                    newly_confirmed_keys.add(key)
         
-        if newly_confirmed_count > 0:
-            print(f"✅ [UI] Confirmed {newly_confirmed_count} new object(s) as stagnant UI elements.")
+        # 6. If new UI objects were confirmed, generalize their type.
+        if newly_confirmed_keys:
+            print(f"✅ [UI] Confirmed {len(newly_confirmed_keys)} new object instance(s) as stagnant UI elements.")
+            newly_confirmed_objects = [obj for obj in current_objects if (obj.get('fingerprint'), obj.get('top_row'), obj.get('left_index')) in newly_confirmed_keys]
+            
+            for obj in newly_confirmed_objects:
+                ui_type_sig = (obj.get('fingerprint'), (obj.get('height'), obj.get('width')))
+                if ui_type_sig not in self.confirmed_ui_types:
+                    self.confirmed_ui_types.add(ui_type_sig)
+                    print(f"✅ [UI] GENERALIZED: All objects with FP {ui_type_sig[0]} and Size {ui_type_sig[1]} are now considered UI.")
 
-        # 5. Separately, check if we can confirm the resource *row* for move-counting.
+        # 7. Separately, check if we can confirm the resource *row* for move-counting.
         if not self.confirmed_resource_indicator and self.confirmed_ui_signatures:
             confirmed_rows = Counter(key[1] for key in self.confirmed_ui_signatures)
             if confirmed_rows:
                 indicator_row, count = confirmed_rows.most_common(1)[0]
-                if count >= 2: # Heuristic: need at least 2 confirmed UI elements on a row
+                if count >= 2:
                     print(f"✅ [UI] Confirmed resource indicator *row* is {indicator_row} for move-counting.")
                     self.confirmed_resource_indicator = {'row_index': indicator_row}
                     grid_width = len(self.previous_frame[0][0]) if self.previous_frame and self.previous_frame[0] else 0
@@ -2793,7 +2817,8 @@ class AGI3(Agent):
             if indicator_sig in level_indicator_signatures: continue
             if part_sig in resource_signatures: continue
             ui_key = (obj.get('fingerprint'), obj.get('top_row'), obj.get('left_index'))
-            if ui_key in self.confirmed_ui_signatures: continue
+            ui_type_key = (obj.get('fingerprint'), (obj.get('height'), obj.get('width')))
+            if ui_key in self.confirmed_ui_signatures or ui_type_key in self.confirmed_ui_types: continue
 
             candidate_objects.append(obj)
 
