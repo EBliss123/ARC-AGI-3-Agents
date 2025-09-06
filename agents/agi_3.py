@@ -81,6 +81,8 @@ class AGI3(Agent):
         self.level_knowledge_is_learned = False
         self.wait_action = GameAction.ACTION6 # Use a secondary action for waiting
         self.initial_level_patterns = set()
+        self.confirmed_ui_signatures = set()
+        self.recoloring_object_candidates = {}
 
         # --- Move Tracking ---
         self.max_moves = 0
@@ -219,6 +221,8 @@ class AGI3(Agent):
         self.last_known_objects = []
         self.last_known_player_obj = None # Crucial: Force agent to re-find itself.
         self.initial_level_patterns.clear()
+        self.confirmed_ui_signatures.clear()
+        self.recoloring_object_candidates.clear()
 
         # --- Reset Level-Specific Layout and Plans ---
         self.has_summarized_interactions = False
@@ -269,6 +273,8 @@ class AGI3(Agent):
     def _reset_for_new_level(self):
         """Resets all level-specific knowledge for a new level, preserving core learned concepts."""
         self.initial_level_patterns.clear()
+        self.confirmed_ui_signatures.clear()
+        self.recoloring_object_candidates.clear()
         
         if self.previous_frame:
             print("-> Capturing static object state from end of previous level...")
@@ -580,8 +586,9 @@ class AGI3(Agent):
 
             # Still run indicator tracking if ANY change happened, to keep it updated.
             if novel_changes_found or known_changes_found:
+                all_objects_on_grid = self._get_all_objects_from_grid(latest_frame.frame[0])
                 # We pass `structured_changes` here, which contains ALL changes (novel and known).
-                self._update_resource_indicator_tracking(structured_changes, self.last_action, latest_frame.frame)
+                self._track_recoloring_ui_objects(all_objects_on_grid, self.last_known_objects)
 
         # --- Object Finding and Tracking ---
         if novel_changes_found:
@@ -594,9 +601,6 @@ class AGI3(Agent):
                         object_logic_changes.append(change)
             else:
                 object_logic_changes = structured_changes
-
-            # 1. Get a reliable list of all objects from the current frame.
-            all_objects_on_grid = self._get_all_objects_from_grid(latest_frame.frame[0])
             
             # 2. Store the tile the agent might be leaving, for context in other functions.
             self.just_vacated_tile = None
@@ -905,7 +909,8 @@ class AGI3(Agent):
             if indicator_sig in life_indicator_signatures: continue
             if indicator_sig in level_indicator_signatures: continue
             if part_sig in resource_signatures: continue
-            if self.confirmed_resource_indicator and obj['top_row'] == self.confirmed_resource_indicator['row_index']: continue
+            ui_key = (obj.get('fingerprint'), obj.get('top_row'), obj.get('left_index'))
+            if ui_key in self.confirmed_ui_signatures: continue
 
             # --- NEW: Rule 2 - Object must be within the current floor's boundaries ---
             if current_floor_object:
@@ -1264,43 +1269,30 @@ class AGI3(Agent):
                         is_known_subject = fingerprint in known_set
                     
                     # --- Determine the object's label based on learned knowledge ---
-                    floor_color = self.world_model.get('floor_color')
-                    wall_colors = self.world_model.get('wall_colors', set())
-                    
-                    label = "Unknown Object" # Default label
+                    label = "Unknown Object"  # Default label
+                    ui_key = (fingerprint, min_row, min_idx)
+                    part_sig = (fingerprint, (height, width), color)
+                    indicator_sig = (height, width, color)
+                    is_known_subject = fingerprint in self.world_model.get('known_transform_subjects', set())
 
-                    # --- NEW: Smarter Floor Check ---
-                    # If we don't have a reachable map yet (e.g., at level start), trust the color.
-                    # Otherwise, perform the strict check against the reachable area.
-                    is_truly_floor = False
-                    if color == floor_color:
-                        if not self.reachable_floor_area:
-                            is_truly_floor = True
-                        elif self.tile_size:
-                            for r_pixel, c_pixel in component_points:
-                                pixel_tile = (r_pixel // self.tile_size, c_pixel // self.tile_size)
-                                if pixel_tile in self.reachable_floor_area:
-                                    is_truly_floor = True
-                                    break
+                    # Highest priority: Is it a confirmed UI element?
+                    if ui_key in self.confirmed_ui_signatures:
+                        label = "UI Element"
                     
-                    # --- NEW: Re-ordered Logic to Prioritize Walls/Floors ---
-                    if is_truly_floor:
+                    # Is it the floor? A "true" floor is a large object of the floor color.
+                    # This prevents small, disconnected floor-colored objects (like UI parts) from being mislabeled.
+                    elif color == self.world_model.get('floor_color') and (height * width > 50): # Heuristic: floor objects are large
                         label = "Floor"
-                    elif color in wall_colors:
+                        
+                    elif color in self.world_model.get('wall_colors', set()):
                         label = "Wall"
-                    elif (fingerprint, (height, width), color) in self.world_model.get('player_part_signatures', set()):
+                    elif part_sig in self.world_model.get('player_part_signatures', set()):
                         label = "Agent Component"
-                    elif (height, width, color) in self.world_model.get('life_indicator_signatures', set()):
+                    elif indicator_sig in self.world_model.get('life_indicator_signatures', set()):
                         label = "Life Indicator"
-                    elif (height, width, color) in self.world_model.get('level_indicator_signatures', set()):
+                    elif indicator_sig in self.world_model.get('level_indicator_signatures', set()):
                         label = "Level Indicator"
-                    elif (self.confirmed_resource_indicator and
-                          self.resource_pixel_color is not None and
-                          self.resource_empty_color is not None and
-                          min_row == self.confirmed_resource_indicator['row_index'] and
-                          color in [self.resource_pixel_color, self.resource_empty_color]):
-                        label = "Resource Indicator"
-                    elif (fingerprint, (height, width), color) in self.world_model.get('resource_signatures', set()):
+                    elif part_sig in self.world_model.get('resource_signatures', set()):
                         label = "Resource"
                     elif is_known_subject:
                         label = "Known Object"
@@ -2307,103 +2299,53 @@ class AGI3(Agent):
                 if wall_candidate_color in self.wall_hypothesis:
                     del self.wall_hypothesis[wall_candidate_color]
     
-    def _update_resource_indicator_tracking(self, structured_changes: list, action: GameAction, latest_grid: list):
-        """Analyzes changes to find a resource indicator, which depletes on any action."""
-        if self.confirmed_resource_indicator or not action:
-            return
+    def _track_recoloring_ui_objects(self, current_objects: list, last_objects: list):
+        """
+        Identifies UI elements by finding stagnant objects that change color.
+        It confirms individual UI signatures for precise filtering, and also identifies
+        the indicator row for move-counting purposes.
+        """
+        # 1. Find all "recolor" events by matching objects on position and shape.
+        recolored_keys = set()
+        last_obj_map = {(obj.get('fingerprint'), obj.get('top_row'), obj.get('left_index')): obj for obj in last_objects}
 
-        changed_rows = {change['row_index'] for change in structured_changes}
+        for curr_obj in current_objects:
+            key = (curr_obj.get('fingerprint'), curr_obj.get('top_row'), curr_obj.get('left_index'))
+            last_obj = last_obj_map.get(key)
+            if last_obj and last_obj.get('color') != curr_obj.get('color'):
+                recolored_keys.add(key)
 
-        # 1. Prune candidates that were expected to change but didn't.
-        keys_to_remove = []
-        for row_idx in self.resource_indicator_candidates:
-            if row_idx not in changed_rows:
-                print(f"📉 Candidate at row {row_idx} was inconsistent (did not change), removing.")
-                keys_to_remove.append(row_idx)
+        # 2. Update confidence for candidates that were recolored this turn.
+        for key in recolored_keys:
+            self.recoloring_object_candidates[key] = self.recoloring_object_candidates.get(key, 0) + 1
 
-        for key in keys_to_remove:
-            del self.resource_indicator_candidates[key]
+        # 3. Prune candidates that were not recolored this turn.
+        stale_candidates = set(self.recoloring_object_candidates.keys()) - recolored_keys
+        for key in list(stale_candidates):
+            if key in self.recoloring_object_candidates:
+                del self.recoloring_object_candidates[key]
+        
+        # 4. Check for newly confirmed individual UI signatures.
+        newly_confirmed_count = 0
+        for key, confidence in self.recoloring_object_candidates.items():
+            if confidence >= self.RESOURCE_CONFIDENCE_THRESHOLD:
+                if key not in self.confirmed_ui_signatures:
+                    self.confirmed_ui_signatures.add(key)
+                    newly_confirmed_count += 1
+        
+        if newly_confirmed_count > 0:
+            print(f"✅ [UI] Confirmed {newly_confirmed_count} new object(s) as stagnant UI elements.")
 
-        # 2. Check all changes for potential indicator patterns
-        for change in structured_changes:
-            row_idx = change['row_index']
-            if len(change['changes']) != 1:
-                continue
-
-            detail = change['changes'][0]
-            current_index, old_val, new_val = detail['index'], detail['from'], detail['to']
-
-            if not isinstance(new_val, (int, float)) or not isinstance(old_val, (int, float)):
-                continue
-
-            value_direction = 'inc' if new_val > old_val else 'dec'
-
-            if row_idx in self.resource_indicator_candidates:
-                candidate = self.resource_indicator_candidates[row_idx]
-
-                if candidate['value_direction'] == value_direction:
-                    index_direction = 'inc' if current_index > candidate['last_index'] else 'dec'
-
-                    if candidate.get('index_direction') is None:
-                        candidate['index_direction'] = index_direction
-                        candidate['confidence'] += 1
-                    elif candidate['index_direction'] == index_direction:
-                        candidate['confidence'] += 1
-                    else:
-                        del self.resource_indicator_candidates[row_idx]
-                        continue
-
-                    candidate['last_index'] = current_index
-                    print(f"📈 Resource candidate at row {row_idx} confidence is now {candidate['confidence']}.")
-
-                    if candidate['confidence'] >= self.RESOURCE_CONFIDENCE_THRESHOLD:
-                        self.confirmed_resource_indicator = {'row_index': row_idx, **candidate}
-                        # Define the full row as a rectangle and add it to the ignore list.
-                        grid_width = len(self.previous_frame[0][0]) if self.previous_frame and self.previous_frame[0] else 0
-                        self.ignored_areas.append({
-                            'top_row': row_idx, 'left_index': 0,
-                            'height': 1, 'width': grid_width
-                        })
-                        print(f"✅ Confirmed resource indicator at row {row_idx}! It will now be ignored for state uniqueness checks.")
-                        self._scan_and_label_all_objects(latest_grid[0], "Resource Indicator Confirmed")
-
-                        # --- Re-check active patterns to filter out the new indicator ---
-                        if self.active_patterns:
-                            print(f"🕵️‍♀️ Re-checking {len(self.active_patterns)} active pattern(s) against the new resource indicator...")
-                            
-                            valid_patterns = []
-                            removed_count = 0
-                            for pattern in self.active_patterns:
-                                # Get both objects from the new pattern structure
-                                obj1 = pattern['object_1']
-                                obj2 = pattern['object_2']
-                                
-                                # Check if either object's vertical span overlaps with the indicator row
-                                obj1_on_indicator = (obj1['top_row'] <= row_idx < obj1['top_row'] + obj1['height'])
-                                obj2_on_indicator = (obj2['top_row'] <= row_idx < obj2['top_row'] + obj2['height'])
-                                
-                                if obj1_on_indicator or obj2_on_indicator:
-                                    # This pattern involves an object on the indicator row, so it's invalid.
-                                    removed_count += 1
-                                else:
-                                    valid_patterns.append(pattern)
-                            
-                            if removed_count > 0:
-                                print(f"-> Removed {removed_count} pattern(s) that were incorrectly tracking the resource indicator.")
-                                self.active_patterns = valid_patterns
-                        
-                        self.resource_indicator_candidates.clear()
-                        return
-                else:
-                    del self.resource_indicator_candidates[row_idx]
-            else:
-                self.resource_indicator_candidates[row_idx] = {
-                    'confidence': 1,
-                    'last_index': current_index,
-                    'value_direction': value_direction,
-                    'index_direction': None
-                }
-                print(f"🤔 New resource candidate found at row {row_idx}.")
+        # 5. Separately, check if we can confirm the resource *row* for move-counting.
+        if not self.confirmed_resource_indicator and self.confirmed_ui_signatures:
+            confirmed_rows = Counter(key[1] for key in self.confirmed_ui_signatures)
+            if confirmed_rows:
+                indicator_row, count = confirmed_rows.most_common(1)[0]
+                if count >= 2: # Heuristic: need at least 2 confirmed UI elements on a row
+                    print(f"✅ [UI] Confirmed resource indicator *row* is {indicator_row} for move-counting.")
+                    self.confirmed_resource_indicator = {'row_index': indicator_row}
+                    grid_width = len(self.previous_frame[0][0]) if self.previous_frame and self.previous_frame[0] else 0
+                    self.ignored_areas.append({'top_row': indicator_row, 'left_index': 0, 'height': 1, 'width': grid_width})
 
     def _find_all_objects_on_tile(self, tile_coords: tuple, grid: list) -> list:
         """Finds and describes all non-background objects that exist on a given tile."""
@@ -2850,7 +2792,8 @@ class AGI3(Agent):
             if indicator_sig in life_indicator_signatures: continue
             if indicator_sig in level_indicator_signatures: continue
             if part_sig in resource_signatures: continue
-            if self.confirmed_resource_indicator and obj['top_row'] == self.confirmed_resource_indicator['row_index']: continue
+            ui_key = (obj.get('fingerprint'), obj.get('top_row'), obj.get('left_index'))
+            if ui_key in self.confirmed_ui_signatures: continue
 
             candidate_objects.append(obj)
 
