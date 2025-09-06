@@ -77,7 +77,7 @@ class AGI3(Agent):
         self.confirmed_resource_indicator = None
         self.resource_bar_full_state = None
         self.resource_bar_empty_state = None
-        self.RESOURCE_CONFIDENCE_THRESHOLD = 3 # Actions in a row to confirm
+        self.RESOURCE_CONFIDENCE_THRESHOLD = 2 # Actions in a row to confirm
         self.level_knowledge_is_learned = False
         self.wait_action = GameAction.ACTION6 # Use a secondary action for waiting
         self.initial_level_patterns = set()
@@ -116,7 +116,7 @@ class AGI3(Agent):
         self.action_effect_hypothesis = {} # Tracks action -> effect hypotheses
         self.wall_hypothesis = {} # Tracks wall color candidates
         self.last_known_player_obj = None # Stores the full player object from the last frame
-        self.CONCEPT_CONFIDENCE_THRESHOLD = 3 # Number of times a pattern must be seen to be learned
+        self.CONCEPT_CONFIDENCE_THRESHOLD = 2 # Number of times a pattern must be seen to be learned
 
         # --- Exploration & Pathfinding ---
         self.exploration_phase = ExplorationPhase.INACTIVE
@@ -3617,7 +3617,6 @@ class AGI3(Agent):
 
     def _analyze_and_update_moves(self, latest_frame: FrameData):
         """Analyzes the resource bar to determine max and current moves."""
-        print(f"Debug Moves Analysis: IndicatorConfirmed={bool(self.confirmed_resource_indicator)}, FullStateSaved={self.resource_bar_full_state is not None}, EmptyStateSaved={self.resource_bar_empty_state is not None}")
         # We need all three components to do anything.
         if not self.confirmed_resource_indicator or self.resource_bar_full_state is None or self.resource_bar_empty_state is None:
             return
