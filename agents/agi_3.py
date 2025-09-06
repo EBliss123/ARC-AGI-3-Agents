@@ -1066,11 +1066,11 @@ class AGI3(Agent):
         player_footprint = (self.last_known_player_obj['height'], self.last_known_player_obj['width'])
         all_objects = self._get_all_objects_from_grid(self.previous_frame[0])
         
-        # An obstacle is any object the agent has learned is a Wall.
+        # An obstacle is a reasonably-sized object the agent has learned is a Wall.
         wall_colors = self.world_model.get('wall_colors', set())
         obstacle_objects = [
             obj for obj in all_objects 
-            if obj['color'] in wall_colors
+            if obj['color'] in wall_colors and not (obj.get('height', 0) >= 64 and obj.get('width', 0) >= 64)
         ]
 
         # --- Helper for Collision and Bounds Detection ---
