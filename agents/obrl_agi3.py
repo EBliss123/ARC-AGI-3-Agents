@@ -17,7 +17,7 @@ class ObrlAgi3Agent(Agent):
         super().__init__(**kwargs)
         self.actions_printed = False
         self.last_object_summary = []
-        self.last_action_taken = None
+        self.last_action_context = None  # Will store a tuple of (action_name, coords_dict)
         self.rule_hypotheses = {}
         self.failure_contexts = {}
 
@@ -48,28 +48,33 @@ class ObrlAgi3Agent(Agent):
         # On subsequent turns, analyze the outcome of the previous action.
         else:
             prev_summary = self.last_object_summary
-            prev_action = self.last_action_taken
             changes = self._log_changes(prev_summary, current_summary)
 
-            if changes:
-                # --- Success Path ---
+            # Only perform learning if a previous action was actually taken.
+            if self.last_action_context:
+                prev_action_name, prev_coords = self.last_action_context
+                # Generate a key that is coordinate-specific for CLICK actions.
+                learning_key = self._get_learning_key(prev_action_name, prev_coords)
+                
+                if changes:
+                    # --- Success Path ---
+                    print("--- Change Log ---")
+                    for change in changes:
+                        print(change)
+                    self._analyze_and_report(learning_key, changes)
+                
+                else:
+                    # --- Failure Path ---
+                    if learning_key in self.rule_hypotheses:
+                        print(f"\n--- Failure Detected for Action {learning_key} ---")
+                        print("Action produced no changes. Recording world state to learn failure conditions.")
+                        self.failure_contexts.setdefault(learning_key, []).append(prev_summary)
+                        self._analyze_failures(learning_key)
+
+            elif changes: # Case where changes occurred without a known previous action
                 print("--- Change Log ---")
                 for change in changes:
                     print(change)
-                
-                if prev_action:
-                    self._analyze_and_report(prev_action.name, changes)
-            
-            elif prev_action:
-                # --- Failure Path ---
-                action_name = prev_action.name
-                # Only track failures for actions we've seen succeed before.
-                if action_name in self.rule_hypotheses:
-                    print(f"\n--- Failure Detected for Action {action_name} ---")
-                    print("Action produced no changes. Recording world state to learn failure conditions.")
-                    # Record the "before" state that led to the failure.
-                    self.failure_contexts.setdefault(action_name, []).append(prev_summary)
-                    self._analyze_failures(action_name)
 
         # Update the memory for the next turn.
         self.last_object_summary = current_summary
@@ -99,6 +104,8 @@ class ObrlAgi3Agent(Agent):
                 possible_moves.append({'type': click_action_template, 'object': obj})
 
         action_to_return = None
+        coords_for_context = None  # Variable to hold click coordinates for our internal memory
+
         # If we have any moves, choose one and prepare to return it.
         if possible_moves:
             choice = random.choice(possible_moves)
@@ -112,6 +119,9 @@ class ObrlAgi3Agent(Agent):
                 print(f"Setting data for CLICK on object {obj_id} with dict: {{'x': {click_x}, 'y': {click_y}}}")
                 action_template.set_data({'x': click_x, 'y': click_y})
                 action_to_return = action_template
+                
+                # Capture the coordinates at the moment we decide on them
+                coords_for_context = {'x': click_x, 'y': click_y}
             else:
                 print(f"Agent chose action: {action_template.name}")
                 action_to_return = action_template
@@ -126,8 +136,8 @@ class ObrlAgi3Agent(Agent):
                 action_to_return = random.choice(fallback_options)
                 print(f"Agent chose fallback action: {action_to_return.name}")
 
-        # Before returning, store the chosen action for the next turn's analysis
-        self.last_action_taken = action_to_return
+        # Before returning, store the context of the chosen action for the next turn's analysis.
+        self.last_action_context = (action_to_return.name, coords_for_context)
         return action_to_return
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
@@ -135,6 +145,12 @@ class ObrlAgi3Agent(Agent):
         This method is called by the game to see if the agent thinks it is done.
         """
         return False
+    
+    def _get_learning_key(self, action_name: str, coords: dict | None) -> str:
+        """Generates a unique key for learning, specific to coordinates for CLICK actions."""
+        if action_name == 'ACTION6' and coords:
+            return f"{action_name}_({coords['x']},{coords['y']})"
+        return action_name
     
     def _analyze_and_report(self, action_name: str, changes: list[str]):
         """Builds a summary of the current changes and refines the stored hypothesis for the action."""
