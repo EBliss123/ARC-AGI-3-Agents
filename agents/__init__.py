@@ -15,6 +15,7 @@ from .templates.smolagents import SmolCodingAgent, SmolVisionAgent
 from .obrl_agi3 import ObrlAgi3Agent
 from .my_custom_agent import MyCustomAgent
 from .agi_3 import AGI3
+from .obrl_agi3 import ObrlAgi3Agent
 
 load_dotenv()
 
