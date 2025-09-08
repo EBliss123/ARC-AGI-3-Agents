@@ -1,0 +1,3541 @@
+# ARC-AGI-3 Main Script
+import random
+import copy
+import math
+import heapq
+from enum import Enum
+from .agent import Agent
+from .structs import FrameData, GameAction, GameState
+from collections import Counter
+
+# --- Game Environment Classes ---
+# These classes will hold the state and logic for each specific game.
+
+class LS20_Game:
+    """Environment for the LS20 game."""
+    pass
+
+class FT09_Game:
+    """Environment for the FT09 game."""
+    pass
+
+class VC33_Game:
+    """Environment for the VC33 game."""
+    pass
+
+class CellType(Enum):
+    """Represents the classification of a single grid cell."""
+    UNKNOWN = 0
+    FLOOR = 1
+    WALL = 2
+    POTENTIALLY_INTERACTABLE = 3 # For identified but not fully understood objects
+    PLAYER = 4
+    CONFIRMED_INTERACTABLE = 5
+    RESOURCE = 6
+    POTENTIAL_MATCH = 7
+
+class ExplorationPhase(Enum):
+    """Manages the agent's goal-oriented exploration strategy."""
+    INACTIVE = 0
+    BUILDING_MAP = 1
+    SEEKING_TARGET = 2
+    EXECUTING_PLAN = 3
+
+class AgentState(Enum):
+    """Represents the agent's current operational state."""
+    DISCOVERY = 1
+    RANDOM_ACTION = 2
+    AWAITING_STABILITY = 3
+
+# --- Core AGI Logic ---
+
+class AGI3(Agent):
+    """The general agent that learns to play the games."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Custom agent initializations can go here.
+        self.previous_frame = None
+        self.changed_pixels = []
+        self.static_pixels = []
+        self.debug_counter = 0
+        self.visited_grids = set() # Stores previously seen grid states
+        self.ignored_areas = []
+        self.state_graph = {} # Stores stateA -> action -> stateB
+        self.last_grid_tuple = None
+
+        # --- State Management ---
+        self.agent_state = AgentState.DISCOVERY
+        self.MASSIVE_CHANGE_THRESHOLD = 4000 # Num changes to trigger wait
+        self.discovery_runs = 0
+        self.last_action = None
+        self.action_effects = {} # Will store actions and all their resulting changes
+        self.action_failures = {}
+        self.ineffective_actions = [] # Tracks actions that had no effect since the last success
+        self.level_start_frame = None
+        self.level_start_score = 0
+        self.resource_indicator_candidates = {}
+        self.confirmed_resource_indicator = None
+        self.resource_bar_full_state = None
+        self.resource_bar_empty_state = None
+        self.RESOURCE_CONFIDENCE_THRESHOLD = 2 # Actions in a row to confirm
+        self.level_knowledge_is_learned = False
+        self.wait_action = GameAction.ACTION6 # Use a secondary action for waiting
+        self.initial_level_patterns = set()
+        self.confirmed_ui_signatures = set()
+        self.recoloring_object_candidates = {}
+        self.confirmed_ui_types = set()
+
+        # --- Move Tracking ---
+        self.max_moves = 0
+        self.current_moves = 0
+        self.resource_pixel_color = None
+        self.resource_empty_color = None
+        self.resource_bar_indices = []
+
+        # --- Goal State Tracking ---
+        self.active_patterns = [] # Stores a list of currently active patterns on the grid.
+
+        # --- Object & Shape Tracking ---
+        self.observed_object_shapes = {} # Maps shape tuple -> count
+        self.last_known_objects = [] # Stores full object descriptions from the last frame
+        self.world_model = {
+            'player_signature': None,
+            'player_part_signatures': set(),
+            'floor_color': None,
+            'wall_colors': set(),
+            'action_map': {},
+            'resource_signatures': set(),
+            'player_part_fingerprints': set(),
+            'known_transform_subjects': set(),
+        }
+        self.cross_level_characteristics = {} # Stores full profiles of objects from previous levels.
+        self.level_count = 1
+        self.world_model['life_indicator_signatures'] = set()
+        self.world_model['level_indicator_signatures'] = set()
+        self.static_object_memory = []
+        self.player_floor_hypothesis = {}
+        self.agent_move_hypothesis = {} # Tracks how many times a shape has moved
+        self.floor_hypothesis = {} # Tracks how many times a color has been identified as floor
+        self.action_effect_hypothesis = {} # Tracks action -> effect hypotheses
+        self.wall_hypothesis = {} # Tracks wall color candidates
+        self.last_known_player_obj = None # Stores the full player object from the last frame
+        self.CONCEPT_CONFIDENCE_THRESHOLD = 2 # Number of times a pattern must be seen to be learned
+
+        # --- Exploration & Pathfinding ---
+        self.exploration_phase = ExplorationPhase.INACTIVE
+        self.tile_map = {} # Stores (tile_x, tile_y) -> CellType for the macro grid
+        self.tile_size = None # Stores the grid size (e.g., 8)
+        self.exploration_target = None # Stores (row, col) of the current target
+        self.exploration_plan = [] # Stores a list of GameActions to execute
+        self.inverse_action_map = {} # e.g., {(0, 1): GameAction.RIGHT} for pathfinding
+        self.reachable_floor_area = set() # Stores all floor tiles connected to the player
+        self.just_vacated_tile = None
+
+        # --- Interaction Learning ---
+        self.observing_interaction_for_tile = None # Stores the coords of the tile being observed
+        self.tile_for_aftermath_analysis = None # NEW NAME: Stores tile for delayed analysis
+        self.frame_at_arrival = None # NEW: Stores the frame from the moment of arrival
+        self.tile_to_log_on_aftermath = None # Stores data for delayed logging
+        self.interaction_hypotheses = {} # signature -> {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
+        self.interactable_object_characteristics = {} # Stores visual characteristics of confirmed interactables.
+        self.static_level_objects = []
+        self.has_summarized_interactions = False
+        self.awaiting_final_summary = False
+        self.final_tile_of_level = None
+        self.level_goal_hypotheses = []
+        self.consumed_tiles_this_life = set()
+
+        # --- Generic Action Groups ---
+        # Get all possible actions, excluding RESET, to create generic groups.
+        all_discoverable_actions = [a for a in GameAction if a is not GameAction.RESET]
+        
+        # Group 1-5 are primary; 6 is secondary.
+        self.primary_actions = all_discoverable_actions[:5]
+        
+        # Safely get the 6th action if it exists.
+        if len(all_discoverable_actions) > 5:
+            self.secondary_actions = [all_discoverable_actions[5]]
+        else:
+            self.secondary_actions = []
+
+        # --- Discovery Phase Tracking ---
+        # Start the first discovery run with a shuffled list of primary actions.
+        actions_for_first_run = self.primary_actions.copy()
+        random.shuffle(actions_for_first_run)
+        self.actions_to_try = actions_for_first_run
+        self.discovery_sub_phase = 'PRIMARY' # Can be 'PRIMARY' or 'SECONDARY'
+        self.discovered_in_current_run = False
+        self.level_knowledge_is_learned = False
+
+        print(f"Custom AGI initialized for game: {self.game_id}")
+
+    def _get_grid_state_tuple(self, frame_data: list) -> tuple:
+        """Creates a hashable tuple of the grid, ignoring specific rectangular areas."""
+        if not frame_data or not frame_data[0]:
+            return tuple()
+
+        # Create a mutable copy of the grid to modify.
+        grid_copy = [list(row) for row in frame_data[0]]
+
+        # "Neutralize" the pixels within each ignored rectangle.
+        for area in self.ignored_areas:
+            start_row, end_row = area['top_row'], area['top_row'] + area['height']
+            start_col, end_col = area['left_index'], area['left_index'] + area['width']
+
+            for r in range(start_row, end_row):
+                if 0 <= r < len(grid_copy):
+                    for c in range(start_col, end_col):
+                        if 0 <= c < len(grid_copy[r]):
+                            grid_copy[r][c] = -1 # Use a neutral "ignored" value.
+        
+        # Convert the modified grid to an immutable, hashable tuple.
+        return tuple(tuple(row) for row in grid_copy)
+
+    def _end_discovery_run(self):
+        """Helper method to finalize a discovery run and set up for the next."""
+        self.discovery_runs += 1
+        print(f"--- Discovery Run {self.discovery_runs} Complete ---")
+
+        if self.discovery_runs >= 3:
+            print("--- All discovery runs complete. Switching to RANDOM_ACTION state. ---")
+            self.agent_state = AgentState.RANDOM_ACTION
+            self.level_knowledge_is_learned = True
+        else:
+            # Set up the next run with a new, randomly shuffled sequence.
+            next_run_actions = self.primary_actions.copy()
+            random.shuffle(next_run_actions)
+            self.actions_to_try = next_run_actions
+            self.discovery_sub_phase = 'PRIMARY'
+            self.discovered_in_current_run = False
+
+    def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
+        """Decide if the agent is done playing."""
+        # The agent stops this attempt if it wins the level.
+        return latest_frame.state is GameState.WIN
+    
+    def _reset_for_new_attempt(self):
+        """Resets the agent's state for a new life or attempt without printing."""
+        # --- Core Resets for any attempt ---
+        self.previous_frame = None
+        self.level_start_frame = None
+        self.last_action = None
+        self.last_known_objects = []
+        self.last_known_player_obj = None # Crucial: Force agent to re-find itself.
+        self.initial_level_patterns.clear()
+
+        # --- Reset Level-Specific Layout and Plans ---
+        self.has_summarized_interactions = False
+        self.awaiting_final_summary = False
+        self.exploration_phase = ExplorationPhase.INACTIVE
+        self.exploration_plan = []
+        self.exploration_target = None
+        self.observing_interaction_for_tile = None
+        self.active_patterns.clear()
+        self.consumed_tiles_this_life.clear()
+
+        # --- Reset Agent's Action State ---
+        if self.level_knowledge_is_learned:
+            self.agent_state = AgentState.RANDOM_ACTION
+        else:
+            self.agent_state = AgentState.DISCOVERY
+            self.discovery_runs = 0
+            # Reset to the first discovery run with a fresh shuffled sequence.
+            initial_actions = self.primary_actions.copy()
+            random.shuffle(initial_actions)
+            self.actions_to_try = initial_actions
+            self.discovery_sub_phase = 'PRIMARY'
+            self.discovered_in_current_run = False
+
+        # --- NEW: Refresh consumable objects on the map for the new life ---
+        print("🔄 Refreshing knowledge of consumable objects for new life.")
+        refreshed_count = 0
+        for signature, hypothesis in self.interaction_hypotheses.items():
+            if hypothesis.get('is_consumable') is True:
+                # Extract tile coordinates from a signature like "tile_pos_(10, 5)"
+                try:
+                    tile_str = signature.replace("tile_pos_(", "").replace(")", "")
+                    tile_coords = tuple(map(int, tile_str.split(',')))
+                    
+                    # If this tile was marked as floor, restore its interactable status.
+                    if self.tile_map.get(tile_coords) == CellType.FLOOR:
+                        # If we know it provides a resource, mark it as such. Otherwise, CONFIRMED.
+                        if hypothesis.get('provides_resource'):
+                            self.tile_map[tile_coords] = CellType.RESOURCE
+                        else:
+                            self.tile_map[tile_coords] = CellType.CONFIRMED_INTERACTABLE
+                        refreshed_count += 1
+                except (ValueError, IndexError):
+                    continue # Signature was not in the expected format
+        if refreshed_count > 0:
+            print(f"-> Refreshed {refreshed_count} consumed tile(s) back to an interactable state.")
+
+    def _reset_for_new_level(self):
+        """Resets all level-specific knowledge for a new level, preserving core learned concepts."""
+        self.initial_level_patterns.clear()
+        self.confirmed_ui_signatures.clear()
+        self.recoloring_object_candidates.clear()
+        self.confirmed_ui_types.clear()
+        
+        if self.previous_frame:
+            print("-> Capturing static object state from end of previous level...")
+            self.static_object_memory = self._get_all_objects_from_grid(self.previous_frame[0])
+        
+        # --- NEW: Increment level counter ---
+        self.level_count += 1
+
+        # Record the agent's last position to correctly label the summary.
+        if self.last_known_player_obj and self.tile_size:
+            self.final_tile_of_level = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
+
+        # --- NEW: Print the summary of the level that was just completed ---
+        # Check if a summary wasn't already printed at the end of the level.
+        if not self.has_summarized_interactions:
+            print("\n--- Final Summary of Previous Level ---")
+            self._review_and_summarize_interactions()
+
+        # A new level is a more thorough version of a new attempt.
+        self._reset_for_new_attempt()
+
+        # Since the world model is preserved, we can skip discovery.
+        print("🧠 Knowledge preserved. Skipping discovery and entering action state.")
+        self.agent_state = AgentState.RANDOM_ACTION
+        # --- NEW: Always synthesize a plan after a level is complete. ---
+        self._synthesize_level_plan_hypothesis()
+
+        # Additionally, reset knowledge that is strictly tied to a level's design.
+        print("🧹 Wiping interaction hypotheses and active patterns for the new level.")
+        self.interaction_hypotheses.clear()
+        self.active_patterns.clear()
+        self.has_summarized_interactions = False
+
+    def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
+        """This is the main decision-making method for the AGI."""
+        frame_before_perception = copy.deepcopy(self.previous_frame)
+        # --- 1. Store initial level state if not already set ---
+        if self.level_start_frame is None:
+            # Only store the initial frame if it actually contains data.
+            if latest_frame.frame:
+                print("--- New Level Detected. Storing initial valid frame and score. ---")
+                self.level_start_frame = copy.deepcopy(latest_frame.frame)
+                self.level_start_score = latest_frame.score
+                self._find_level_indicator(latest_frame.frame)
+                self._describe_initial_objects(latest_frame.frame[0])
+                
+                # --- NEW: Capture and store initial patterns to ignore during the level ---
+                print("-> Capturing initial patterns to ignore...")
+                initial_objects = self._get_all_objects_from_grid(latest_frame.frame[0])
+                self._scan_for_fingerprint_patterns(initial_objects)
+                
+                # Store the IDs of any patterns found and then clear the active list for the turn.
+                self.initial_level_patterns = {p.get('id') for p in self.active_patterns if p.get('id')}
+                self.active_patterns.clear()
+                
+                if self.initial_level_patterns:
+                    print(f"-> Stored {len(self.initial_level_patterns)} initial pattern(s).")
+                
+                if self.confirmed_resource_indicator:
+                    indicator_row_index = self.confirmed_resource_indicator['row_index']
+                    self.resource_bar_full_state = copy.deepcopy(latest_frame.frame[0][indicator_row_index])
+                    print(f"-> Captured the 'full' state of the resource bar at row {indicator_row_index}.")
+            else:
+                # If the frame is blank, print a message but do nothing else.
+                # This allows the normal action-selection logic below to run,
+                # preventing the VALIDATION_ERROR. We'll try to store the frame
+                # again on the next turn.
+                print("--- Ignoring blank starting frame. Waiting for a valid one... ---")
+        
+        # --- Handle screen transitions before any other logic ---
+        if self.agent_state == AgentState.AWAITING_STABILITY:
+            # We perceive here to check if the screen has stopped changing.
+            novel_changes_found, _, _, _ = self.perceive(latest_frame)
+
+            # If there are NO changes from the last frame, the screen is stable.
+            if not novel_changes_found:
+                print("✅ Screen is stable (no change from last frame). Analyzing outcome...")
+                new_score = latest_frame.score
+
+                if new_score > self.level_start_score:
+                    print(f"--- New Level Detected! Score increased to {new_score}. ---")
+                    self.level_start_frame = copy.deepcopy(latest_frame.frame)
+                    self.level_start_score = new_score
+                    self._reset_for_new_level() 
+                    return self.wait_action
+                else:
+                    print("--- Lost a Life (Score did not increase). Analyzing reset state... ---")
+                    if self.level_start_frame:
+                        print("-> Comparing object states from level start to after life was lost...")
+                        objects_before = self._get_all_objects_from_grid(self.level_start_frame[0])
+                        objects_after = self._get_all_objects_from_grid(latest_frame.frame[0])
+
+                        map_before = {(obj['top_row'], obj['left_index']): obj for obj in objects_before}
+                        map_after = {(obj['top_row'], obj['left_index']): obj for obj in objects_after}
+                        
+                        changed_objects = []
+                        for pos, obj_before in map_before.items():
+                            obj_after = map_after.get(pos)
+                            # A change is the same fingerprint but a different color at the same location.
+                            if (obj_after and
+                                obj_before.get('fingerprint') == obj_after.get('fingerprint') and
+                                obj_before.get('color') != obj_after.get('color')):
+                                changed_objects.append({'before': obj_before, 'after': obj_after})
+
+                        if changed_objects:
+                            print(f"-> Found {len(changed_objects)} transformed object(s). Learning as life indicator(s).")
+                            learned_new_sig = False
+                            for change in changed_objects:
+                                before_obj = change['before']
+                                after_obj = change['after']
+
+                                before_sig = (before_obj['height'], before_obj['width'], before_obj['color'])
+                                after_sig = (after_obj['height'], after_obj['width'], after_obj['color'])
+
+                                # Process both the 'before' (full) and 'after' (empty) states of the indicator
+                                for sig_tuple, obj_ref, state_name in [(before_sig, before_obj, "'before'"), (after_sig, after_obj, "'after'")]:
+                                    log_sig_str = f"{sig_tuple[0]}x{sig_tuple[1]}, color: {sig_tuple[2]}"
+                                    
+                                    if sig_tuple not in self.world_model.get('life_indicator_signatures', set()):
+                                        self.world_model.setdefault('life_indicator_signatures', set()).add(sig_tuple)
+                                        print(f"✅ [LIFE INDICATOR] Learned new signature (from {state_name} state): {log_sig_str} at ({obj_ref['top_row']}, {obj_ref['left_index']}).")
+                                        learned_new_sig = True
+                                    else:
+                                        print(f"-> Signature (from {state_name} state) {log_sig_str} at ({obj_ref['top_row']}, {obj_ref['left_index']}) was already known.")
+
+                                # The ignored area logic only applies to the 'after' object's final position
+                                new_area = {'top_row': after_obj['top_row'], 'left_index': after_obj['left_index'], 'height': after_obj['height'], 'width': after_obj['width']}
+                                if new_area not in self.ignored_areas:
+                                    self.ignored_areas.append(new_area)
+
+                            if learned_new_sig:
+                                print(f"DEBUG: Rescanning with life indicator signatures: {self.world_model.get('life_indicator_signatures', set())}")
+                                self._scan_and_label_all_objects(latest_frame.frame[0], "Life Indicator Confirmed")
+                        else:
+                            print("-> No object transformations were isolated.")
+                    else:
+                        print("-> Could not perform analysis: Level start frame was not captured.")
+                    
+                    self._reset_for_new_attempt()
+                    # After handling the transition, wait for the next turn to act.
+                    return self.wait_action
+            else:
+                # If the screen is still changing, just wait.
+                return self.wait_action
+            
+        agent_part_fingerprints = set()
+        novel_changes_found, known_changes_found, change_descriptions, structured_changes = self.perceive(latest_frame)    
+        
+        # --- Update and display move count ---
+        self._analyze_and_update_moves(latest_frame)
+        if self.max_moves > 0:
+            print(f"-> Moves Remaining: {self.current_moves}/{self.max_moves}")
+
+        # --- NEW: Check for and analyze the "aftermath" of an interaction ---
+        if self.observing_interaction_for_tile is not None:
+            # Get the agent's CURRENT tile position to see if it successfully moved.
+            current_player_tile = None
+            if self.last_known_player_obj and self.tile_size:
+                current_player_tile = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
+
+            # If the player is still on the tile we're observing, their move failed.
+            if current_player_tile == self.observing_interaction_for_tile:
+                print(f"-> Aftermath check for tile {self.observing_interaction_for_tile} paused: Agent's move failed.")
+                # We do nothing else; the flag remains, and we'll re-check after the next move attempt.
+            else:
+                # The agent has successfully moved away. Now we can analyze the aftermath.
+                print("-> Stepped away from observed tile. Analyzing aftermath...")
+                self._analyze_consumable_aftermath(latest_frame.frame)
+
+                # --- NEW: Full aftermath analysis, including classification and logging ---
+                if self.tile_for_aftermath_analysis and self.frame_at_arrival:
+                    tile_to_analyze = self.tile_for_aftermath_analysis
+
+                    # Ensure we are analyzing the correct tile for the current interaction cycle.
+                    if tile_to_analyze == self.observing_interaction_for_tile:
+                        # --- NEW: Add debug print ---
+                        print(f"🧠 Checking for match. Long-term memory contains: {list(self.cross_level_characteristics.keys())}")
+
+                        # 1. Perform the cross-level match check using the pre-interaction frame.
+                        is_match = False
+                        objects_on_tile = self._find_all_objects_on_tile(tile_to_analyze, self.frame_at_arrival)
+                        for obj in objects_on_tile:
+                            if obj.get('fingerprint') in self.cross_level_characteristics:
+                                is_match = True
+                                break
+
+                        # 2. Reclassify the tile on the map based on the check.
+                        if is_match:
+                            self.tile_map[tile_to_analyze] = CellType.POTENTIAL_MATCH
+                            print(f"✅ Aftermath classification: Tile {tile_to_analyze} is a potential match '~'.")
+                        else:
+                            self.tile_map[tile_to_analyze] = CellType.CONFIRMED_INTERACTABLE
+                            print(f"✅ Aftermath classification: Tile {tile_to_analyze} is a new interactable '!'.")
+
+                        # 3. Log the characteristics of the tile's AFTERMATH state.
+                        self._log_object_characteristics(tile_to_analyze, latest_frame.frame)
+
+                    # 4. Reset the flags for the next interaction cycle.
+                    self.tile_for_aftermath_analysis = None
+                    self.frame_at_arrival = None
+
+                # End the full observation cycle and return to normal exploration.
+                self.observing_interaction_for_tile = None
+                self.exploration_phase = ExplorationPhase.BUILDING_MAP # Resume normal exploration
+            
+
+        # --- Trigger queued summary AFTER aftermath is processed ---
+        if self.awaiting_final_summary and self.observing_interaction_for_tile is None:
+            self._review_and_summarize_interactions()
+            self.awaiting_final_summary = False # Reset flag
+            self.exploration_phase = ExplorationPhase.INACTIVE # Officially end exploration
+        
+        # --- State Graph Update ---
+        # If we have a previous state and an action that led to the current state,
+        # update the state graph to record the transition.
+        grid_tuple = self._get_grid_state_tuple(latest_frame.frame)
+        if self.last_grid_tuple is not None and self.last_action is not None:
+            if self.last_grid_tuple not in self.state_graph:
+                self.state_graph[self.last_grid_tuple] = {}
+            self.state_graph[self.last_grid_tuple][self.last_action] = grid_tuple
+
+        # ---
+
+        if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
+            # If the whole game is new/over, reset everything.
+            if latest_frame.state == GameState.NOT_PLAYED:
+                print("--- New Game Detected. Resetting all knowledge. ---")
+                self.level_knowledge_is_learned = False
+            else: # GameState.GAME_OVER
+                print("--- Game Over Detected. Resetting attempt. ---")
+            
+            self._reset_for_new_attempt()
+            return GameAction.RESET
+
+        # --- 2. Perception & Consequence of Last Action ---
+        # Create a hashable representation of the grid for state graph tracking.
+        grid_tuple = self._get_grid_state_tuple(latest_frame.frame)
+
+        # Create a hashable representation of the grid for state graph tracking.
+        # We already did this above for the state graph, so we just use the variable.
+        
+        # Check if the current state is one we've seen before.
+        if grid_tuple in self.visited_grids:
+            print(f"-> State already visited ({len(self.visited_grids)} unique states known).")
+        else:
+            print(f"✅ New unique state discovered! ({len(self.visited_grids) + 1} total)")
+            self.visited_grids.add(grid_tuple)
+
+        # Check for massive changes indicating a transition
+        if novel_changes_found:
+            is_dimension_change = "Frame dimensions changed" in change_descriptions
+            if len(change_descriptions) > self.MASSIVE_CHANGE_THRESHOLD or is_dimension_change:
+                print(f"💥 Massive change detected ({len(change_descriptions)} changes). Likely a level transition.")
+
+                # --- Capture the frame BEFORE the massive change as the potential 'empty' state ---
+                if self.confirmed_resource_indicator and frame_before_perception:
+                    # Check if score has NOT increased, indicating a death, not a win.
+                    if latest_frame.score <= self.level_start_score:
+                        indicator_row_index = self.confirmed_resource_indicator['row_index']
+                        # frame_before_perception holds the grid state right before the death animation.
+                        self.resource_bar_empty_state = copy.deepcopy(frame_before_perception[0][indicator_row_index])
+                        print(f"-> Captured potential 'empty' state of the resource bar from the frame before transition.")
+
+                print("-> Waiting for stability...")
+                self.agent_state = AgentState.AWAITING_STABILITY
+                self.stability_counter = 0
+                self.previous_frame = None # Invalidate frame to ensure fresh perception after stability
+                return self.wait_action
+
+        # Process the result of the last action, but only if it wasn't a wait action.
+        if self.last_action and self.last_action is not self.wait_action:
+            # A "successful" action is one that causes a novel, non-indicator change.
+            if novel_changes_found:
+                # --- Action SUCCEEDED (caused a novel change) ---
+                was_cleared = len(self.ineffective_actions) > 0
+                self.ineffective_actions.clear()
+                clear_message = " Clearing ineffective actions list." if was_cleared else ""
+
+                if self.agent_state == AgentState.DISCOVERY:
+                    self.action_effects[self.last_action] = change_descriptions
+                    self.discovered_in_current_run = True
+                    print(f"Action {self.last_action.name} caused {len(change_descriptions)} novel changes. Storing success.{clear_message}")
+                else: # RANDOM_ACTION state
+                    print(f"Known action {self.last_action.name} succeeded, causing {len(change_descriptions)} novel changes.{clear_message}")
+
+                for description in change_descriptions[:10]:
+                    print(description)
+                if len(change_descriptions) > 10:
+                    print("  - ...and more.")
+
+            else:
+                # --- An action failed to produce a novel change ---
+                # If this was a KNOWN action, it's a learning opportunity.
+                if self.last_action in self.world_model['action_map']:
+                    self._learn_from_interaction_failure(self.last_action, self.previous_frame)
+
+                if known_changes_found:
+                    print("💧 Resource level changed, but no other effects were observed.")
+
+                if self.last_action not in self.ineffective_actions:
+                    self.ineffective_actions.append(self.last_action)
+
+                if self.agent_state == AgentState.RANDOM_ACTION:
+                    print(f"Action {self.last_action.name} had no novel effect. Ineffective actions: {[a.name for a in self.ineffective_actions]}")
+                    context = copy.deepcopy(self.previous_frame)
+                    if self.last_action not in self.action_failures:
+                        self.action_failures[self.last_action] = []
+                    self.action_failures[self.last_action].append(context)
+
+            # Still run indicator tracking if ANY change happened, to keep it updated.
+            if novel_changes_found or known_changes_found:
+                all_objects_on_grid = self._get_all_objects_from_grid(latest_frame.frame[0])
+                # We pass `structured_changes` here, which contains ALL changes (novel and known).
+                self._track_recoloring_ui_objects(all_objects_on_grid, self.last_known_objects)
+
+        # --- Object Finding and Tracking ---
+        if novel_changes_found:
+            # --- Separate UI changes from game-world changes for analysis ---
+            object_logic_changes = []
+            if self.confirmed_resource_indicator:
+                indicator_row = self.confirmed_resource_indicator['row_index']
+                for change in structured_changes:
+                    if change['row_index'] != indicator_row:
+                        object_logic_changes.append(change)
+            else:
+                object_logic_changes = structured_changes
+            
+            # 2. Store the tile the agent might be leaving, for context in other functions.
+            self.just_vacated_tile = None
+            if self.last_known_player_obj and self.tile_size:
+                self.just_vacated_tile = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
+
+            moved_agent_this_turn = None
+            
+            # 3. Track objects using the full, reliable list to find the agent and its parts.
+            tracking_logs, moved_agent_this_turn, agent_part_fingerprints = self._track_objects(all_objects_on_grid, self.last_known_objects, latest_frame.frame, object_logic_changes, self.last_action)
+            if tracking_logs:
+                print(f"--- Object Tracking Report (Action: {self.last_action.name}) ---")
+                for log in tracking_logs:
+                    print(log)
+
+            # 4. Scan the complete grid for fingerprint-based patterns.
+            self._scan_for_fingerprint_patterns(all_objects_on_grid)
+            
+            if self.active_patterns:
+                print(f"--- {len(self.active_patterns)} Active Pattern Instance(s) on Grid ---")
+                for i, pattern in enumerate(self.active_patterns):
+                    obj1_pixel = (pattern['object_1']['top_row'], pattern['object_1']['left_index'])
+                    obj2_pixel = (pattern['object_2']['top_row'], pattern['object_2']['left_index'])
+                    print(f"  - Pattern {i+1}: Object at pixel {obj1_pixel} matches object at pixel {obj2_pixel} (FP: {pattern['fingerprint']}).")
+           
+            # 5. Update memory for the next turn with the reliable, full-scan list.
+            self.last_known_objects = all_objects_on_grid
+
+            # 6. Update the player object's known position for the next turn.
+            if moved_agent_this_turn:
+                self.last_known_player_obj = moved_agent_this_turn
+
+                        # --- NEW: Check for resource refill events ---
+            resource_event = None
+            if self.confirmed_resource_indicator:
+                indicator_row = self.confirmed_resource_indicator['row_index']
+                for change in structured_changes:
+                    if change['row_index'] == indicator_row:
+                        for pixel in change['changes']:
+                            if isinstance(pixel.get('to'), (int, float)) and isinstance(pixel.get('from'), (int, float)):
+                                if pixel['to'] > pixel['from']:
+                                    resource_event = "REFILLED"
+                                    break
+                    if resource_event:
+                        break
+            
+            if resource_event == "REFILLED":
+                print(f"✅ [RESOURCE] Resource bar was refilled!")
+                if self.last_known_player_obj and self.tile_size and frame_before_perception:
+                    player_tile = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
+                    print(f"-> Agent is on tile {player_tile}. Classifying as a resource.")
+                    self.tile_map[player_tile] = CellType.RESOURCE
+
+                    # --- NEW: Learn the visual signature of the resource object ---
+                    # Find the object that was on this tile in the frame *before* the move.
+                    resource_obj = self._find_object_on_tile(player_tile, frame_before_perception)
+                    if resource_obj and resource_obj.get('fingerprint') is not None:
+                        res_fingerprint = resource_obj['fingerprint']
+                        res_size = (resource_obj['height'], resource_obj['width'])
+                        res_color = resource_obj['color']
+                        composite_signature = (res_fingerprint, res_size, res_color)
+
+                        if composite_signature not in self.world_model['resource_signatures']:
+                            self.world_model['resource_signatures'].add(composite_signature)
+                            print(f"✅ [RESOURCE] Learned new composite resource signature: {composite_signature}")
+                    
+                    self._log_object_characteristics(player_tile, frame_before_perception)
+
+                    # Update interaction hypothesis for this tile
+                    signature = f"tile_pos_{player_tile}"
+                    if signature not in self.interaction_hypotheses:
+                        self.interaction_hypotheses[signature] = {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
+                    self.interaction_hypotheses[signature]['provides_resource'] = True
+
+        # --- NEW, SIMPLIFIED NEW-LEVEL DETECTION ---
+        # If the score has increased at any point, assume it's a new level and reset.
+        if latest_frame.score > self.level_start_score:
+            print(f"--- New Level Detected (Score Increased)! Analyzing final move before reset. ---")
+            
+            # --- Manually trigger interaction analysis for the goal tile ---
+            if self.last_known_player_obj and self.tile_size:
+                goal_tile = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
+                print(f"-> Analyzing winning interaction with tile {goal_tile}...")
+                self.observing_interaction_for_tile = goal_tile
+                self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect', latest_frame.frame, frame_before_perception, self.last_known_objects, self.world_model['player_part_fingerprints'])
+                self.observing_interaction_for_tile = None # Clear immediately after use.
+
+                # --- NEW: Special case to log characteristics for the goal tile ---
+                # This must use the frame from *before* the agent moved onto the tile.
+                print(f"-> Logging characteristics for goal tile {goal_tile} before level reset.")
+                if frame_before_perception:
+                    self._log_object_characteristics(goal_tile, frame_before_perception)
+
+            # Now that the final interaction is logged, proceed with the reset.
+            self.level_start_frame = copy.deepcopy(latest_frame.frame)
+            self.level_start_score = latest_frame.score
+            self._summarize_level_goal()
+            self._reset_for_new_level()
+            return self.wait_action
+
+        # --- Intelligent Exploration Logic ---
+        can_explore = (self.world_model.get('player_signature') and
+               self.world_model.get('floor_color') and
+               self.world_model.get('action_map') and
+               self.last_known_player_obj)
+
+        if can_explore and self.exploration_phase == ExplorationPhase.INACTIVE:
+            print("🤖 World model is sufficiently complete. Activating exploration phase.")
+            self.exploration_phase = ExplorationPhase.BUILDING_MAP
+
+        if self.exploration_phase != ExplorationPhase.INACTIVE:
+            if self.exploration_phase == ExplorationPhase.EXECUTING_PLAN:
+                if self.exploration_plan:
+                    action = self.exploration_plan.pop(0)
+                    print(f"🗺️ Executing plan: {action.name}. {len(self.exploration_plan)} steps remaining.")
+                    self.last_action = action
+                    self.last_grid_tuple = grid_tuple
+                    return action
+                else:
+                    print("✅ Plan complete. Beginning interaction observation.")
+                    if self.exploration_target and self.tile_size:
+                        target_tile = (self.exploration_target[0] // self.tile_size, self.exploration_target[1] // self.tile_size)
+                        if self.tile_map.get(target_tile) == CellType.POTENTIALLY_INTERACTABLE:
+                            # --- NEW: Queue the tile for full analysis in the aftermath phase ---
+                            print(f"-> Queuing tile {target_tile} for classification and logging after aftermath.")
+                            self.tile_for_aftermath_analysis = target_tile
+                            self.frame_at_arrival = copy.deepcopy(frame_before_perception)
+                            self.frame_for_logging = copy.deepcopy(latest_frame.frame)
+                        self.observing_interaction_for_tile = target_tile
+                        self._analyze_and_log_interaction_effect(structured_changes, 'immediate_effect', latest_frame.frame, frame_before_perception, self.last_known_objects, self.world_model['player_part_fingerprints'])
+                    # Set the phase for the *next* turn, then explicitly wait.
+                    self.exploration_phase = ExplorationPhase.BUILDING_MAP
+
+                    # --- NEW: Explicitly wait one turn to observe the interaction before moving away. ---
+                    print("-> Pausing for one turn to observe interaction.")
+                    self.last_action = self.wait_action
+                    self.last_grid_tuple = grid_tuple
+                    return self.wait_action
+
+            if self.exploration_phase == ExplorationPhase.BUILDING_MAP:
+                print("🗺️ Building/updating the level map...")
+                self.just_vacated_tile = None # Clear the one-time flag after use.
+                self.exploration_phase = ExplorationPhase.SEEKING_TARGET
+
+            if self.exploration_phase == ExplorationPhase.SEEKING_TARGET:
+                print("🗺️ Seeking a new exploration target...")
+                target_found = self._find_target_and_plan()
+                if target_found:
+                    # The printout for this is now handled inside _find_target_and_plan.
+                    self.exploration_phase = ExplorationPhase.EXECUTING_PLAN
+                    # Execute the first step of the new plan immediately.
+                    if self.exploration_plan:
+                        action = self.exploration_plan.pop(0)
+                        print(f"🗺️ Executing plan: {action.name}. {len(self.exploration_plan)} steps remaining.")
+                        self.last_action = action
+                        self.last_grid_tuple = grid_tuple
+                        return action
+                else:
+                    # If we just finished exploring and queued a summary, we should pause.
+                    # This allows the summary to print and the aftermath of the last action to be processed.
+                    if self.awaiting_final_summary:
+                        print("🧐 Pausing exploration to generate summary and process interaction aftermath.")
+                        self.last_action = self.wait_action
+                        self.last_grid_tuple = grid_tuple
+                        return self.wait_action
+                    else:
+                        # If there are no targets AND a summary isn't pending, exploration is truly done.
+                        print("🧐 No more targets found. Reverting to state graph exploration.")
+                        self.exploration_phase = ExplorationPhase.INACTIVE
+                        # Fall through to the default state graph action state
+
+
+
+        # --- 3. Choose a New Action to Take ---
+        if self.agent_state == AgentState.DISCOVERY:
+            if not self.actions_to_try:
+                if self.discovery_sub_phase == 'PRIMARY':
+                    if self.discovered_in_current_run or not self.secondary_actions:
+                        self._end_discovery_run()
+                    else:
+                        print("--- Primary actions yielded no results. Trying secondary actions. ---")
+                        self.discovery_sub_phase = 'SECONDARY'
+                        self.actions_to_try = self.secondary_actions.copy()
+                else: 
+                    self._end_discovery_run()
+            
+            if self.agent_state == AgentState.DISCOVERY and self.actions_to_try:
+                action = self.actions_to_try.pop(0)
+                self.last_action = action
+                return action
+
+        # If discovery is over, use the state graph to explore intelligently.
+        if self.agent_state == AgentState.RANDOM_ACTION:
+            print("--- Choosing Action Based on State Graph ---")
+            
+            # 1. Identify all possible actions.
+            base_actions = list(self.action_effects.keys())
+            available_actions = [a for a in base_actions if a not in self.ineffective_actions]
+            if not available_actions and base_actions:
+                print("--- All actions were ineffective. Resetting list. ---")
+                self.ineffective_actions.clear()
+                available_actions = base_actions
+
+            # 2. Categorize actions based on the state graph.
+            novel_actions = []
+            boring_actions = []
+            known_transitions = self.state_graph.get(grid_tuple, {})
+
+            for act in available_actions:
+                if act not in known_transitions:
+                    # This action has not been tried from this specific grid state. It's novel.
+                    novel_actions.append(act)
+                else:
+                    # We know where this action leads. We'll consider it "boring" to prioritize novelty.
+                    boring_actions.append(act)
+
+            print(f"Novel actions from this state: {[a.name for a in novel_actions]}")
+            print(f"Boring actions from this state: {[a.name for a in boring_actions]}")
+
+            # 3. Prioritize novel actions to maximize discovery.
+            if novel_actions:
+                action = random.choice(novel_actions)
+            elif boring_actions:
+                action = random.choice(boring_actions)
+            else:
+                action = self.wait_action # Fallback if no actions are available
+
+        self.last_grid_tuple = grid_tuple
+        self.last_action = action
+        return action
+
+    def _find_target_and_plan(self) -> bool:
+        """
+        Finds the best reachable, interactable OBJECT by filtering, prioritizing,
+        and then pathfinding to it using the pixel-based navigation system.
+        """
+        self.exploration_target = None
+        self.exploration_plan = []
+        if not self.last_known_player_obj or not self.previous_frame:
+            return False
+
+        player_pixel_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
+        all_objects = self._get_all_objects_from_grid(self.previous_frame[0])
+        
+        # --- PRIORITY 0: SURVIVAL ---
+        if self.max_moves > 0: # Only check for resources if move counting is active
+            nearest_resource_info = self._find_nearest_resource(player_pixel_pos, all_objects)
+            if nearest_resource_info:
+                distance_to_resource = len(nearest_resource_info['path'])
+                safety_buffer = 1
+                if self.current_moves <= distance_to_resource + safety_buffer:
+                    print(f"⚠️ Activating PRIORITY 0 (SURVIVAL): Low on moves ({self.current_moves})! Resource is {distance_to_resource} steps away.")
+                    target_obj = nearest_resource_info['object']
+                    self.exploration_target = (target_obj['top_row'], target_obj['left_index'])
+                    self.exploration_plan = nearest_resource_info['path']
+                    return True
+
+        # --- Get and filter all potential interactable objects ---
+        current_floor_object = self._get_playable_area_pixels(all_objects, return_object=True)
+        candidate_objects = []
+        agent_part_signatures = self.world_model.get('player_part_signatures', set())
+        resource_signatures = self.world_model.get('resource_signatures', set())
+        
+        for obj in all_objects:
+            h, w, c, fp = obj['height'], obj['width'], obj['color'], obj['fingerprint']
+            if h >= 64 and w >= 64: continue
+
+            part_sig = (fp, (h, w), c)
+            ui_key = (obj.get('fingerprint'), obj.get('top_row'), obj.get('left_index'))
+            ui_type_key = (obj.get('fingerprint'), (obj.get('height'), obj.get('width')))
+
+            if c == self.world_model.get('floor_color'): continue
+            if c in self.world_model.get('wall_colors', set()): continue
+            if part_sig in agent_part_signatures: continue
+            if part_sig in resource_signatures: continue
+            if ui_key in self.confirmed_ui_signatures or ui_type_key in self.confirmed_ui_types: continue
+
+            if current_floor_object:
+                is_on_floor = (obj['top_row'] >= current_floor_object['top_row'] and
+                               obj['left_index'] >= current_floor_object['left_index'] and
+                               (obj['top_row'] + obj['height']) <= (current_floor_object['top_row'] + current_floor_object['height']) and
+                               (obj['left_index'] + obj['width']) <= (current_floor_object['left_index'] + current_floor_object['width']))
+                if not is_on_floor:
+                    continue
+            candidate_objects.append(obj)
+
+        # --- Filter these candidate_objects based on priorities ---
+        potential_target_objects = []
+        untested_objects = [obj for obj in candidate_objects if f"obj_{obj['fingerprint']}_{obj['top_row']}_{obj['left_index']}" not in self.interaction_hypotheses]
+
+        if untested_objects:
+            print("🎯 Activating PRIORITY 1: Seeking all untested objects.")
+            potential_target_objects = untested_objects
+        else:
+            if self.active_patterns:
+                print("🎯 Activating PRIORITY 2: Pattern active. Seeking interactables with no known effect.")
+                potential_target_objects = [obj for obj in candidate_objects if self.interaction_hypotheses.get(f"obj_{obj['fingerprint']}_{obj['top_row']}_{obj['left_index']}", {}).get('has_effect') is False]
+            else:
+                print("🎯 Activating PRIORITY 3: No patterns active. Seeking interactables with a known function.")
+                potential_target_objects = [obj for obj in candidate_objects if self.interaction_hypotheses.get(f"obj_{obj['fingerprint']}_{obj['top_row']}_{obj['left_index']}", {}).get('has_effect') is True]
+
+        if not potential_target_objects:
+            print("🧐 No more targets found based on current priorities.")
+            return False
+
+        # --- Pathfinding with the new "permission" logic ---
+        playable_area_pixels = self._get_playable_area_pixels(all_objects, return_object=False)
+        reachable_targets = []
+
+        for obj in potential_target_objects:
+            interaction_positions = self._get_interaction_pixel_positions(obj)
+            target_object_pixels = self._get_object_pixels(obj)
+            walkable_for_this_target = playable_area_pixels.union(target_object_pixels)
+
+            shortest_path_for_obj = None
+            best_target_pos_for_obj = None
+            for target_pos in interaction_positions:
+                path = self._find_path_to_position(player_pixel_pos, target_pos, walkable_for_this_target)
+                if path and (shortest_path_for_obj is None or len(path) < len(shortest_path_for_obj)):
+                    shortest_path_for_obj = path
+                    best_target_pos_for_obj = target_pos
+
+            if shortest_path_for_obj:
+                reachable_targets.append({'object': obj, 'path': shortest_path_for_obj, 'target_pos': best_target_pos_for_obj})
+
+        if not reachable_targets:
+            print("🧐 All potential object targets are currently unreachable.")
+            return False
+
+        best_target = min(reachable_targets, key=lambda t: len(t['path']))
+        target_obj = best_target['object']
+        target_pixel_to_stand_on = best_target['target_pos']
+        self.exploration_target = (target_obj['top_row'], target_obj['left_index'])
+        self.exploration_plan = best_target['path']
+        print(f"🎯 New object target acquired at pixel {self.exploration_target}. Plan to stand at {target_pixel_to_stand_on} created with {len(self.exploration_plan)} steps.")
+        return True
+
+    def _find_nearest_resource(self, player_pixel_pos: tuple, all_objects: list) -> dict | None:
+        """Finds the closest reachable resource object using the new pathfinder."""
+        playable_area_pixels = self._get_playable_area_pixels(all_objects)
+        resource_signatures = self.world_model.get('resource_signatures', set())
+        resource_objects = [obj for obj in all_objects if (obj.get('fingerprint'), (obj.get('height'), obj.get('width')), obj.get('color')) in resource_signatures]
+        if not resource_objects: return None
+
+        reachable_resources = []
+        for resource_obj in resource_objects:
+            interaction_positions = self._get_interaction_pixel_positions(resource_obj)
+            target_object_pixels = self._get_object_pixels(resource_obj)
+            walkable_for_this_target = playable_area_pixels.union(target_object_pixels)
+            
+            shortest_path = None
+            best_target_pos = None
+            for pos in interaction_positions:
+                path = self._find_path_to_position(player_pixel_pos, pos, walkable_for_this_target)
+                if path and (shortest_path is None or len(path) < len(shortest_path)):
+                    shortest_path = path
+                    best_target_pos = pos
+            if shortest_path:
+                reachable_resources.append({'object': resource_obj, 'path': shortest_path, 'target_pos': best_target_pos})
+
+        if not reachable_resources: return None
+        return min(reachable_resources, key=lambda r: len(r['path']))
+
+    def _find_path_to_position(self, start_pos: tuple, target_pos: tuple, playable_pixels: set) -> list | None:
+        """
+        Finds a path using A*, where a valid move is one where the agent's
+        entire footprint lands on the provided set of playable pixels.
+        """
+        if not self.world_model.get('action_map') or not self.last_known_player_obj or not playable_pixels:
+            return None
+
+        player_h, player_w = self.last_known_player_obj['height'], self.last_known_player_obj['width']
+
+        # --- Helper that checks if the agent's ENTIRE footprint is on the floor ---
+        def is_valid_position(pos: tuple) -> bool:
+            # Iterate through every pixel of the agent's bounding box at the new position.
+            for r_offset in range(player_h):
+                for c_offset in range(player_w):
+                    # Calculate the actual pixel coordinate on the grid.
+                    check_pixel = (pos[0] + r_offset, pos[1] + c_offset)
+                    
+                    # If any pixel of the agent's body is not on a valid floor pixel, the position is invalid.
+                    if check_pixel not in playable_pixels:
+                        # --- NEW: Debug print for a failed validity check ---
+                        # We only need to print the first pixel that fails.
+                        return False
+            
+            # If all pixels are on the floor, the position is valid.
+            return True
+
+        # A* Implementation
+        action_map = self.world_model['action_map']
+        vector_to_action = {tuple(v['move_vector']): k for k, v in action_map.items() if 'move_vector' in v and tuple(v['move_vector']) != (0,0)}
+        if not vector_to_action: return None
+
+        def heuristic(a, b): return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+        open_set = []
+        heapq.heappush(open_set, (heuristic(start_pos, target_pos), 0, start_pos, []))
+        g_scores = {start_pos: 0}
+        
+        iterations = 0
+        max_iterations = 5000
+
+        while open_set:
+            iterations += 1
+            if iterations > max_iterations:
+                return None # Timeout
+
+            _, g, current_pos, path = heapq.heappop(open_set)
+
+            if current_pos == target_pos: # Require an exact match
+                return [vector_to_action[vec] for vec in path]
+
+            for vector, action in vector_to_action.items():
+                if current_pos == start_pos and action in self.ineffective_actions:
+                    continue
+
+                neighbor_pos = (current_pos[0] + vector[0], current_pos[1] + vector[1])
+                if not is_valid_position(neighbor_pos):
+                    continue
+
+                tentative_g_score = g + 1
+                if tentative_g_score < g_scores.get(neighbor_pos, float('inf')):
+                    g_scores[neighbor_pos] = tentative_g_score
+                    f_score = tentative_g_score + heuristic(neighbor_pos, target_pos)
+                    heapq.heappush(open_set, (f_score, tentative_g_score, neighbor_pos, path + [vector]))
+        return None
+
+    def _get_object_pixels(self, obj: dict) -> set:
+        """Returns a set of all pixel coordinates for a given object."""
+        pixels = set()
+        if not obj or 'data_map' not in obj:
+            return pixels
+        
+        obj_map = obj['data_map']
+        for r_offset, row in enumerate(obj_map):
+            for c_offset, pixel_color in enumerate(row):
+                if pixel_color is not None:
+                    actual_r = obj['top_row'] + r_offset
+                    actual_c = obj['left_index'] + c_offset
+                    pixels.add((actual_r, actual_c))
+        return pixels
+    
+    def _get_playable_area_pixels(self, all_objects: list, return_object=False) -> set | dict:
+        """
+        Finds the floor object the player is on and returns a set of all its pixel coordinates
+        or the object dictionary itself.
+        """
+        if not self.last_known_player_obj or not self.world_model.get('floor_color'):
+            return {} if return_object else set()
+
+        player_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
+        floor_color = self.world_model.get('floor_color')
+        
+        current_floor_object = None
+        for obj in all_objects:
+            if obj['color'] == floor_color:
+                if (obj['top_row'] <= player_pos[0] < obj['top_row'] + obj['height'] and
+                    obj['left_index'] <= player_pos[1] < obj['left_index'] + obj['width']):
+                    current_floor_object = obj
+                    break
+        
+        if return_object:
+            return current_floor_object
+
+        if not current_floor_object:
+            return set()
+
+        floor_pixels = set()
+        floor_map = current_floor_object['data_map']
+        for r_offset, row in enumerate(floor_map):
+            for c_offset, pixel_color in enumerate(row):
+                if pixel_color is not None:
+                    actual_r = current_floor_object['top_row'] + r_offset
+                    actual_c = current_floor_object['left_index'] + c_offset
+                    floor_pixels.add((actual_r, actual_c))
+        
+        return floor_pixels
+    
+    def perceive(self, latest_frame: FrameData) -> tuple[bool, bool, list[str], list]:
+        """Compares frames, separating novel changes from known indicator changes."""
+        current_frame = latest_frame.frame
+        novel_changes_found = False
+        known_changes_found = False
+        novel_change_descriptions = []
+        all_structured_changes = []
+
+        if not current_frame:
+            return False, False, [], []
+
+        if self.previous_frame is None:
+            self.previous_frame = copy.deepcopy(current_frame)
+            return False, False, [], []
+
+        # The "grid" is a list containing one list of rows. The number of rows is the "width".
+        num_rows = len(current_frame[0])
+        prev_num_rows = len(self.previous_frame[0])
+
+        if num_rows != prev_num_rows:
+            print("--- Frame dimensions changed (number of rows)! Analyzing... ---")
+            self.previous_frame = copy.deepcopy(current_frame)
+            return True, False, ["Frame dimensions changed"], []
+
+        # Iterate through the list of rows. The "coordinate" is just the row_index.
+        for row_index in range(num_rows):
+            old_row_data = self.previous_frame[0][row_index]
+            new_row_data = current_frame[0][row_index]
+
+            if old_row_data != new_row_data:
+                # First, create structured data for ALL changes.
+                pixel_level_changes = []
+                if len(old_row_data) == len(new_row_data):
+                    for i in range(len(old_row_data)):
+                        if old_row_data[i] != new_row_data[i]:
+                            pixel_level_changes.append({'index': i, 'from': old_row_data[i], 'to': new_row_data[i]})
+                if pixel_level_changes:
+                    all_structured_changes.append({'row_index': row_index, 'changes': pixel_level_changes})
+
+                # Second, check if it's a known indicator change or a novel one.
+                if self.confirmed_resource_indicator and row_index == self.confirmed_resource_indicator['row_index']:
+                    known_changes_found = True
+                else:
+                    novel_changes_found = True
+                    novel_change_descriptions.append(f"  - Changes at row {row_index}:")
+                    if len(old_row_data) == len(new_row_data):
+                        for change in pixel_level_changes:
+                            novel_change_descriptions.append(f"    - Pixel {change['index']}: From {change['from']} to {change['to']}")
+                    else:
+                        novel_change_descriptions.append(f"    - Data lists changed length.")
+
+        self.previous_frame = copy.deepcopy(current_frame)
+        return novel_changes_found, known_changes_found, novel_change_descriptions, all_structured_changes
+
+    def _describe_initial_objects(self, grid_data: list):
+        """
+        Scans the initial grid at the start of a level to label all objects.
+        """
+        self._scan_and_label_all_objects(grid_data, "Initial Level Analysis")
+
+    def _scan_and_label_all_objects(self, grid_data: list, reason: str):
+        """
+        Scans the entire grid, finds all objects, labels them based on
+        current knowledge, and prints a summary.
+        """
+        if not grid_data or not grid_data[0]:
+            print(f"Object scan skipped for '{reason}': No grid data.")
+            return
+
+        print(f"\n--- Full Object Scan (Reason: {reason}) ---")
+        grid_height = len(grid_data)
+        grid_width = len(grid_data[0])
+        visited_coords = set()
+
+        background_colors = {self.world_model.get('floor_color')} | self.world_model.get('wall_colors', set())
+        background_colors.discard(None)
+
+        for r in range(grid_height):
+            for c in range(grid_width):
+                if (r, c) in visited_coords:
+                    continue
+
+                color = grid_data[r][c]
+
+                component_points = set()
+                q = [(r, c)]
+                visited_coords.add((r, c))
+                
+                while q:
+                    p = q.pop(0)
+                    component_points.add(p)
+                    row, col = p
+                    
+                    for dr in [-1, 0, 1]:
+                        for dc in [-1, 0, 1]:
+                            if dr == 0 and dc == 0:
+                                continue
+                            
+                            neighbor = (row + dr, col + dc)
+                            if (0 <= neighbor[0] < grid_height and 
+                                0 <= neighbor[1] < grid_width and 
+                                neighbor not in visited_coords and 
+                                grid_data[neighbor[0]][neighbor[1]] == color):
+                                
+                                visited_coords.add(neighbor)
+                                q.append(neighbor)
+                
+                if component_points:
+                    min_row = min(r_ for r_, _ in component_points)
+                    max_row = max(r_ for r_, _ in component_points)
+                    min_idx = min(p_idx for _, p_idx in component_points)
+                    max_idx = max(p_idx for _, p_idx in component_points)
+                    height, width = max_row - min_row + 1, max_idx - min_idx + 1
+
+                    data_map = tuple(tuple(grid_data[r][c] if (r, c) in component_points else None for c in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
+                    _, fingerprint, _ = self._create_normalized_fingerprint(data_map)
+
+                    # --- NEW, COMBINED DEBUG STEP ---
+                    is_known_subject = False
+                    if fingerprint != 0: # Avoid checking the background
+                        known_set = self.world_model.get('known_transform_subjects', set())
+                        is_known_subject = fingerprint in known_set
+                    
+                    # --- Determine the object's label based on learned knowledge ---
+                    label = "Unknown Object"  # Default label
+                    ui_key = (fingerprint, min_row, min_idx)
+                    part_sig = (fingerprint, (height, width), color)
+                    indicator_sig = (height, width, color)
+                    is_known_subject = fingerprint in self.world_model.get('known_transform_subjects', set())
+
+                    # Highest priority: Is it a confirmed UI element?
+                    ui_type_key = (fingerprint, (height, width))
+                    if ui_key in self.confirmed_ui_signatures or ui_type_key in self.confirmed_ui_types:
+                        label = "UI Element"
+                    
+                    # Is it the floor? A "true" floor is a large object of the floor color.
+                    # This prevents small, disconnected floor-colored objects (like UI parts) from being mislabeled.
+                    elif color == self.world_model.get('floor_color') and (height * width > 50): # Heuristic: floor objects are large
+                        label = "Floor"
+                        
+                    elif color in self.world_model.get('wall_colors', set()):
+                        label = "Wall"
+                    elif part_sig in self.world_model.get('player_part_signatures', set()):
+                        label = "Agent Component"
+                    elif indicator_sig in self.world_model.get('life_indicator_signatures', set()):
+                        label = "Life Indicator"
+                    elif indicator_sig in self.world_model.get('level_indicator_signatures', set()):
+                        label = "Level Indicator"
+                    elif part_sig in self.world_model.get('resource_signatures', set()):
+                        label = "Resource"
+                    elif is_known_subject:
+                        label = "Known Object"
+
+                    print(f"- Found a {height}x{width} object of color {color} at pixel ({min_row}, {min_idx}) with fingerprint {fingerprint}. [{label}]")
+
+        print("--- End of Scan ---\n")
+
+    def _get_interaction_pixel_positions(self, target_obj: dict) -> list:
+        """Calculates the target pixel position(s) for interacting with an object."""
+        # For the "step on" model, the target is the object's own top-left corner.
+        target_pos = (target_obj['top_row'], target_obj['left_index'])
+        return [target_pos]
+
+    def _get_all_objects_from_grid(self, grid_data: list) -> list[dict]:
+        """Scans a grid and returns a list of all found objects without printing or labeling."""
+        if not grid_data or not grid_data[0]:
+            return []
+
+        final_objects = []
+        grid_height = len(grid_data)
+        grid_width = len(grid_data[0])
+        visited_coords = set()
+
+        for r in range(grid_height):
+            for c in range(grid_width):
+                if (r, c) in visited_coords:
+                    continue
+
+                color = grid_data[r][c]
+                
+                # The floor/background check from the main scanner is not needed here,
+                # as we want to capture ALL objects for a direct comparison.
+
+                component_points = set()
+                q = [(r, c)]
+                visited_coords.add((r, c))
+                
+                while q:
+                    p = q.pop(0)
+                    component_points.add(p)
+                    row, col = p
+                    
+                    for dr in [-1, 0, 1]:
+                        for dc in [-1, 0, 1]:
+                            if dr == 0 and dc == 0:
+                                continue
+                            
+                            neighbor = (row + dr, col + dc)
+                            if (0 <= neighbor[0] < grid_height and 
+                                0 <= neighbor[1] < grid_width and 
+                                neighbor not in visited_coords and 
+                                grid_data[neighbor[0]][neighbor[1]] == color):
+                                
+                                visited_coords.add(neighbor)
+                                q.append(neighbor)
+                
+                if component_points:
+                    min_row = min(r_ for r_, _ in component_points)
+                    max_row = max(r_ for r_, _ in component_points)
+                    min_idx = min(p_idx for _, p_idx in component_points)
+                    max_idx = max(p_idx for _, p_idx in component_points)
+                    height, width = max_row - min_row + 1, max_idx - min_idx + 1
+
+                    background_color = None
+                    border_min_row = max(0, min_row - 1)
+                    border_max_row = min(grid_height - 1, max_row + 1)
+                    border_min_idx = max(0, min_idx - 1)
+                    border_max_idx = min(grid_width - 1, max_idx + 1)
+                    
+                    border_colors = []
+                    for r_ in range(border_min_row, border_max_row + 1):
+                        for c_ in range(border_min_idx, border_max_idx + 1):
+                            is_on_border = (r_ < min_row or r_ > max_row or c_ < min_idx or c_ > max_idx)
+                            if is_on_border:
+                                border_colors.append(grid_data[r_][c_])
+                    
+                    if border_colors and all(c__ == border_colors[0] for c__ in border_colors):
+                        background_color = border_colors[0]
+
+                    data_map = tuple(tuple(grid_data[r][c] if (r, c) in component_points else None for c in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
+                    _, fingerprint, _ = self._create_normalized_fingerprint(data_map)
+
+                    final_objects.append({
+                        'height': height, 'width': width, 'top_row': min_row,
+                        'left_index': min_idx, 'color': color,
+                        'fingerprint': fingerprint,
+                        'data_map': data_map
+                    })
+        return final_objects
+
+    def _compare_and_print_hypothesis_details(self, signature: str, remembered_hypo: dict):
+        """
+        Performs a hybrid comparison: detailed for simple cases, high-level for complex ones.
+        Compares the current hypothesis against a synthesized historical one.
+        """
+        current_hypo = self.interaction_hypotheses.get(signature, {})
+        
+        consistent = []
+        inconsistent = []
+
+        # --- Base Attributes Comparison ---
+        # 1. Compare Persistence (is_consumable)
+        current_persist = current_hypo.get('is_consumable')
+        rem_persist_set = remembered_hypo.get('is_consumable', set())
+        
+        if len(rem_persist_set) == 1:
+            rem_persist = next(iter(rem_persist_set)) if rem_persist_set else None
+            if current_persist == rem_persist:
+                val = "Consumable" if current_persist is True else "Persistent" if current_persist is False else "Unknown"
+                consistent.append(f"Persistence ({val})")
+            else:
+                p_curr = "Consumable" if current_persist is True else "Persistent" if current_persist is False else "Unknown"
+                p_rem = "Consumable" if rem_persist is True else "Persistent" if rem_persist is False else "Unknown"
+                inconsistent.append(f"Persistence (Current: {p_curr}, History: {p_rem})")
+        elif len(rem_persist_set) > 1:
+            p_curr = "Consumable" if current_persist is True else "Persistent" if current_persist is False else "Unknown"
+            inconsistent.append(f"Persistence (Current: {p_curr}, History was inconsistent: {rem_persist_set})")
+
+        # 2. Compare Resource Provision
+        current_res = current_hypo.get('provides_resource', False)
+        rem_res_set = remembered_hypo.get('provides_resource', {False})
+        if len(rem_res_set) == 1:
+             rem_res = next(iter(rem_res_set)) if rem_res_set else False
+             if current_res == rem_res:
+                 if current_res: consistent.append("Provides resource")
+             else:
+                 inconsistent.append(f"Resource provision (Current: {current_res}, History: {rem_res})")
+        elif len(rem_res_set) > 1:
+            inconsistent.append(f"Resource provision (Current: {current_res}, History was inconsistent: {rem_res_set})")
+
+        # --- Granular Effects Comparison ---
+        for effect_type in ['immediate_effect', 'aftermath_effect']:
+            label = effect_type.replace('_', ' ').title()
+            current_outcomes = current_hypo.get(effect_type, [])
+            rem_outcomes = remembered_hypo.get(effect_type, [])
+
+            # Special Case: If both have exactly one outcome with one object, do a detailed comparison.
+            is_simple_case = (len(current_outcomes) == 1 and len(current_outcomes[0]) == 1 and
+                              len(rem_outcomes) == 1 and len(rem_outcomes[0]) == 1)
+
+            if is_simple_case:
+                current_obj = current_outcomes[0][0]
+                rem_obj = rem_outcomes[0][0]
+                
+                effect_consistent = []
+                effect_inconsistent = []
+
+                if current_obj.get('color') == rem_obj.get('color'):
+                    effect_consistent.append(f"Color ({current_obj.get('color')})")
+                else:
+                    effect_inconsistent.append(f"Color (Current: {current_obj.get('color')}, History: {rem_obj.get('color')})")
+                
+                current_size = (current_obj.get('height'), current_obj.get('width'))
+                rem_size = (rem_obj.get('height'), rem_obj.get('width'))
+                if current_size == rem_size:
+                    effect_consistent.append(f"Size {current_size}")
+                else:
+                    effect_inconsistent.append(f"Size (Current: {current_size}, History: {rem_size})")
+
+                if current_obj.get('fingerprint') == rem_obj.get('fingerprint'):
+                    effect_consistent.append("Shape")
+                else:
+                    effect_inconsistent.append("Shape")
+
+                current_loc_str = self._get_object_summary_string(current_obj).split(' (')[0]
+                rem_loc_str = self._get_object_summary_string(rem_obj).split(' (')[0]
+                if current_loc_str != rem_loc_str:
+                     effect_inconsistent.append(f"Location (Current: {current_loc_str}, History: {rem_loc_str})")
+                
+                if effect_inconsistent:
+                    inconsistent.append(f"{label} has inconsistencies:")
+                    for item in effect_consistent:
+                        inconsistent.append(f"   - ✔️ Consistent: {item}")
+                    for item in effect_inconsistent:
+                        inconsistent.append(f"   - ✖️ Inconsistent: {item}")
+                else:
+                    consistent.append(f"{label} is consistent")
+
+            # General Case: Use high-level set comparison for complex interactions.
+            else:
+                if not current_outcomes and not rem_outcomes: continue
+
+                get_canonical = lambda outcomes: {
+                    tuple(sorted([self._get_object_summary_string(obj) for obj in outcome]))
+                    for outcome in outcomes
+                }
+                current_set = get_canonical(current_outcomes)
+                rem_set = get_canonical(rem_outcomes)
+
+                if current_set == rem_set:
+                    consistent.append(f"{label} (has {len(current_set)} outcome(s))")
+                else:
+                    inconsistent.append(f"{label}")
+                    added = current_set - rem_set
+                    removed = rem_set - current_set
+                    if added:
+                        inconsistent.append(f"  - Gained {len(added)} outcome(s) in current level.")
+                    if removed:
+                        inconsistent.append(f"  - Lost {len(removed)} outcome(s) from history.")
+
+        # --- Final Print ---
+        if consistent:
+            print("        -> Consistent Attributes:")
+            for item in consistent:
+                print(f"           - {item}")
+        if inconsistent:
+            print("        -> ⚠️ Inconsistent Attributes:")
+            for item in inconsistent:
+                print(f"           - {item}")
+
+    def _get_object_summary_string(self, obj: dict) -> str:
+        """Creates a standardized, detailed summary string for an object dictionary."""
+        if not obj:
+            return "Invalid object."
+
+        # Part 1: Format location using only pixel coordinates for consistency.
+        pos = (obj.get('top_row', 0), obj.get('left_index', 0))
+        location_str = f"at pixel {pos}"
+
+        # Part 2: Format object details.
+        size = (obj.get('height', 0), obj.get('width', 0))
+        details = []
+        if obj.get('original_color') is not None:
+            details.append(f"Color {obj['original_color']}->{obj['color']}")
+        else:
+            details.append(f"Color {obj.get('color')}")
+        details.append(f"FP:{obj.get('fingerprint')}")
+        
+        return f"A {size[0]}x{size[1]} object {location_str} ({', '.join(details)})."
+
+    def _create_normalized_fingerprint(self, obj_datamap: tuple) -> tuple:
+        """
+        Creates a scale-invariant fingerprint of an object's data map.
+        This allows matching objects of different sizes that have the same proportions and pattern.
+        """
+        if not obj_datamap or not obj_datamap[0]:
+            return None, None # Return None if datamap is empty
+
+        height = len(obj_datamap)
+        width = len(obj_datamap[0])
+
+        # 1. Find the greatest common divisor (GCD) to get the base aspect ratio.
+        divisor = math.gcd(height, width)
+        base_h = height // divisor
+        base_w = width // divisor
+
+        # The scale factor tells us how many pixels in the original map
+        # correspond to one pixel in the normalized map.
+        scale_h = divisor
+        scale_w = divisor
+
+        # 2. Create the normalized map by sampling pixels.
+        normalized_map_list = []
+        for r in range(base_h):
+            new_row = []
+            for c in range(base_w):
+                # Sample the top-left pixel of the corresponding block in the original map.
+                original_row = r * scale_h
+                original_col = c * scale_w
+                sampled_pixel = obj_datamap[original_row][original_col]
+                if sampled_pixel is not None: sampled_pixel = 1
+                new_row.append(sampled_pixel)
+            normalized_map_list.append(tuple(new_row))
+        
+        normalized_map_tuple = tuple(normalized_map_list)
+
+        # 3. Generate the final fingerprint using a hash of the tuple.
+        fingerprint = hash(normalized_map_tuple)
+        
+        # Return the base shape, the fingerprint, AND the normalized map itself for debugging.
+        return ((base_h, base_w), fingerprint, normalized_map_tuple)
+
+    
+    def _find_static_candidates_by_color(self, color: int, grid_data: list) -> list[dict]:
+        """Scans the entire grid to find and describe all objects of a specific color."""
+        if not grid_data or not grid_data[0]:
+            return []
+
+        candidates = []
+        grid_height = len(grid_data)
+        grid_width = len(grid_data[0])
+        visited_coords = set()
+
+        for r in range(grid_height):
+            for c in range(grid_width):
+                if (r, c) not in visited_coords and grid_data[r][c] == color:
+                    # Found a starting point for a potential candidate object.
+                    # Use flood-fill to find all its connected pixels.
+                    component_points = set()
+                    q = [(r, c)]
+                    visited_coords.add((r, c))
+                    
+                    while q:
+                        p = q.pop(0)
+                        component_points.add(p)
+                        row, col = p
+                        
+                        for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                            neighbor = (row + dr, col + dc)
+                            if (0 <= neighbor[0] < grid_height and 
+                                0 <= neighbor[1] < grid_width and 
+                                neighbor not in visited_coords and 
+                                grid_data[neighbor[0]][neighbor[1]] == color):
+                                
+                                visited_coords.add(neighbor)
+                                q.append(neighbor)
+                    
+                    # If an object was found, describe it.
+                    if component_points:
+                        min_row = min(r for r, _ in component_points)
+                        max_row = max(r for r, _ in component_points)
+                        min_idx = min(p_idx for _, p_idx in component_points)
+                        max_idx = max(p_idx for _, p_idx in component_points)
+                        height, width = max_row - min_row + 1, max_idx - min_idx + 1
+
+                        data_map = tuple(tuple(grid_data[r][p] if (r, p) in component_points else None for p in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
+                        base_shape, fingerprint, norm_map = self._create_normalized_fingerprint(data_map)
+
+                        candidates.append({
+                            'height': height, 'width': width, 'top_row': min_row,
+                            'left_index': min_idx, 'color': color,
+                            'data_map': data_map, 'fingerprint': fingerprint, 'base_shape': base_shape, 'normalized_map': norm_map
+                        })
+        return candidates
+
+    def _find_and_describe_objects(self, structured_changes: list, latest_frame: list, is_interaction_analysis: bool = False) -> list[dict]:
+        """Finds objects by grouping changed pixels by their new color first, then clustering."""
+        # --- Create a lookup map for original colors ---
+        from_color_map = {}
+        for change in structured_changes:
+            row_idx = change['row_index']
+            for pixel_change in change['changes']:
+                from_color_map[(row_idx, pixel_change['index'])] = pixel_change['from']
+
+        changed_coords = set()
+        for change in structured_changes:
+            row_idx = change['row_index']
+            for pixel_change in change['changes']:
+                changed_coords.add((row_idx, pixel_change['index']))
+        
+        if not structured_changes:
+            return []
+
+        # 1. Group points by object color, handling both additions and removals.
+        floor_color = self.world_model.get('floor_color')
+        wall_colors = self.world_model.get('wall_colors', set())
+        background_colors = {floor_color} | wall_colors
+        background_colors.discard(None)
+
+        points_by_color = {} # This is the dictionary the original function expects.
+        grid = latest_frame[0]
+        grid_height = len(grid)
+        grid_width = len(grid[0]) if grid_height > 0 else 0
+
+        for change in structured_changes:
+            r = change['row_index']
+            for px_change in change['changes']:
+                c = px_change['index']
+                from_color = px_change['from']
+                to_color = px_change['to']
+                coord = (r, c)
+
+                # Case 1: A new object color appears. The changed pixel itself is the seed.
+                if to_color not in background_colors:
+                    if to_color not in points_by_color:
+                        points_by_color[to_color] = set()
+                    points_by_color[to_color].add(coord)
+
+                # Case 2: An old object color disappears. Seeds must be neighbors
+                # that are still the original color.
+                if from_color not in background_colors and to_color in background_colors:
+                    for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                        neighbor = (r + dr, c + dc)
+                        if not (0 <= neighbor[0] < grid_height and 0 <= neighbor[1] < grid_width):
+                            continue
+                        
+                        if grid[neighbor[0]][neighbor[1]] == from_color:
+                            if from_color not in points_by_color:
+                                points_by_color[from_color] = set()
+                            points_by_color[from_color].add(neighbor)
+
+        # 2. Run a more comprehensive flood-fill starting from each changed pixel
+        #    to find the full extent of each object, including its static parts.
+        monochromatic_parts = []
+        visited_coords = set() # Use one visited set for the whole grid, including static pixels explored.
+        grid = latest_frame[0]
+        grid_height = len(grid)
+        grid_width = len(grid[0]) if grid_height > 0 else 0
+
+        # We still iterate through the changed points to find starting locations for our search.
+        for color, points in points_by_color.items():
+            for point in points:
+                if point not in visited_coords:
+                    # Start a new search for a component.
+                    component_points = set()
+                    q = [point]
+                    visited_coords.add(point) # Mark as visited to avoid redundant searches.
+                    
+                    while q:
+                        p = q.pop(0)
+                        component_points.add(p)
+                        r, p_idx = p
+                        
+                        # Explore all four neighbors.
+                        for dr, dp_idx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                            neighbor = (r + dr, p_idx + dp_idx)
+
+                            # Check if neighbor is within grid boundaries.
+                            if not (0 <= neighbor[0] < grid_height and 0 <= neighbor[1] < grid_width):
+                                continue
+                            
+                            # The crucial change: If the neighbor is the same color and we haven't
+                            # visited it yet, add it to the queue. This allows the search to
+                            # expand across both changed and static pixels.
+                            if neighbor not in visited_coords and grid[neighbor[0]][neighbor[1]] == color:
+                                visited_coords.add(neighbor)
+                                q.append(neighbor)
+                                
+                    monochromatic_parts.append(component_points)
+
+        # 3. For now, we treat each part as a separate object.
+        # A future improvement could merge touching parts of different colors.
+        final_objects = []
+        grid = latest_frame[0]
+        grid_height = len(grid)
+        grid_width = len(grid[0]) if grid_height > 0 else 0
+
+        for obj_points in monochromatic_parts:
+            if not obj_points: continue
+
+            # --- NEW: Filter for incidentally-discovered static objects ---
+            if not is_interaction_analysis:
+                # An object is static if it was only detected because it was adjacent to a
+                # change, but none of its own pixels actually changed this frame.
+                changed_pixels_in_component = changed_coords.intersection(obj_points)
+                if not changed_pixels_in_component:
+                    print(f"🕵️‍♀️ Ignoring static object discovered adjacent to a change.")
+                    continue
+
+            # --- Background Verification Step ---
+            # An "object" is likely a background reveal if it's the known floor color,
+            # or if the number of pixels that actually changed is tiny compared to its total size.
+            sample_point = next(iter(obj_points))
+            obj_color = grid[sample_point[0]][sample_point[1]]
+            known_floor_color = self.world_model.get('floor_color')
+
+            # If we have confirmed the floor color, the check is simple and reliable.
+            if known_floor_color is not None:
+                if obj_color == known_floor_color:
+                    # This is just the floor being revealed. Log it and skip creating an object.
+                    print(f"🕵️‍♀️ [FLOOR]: A change revealed the known floor color ({obj_color}). Ignoring as object.")
+                    continue
+                # Otherwise, if it's not the floor color, it must be a real object.
+
+            else:
+                # If we DON'T know the floor color yet, we use a heuristic to learn it.
+                # A background reveal happens when a small change connects to a massive static area.
+                changed_pixels_in_component = changed_coords.intersection(obj_points)
+
+                # Heuristic: If the component is large and the changed part is small, it's probably background.
+                # This prevents the entire 64x64 background from being treated as an object.
+                is_background_candidate = False
+                if len(obj_points) > 50: # Must be a reasonably large area
+                    # Avoid division by zero if obj_points is somehow empty, though we check earlier.
+                    if len(obj_points) > 0:
+                        ratio = len(changed_pixels_in_component) / len(obj_points)
+                        if ratio < 0.5: # The changed part is less than half the total size
+                            is_background_candidate = True
+
+                if is_background_candidate:
+                    self.floor_hypothesis[obj_color] = self.floor_hypothesis.get(obj_color, 0) + 1
+                    confidence = self.floor_hypothesis[obj_color]
+                    print(f"🕵️‍♀️ Floor Hypothesis: A small change revealed a large area of color {obj_color} (Confidence: {confidence}).")
+
+                    if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
+                        self.world_model['floor_color'] = obj_color
+                        print(f"✅ [FLOOR] Confirmed: Color {obj_color} is the floor.")
+                        # Future improvement: could add map cleanup logic here.
+
+                    # While learning what the floor is, we skip creating an object from background reveals.
+                    continue
+
+            # --- If it's a real object, proceed with description ---
+            min_row = min(r for r, _ in obj_points)
+            max_row = max(r for r, _ in obj_points)
+            min_idx = min(p_idx for _, p_idx in obj_points)
+            max_idx = max(p_idx for _, p_idx in obj_points)
+            height, width = max_row - min_row + 1, max_idx - min_idx + 1
+
+            # --- NEW: Hard-coded filter for the 64x64 background object ---
+            # If an object is found that spans the entire grid, it's the background/wall canvas.
+            # We explicitly ignore it to prevent it from being treated as a dynamic game object.
+            if height >= 64 and width >= 64 and min_row == 0 and min_idx == 0:
+                print(f"🕵️‍♀️ Ignoring the {height}x{width} canvas object found at ({min_row}, {min_idx}).")
+                continue # Skip to the next monochromatic part
+
+            # The background check from the last update is still useful for context.
+            border_colors = []
+            background_color = None
+            border_min_row = max(0, min_row - 1)
+            border_max_row = min(grid_height - 1, max_row + 1)
+            border_min_idx = max(0, min_idx - 1)
+            border_max_idx = min(grid_width - 1, max_idx + 1)
+
+            for r in range(border_min_row, border_max_row + 1):
+                for p_idx in range(border_min_idx, border_max_idx + 1):
+                    is_on_border = (r < min_row or r > max_row or p_idx < min_idx or p_idx > max_idx)
+                    if is_on_border:
+                        border_colors.append(grid[r][p_idx])
+            
+            if border_colors and all(c == border_colors[0] for c in border_colors):
+                background_color = border_colors[0]
+
+            data_map = tuple(tuple(grid[r][p] if (r, p) in obj_points else None for p in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
+            base_shape, fingerprint, norm_map = self._create_normalized_fingerprint(data_map)
+
+            original_color = from_color_map.get(sample_point) # Get original color from our map
+
+            final_objects.append({
+                'height': height, 'width': width, 'top_row': min_row,
+                'left_index': min_idx, 'color': obj_color,
+                'original_color': original_color,
+                'data_map': data_map,
+                'background_color': background_color,
+                'fingerprint': fingerprint, 
+                'base_shape': base_shape,
+                'normalized_map': norm_map
+            })
+
+        return final_objects
+    
+    def _are_objects_adjacent(self, obj1: dict, obj2: dict) -> bool:
+        """Checks if two objects' bounding boxes are touching or overlapping."""
+        # Define the bounding box edges for obj1
+        obj1_left = obj1['left_index']
+        obj1_right = obj1['left_index'] + obj1['width']
+        obj1_top = obj1['top_row']
+        obj1_bottom = obj1['top_row'] + obj1['height']
+
+        # Define the bounding box edges for obj2
+        obj2_left = obj2['left_index']
+        obj2_right = obj2['left_index'] + obj2['width']
+        obj2_top = obj2['top_row']
+        obj2_bottom = obj2['top_row'] + obj2['height']
+
+        # Check for no overlap. Two rectangles do NOT overlap if one is entirely
+        # to the left, right, above, or below the other.
+        if (obj1_right < obj2_left or obj2_right < obj1_left or
+            obj1_bottom < obj2_top or obj2_bottom < obj1_top):
+            return False
+        
+        # If they are not completely separate, they must be adjacent or overlapping.
+        return True
+    
+    def _track_objects(self, current_objects: list, last_objects: list, latest_grid: list, structured_changes: list, action: GameAction) -> list[str]:
+        """Compares current objects to last known objects to track movement and changes."""
+        log_messages = []
+        unmatched_current = list(current_objects)
+        unmatched_last = list(last_objects)
+
+        # --- Stage 1: Match by same position & shape (for Recolor) ---
+        # This is the highest priority. We use a safe while loop to handle list modification.
+        i = 0
+        while i < len(unmatched_current):
+            curr_obj = unmatched_current[i]
+            match_found = False
+            j = 0
+            while j < len(unmatched_last):
+                last_obj = unmatched_last[j]
+                if (curr_obj['top_row'] == last_obj['top_row'] and
+                    curr_obj['left_index'] == last_obj['left_index'] and
+                    curr_obj['height'] == last_obj['height'] and
+                    curr_obj['width'] == last_obj['width']):
+                    
+                    if curr_obj['data_map'] != last_obj['data_map']:
+                        log_messages.append(f"🎨 RECOLOR: Object at ({curr_obj['top_row']}, {curr_obj['left_index']}) changed its data.")
+                    
+                    # Pair found. Remove both from their lists and stop searching for this curr_obj.
+                    unmatched_current.pop(i)
+                    unmatched_last.pop(j)
+                    match_found = True
+                    break # Exit the inner (j) loop
+                else:
+                    j += 1
+            
+            if not match_found:
+                # If no match was found for curr_obj, move to the next one.
+                i += 1
+
+        # --- Stage 2: Move Detection & Composite Grouping ---
+        move_matched_pairs = []
+        i = 0
+        while i < len(unmatched_current):
+            curr_obj = unmatched_current[i]
+            match_found = False
+            j = 0
+            while j < len(unmatched_last):
+                last_obj = unmatched_last[j]
+                if curr_obj.get('fingerprint') and curr_obj['fingerprint'] == last_obj.get('fingerprint'):
+                    move_matched_pairs.append((curr_obj, last_obj))
+                    unmatched_current.pop(i)
+                    unmatched_last.pop(j)
+                    match_found = True
+                    break
+                else:
+                    j += 1
+            if not match_found:
+                i += 1
+
+        # --- Group moves by vector ---
+        moves_by_vector = {}
+        for curr, last in move_matched_pairs:
+            vector = (curr['top_row'] - last['top_row'], curr['left_index'] - last['left_index'])
+            if vector not in moves_by_vector:
+                moves_by_vector[vector] = []
+            moves_by_vector[vector].append((curr, last))
+
+        # --- Analyze groups for composite objects and identify true moves ---
+        processed_pairs = []
+        true_moves = [] # Will store structured info about each move.
+
+        for vector, pairs in moves_by_vector.items():
+            if len(pairs) < 2: continue
+
+            unclustered = list(pairs)
+            while unclustered:
+                cluster = [unclustered.pop(0)]
+                while True:
+                    new_neighbor_found = False
+                    for neighbor_pair in list(unclustered):
+                        is_adjacent = any(self._are_objects_adjacent(neighbor_pair[0], member_pair[0]) for member_pair in cluster)
+                        if is_adjacent:
+                            cluster.append(neighbor_pair)
+                            unclustered.remove(neighbor_pair)
+                            new_neighbor_found = True
+                    if not new_neighbor_found:
+                        break
+
+                if len(cluster) > 1:
+                    min_row = min(p[0]['top_row'] for p in cluster)
+                    max_row = max(p[0]['top_row'] + p[0]['height'] for p in cluster)
+                    min_col = min(p[0]['left_index'] for p in cluster)
+                    max_col = max(p[0]['left_index'] + p[0]['width'] for p in cluster)
+
+                    comp_h, comp_w = max_row - min_row, max_col - min_col
+                    
+                    # --- NEW: Build a full datamap for the composite object ---
+                    composite_datamap_list = [[None for _ in range(comp_w)] for _ in range(comp_h)]
+                    for curr_part, _ in cluster:
+                        part_h, part_w = curr_part['height'], curr_part['width']
+                        part_r_offset = curr_part['top_row'] - min_row
+                        part_c_offset = curr_part['left_index'] - min_col
+                        part_datamap = curr_part['data_map']
+                        for r in range(part_h):
+                            for c in range(part_w):
+                                if part_datamap[r][c] is not None:
+                                    composite_datamap_list[part_r_offset + r][part_c_offset + c] = part_datamap[r][c]
+                    composite_datamap = tuple(tuple(row) for row in composite_datamap_list)
+
+                    # --- NEW: Use the visual fingerprint as the signature ---
+                    _, signature, _ = self._create_normalized_fingerprint(composite_datamap)
+                    
+                    # Generate a simpler log if the moved object is the confirmed agent.
+                    if signature == self.world_model.get('player_signature'):
+                        log_messages.append(f"🧠 [AGENT] moved by vector {vector}.")
+                    else:
+                        log_messages.append(f"🧠 COMPOSITE MOVE: Object [{comp_h}x{comp_w}] with fingerprint {signature} moved by vector {vector}.")
+                
+                    true_moves.append({'type': 'composite', 'signature': signature, 'dimensions': (comp_h, comp_w), 'parts': cluster, 'vector': vector})
+                    for pair in cluster: processed_pairs.append(pair)
+
+        # Log individual moves and collect their structured info.
+        for curr, last in move_matched_pairs:
+            if (curr, last) not in processed_pairs:
+                signature = curr.get('fingerprint')
+                # Generate a simpler log if the moved object is the confirmed agent.
+                if signature == self.world_model.get('player_signature'):
+                    log_messages.append(f"🧠 [AGENT] moved from ({last['top_row']}, {last['left_index']}) to ({curr['top_row']}, {curr['left_index']}).")
+                else:
+                    log_messages.append(f"🧠 MOVE: Object [{curr['height']}x{curr['width']}] moved from ({last['top_row']}, {last['left_index']}) to ({curr['top_row']}, {curr['left_index']}).")
+
+                vector = (curr['top_row'] - last['top_row'], curr['left_index'] - last['left_index'])
+                true_moves.append({'type': 'individual', 'signature': signature, 'curr_obj': curr, 'last_obj': last, 'vector': vector})
+
+        # --- Concept Learning from Movement (Agent and Floor) ---
+        moved_agent_obj = None
+        if not true_moves:
+            agent_part_fingerprints = set()
+            if moved_agent_obj and moved_agent_obj.get('parts'):
+                agent_part_fingerprints = {part['fingerprint'] for part in moved_agent_obj['parts'] if 'fingerprint' in part}
+            
+            return log_messages, moved_agent_obj, agent_part_fingerprints
+
+        # 1. Identify the Agent
+        if self.world_model['player_signature'] is None:
+            for move in true_moves:
+                signature = move['signature']
+                self.agent_move_hypothesis[signature] = self.agent_move_hypothesis.get(signature, 0) + 1
+                confidence = self.agent_move_hypothesis[signature]
+                log_messages.append(f"🕵️‍♂️ Agent Hypothesis: Signature {signature} has moved {confidence} time(s).")
+
+                if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
+                    self.world_model['player_signature'] = signature
+                    log_messages.append(f"✅ Confirmed Agent Signature: {signature}.")
+
+                    # --- Store the fingerprints of the agent's component parts ---
+                    agent_parts_to_store = []
+                    if move['type'] == 'composite':
+                        # The 'parts' in a move are tuples of (curr_obj, last_obj). We need the current one.
+                        agent_parts_to_store = [p[0] for p in move['parts']]
+                    elif move['type'] == 'individual':
+                        agent_parts_to_store = [move['curr_obj']]
+                    
+                    # Add each part's fingerprint to the set
+                    for part in agent_parts_to_store:
+                        if 'fingerprint' in part:
+                            self.world_model['player_part_fingerprints'].add(part['fingerprint'])
+                            # --- NEW: Store the detailed signature for more accurate labeling ---
+                            part_sig = (part['fingerprint'], (part['height'], part['width']), part['color'])
+                            self.world_model['player_part_signatures'].add(part_sig)
+                    
+                    log_messages.append(f"-> Stored {len(self.world_model['player_part_fingerprints'])} unique agent part fingerprint(s).")
+                    self._scan_and_label_all_objects(latest_grid[0], "Agent Confirmed")
+                    
+                    break # Stop after confirming.
+
+        # 2. Identify the Floor (can only happen after agent is known)
+        if self.world_model['player_signature'] is not None and self.world_model['floor_color'] is None:
+            agent_move = None
+            for move in true_moves:
+                if move['signature'] == self.world_model['player_signature']:
+                    agent_move = move
+                    break
+            
+            if agent_move:
+                # The agent moved. Find the color of the ground it revealed by looking
+                # at the pixel changes that occurred within its previous bounding box.
+                last_pos_parts = []
+                if agent_move['type'] == 'individual':
+                    last_pos_parts = [agent_move['last_obj']]
+                else: # composite
+                    last_pos_parts = [p[1] for p in agent_move['parts']] # p[1] is the last_obj
+                
+                if last_pos_parts:
+                    min_r = min(p['top_row'] for p in last_pos_parts)
+                    max_r = max(p['top_row'] + p['height'] for p in last_pos_parts)
+                    min_c = min(p['left_index'] for p in last_pos_parts)
+                    max_c = max(p['left_index'] + p['width'] for p in last_pos_parts)
+                    
+                    revealed_colors = Counter()
+                    # Check structured_changes for pixels that changed TO a new color within this box
+                    for change in structured_changes:
+                        row_idx = change['row_index']
+                        if min_r <= row_idx < max_r:
+                            for px_change in change['changes']:
+                                col_idx = px_change['index']
+                                if min_c <= col_idx < max_c:
+                                    revealed_colors[px_change['to']] += 1
+                    
+                    if revealed_colors:
+                        # The most common color revealed is our best candidate for the floor.
+                        floor_candidate, _ = revealed_colors.most_common(1)[0]
+                        
+                        self.floor_hypothesis[floor_candidate] = self.floor_hypothesis.get(floor_candidate, 0) + 1
+                        confidence = self.floor_hypothesis[floor_candidate]
+                        log_messages.append(f"🕵️‍♀️ Floor Hypothesis: Agent movement revealed color {floor_candidate} (Confidence: {confidence}).")
+
+                        if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
+                            self.world_model['floor_color'] = floor_candidate
+                            log_messages.append(f"✅ Confirmed Floor Color: {floor_candidate}.")
+                            self._scan_and_label_all_objects(latest_grid[0], "Floor Color Confirmed")
+
+                            # --- Map Cleanup Logic ---
+                            if self.tile_size:
+                                reclassified_count = 0
+                                grid_data = latest_grid[0]
+                                for tile_coords, cell_type in list(self.tile_map.items()):
+                                    if cell_type != CellType.FLOOR:
+                                        tile_row = tile_coords[0] * self.tile_size
+                                        tile_col = tile_coords[1] * self.tile_size
+                                        if 0 <= tile_row < len(grid_data) and 0 <= tile_col < len(grid_data[0]):
+                                            tile_color = grid_data[tile_row][tile_col]
+                                            if tile_color == floor_candidate:
+                                                self.tile_map[tile_coords] = CellType.FLOOR
+                                                reclassified_count += 1
+                                if reclassified_count > 0:
+                                    log_messages.append(f"🧹 Map Cleanup: Reclassified {reclassified_count} tile(s) as newly confirmed floor.")
+
+        # --- Action Effect Learning ---
+        # Learn how actions affect the agent.
+        if self.world_model['player_signature'] is not None and action:
+            for move in true_moves:
+                if move['signature'] == self.world_model['player_signature']:
+                    # --- THE AGENT MOVED ---
+                    effect_vector = move['vector']
+
+                    # 1. Get the current-frame object descriptions for all agent parts.
+                    agent_parts = []
+                    if move['type'] == 'composite':
+                        agent_parts = [p[0] for p in move['parts']]
+                    elif move['type'] == 'individual' and 'curr_obj' in move:
+                        agent_parts = [move['curr_obj']]
+                    
+                    if not agent_parts: continue # Safety check
+
+                    # 2. Combine the parts into a single descriptor for self.last_known_player_obj
+                    min_row = min(p['top_row'] for p in agent_parts)
+                    max_row = max(p['top_row'] + p['height'] for p in agent_parts)
+                    min_col = min(p['left_index'] for p in agent_parts)
+                    max_col = max(p['left_index'] + p['width'] for p in agent_parts)
+
+                    # Create a descriptor that includes the parts for future filtering.
+                    moved_agent_obj = {
+                        'height': max_row - min_row, 
+                        'width': max_col - min_col,
+                        'top_row': min_row, 
+                        'left_index': min_col,
+                        'parts': agent_parts  # Store the individual component objects
+                    }
+
+                    # 2. Update and test action effect hypotheses
+                    # Initialize hypothesis dict for this action if it doesn't exist.
+                    if action not in self.action_effect_hypothesis:
+                        self.action_effect_hypothesis[action] = {}
+
+                    hypo_dict = self.action_effect_hypothesis[action]
+                    hypo_dict[effect_vector] = hypo_dict.get(effect_vector, 0) + 1
+                    confidence = hypo_dict[effect_vector]
+
+                    log_messages.append(f"🕵️‍♀️ Action Hypothesis: {action.name} -> move by {effect_vector} (Confidence: {confidence}).")
+
+                    # If confidence is high, check if this updates our world model.
+                    if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
+                        current_known_vector = self.world_model['action_map'].get(action, {}).get('move_vector')
+
+                        # Update if the action is new or the vector has changed.
+                        if effect_vector != current_known_vector:
+                            self.world_model['action_map'][action] = {'move_vector': effect_vector}
+                            log_messages.append(f"✅ UPDATED Action Effect: {action.name} now moves agent by vector {effect_vector}.")
+                            
+                            # The hypothesis is confirmed, clear it to learn the next one.
+                            if action in self.action_effect_hypothesis:
+                                del self.action_effect_hypothesis[action]
+
+                    break # Agent's move found, no need to check other moves.
+
+            # --- NEW: Enhanced Fuzzy Matching with Full Body Reconstruction ---
+            if not moved_agent_obj and self.last_known_player_obj:
+                log_messages.append("⚠️ Agent signature not found. Re-acquiring by proximity and direction...")
+                last_pos = (self.last_known_player_obj['top_row'], self.last_known_player_obj['left_index'])
+                expected_vector = self.world_model.get('action_map', {}).get(self.last_action, {}).get('move_vector')
+
+                best_candidate_move = None
+                min_distance = float('inf')
+                
+                # Find the single best "anchor" part of the agent.
+                for move in true_moves:
+                    if expected_vector:
+                        move_vector = move['vector']
+                        dot_product = (expected_vector[0] * move_vector[0]) + (expected_vector[1] * move_vector[1])
+                        if dot_product <= 0: continue
+
+                    last_obj_pos = None
+                    if move['type'] == 'individual':
+                        last_obj_pos = (move['last_obj']['top_row'], move['last_obj']['left_index'])
+                    elif move['type'] == 'composite':
+                        min_row = min(p[1]['top_row'] for p in move['parts'])
+                        min_col = min(p[1]['left_index'] for p in move['parts'])
+                        last_obj_pos = (min_row, min_col)
+                    
+                    if last_obj_pos:
+                        distance = math.sqrt((last_pos[0] - last_obj_pos[0])**2 + (last_pos[1] - last_obj_pos[1])**2)
+                        if distance < min_distance:
+                            min_distance = distance
+                            best_candidate_move = move
+                
+                threshold = self.tile_size * 2.5 if self.tile_size else 24
+                if best_candidate_move and min_distance < threshold:
+                    log_messages.append(f"✅ Agent Re-acquired: Found anchor part with signature {best_candidate_move['signature']} by proximity (distance: {min_distance:.2f}).")
+                    
+                    # --- Full Body Reconstruction ---
+                    # Now that we have an anchor, find all adjacent, untracked objects to rebuild the full agent.
+                    anchor_part = best_candidate_move['curr_obj']
+                    reconstructed_parts = [anchor_part]
+                    
+                    # Create a copy of unmatched objects to search through.
+                    search_pool = [obj for obj in current_objects if obj is not anchor_part]
+                    if anchor_part in search_pool:
+                        search_pool.remove(anchor_part)
+
+                    cluster_q = [anchor_part]
+                    while cluster_q:
+                        current_part = cluster_q.pop(0)
+                        for other_part in list(search_pool):
+                            if self._are_objects_adjacent(current_part, other_part):
+                                reconstructed_parts.append(other_part)
+                                search_pool.remove(other_part)
+                                cluster_q.append(other_part)
+                    
+                    log_messages.append(f"✅ Reconstructed agent with {len(reconstructed_parts)} parts.")
+
+                    # Build the final agent object from all the reconstructed parts.
+                    min_row = min(p['top_row'] for p in reconstructed_parts)
+                    max_row = max(p['top_row'] + p['height'] for p in reconstructed_parts)
+                    min_col = min(p['left_index'] for p in reconstructed_parts)
+                    max_col = max(p['left_index'] + p['width'] for p in reconstructed_parts)
+                    moved_agent_obj = {
+                        'height': max_row - min_row, 'width': max_col - min_col,
+                        'top_row': min_row, 'left_index': min_col, 'parts': reconstructed_parts
+                    }
+
+        agent_part_fingerprints = set()
+        if moved_agent_obj and moved_agent_obj.get('parts'):
+            agent_part_fingerprints = {part['fingerprint'] for part in moved_agent_obj['parts'] if 'fingerprint' in part}
+        
+        return log_messages, moved_agent_obj, agent_part_fingerprints
+    
+    def _learn_from_interaction_failure(self, action: GameAction, last_grid: list):
+        """Analyzes why a known action failed and scraps the current plan if a wall is hit."""
+        player_sig = self.world_model.get('player_signature')
+        action_effect = self.world_model['action_map'].get(action)
+        
+        if not (player_sig and self.last_known_player_obj and action_effect and 'move_vector' in action_effect):
+            return
+
+        move_vector = action_effect['move_vector']
+        last_obj = self.last_known_player_obj
+        
+        final_top_row = last_obj['top_row'] + move_vector[0]
+        final_left_index = last_obj['left_index'] + move_vector[1]
+        final_bottom_row = final_top_row + last_obj['height']
+        final_right_index = final_left_index + last_obj['width']
+        
+        grid_height = len(last_grid[0])
+        grid_width = len(last_grid[0][0]) if grid_height > 0 else 0
+        blocking_colors = Counter()
+        floor_color = self.world_model.get('floor_color')
+        
+        for r in range(final_top_row, final_bottom_row):
+            for p_idx in range(final_left_index, final_right_index):
+                if 0 <= r < grid_height and 0 <= p_idx < grid_width:
+                    color = last_grid[0][r][p_idx]
+                    if color != floor_color:
+                        blocking_colors[color] += 1
+                else:
+                    blocking_colors[-1] += 1
+                        
+        if not blocking_colors:
+            return
+
+        a_wall_was_hit = False
+        for wall_candidate_color in blocking_colors.keys():
+            wall_name = "Out of Bounds" if wall_candidate_color == -1 else f"Color {wall_candidate_color}"
+            
+            if wall_candidate_color in self.world_model['wall_colors']:
+                print(f"🧱 [WALL] Collision with known wall ({wall_name}) detected.")
+                a_wall_was_hit = True
+                continue
+
+            self.wall_hypothesis[wall_candidate_color] = self.wall_hypothesis.get(wall_candidate_color, 0) + 1
+            confidence = self.wall_hypothesis[wall_candidate_color]
+            print(f"🧱 Wall Hypothesis: {wall_name} blocked movement (Confidence: {confidence}).")
+
+            if confidence >= self.CONCEPT_CONFIDENCE_THRESHOLD:
+                self.world_model['wall_colors'].add(wall_candidate_color)
+                print(f"✅ [WALL] Confirmed: {wall_name} is a wall.")
+                self._scan_and_label_all_objects(last_grid[0], f"Wall Confirmed ({wall_name})")
+                a_wall_was_hit = True
+                
+                if wall_candidate_color in self.wall_hypothesis:
+                    del self.wall_hypothesis[wall_candidate_color]
+
+        # --- NEW: Invalidate plan if ANY wall was hit (new or old) ---
+        if a_wall_was_hit and self.exploration_plan:
+            print(" Bumping into a wall has invalidated the current plan. Re-planning...")
+            self.exploration_plan.clear()
+            self.exploration_phase = ExplorationPhase.SEEKING_TARGET
+    
+    def _track_recoloring_ui_objects(self, current_objects: list, last_objects: list):
+        """
+        Identifies UI elements by finding stagnant objects that change color, then
+        groups all stagnant objects on that same row as part of the UI.
+        """
+        if self.confirmed_resource_indicator and self.confirmed_ui_signatures:
+            return
+
+        # 1. Find all stagnant (non-moving) and recolored objects simultaneously.
+        stagnant_keys = set()
+        recolored_keys = set()
+        last_obj_map = {(obj.get('fingerprint'), obj.get('top_row'), obj.get('left_index')): obj for obj in last_objects}
+
+        for curr_obj in current_objects:
+            key = (curr_obj.get('fingerprint'), curr_obj.get('top_row'), curr_obj.get('left_index'))
+            last_obj = last_obj_map.get(key)
+            if last_obj:
+                stagnant_keys.add(key)
+                if last_obj.get('color') != curr_obj.get('color'):
+                    recolored_keys.add(key)
+
+        # 2. The "Grouping" Heuristic: If any objects were recolored, assume all stagnant
+        #    objects on those same rows are also part of the UI.
+        ui_candidate_keys = set()
+        if recolored_keys:
+            active_ui_rows = {key[1] for key in recolored_keys}  # Get the row_index from the keys
+            for key in stagnant_keys:
+                if key[1] in active_ui_rows:  # Check if this stagnant object is on an active row
+                    ui_candidate_keys.add(key)
+        
+        # 3. Update confidence for all identified UI candidates.
+        for key in ui_candidate_keys:
+            self.recoloring_object_candidates[key] = self.recoloring_object_candidates.get(key, 0) + 1
+
+        # 4. Prune candidates that are no longer stagnant (i.e., they disappeared).
+        stale_candidates = set(self.recoloring_object_candidates.keys()) - stagnant_keys
+        for key in list(stale_candidates):
+            if key in self.recoloring_object_candidates:
+                del self.recoloring_object_candidates[key]
+        
+        # 5. Check for newly confirmed individual UI signatures.
+        newly_confirmed_keys = set()
+        for key, confidence in self.recoloring_object_candidates.items():
+            if confidence >= self.RESOURCE_CONFIDENCE_THRESHOLD:
+                if key not in self.confirmed_ui_signatures:
+                    self.confirmed_ui_signatures.add(key)
+                    newly_confirmed_keys.add(key)
+        
+        # 6. If new UI objects were confirmed, generalize their type.
+        if newly_confirmed_keys:
+            print(f"✅ [UI] Confirmed {len(newly_confirmed_keys)} new object instance(s) as stagnant UI elements.")
+            newly_confirmed_objects = [obj for obj in current_objects if (obj.get('fingerprint'), obj.get('top_row'), obj.get('left_index')) in newly_confirmed_keys]
+            
+            for obj in newly_confirmed_objects:
+                ui_type_sig = (obj.get('fingerprint'), (obj.get('height'), obj.get('width')))
+                if ui_type_sig not in self.confirmed_ui_types:
+                    self.confirmed_ui_types.add(ui_type_sig)
+                    print(f"✅ [UI] GENERALIZED: All objects with FP {ui_type_sig[0]} and Size {ui_type_sig[1]} are now considered UI.")
+
+        # 7. Separately, check if we can confirm the resource *row* for move-counting.
+        if not self.confirmed_resource_indicator and self.confirmed_ui_signatures:
+            confirmed_rows = Counter(key[1] for key in self.confirmed_ui_signatures)
+            if confirmed_rows:
+                indicator_row, count = confirmed_rows.most_common(1)[0]
+                if count >= 2:
+                    print(f"✅ [UI] Confirmed resource indicator *row* is {indicator_row} for move-counting.")
+                    self.confirmed_resource_indicator = {'row_index': indicator_row}
+                    grid_width = len(self.previous_frame[0][0]) if self.previous_frame and self.previous_frame[0] else 0
+                    self.ignored_areas.append({'top_row': indicator_row, 'left_index': 0, 'height': 1, 'width': grid_width})
+
+    def _find_all_objects_on_tile(self, tile_coords: tuple, grid: list) -> list:
+        """Finds and describes all non-background objects that exist on a given tile."""
+        if not self.tile_size or not grid or not grid[0]:
+            return []
+
+        grid_data = grid[0]
+        grid_height = len(grid_data)
+        grid_width = len(grid_data[0]) if grid_height > 0 else 0
+
+        # Get known background colors to avoid starting searches on them.
+        background_colors = {self.world_model.get('floor_color')} | self.world_model.get('wall_colors', set())
+        background_colors.discard(None)
+
+        found_objects = []
+        # Use a grid-wide visited set to ensure we describe each object only once.
+        pixels_in_found_objects = set()
+
+        # Define the pixel boundaries of the target tile.
+        start_row = tile_coords[0] * self.tile_size
+        end_row = start_row + self.tile_size
+        start_col = tile_coords[1] * self.tile_size
+        end_col = start_col + self.tile_size
+
+        # Iterate only through the pixels *within the specified tile*.
+        for r in range(start_row, end_row):
+            for c in range(start_col, end_col):
+                if not (0 <= r < grid_height and 0 <= c < grid_width):
+                    continue
+
+                coord = (r, c)
+                pixel_color = grid_data[r][c]
+
+                if coord in pixels_in_found_objects or pixel_color in background_colors:
+                    continue
+
+                # This is a new, non-background pixel. Find the entire object it belongs to.
+                component_points = set()
+                q = [coord]
+                visited_for_this_object = {coord}
+
+                while q:
+                    p = q.pop(0)
+                    component_points.add(p)
+                    row, col = p
+
+                    for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                        neighbor = (row + dr, col + dc)
+                        if (0 <= neighbor[0] < grid_height and 
+                            0 <= neighbor[1] < grid_width and 
+                            neighbor not in visited_for_this_object and 
+                            grid_data[neighbor[0]][neighbor[1]] == pixel_color):
+
+                            visited_for_this_object.add(neighbor)
+                            q.append(neighbor)
+
+                if component_points:
+                    min_r_obj = min(r_obj for r_obj, _ in component_points)
+                    max_r_obj = max(r_obj for r_obj, _ in component_points)
+                    min_c_obj = min(c_obj for _, c_obj in component_points)
+                    max_c_obj = max(c_obj for _, c_obj in component_points)
+                    height, width = max_r_obj - min_r_obj + 1, max_c_obj - min_c_obj + 1
+
+                    data_map = tuple(tuple(grid_data[row][col] if (row, col) in component_points else None for col in range(min_c_obj, max_c_obj + 1)) for row in range(min_r_obj, max_r_obj + 1))
+                    base_shape, fingerprint, norm_map = self._create_normalized_fingerprint(data_map)
+
+                    found_objects.append({
+                        'height': height, 'width': width, 'top_row': min_r_obj,
+                        'left_index': min_c_obj, 'color': pixel_color,
+                        'data_map': data_map, 'fingerprint': fingerprint, 'base_shape': base_shape
+                    })
+
+                    pixels_in_found_objects.update(component_points)
+
+        return found_objects
+
+    def _find_object_on_tile(self, tile_coords: tuple, grid: list) -> dict | None:
+        """Finds and describes the first non-background object found on a given tile."""
+        if not self.tile_size or not grid or not grid[0]:
+            return None
+        
+        grid_data = grid[0]
+        background_colors = {self.world_model.get('floor_color')} | self.world_model.get('wall_colors', set())
+        background_colors.discard(None) # Ensure None is not in the set
+        
+        # Scan pixels within the tile for a starting pixel of a non-background object
+        start_row, start_col = tile_coords[0] * self.tile_size, tile_coords[1] * self.tile_size
+        object_color = None
+        start_pixel_coord = None
+        for r in range(start_row, start_row + self.tile_size):
+            for c in range(start_col, start_col + self.tile_size):
+                if 0 <= r < len(grid_data) and 0 <= c < len(grid_data[0]):
+                    pixel_color = grid_data[r][c]
+                    if pixel_color not in background_colors:
+                        object_color = pixel_color
+                        start_pixel_coord = (r, c)
+                        break
+            if object_color is not None:
+                break
+                
+        if object_color is None:
+            return None # Tile is empty (floor/wall)
+            
+        # Now that we have a color, find all objects of that color on the entire grid
+        candidate_objects = self._find_static_candidates_by_color(object_color, grid_data)
+        
+        # Find the specific candidate that contains our start pixel
+        for obj in candidate_objects:
+            if (obj['top_row'] <= start_pixel_coord[0] < obj['top_row'] + obj['height'] and
+                obj['left_index'] <= start_pixel_coord[1] < obj['left_index'] + obj['width']):
+                
+                # Bounding box is a loose check; confirm pixel is part of the actual object data
+                relative_r = start_pixel_coord[0] - obj['top_row']
+                relative_c = start_pixel_coord[1] - obj['left_index']
+                if obj['data_map'][relative_r][relative_c] is not None:
+                    return obj # This is our object
+                
+        return None
+
+    def _extract_object_at_tile(self, tile_coords: tuple, grid_data: list, visited_tiles: set) -> dict | None:
+        """
+        Performs a flood-fill starting from a tile to find, describe, and fingerprint a complete static object.
+        This can handle objects that span multiple tiles.
+        """
+        if tile_coords in visited_tiles:
+            return None
+
+        # Get known background colors to define the object's boundaries
+        floor_color = self.world_model.get('floor_color')
+        wall_colors = self.world_model.get('wall_colors', set())
+        background_colors = {floor_color} | wall_colors
+        
+        # Flood-fill to find all tiles belonging to this object
+        q = [tile_coords]
+        object_tiles = set(q)
+        visited_tiles.add(tile_coords)
+
+        while q:
+            current_tile = q.pop(0)
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                neighbor = (current_tile[0] + dr, current_tile[1] + dc)
+                if self.tile_map.get(neighbor) in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.POTENTIAL_MATCH] and neighbor not in visited_tiles:
+                    visited_tiles.add(neighbor)
+                    object_tiles.add(neighbor)
+                    q.append(neighbor)
+        
+        # Now, find all the actual pixels for the object
+        object_pixels = set()
+
+
+
+        for r_tile, c_tile in object_tiles:
+            for r_pixel in range(r_tile * self.tile_size, (r_tile + 1) * self.tile_size):
+                for c_pixel in range(c_tile * self.tile_size, (c_tile + 1) * self.tile_size):
+                    if 0 <= r_pixel < len(grid_data) and 0 <= c_pixel < len(grid_data[0]):
+                        if grid_data[r_pixel][c_pixel] not in background_colors:
+                            object_pixels.add((r_pixel, c_pixel))
+
+        if not object_pixels:
+            return None
+
+        # Use the same logic from _find_and_describe_objects to create the description
+        min_row = min(r for r, _ in object_pixels)
+        max_row = max(r for r, _ in object_pixels)
+        min_idx = min(p_idx for _, p_idx in object_pixels)
+        max_idx = max(p_idx for _, p_idx in object_pixels)
+        height, width = max_row - min_row + 1, max_idx - min_idx + 1
+
+        data_map = tuple(tuple(grid_data[r][p] for p in range(min_idx, max_idx + 1)) for r in range(min_row, max_row + 1))
+        base_shape, fingerprint, norm_map = self._create_normalized_fingerprint(data_map)
+
+        # Return a complete object description
+        return {
+            'height': height, 'width': width, 'top_row': min_row,
+            'left_index': min_idx, 'color': grid_data[min_row][min_idx], # Sample color
+            'data_map': data_map, 'fingerprint': fingerprint, 'base_shape': base_shape    
+        }
+
+    def _analyze_and_log_interaction_effect(self, structured_changes: list, effect_type: str, latest_grid: list, grid_before_interaction: list, static_objects_before_action: list, current_agent_fingerprints: set):
+        """Analyzes pixel changes from an interaction and logs them as a hypothesis."""
+        if self.observing_interaction_for_tile is None:
+            return
+        
+        object_signature = f"tile_pos_{self.observing_interaction_for_tile}"
+
+        # 1. Define ignore zones to filter out irrelevant changes (player movement, UI).
+        ignore_coords = set()
+        
+        # Add the player's last known position to the ignore zone.
+        if self.last_known_player_obj:
+            player_box = self.last_known_player_obj
+            for r in range(player_box['top_row'], player_box['top_row'] + player_box['height']):
+                for c in range(player_box['left_index'], player_box['left_index'] + player_box['width']):
+                    ignore_coords.add((r,c))
+
+        # Add the resource indicator row, if known.
+        if self.confirmed_resource_indicator:
+            indicator_row = self.confirmed_resource_indicator.get('row_index')
+            # Add the entire row to the ignore zone.
+            grid_width = len(latest_grid[0][0]) if latest_grid and latest_grid[0] else 0
+            for c in range(grid_width):
+                ignore_coords.add((indicator_row, c))
+
+        # 2. Filter the raw pixel changes using the ignore zones.
+        interaction_effects_pixels = []
+        for change in structured_changes:
+            filtered_pixel_changes = []
+            for px in change['changes']:
+                if (change['row_index'], px['index']) not in ignore_coords:
+                    filtered_pixel_changes.append(px)
+            
+            if filtered_pixel_changes:
+                interaction_effects_pixels.append({'row_index': change['row_index'], 'changes': filtered_pixel_changes})
+
+        if not interaction_effects_pixels:
+            print(f"-> No observable '{effect_type}' pixel changes found (excluding agent movement and UI).")
+            return
+
+        # 3. Convert the filtered pixel changes into whole OBJECTS.
+        effect_objects = self._find_and_describe_objects(interaction_effects_pixels, latest_grid, is_interaction_analysis=True)
+
+        # 4. Filter out any objects that are known parts of the agent.
+        if current_agent_fingerprints:
+            agent_part_fingerprints = current_agent_fingerprints
+            
+            if agent_part_fingerprints:
+                original_count = len(effect_objects)
+                # Keep only the objects whose fingerprint is NOT in the set of agent part fingerprints.
+                effect_objects = [obj for obj in effect_objects if obj.get('fingerprint') not in agent_part_fingerprints]
+                filtered_count = original_count - len(effect_objects)
+                if filtered_count > 0:
+                    print(f"🕵️‍♂️ Interaction analysis is ignoring {filtered_count} object(s) matching agent parts.")
+
+        # 5. Log the results and synthesize rules.
+        print(f"-> Found {len(effect_objects)} object(s) as a result of the '{effect_type}':")
+        for i, obj in enumerate(effect_objects):
+            summary_str = self._get_object_summary_string(obj)
+            print(f"  - Object {i+1}: {summary_str}")
+
+        # Initialize the hypothesis for this tile if it's the first time we've seen it.
+        if object_signature not in self.interaction_hypotheses:
+            self.interaction_hypotheses[object_signature] = {'immediate_effect': [], 'aftermath_effect': [], 'confidence': 0}
+        
+        # --- NEW: Re-analyze results to identify transformations vs. spawns. ---
+        interaction_events = []
+        unmatched_appeared = list(effect_objects)
+        
+        if grid_before_interaction:
+            # 1. Find objects that vanished by inverting the change data.
+            disappearance_pixels = []
+            for change in interaction_effects_pixels:
+                swapped_changes = []
+                for px in change['changes']:
+                    swapped_changes.append({'index': px['index'], 'from': px['to'], 'to': px['from']})
+                disappearance_pixels.append({'row_index': change['row_index'], 'changes': swapped_changes})
+            
+            vanished_objects = self._find_and_describe_objects(disappearance_pixels, grid_before_interaction, is_interaction_analysis=True)
+            unmatched_vanished = list(vanished_objects)
+            transform_pairs = []
+
+            # 2. Match appeared objects to vanished objects based on proximity.
+            for appeared in list(unmatched_appeared):
+                best_match = None
+                min_dist = float('inf')
+
+                app_x = appeared['left_index'] + appeared['width'] / 2
+                app_y = appeared['top_row'] + appeared['height'] / 2
+
+                for vanished in unmatched_vanished:
+                    van_x = vanished['left_index'] + vanished['width'] / 2
+                    van_y = vanished['top_row'] + vanished['height'] / 2
+                    dist = math.sqrt((app_x - van_x)**2 + (app_y - van_y)**2)
+                    
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_match = vanished
+                
+                if best_match:
+                    # --- DYNAMIC THRESHOLD LOGIC ---
+                    # The max distance for a match is proportional to the size of the objects.
+                    # We use the sum of their largest dimensions (height or width) as a baseline.
+                    appeared_max_dim = max(appeared['height'], appeared['width'])
+                    vanished_max_dim = max(best_match['height'], best_match['width'])
+                    
+                    # A generous threshold is twice the sum of their max dimensions,
+                    # plus one tile_size as a minimum buffer for very small objects.
+                    base_threshold = (appeared_max_dim + vanished_max_dim) * 2
+                    min_buffer = self.tile_size if self.tile_size else 8
+                    dynamic_threshold = base_threshold + min_buffer
+
+                    if min_dist < dynamic_threshold:
+                        transform_pairs.append({'before': best_match, 'after': appeared})
+                        # --- NEW: Log fingerprints of transformed objects ---
+                        if 'fingerprint' in best_match:
+                            self.world_model['known_transform_subjects'].add(best_match['fingerprint'])
+                        if 'fingerprint' in appeared:
+                            self.world_model['known_transform_subjects'].add(appeared['fingerprint'])
+                        unmatched_appeared.remove(appeared)
+                        unmatched_vanished.remove(best_match)
+            
+            # 3. Build the final event list from the matched pairs.
+            for pair in transform_pairs:
+                interaction_events.append({'type': 'TRANSFORM', **pair})
+        
+        # 4. Any remaining appeared objects are classified as spawns.
+        for obj in unmatched_appeared:
+            interaction_events.append({'type': 'SPAWN', 'object': obj})
+            # --- FIX & DEBUG: Log fingerprints of spawned objects as well ---
+            if 'fingerprint' in obj:
+                self.world_model['known_transform_subjects'].add(obj['fingerprint'])
+
+        # An "outcome" is a list of all events (spawns/transforms) from a single interaction.
+        if not interaction_events:
+            return
+
+        known_outcomes = self.interaction_hypotheses[object_signature].get(effect_type, [])
+
+        # Create a canonical fingerprint for the current list of events to check for duplicates.
+        def get_events_fingerprint(events):
+            event_fps = []
+            for event in events:
+                if event['type'] == 'SPAWN':
+                    event_fps.append(('s', event['object'].get('fingerprint')))
+                elif event['type'] == 'TRANSFORM':
+                    event_fps.append(('t', event['before'].get('fingerprint'), event['after'].get('fingerprint')))
+            return tuple(sorted(event_fps))
+
+        current_events_fp = get_events_fingerprint(interaction_events)
+
+        # Check against fingerprints of known outcomes (which are also lists of events).
+        is_known = any(get_events_fingerprint(known_event_list) == current_events_fp for known_event_list in known_outcomes)
+
+        if not is_known:
+            known_outcomes.append(interaction_events)
+            print(f"💡 NEW OUTCOME LEARNED: A new '{effect_type}' interaction for '{object_signature}' has been recorded.")
+            # --- NEW: Re-scan the environment with updated knowledge ---
+            print("-> Knowledge about transformable objects has updated. Re-scanning environment.")
+            self._scan_and_label_all_objects(latest_grid[0], "New Transformation Learned")
+        else:
+            print(f"-> The observed '{effect_type}' interaction for '{object_signature}' was already known.")
+
+    def _log_object_characteristics(self, tile_coords: tuple, grid: list):
+        """Finds all objects on a tile, groups them by color, and logs their characteristics."""
+        if tile_coords in self.interactable_object_characteristics:
+            # Already logged, no need to do it again.
+            return
+
+        all_objects_on_tile = self._find_all_objects_on_tile(tile_coords, grid)
+        if not all_objects_on_tile:
+            return
+
+        # Get known background/resource info for filtering
+        background_colors = {self.world_model.get('floor_color')} | self.world_model.get('wall_colors', set())
+        background_colors.discard(None)
+        resource_signatures = self.world_model.get('resource_signatures', set())
+
+        characteristics_by_color = {}
+        for obj in all_objects_on_tile:
+            obj_color = obj.get('color')
+            obj_fingerprint = obj.get('fingerprint')
+
+            # Filter out background and resource objects
+            if obj_color in background_colors:
+                continue
+
+            if obj_color not in characteristics_by_color:
+                characteristics_by_color[obj_color] = []
+
+            characteristics = {
+                'size': (obj.get('height'), obj.get('width')),
+                'shape_fingerprint': obj_fingerprint,
+                'location': (obj.get('top_row'), obj.get('left_index'))
+            }
+            characteristics_by_color[obj_color].append(characteristics)
+
+        if characteristics_by_color:
+            self.interactable_object_characteristics[tile_coords] = characteristics_by_color
+            summary_str = ", ".join([f"{len(objs)} object(s) of color {color}" for color, objs in characteristics_by_color.items()])
+            print(f"🔬 Characteristics logged for tile {tile_coords}: {summary_str}")
+            for color, objects in characteristics_by_color.items():
+                print(f"  - Color {color}:")
+                for i, char in enumerate(objects):
+                    size_str = f"{char['size'][0]}x{char['size'][1]}"
+                    loc_str = char['location']
+                    fingerprint = char['shape_fingerprint']
+                    print(f"    - Object {i+1}: Size={size_str}, Location={loc_str}, Fingerprint={fingerprint}")
+
+    def _analyze_consumable_aftermath(self, latest_grid: list):
+        """Checks if the interacted-with object was consumed (i.e., turned to floor)."""
+        interacted_tile = self.observing_interaction_for_tile
+        if not interacted_tile or not self.tile_size or not latest_grid:
+            return
+
+        floor_color = self.world_model.get('floor_color')
+        if floor_color is None:
+            print("-> Aftermath check skipped: Floor color is not yet known.")
+            return
+
+        # Sample the top-left pixel of the tile to determine its current state.
+        tile_r, tile_c = interacted_tile
+        tile_pixel_r, tile_pixel_c = tile_r * self.tile_size, tile_c * self.tile_size
+        current_tile_color = latest_grid[0][tile_pixel_r][tile_pixel_c]
+
+        object_signature = f"tile_pos_{interacted_tile}"
+
+        if current_tile_color == floor_color:
+            print(f"✅ Aftermath: Object at tile {interacted_tile} was consumed (turned to floor).")
+            if object_signature in self.interaction_hypotheses:
+                self.interaction_hypotheses[object_signature]['is_consumable'] = True
+            self.consumed_tiles_this_life.add(interacted_tile)
+        else:
+            print(f"🔄 Aftermath: Object at tile {interacted_tile} is persistent (did not turn to floor).")
+            if object_signature in self.interaction_hypotheses:
+                self.interaction_hypotheses[object_signature]['is_consumable'] = False
+
+    def _scan_for_fingerprint_patterns(self, all_grid_objects: list):
+        """
+        Scans all objects on the grid to find patterns based on matching fingerprints.
+        A pattern is defined as two or more non-UI, non-agent objects sharing the same shape fingerprint.
+        This scan ignores patterns that were present at the start of the level.
+        """
+        if not all_grid_objects:
+            return
+
+        print("🔬 Scanning for fingerprint-based patterns across all objects...")
+
+        # 1. Filter for candidate objects (e.g., [Unknown Object] or [Known Object])
+        candidate_objects = []
+        agent_part_signatures = self.world_model.get('player_part_signatures', set())
+        life_indicator_signatures = self.world_model.get('life_indicator_signatures', set())
+        level_indicator_signatures = self.world_model.get('level_indicator_signatures', set())
+        resource_signatures = self.world_model.get('resource_signatures', set())
+        
+        for obj in all_grid_objects:
+            h, w, c, fp = obj['height'], obj['width'], obj['color'], obj['fingerprint']
+            
+            part_sig = (fp, (h, w), c)
+            indicator_sig = (h, w, c)
+
+            # Skip known background, agent, or UI elements
+            if c == self.world_model.get('floor_color'): continue
+            if c in self.world_model.get('wall_colors', set()): continue
+            if part_sig in agent_part_signatures: continue
+            if indicator_sig in life_indicator_signatures: continue
+            if indicator_sig in level_indicator_signatures: continue
+            if part_sig in resource_signatures: continue
+            ui_key = (obj.get('fingerprint'), obj.get('top_row'), obj.get('left_index'))
+            ui_type_key = (obj.get('fingerprint'), (obj.get('height'), obj.get('width')))
+            if ui_key in self.confirmed_ui_signatures or ui_type_key in self.confirmed_ui_types: continue
+
+            candidate_objects.append(obj)
+
+        # 2. Group candidate objects by fingerprint
+        objects_by_fingerprint = {}
+        for obj in candidate_objects:
+            fp = obj.get('fingerprint')
+            if fp is None or fp == 0: continue
+            if fp not in objects_by_fingerprint:
+                objects_by_fingerprint[fp] = []
+            objects_by_fingerprint[fp].append(obj)
+
+        # 3. Clear existing patterns and build the new list from identified pairs
+        self.active_patterns.clear()
+        
+        for fingerprint, objects in objects_by_fingerprint.items():
+            if len(objects) > 1:
+                for i in range(len(objects)):
+                    for j in range(i + 1, len(objects)):
+                        obj1 = objects[i]
+                        obj2 = objects[j]
+                        
+                        pattern_id = tuple(sorted((
+                            (obj1['top_row'], obj1['left_index']),
+                            (obj2['top_row'], obj2['left_index'])
+                        )))
+
+                        # --- NEW: Check against initial level patterns ---
+                        if pattern_id in self.initial_level_patterns:
+                            continue # Ignore this pattern, it was there at the start.
+
+                        new_pattern = {
+                            'object_1': obj1,
+                            'object_2': obj2,
+                            'fingerprint': fingerprint, 
+                            'id': pattern_id
+                        }
+                        self.active_patterns.append(new_pattern)
+        
+        unique_patterns = {p['id']: p for p in self.active_patterns}
+        self.active_patterns = list(unique_patterns.values())
+
+        if self.active_patterns:
+            print(f"✅ Found {len(self.active_patterns)} new pattern instance(s) based on matching fingerprints.")
+
+    def _print_debug_map(self):
+        """Prints a human-readable version of the agent's tile_map to the console."""
+        if not self.tile_map:
+            print("🗺️ Debug Map: No map data to print.")
+            return
+        
+        # The "playable area" includes reachable tiles and their immediate neighbors.
+        display_area = set(self.reachable_floor_area)
+        for r_tile, c_tile in self.reachable_floor_area:
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                neighbor = (r_tile + dr, c_tile + dc)
+                if neighbor in self.tile_map:
+                    display_area.add(neighbor)
+
+        if not display_area:
+            print("🗺️ Debug Map: No playable area found to print.")
+            return
+
+        print("\n--- Agent's Debug Map ---")
+        player_tile = None
+        if self.last_known_player_obj and self.tile_size:
+            player_tile = (self.last_known_player_obj['top_row'] // self.tile_size, 
+                           self.last_known_player_obj['left_index'] // self.tile_size)
+
+        target_tile = None
+        if self.exploration_target and self.tile_size:
+            target_tile = (self.exploration_target[0] // self.tile_size, 
+                           self.exploration_target[1] // self.tile_size)
+
+        min_r = min(r for r, c in display_area)
+        max_r = max(r for r, c in display_area)
+        min_c = min(c for r, c in display_area)
+        max_c = max(c for r, c in display_area)
+
+        for r in range(min_r, max_r + 1):
+            row_str = ""
+            for c in range(min_c, max_c + 1):
+                current_tile = (r,c)
+                if current_tile not in display_area:
+                    row_str += "   " # Print empty space for non-playable area
+                    continue
+                if (r, c) == player_tile:
+                    row_str += " P "
+                elif (r, c) == target_tile:
+                    row_str += " T "
+                else:
+                    cell = self.tile_map.get((r, c), CellType.UNKNOWN)
+                    if cell == CellType.FLOOR:
+                        row_str += " . "
+                    elif cell == CellType.WALL:
+                        row_str += " # "
+                    elif cell == CellType.POTENTIALLY_INTERACTABLE:
+                        row_str += " ? "
+                    elif cell == CellType.CONFIRMED_INTERACTABLE:
+                        row_str += " ! "
+                    elif cell == CellType.RESOURCE:
+                        row_str += " R "
+                    elif cell == CellType.POTENTIAL_MATCH:
+                        row_str += " ~ "
+                    else: # UNKNOWN
+                        row_str += "   "
+            print(row_str)
+        print("--- Key: P=Player, T=Target, .=Floor, #=Wall, ?=Potential, !=Confirmed, ~=Match ---\n")
+
+    def _format_location_string(self, pixel_pos: tuple) -> str:
+        """Formats a pixel position into a 'tile (r, c)' or 'pixel (r, c)' string."""
+        if not self.tile_size:
+            return f"pixel {pixel_pos}"
+
+        # Determine the "playable area" to see if tile coordinates are relevant.
+        display_area = set(self.reachable_floor_area)
+        for r_tile, c_tile in self.reachable_floor_area:
+            for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                neighbor = (r_tile + dr, c_tile + dc)
+                if neighbor in self.tile_map:
+                    display_area.add(neighbor)
+        
+        tile_pos = (pixel_pos[0] // self.tile_size, pixel_pos[1] // self.tile_size)
+        if display_area and tile_pos in display_area:
+            return f"tile {tile_pos}"
+        else:
+            return f"pixel {pixel_pos}"
+
+    def _synthesize_and_print_function_hypothesis(self, hypothesis: dict):
+        """Analyzes all known outcomes for a tile to generate a detailed, rule-based hypothesis."""
+        if not hypothesis:
+            return
+
+        all_outcomes = []
+        for effect_type in ['immediate_effect', 'aftermath_effect']:
+            outcomes = hypothesis.get(effect_type, [])
+            if outcomes:
+                all_outcomes.extend(outcomes)
+        
+        outcomes_with_transforms = [
+            outcome for outcome in all_outcomes 
+            if any(event.get('type') == 'TRANSFORM' for event in outcome)
+        ]
+
+        # Flatten the list of outcomes into the single list the rest of the function expects.
+        all_transform_events = []
+        for outcome in outcomes_with_transforms:
+            all_transform_events.extend(outcome)
+
+        if not outcomes_with_transforms:
+            return
+
+        # --- 1. Collect all details from every transformation event ---
+        locations = set()
+        result_locations = set()
+        color_transitions = set()
+        size_transitions = set()
+        shape_transitions = set()
+
+        for event in all_transform_events:
+            before_obj, after_obj = event.get('before', {}), event.get('after', {})
+            if before_obj:
+                locations.add((before_obj.get('top_row'), before_obj.get('left_index')))
+                if after_obj:
+                    result_locations.add((after_obj.get('top_row'), after_obj.get('left_index')))
+                    color_transitions.add((before_obj.get('color'), after_obj.get('color')))
+                    size_transitions.add(((before_obj.get('height'), before_obj.get('width')),
+                                          (after_obj.get('height'), after_obj.get('width'))))
+                    shape_transitions.add((before_obj.get('fingerprint'), after_obj.get('fingerprint')))
+
+        # --- 2. Define a helper for printing properties ---
+        def print_prop(label, data_set):
+            if not data_set:
+                print(f"        - {label}: (No data)")
+                return
+            
+            # Sanitize the set by removing any None values before analysis
+            sanitized_set = {item for item in data_set if item is not None and item != (None, None)}
+            if not sanitized_set:
+                print(f"        - {label}: (No data)")
+                return
+
+            if len(sanitized_set) == 1:
+                value = next(iter(sanitized_set))
+                if label == "Size":
+                     print(f"        - {label}: {value[0]}x{value[1]}")
+                else:
+                     print(f"        - {label}: {value}")
+            else:
+                print(f"        - {label}: Varies")
+
+        # --- 3. Print the detailed, structured hypothesis ---
+        print("  - Hypothesized Function: Can have multiple effects based on the target:")
+    
+        def print_rules_for_outcome(transform_events, outcome_index, total_outcomes):
+            if not transform_events:
+                return
+
+            outcome_title = f"    - For Outcome {outcome_index}:" if total_outcomes > 1 else "    - For This Outcome:"
+            print(outcome_title)
+            
+            def print_prop(label, data_set):
+                if not data_set:
+                    print(f"        - {label}: (No data)")
+                    return
+                sanitized_set = {item for item in data_set if item is not None and item != (None, None)}
+                if not sanitized_set:
+                    print(f"        - {label}: (No data)")
+                    return
+                if len(sanitized_set) == 1:
+                    value = next(iter(sanitized_set))
+                    if label == "Size": print(f"        - {label}: {value[0]}x{value[1]}")
+                    else: print(f"        - {label}: {value}")
+                else:
+                    print(f"        - {label}: Varies")
+
+            locations, result_locations = set(), set()
+            color_transitions, size_transitions, shape_transitions = set(), set(), set()
+
+            for event in transform_events:
+                before_obj, after_obj = event.get('before', {}), event.get('after', {})
+                if before_obj:
+                    locations.add((before_obj.get('top_row'), before_obj.get('left_index')))
+                    if after_obj:
+                        result_locations.add((after_obj.get('top_row'), after_obj.get('left_index')))
+                        color_transitions.add((before_obj.get('color'), after_obj.get('color')))
+                        size_transitions.add(((before_obj.get('height'), before_obj.get('width')), (after_obj.get('height'), after_obj.get('width'))))
+                        shape_transitions.add((before_obj.get('fingerprint'), after_obj.get('fingerprint')))
+
+            before_shapes = {t[0] for t in shape_transitions}
+            before_sizes = {t[0] for t in size_transitions}
+            before_colors = {t[0] for t in color_transitions}
+            after_shapes = {t[1] for t in shape_transitions}
+            after_sizes = {t[1] for t in size_transitions}
+            after_colors = {t[1] for t in color_transitions}
+
+            print("        - Target Properties:")
+            print_prop("Shape (FP)", before_shapes)
+            print_prop("Size", before_sizes)
+            print_prop("Color", before_colors)
+            print_prop("Location", locations)
+
+            print("        - Resulting Properties:")
+            print_prop("Shape (FP)", after_shapes)
+            print_prop("Size", after_sizes)
+            print_prop("Color", after_colors)
+            print_prop("Location", result_locations)
+            
+            print("        - Transformation Rules:")
+            if len(color_transitions) == 1:
+                b_col, a_col = next(iter(color_transitions))
+                if b_col == a_col: print(f"          - Color {b_col} is consistently maintained.")
+                else: print(f"          - Color consistently changes from {b_col} to {a_col}.")
+            else: print("          - Color change rule varies.")
+
+            if len(size_transitions) == 1:
+                b_size, a_size = next(iter(size_transitions))
+                if b_size == a_size: print(f"          - Size {b_size[0]}x{b_size[1]} is consistently maintained.")
+                else: print(f"          - Size consistently changes from {b_size[0]}x{b_size[1]} to {a_size[0]}x{a_size[1]}.")
+            elif len(before_sizes) == 1:
+                b_size = next(iter(before_sizes))
+                print(f"          - Size changes from {b_size[0]}x{b_size[1]} to a new, variable size.")
+            else: print("          - Size change rule varies.")
+
+            if len(shape_transitions) == 1:
+                b_fp, a_fp = next(iter(shape_transitions))
+                if b_fp == a_fp: print(f"          - Shape is consistently maintained (FP {b_fp}).")
+                else: print(f"          - Shape consistently changes from FP {b_fp} to {a_fp}.")
+            elif len(before_shapes) == 1:
+                b_fp = next(iter(before_shapes))
+                print(f"          - Shape changes from FP {b_fp} to a new, variable shape.")
+            else: print("          - Shape change rule varies.")
+
+        for i, outcome in enumerate(outcomes_with_transforms):
+            transform_events = [event for event in outcome if event.get('type') == 'TRANSFORM']
+            print_rules_for_outcome(transform_events, i + 1, len(outcomes_with_transforms))
+
+        # --- NEW: Synthesize an overall rule if there are multiple outcomes ---
+        if len(outcomes_with_transforms) > 1:
+            print("    - Overall Transformation Rule:")
+            
+            all_color_transitions = set()
+            all_size_transitions = set()
+            all_shape_transitions = set()
+
+            for outcome in outcomes_with_transforms:
+                for event in outcome:
+                    if event.get('type') == 'TRANSFORM':
+                        before_obj, after_obj = event.get('before', {}), event.get('after', {})
+                        if before_obj and after_obj:
+                            all_color_transitions.add((before_obj.get('color'), after_obj.get('color')))
+                            all_size_transitions.add(((before_obj.get('height'), before_obj.get('width')),
+                                                      (after_obj.get('height'), after_obj.get('width'))))
+                            all_shape_transitions.add((before_obj.get('fingerprint'), after_obj.get('fingerprint')))
+            
+            # Helper function to analyze a set of transitions (before, after)
+            def analyze_transitions(transitions: set, label: str):
+                if not transitions: return
+
+                # Case 1: The attribute is always maintained (before == after).
+                if all(b == a for b, a in transitions):
+                    before_values = {b for b, a in transitions}
+                    if len(before_values) == 1:
+                        val = next(iter(before_values))
+                        val_str = f"{val[0]}x{val[1]}" if isinstance(val, tuple) else val
+                        print(f"        - {label} {val_str} was always maintained.")
+                    else:
+                        print(f"        - {label} was always maintained (but the specific value varied).")
+                # Case 2: There is one single, consistent change rule (e.g., always 8 -> 3).
+                elif len(transitions) > 0 and all(t == next(iter(transitions)) for t in transitions):
+                    b, a = next(iter(transitions))
+                    b_str = f"{b[0]}x{b[1]}" if isinstance(b, tuple) else b
+                    a_str = f"{a[0]}x{a[1]}" if isinstance(a, tuple) else a
+                    print(f"        - {label} consistently changed from {b_str} to {a_str}.")
+                # Case 3: The rule is variable.
+                else:
+                    print(f"        - {label} transformation rule is variable across outcomes.")
+
+            # Analyze and print the overall rules
+            analyze_transitions(all_color_transitions, "Color")
+            analyze_transitions(all_size_transitions, "Size")
+            analyze_transitions(all_shape_transitions, "Shape")
+    def _review_and_summarize_interactions(self):
+        """Reviews all interactable tiles and summarizes their learned properties."""
+        print("\n--- 🧠 Interaction Knowledge Summary 🧠 ---")
+        
+        interactable_tiles = [
+            pos for pos, cell_type in self.tile_map.items() 
+            if cell_type in [CellType.POTENTIALLY_INTERACTABLE, CellType.CONFIRMED_INTERACTABLE, CellType.POTENTIAL_MATCH, CellType.RESOURCE]
+            and pos in self.reachable_floor_area
+        ]
+
+        if not interactable_tiles:
+            print("No interactable tiles were identified on the map.")
+            self.has_summarized_interactions = True
+            return
+
+        # --- Main Tile-by-Tile Summary ---
+        for tile_pos in sorted(interactable_tiles):
+            signature = f"tile_pos_{tile_pos}"
+            hypothesis = self.interaction_hypotheses.get(signature)
+            cell_type = self.tile_map.get(tile_pos)
+
+            print(f"Tile {tile_pos} (Type: {cell_type.name}):")
+
+            if tile_pos == self.final_tile_of_level:
+                print(f"  - Function: Causes new level when interacted with.")
+                print(f"  - Type: Unknown (Level Ended Before Aftermath Observed).")
+            elif cell_type == CellType.RESOURCE:
+                print(f"  - Function: Resource (fills resource bar).")
+                print(f"  - Type: Consumable (disappears after use).")
+            elif not hypothesis:
+                print(f"  - Function: Untested.")
+                print(f"  - Type: Unknown.")
+            else:
+                # Helper to print outcomes for a given effect type
+                def print_outcomes(outcomes: list, label: str):
+                    if not outcomes:
+                        return
+                    
+                    print(f"    - {label}: Can result in {len(outcomes)} unique outcome(s).")
+                    for i, events in enumerate(outcomes):
+                        title = f"      - Outcome {i+1}:" if len(outcomes) > 1 else "      - Outcome:"
+                        print(title)
+
+                        # Print Resulting Events
+                        if events:
+                            print(f"        - Result: Causes {len(events)} event(s):")
+                            for event in events:
+                                if event['type'] == 'SPAWN':
+                                    obj = event['object']
+                                    print(f"          - SPAWN: {self._get_object_summary_string(obj)}")
+                                elif event['type'] == 'TRANSFORM':
+                                    before_obj, after_obj = event['before'], event['after']
+                                    loc = (after_obj['top_row'], after_obj['left_index'])
+                                    print(f"          - TRANSFORM: Object at pixel {loc} changes:")
+                                    
+                                    # Compare attributes and print a detailed report
+                                    if before_obj.get('fingerprint') != after_obj.get('fingerprint'):
+                                        print(f"            - Shape changed (FP {before_obj.get('fingerprint')} -> {after_obj.get('fingerprint')}).")
+                                    else:
+                                        print(f"            - Shape was maintained.")
+                                    
+                                    if before_obj.get('color') != after_obj.get('color'):
+                                        print(f"            - Color changed ({before_obj.get('color')} -> {after_obj.get('color')}).")
+                                    else:
+                                        print(f"            - Color {after_obj.get('color')} was maintained.")
+                                    
+                                    b_size = (before_obj.get('height'), before_obj.get('width'))
+                                    a_size = (after_obj.get('height'), after_obj.get('width'))
+                                    if b_size != a_size:
+                                        print(f"            - Size changed ({b_size[0]}x{b_size[1]} -> {a_size[0]}x{a_size[1]}).")
+                        else:
+                            print(f"        - Result: Causes no observable events.")
+
+                # Check for all possible functions
+                is_resource = hypothesis.get('provides_resource', False)
+                immediate_outcomes = hypothesis.get('immediate_effect', [])
+                aftermath_outcomes = hypothesis.get('aftermath_effect', [])
+                has_any_effect = is_resource or immediate_outcomes or aftermath_outcomes
+
+                print(f"  - Function:")
+                if not has_any_effect:
+                    print(f"    - No effect observed.")
+                else:
+                    if is_resource:
+                        print(f"    - Resource (fills resource bar).")
+                    print_outcomes(immediate_outcomes, "Immediate Effect")
+                    print_outcomes(aftermath_outcomes, "Aftermath Effect")
+
+                type_desc = "Unknown (aftermath not observed)."
+                is_consumable = hypothesis.get('is_consumable')
+                if is_consumable is True: type_desc = "Consumable (disappears after use)."
+                elif is_consumable is False: type_desc = "Persistent (remains after use)."
+                print(f"  - Type: {type_desc}")
+                self._synthesize_and_print_function_hypothesis(hypothesis)
+
+                if cell_type == CellType.POTENTIAL_MATCH:
+                    print(f"  - Match Analysis:")
+                    current_characteristics = self.interactable_object_characteristics.get(tile_pos)
+                    if current_characteristics:
+                        # Iterate through each distinct part of the object on the current tile
+                        for color, object_list in current_characteristics.items():
+                            for obj_char in object_list:
+                                fp = obj_char['shape_fingerprint']
+                                remembered_profiles = self.cross_level_characteristics.get(fp, [])
+                                
+                                if not remembered_profiles:
+                                    print(f"      - Part (Color {color}, FP {fp}): No profile in memory.")
+                                    continue
+
+                                print(f"      --- Comparing Part (Color {color}) ---")
+                                any_perfect_match_found_for_part = False
+
+                                # --- NEW: Tiered Matching Logic ---
+                                perfect_matches = []
+                                characteristic_matches = []
+                                
+                                for p in remembered_profiles:
+                                    is_color_match = (p['color'] == color)
+                                    is_size_match = (p['size'] == obj_char['size'])
+
+                                    if is_color_match and is_size_match:
+                                        perfect_matches.append(p)
+                                    elif is_color_match and not is_size_match:
+                                        characteristic_matches.append(p)
+                                
+                                matches_to_analyze = []
+                                match_type_str = ""
+
+                                if perfect_matches:
+                                    matches_to_analyze = perfect_matches
+                                    match_type_str = "perfect"
+                                elif characteristic_matches:
+                                    matches_to_analyze = characteristic_matches
+                                    match_type_str = "characteristic (same color, different size)"
+                                
+                                if matches_to_analyze:
+                                    print(f"        - ✅ Found {len(matches_to_analyze)} {match_type_str} match(es) in memory (from levels {[p['level_source'] for p in matches_to_analyze]}).")
+                                    
+                                    # Synthesize a single historical profile from all found matches.
+                                    synthesized_hypo = {
+                                        'is_consumable': set(), 'provides_resource': set(),
+                                        'immediate_effect': [], 'aftermath_effect': []
+                                    }
+                                    unique_rem_outcomes = {'immediate_effect': set(), 'aftermath_effect': set()}
+
+                                    for match in matches_to_analyze:
+                                        hypo = match.get('hypothesis')
+                                        if not hypo: continue
+                                        
+                                        persistence_value = hypo.get('is_consumable')
+                                        if persistence_value is not None:
+                                            synthesized_hypo['is_consumable'].add(persistence_value)
+                                        synthesized_hypo['provides_resource'].add(hypo.get('provides_resource', False))
+                                        for effect_type in ['immediate_effect', 'aftermath_effect']:
+                                            outcomes = hypo.get(effect_type, [])
+                                            for outcome in outcomes:
+                                                canonical_outcome = tuple(sorted([self._get_object_summary_string(obj) for obj in outcome]))
+                                                if canonical_outcome not in unique_rem_outcomes[effect_type]:
+                                                    unique_rem_outcomes[effect_type].add(canonical_outcome)
+                                                    synthesized_hypo[effect_type].append(outcome)
+
+                                    # Perform a single, detailed comparison against the synthesized profile.
+                                    self._compare_and_print_hypothesis_details(signature, synthesized_hypo)
+                                else:
+                                    # This is the fallback if no perfect or characteristic matches were found.
+                                    best_partial = remembered_profiles[0]
+                                    print(f"        - ⚠️ No strong match found. Best partial (shape) match is from Level {best_partial['level_source']}.")
+
+            characteristics_data = self.interactable_object_characteristics.get(tile_pos)
+            if characteristics_data:
+                print(f"  - Characteristics:")
+                for color, objects in characteristics_data.items():
+                    print(f"    - Color {color}:")
+                    for i, char in enumerate(objects):
+                        size_str = f"{char['size'][0]}x{char['size'][1]}"
+                        fingerprint = char['shape_fingerprint']
+                        print(f"      - Object {i+1}: Size={size_str}, Fingerprint={fingerprint}")
+            else:
+                print(f"  - Characteristics: Not logged.")
+
+        # --- Off-Grid Effects Summary ---
+        unique_off_grid_effects = set()
+        if self.tile_size:
+            display_area = set(self.reachable_floor_area)
+            for r_tile, c_tile in self.reachable_floor_area:
+                for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                    neighbor = (r_tile + dr, c_tile + dc)
+                    if neighbor in self.tile_map:
+                        display_area.add(neighbor)
+            
+            for hypothesis in self.interaction_hypotheses.values():
+                all_event_lists = hypothesis.get('immediate_effect', []) + hypothesis.get('aftermath_effect', [])
+                for event_list in all_event_lists:
+                    for event in event_list:
+                        # Extract the final state of the object from the event
+                        obj_to_check = None
+                        if event.get('type') == 'SPAWN':
+                            obj_to_check = event.get('object')
+                        elif event.get('type') == 'TRANSFORM':
+                            obj_to_check = event.get('after')
+
+                        # Check if the object is valid and if it's outside the main play area
+                        if obj_to_check and 'top_row' in obj_to_check:
+                            obj_tile_pos = (obj_to_check['top_row'] // self.tile_size, obj_to_check['left_index'] // self.tile_size)
+                            if obj_tile_pos not in display_area:
+                                summary_str = self._get_object_summary_string(obj_to_check)
+                                unique_off_grid_effects.add(summary_str)
+        
+        if unique_off_grid_effects:
+            print("\n--- Off-Grid Effects Summary ---")
+            print("The following unique off-grid object changes were observed:")
+            for effect_str in sorted(list(unique_off_grid_effects)):
+                print(f"  - {effect_str}")
+
+        # --- Cross-Level Learning Logic ---
+        profiles_added = 0
+        level_learned_from = self.level_count - 1 if self.level_count > 1 else 1
+        for tile_pos, tile_data in self.interactable_object_characteristics.items():
+            for color, object_list in tile_data.items():
+                for obj_char in object_list:
+                    fp = obj_char['shape_fingerprint']
+                    if fp not in self.cross_level_characteristics: self.cross_level_characteristics[fp] = []
+                    hypothesis = self.interaction_hypotheses.get(f"tile_pos_{tile_pos}")
+                    profile = {
+                        'color': color, 
+                        'size': obj_char['size'], 
+                        'level_source': level_learned_from, 
+                        'hypothesis': copy.deepcopy(hypothesis) if hypothesis else None
+                    }
+                    if profile not in self.cross_level_characteristics[fp]:
+                        self.cross_level_characteristics[fp].append(profile)
+                        profiles_added += 1
+        if profiles_added > 0:
+            total_profiles = sum(len(v) for v in self.cross_level_characteristics.values())
+            print(f"\n🧠 Added {profiles_added} new unique object profiles to long-term memory ({total_profiles} total).")
+
+        print("-----------------------------------------\n")
+        self.has_summarized_interactions = True
+
+    def _summarize_level_goal(self):
+        """Analyzes and stores the state of the game at the moment a level is won."""
+        print("\n--- 🎯 Post-Level Goal Hypothesis ---")
+
+        # Determine the "playable area" to correctly format locations
+        display_area = set()
+        if self.tile_size:
+            display_area = set(self.reachable_floor_area)
+            for r_tile, c_tile in self.reachable_floor_area:
+                for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                    neighbor = (r_tile + dr, c_tile + dc)
+                    if neighbor in self.tile_map:
+                        display_area.add(neighbor)
+
+        goal_hypothesis = {
+            'goal_tile_interaction': None,
+            'active_patterns_at_win': None
+        }
+
+        # 1. Capture the final, winning interaction.
+        goal_tile = None
+        if self.last_known_player_obj and self.tile_size:
+            goal_tile = (self.last_known_player_obj['top_row'] // self.tile_size, self.last_known_player_obj['left_index'] // self.tile_size)
+            signature = f"tile_pos_{goal_tile}"
+            interaction_summary = self.interaction_hypotheses.get(signature)
+            goal_hypothesis['goal_tile_interaction'] = interaction_summary
+            goal_hypothesis['final_tile_of_level'] = goal_tile
+
+            print(f"Final Interaction: Stepped on tile {goal_tile}.")
+            if not interaction_summary:
+                print("  -> Note: No specific interaction effect was recorded for this tile.")
+
+        # 2. Capture any active patterns on the grid.
+        if self.active_patterns:
+            goal_hypothesis['active_patterns_at_win'] = copy.deepcopy(self.active_patterns)
+            print(f"Active Pattern at Win-Time:")
+            for i, pattern in enumerate(self.active_patterns):
+                dk, sk = pattern['dynamic_key'], pattern['static_key']
+                dk_pixel, sk_pixel = (dk['top_row'], dk['left_index']), (sk['top_row'], sk['left_index'])
+
+                # Helper to format location string based on whether it's on the grid
+                def format_loc(pixel_pos):
+                    if self.tile_size:
+                        tile_pos = (pixel_pos[0] // self.tile_size, pixel_pos[1] // self.tile_size)
+                        if tile_pos in display_area:
+                            return f"tile {tile_pos}"
+                    return f"pixel {pixel_pos}"
+
+                print(f"  - Pattern {i+1}: Dynamic object at {format_loc(dk_pixel)} matches Static object at {format_loc(sk_pixel)}.")
+                # Future: Could print more detailed characteristics here.
+        else:
+            print("No active patterns were present at the end of the level.")
+
+        # 3. Store the hypothesis for future learning.
+        self.level_goal_hypotheses.append(goal_hypothesis)
+        print(f"Hypothesis stored. Total goal hypotheses: {len(self.level_goal_hypotheses)}")
+        print("-------------------------------------\n")
+
+    def _find_level_indicator(self, new_level_frame: list):
+        """Compares static objects from the end of the last level to the start of the new one."""
+        if not self.static_object_memory:
+            print("-> Skipping level indicator check: No memory of previous level's objects.")
+            return
+
+        print("🔬 Analyzing for level indicators by comparing to previous level...")
+        objects_now = self._get_all_objects_from_grid(new_level_frame[0])
+        map_before = {(obj['top_row'], obj['left_index']): obj for obj in self.static_object_memory}
+        
+        found_count = 0
+        for obj_now in objects_now:
+            # --- Optimization: Only check objects that are currently unknown ---
+            h, w, c, fp = obj_now['height'], obj_now['width'], obj_now['color'], obj_now['fingerprint']
+            is_already_known = (
+                c == self.world_model.get('floor_color') or
+                c in self.world_model.get('wall_colors', set()) or
+                (fp, (h, w), c) in self.world_model.get('player_part_signatures', set()) or
+                (h, w, c) in self.world_model.get('life_indicator_signatures', set()) or
+                (self.confirmed_resource_indicator and
+                 c in [self.resource_pixel_color, self.resource_empty_color] and
+                 obj_now['top_row'] == self.confirmed_resource_indicator['row_index'])
+            )
+            if is_already_known:
+                continue
+            # --- End Optimization ---
+
+            pos = (obj_now['top_row'], obj_now['left_index'])
+            obj_before = map_before.get(pos)
+
+            # Heuristic: Same position, shape, and size, but different color.
+            if (obj_before and
+                obj_before.get('fingerprint') == fp and
+                obj_before.get('height') == h and
+                obj_before.get('width') == w and
+                obj_before.get('color') != c):
+                
+                before_sig = (h, w, obj_before['color'])
+                now_sig = (h, w, c)
+                
+                self.world_model.setdefault('level_indicator_signatures', set()).add(before_sig)
+                self.world_model.setdefault('level_indicator_signatures', set()).add(now_sig)
+                found_count += 1
+                print(f"✅ [LEVEL INDICATOR] Found indicator at {pos}. Learned signatures: {before_sig} and {now_sig}.")
+
+        if found_count > 0:
+            print(f"-> Found {found_count} total level indicator(s).")
+        else:
+            print("-> No level indicators found matching the heuristic.")
+
+    def _synthesize_level_plan_hypothesis(self):
+        """Analyzes all learned data to form a high-level, multi-step hypothesis about how to win."""
+        print("\n--- 📜 Synthesizing Level Plan Hypothesis 📜 ---")
+
+        if not self.level_goal_hypotheses:
+            print("-> No goal hypotheses to analyze.")
+            return
+
+        latest_goal = self.level_goal_hypotheses[-1]
+        plan_steps_reversed = []
+
+        def get_loc_str_from_tile(tile_coords_tuple: tuple) -> str:
+            """Helper to find an object's pixel coordinates from its tile coordinates."""
+            characteristics = self.interactable_object_characteristics.get(tile_coords_tuple)
+            if characteristics:
+                # An object on a tile can have multiple parts. Just get the location of the first one found.
+                first_color = next(iter(characteristics))
+                first_object_char = characteristics[first_color][0]
+                pixel_loc = first_object_char.get('location')
+                if pixel_loc:
+                    return f"pixel {pixel_loc}"
+            # Fallback if pixel coordinates can't be found
+            return f"tile {tile_coords_tuple}"
+
+        # 1. Start with the final action.
+        final_tile = latest_goal.get('final_tile_of_level')
+        if not final_tile:
+            print("-> Could not determine final action. Cannot synthesize plan.")
+            return
+        final_loc_str = get_loc_str_from_tile(final_tile)
+        plan_steps_reversed.append(f"Interact with the object at {final_loc_str} to complete the level.")
+
+        # 2. Identify preconditions for the final action.
+        required_preconditions = []
+        patterns_at_win = latest_goal.get('active_patterns_at_win')
+        if patterns_at_win:
+            for pattern in patterns_at_win:
+                required_preconditions.append({'type': 'PATTERN', 'pattern': pattern})
+
+        # 3. Backtrack to solve for the preconditions.
+        current_preconditions = list(required_preconditions)
+        solved_preconditions = set()
+        max_steps = 5
+
+        while current_preconditions and len(plan_steps_reversed) < max_steps:
+            precondition = current_preconditions.pop(0)
+            precondition_id = str(precondition['pattern']['fingerprint'])
+            if precondition_id in solved_preconditions:
+                continue
+            solved_preconditions.add(precondition_id)
+            
+            if precondition['type'] == 'PATTERN':
+                required_object = precondition['pattern']['dynamic_key']
+                required_fingerprint = required_object.get('fingerprint')
+                required_color = required_object.get('color')
+                required_size = (required_object.get('height'), required_object.get('width'))
+
+                producer_found = False
+                for signature, hypothesis in self.interaction_hypotheses.items():
+                    all_outcomes = hypothesis.get('immediate_effect', []) + hypothesis.get('aftermath_effect', [])
+                    for outcome in all_outcomes:
+                        for event in outcome:
+                            resulting_obj = None
+                            if event.get('type') in ['SPAWN', 'TRANSFORM']:
+                                resulting_obj = event.get('after') or event.get('object')
+                            
+                            if resulting_obj:
+                                if (resulting_obj.get('fingerprint') == required_fingerprint and
+                                    resulting_obj.get('color') == required_color and
+                                    (resulting_obj.get('height'), resulting_obj.get('width')) == required_size):
+                                    
+                                    try:
+                                        producer_tile_str = signature.replace("tile_pos_", "")
+                                        producer_tile_tuple = tuple(map(int, producer_tile_str.strip('()').split(',')))
+                                        producer_loc_str = get_loc_str_from_tile(producer_tile_tuple)
+                                    except:
+                                        producer_loc_str = f"tile {producer_tile_str}"
+                                    
+                                    plan_steps_reversed.append(f"Interact with the object at {producer_loc_str} to create the required pattern component.")
+                                    producer_found = True
+                                    break
+                        if producer_found: break
+                    if producer_found: break
+            
+                if not producer_found:
+                    plan_steps_reversed.append(f"Obtain the required pattern component (source unknown).")
+
+        # 4. Print the final plan in the correct, sequential order.
+        print("Based on the last successful level, the hypothesized plan is:")
+        if not plan_steps_reversed:
+            print("-> No steps could be determined.")
+        else:
+            for i, step_text in enumerate(reversed(plan_steps_reversed)):
+                print(f"  - Step {i+1}: {step_text}")
+
+    def _analyze_and_update_moves(self, latest_frame: FrameData):
+        """Analyzes the resource bar to determine max and current moves."""
+        # We need all three components to do anything.
+        if not self.confirmed_resource_indicator or self.resource_bar_full_state is None or self.resource_bar_empty_state is None:
+            return
+
+        # --- One-time analysis to learn about the bar ---
+        if self.max_moves == 0:
+            full_bar = self.resource_bar_full_state
+            empty_bar = self.resource_bar_empty_state
+
+            # Find the pixels that actually change, and what they change to/from.
+            # This makes the logic robust against bars with decorative, non-functional pixels.
+            for i in range(len(full_bar)):
+                if i < len(empty_bar) and full_bar[i] != empty_bar[i]:
+                    # This is a functional pixel of the resource bar.
+                    self.resource_bar_indices.append(i)
+                    # We only need to set the colors once.
+                    if self.resource_pixel_color is None:
+                        self.resource_pixel_color = full_bar[i]
+                        self.resource_empty_color = empty_bar[i]
+
+            if self.resource_bar_indices:
+                self.max_moves = len(self.resource_bar_indices)
+                print(f"✅ [RESOURCE] Moves logic initialized. Max Moves: {self.max_moves}. Resource Color: {self.resource_pixel_color}, Empty Color: {self.resource_empty_color}.")
+            else:
+                # This could happen if the full/empty states are identical for some reason.
+                print("⚠️ [RESOURCE] Could not determine move count. Full and empty resource bars are identical.")
+                return # Exit if we failed to initialize.
+
+        # --- Per-turn update of the current move count ---
+        if not latest_frame.frame or not latest_frame.frame[0]:
+            return # Cannot update if the frame is empty.
+
+        indicator_row_index = self.confirmed_resource_indicator['row_index']
+        
+        # Safety check for frame dimensions
+        if indicator_row_index >= len(latest_frame.frame[0]):
+            return
+            
+        current_bar = latest_frame.frame[0][indicator_row_index]
+        
+        current_count = 0
+        for i in self.resource_bar_indices:
+            if i < len(current_bar) and current_bar[i] == self.resource_pixel_color:
+                current_count += 1
+        
+        self.current_moves = current_count        
