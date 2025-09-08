@@ -66,7 +66,7 @@ class Swarm:
         else:
             self.tags.extend(["agent", self.agent_name])
 
-    def main(self) -> Scorecard:
+    def main(self) -> Scorecard | None:
         """The main orchestration loop, continues until all agents are done."""
 
         # submit start of scorecard
@@ -99,15 +99,15 @@ class Swarm:
             t.join()
 
         # all agents are now done
-        card_id_for_url = self.card_id
-        scorecard = self.close_scorecard(self.card_id)
+        card_id = self.card_id
+        scorecard = self.close_scorecard(card_id)
         if scorecard:
             logger.info("--- FINAL SCORECARD REPORT ---")
             logger.info(json.dumps(scorecard.model_dump(), indent=2))
 
         # Provide web link to scorecard
-        if card_id_for_url:
-            scorecard_url = f"{self.ROOT_URL}/scorecards/{card_id_for_url}"
+        if card_id:
+            scorecard_url = f"{self.ROOT_URL}/scorecards/{card_id}"
             logger.info(f"View your scorecard online: {scorecard_url}")
 
         self.cleanup(scorecard)
@@ -122,16 +122,18 @@ class Swarm:
             json=json.loads(json_str),
             headers=self.headers,
         )
-        
+
         try:
             response_data = r.json()
         except ValueError:
             raise Exception(f"Failed to open scorecard: {r.status_code} - {r.text}")
 
         if not r.ok:
-            raise Exception(f"API error during open scorecard: {r.status_code} - {response_data}")
+            raise Exception(
+                f"API error during open scorecard: {r.status_code} - {response_data}"
+            )
 
-        return response_data["card_id"]
+        return str(response_data["card_id"])
 
     def close_scorecard(self, card_id: str) -> Optional[Scorecard]:
         self.card_id = None
@@ -141,7 +143,7 @@ class Swarm:
             json=json.loads(json_str),
             headers=self.headers,
         )
-        
+
         try:
             response_data = r.json()
         except ValueError:
@@ -149,9 +151,11 @@ class Swarm:
             return None
 
         if not r.ok:
-            logger.warning(f"API error during close scorecard: {r.status_code} - {response_data}")
+            logger.warning(
+                f"API error during close scorecard: {r.status_code} - {response_data}"
+            )
             return None
-            
+
         return Scorecard.model_validate(response_data)
 
     def cleanup(self, scorecard: Optional[Scorecard] = None) -> None:
