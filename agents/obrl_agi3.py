@@ -29,7 +29,7 @@ class ObrlAgi3Agent(Agent):
 
         # If we just discovered the game-specific actions, print them once.
         if game_specific_actions and not self.actions_printed:
-            print(f"Discovered game-specific actions: {game_specific_actions}")
+            print(f"Discovered game-specific actions: {[action.name for action in game_specific_actions]}")
             self.actions_printed = True
 
         # If the game-specific list is available, choose from it.
