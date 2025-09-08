@@ -13,8 +13,8 @@ class ObrlAgi3Agent(Agent):
         The constructor for the agent.
         """
         super().__init__(**kwargs)
-        # A flag to make sure we only print the actions once.
         self.actions_printed = False
+        self.last_object_summary = []
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -25,11 +25,14 @@ class ObrlAgi3Agent(Agent):
             self.actions_printed = False  # Reset the print flag for the new game.
             return GameAction.RESET
         
-        # On every turn, perceive the objects on the screen.
-        object_summary = self._perceive_objects(latest_frame)
-        if object_summary:
-            print(f"--- Frame Summary ---")
-            for obj in object_summary:
+        current_summary = self._perceive_objects(latest_frame)
+
+        # If this is the first scan (last summary is empty), print the full summary.
+        if not self.last_object_summary:
+            print("--- Initial Frame Summary ---")
+            if not current_summary:
+                print("No objects found.")
+            for obj in current_summary:
                 obj_id = obj['id'].replace('obj_', 'id_')
                 size_str = f"{obj['size'][0]}x{obj['size'][1]}"
                 print(
@@ -37,6 +40,16 @@ class ObrlAgi3Agent(Agent):
                     f"at position {obj['position']} with {obj['pixels']} pixels "
                     f"and shape fingerprint {obj['fingerprint']}."
                 )
+        # On subsequent turns, print only the changes.
+        else:
+            changes = self._log_changes(self.last_object_summary, current_summary)
+            if changes:
+                print("--- Change Log ---")
+                for change in changes:
+                    print(change)
+
+        # Update the memory for the next turn.
+        self.last_object_summary = current_summary
 
         # This is the REAL list of actions for this specific game on this turn.
         game_specific_actions = latest_frame.available_actions
@@ -123,3 +136,55 @@ class ObrlAgi3Agent(Agent):
                 objects.append(obj)
 
         return objects
+    
+    def _log_changes(self, old_summary: list[dict], new_summary: list[dict]) -> list[str]:
+        """Compares summaries by tracking objects via a stable ID (fingerprint, size)."""
+        changes = []
+
+        # Helper to create a stable ID for an object
+        def get_stable_id(obj):
+            return (obj['fingerprint'], obj['size'])
+
+        # Group objects by their stable ID
+        old_map = {}
+        for obj in old_summary:
+            stable_id = get_stable_id(obj)
+            if stable_id not in old_map:
+                old_map[stable_id] = []
+            old_map[stable_id].append(obj)
+
+        new_map = {}
+        for obj in new_summary:
+            stable_id = get_stable_id(obj)
+            if stable_id not in new_map:
+                new_map[stable_id] = []
+            new_map[stable_id].append(obj)
+
+        old_ids = set(old_map.keys())
+        new_ids = set(new_map.keys())
+
+        # Find objects that exist in both frames (potential moves or recolors)
+        for stable_id in old_ids & new_ids:
+            old_obj = old_map[stable_id][0] # For simplicity, we'll track the first match
+            new_obj = new_map[stable_id][0]
+
+            if old_obj['position'] != new_obj['position']:
+                changes.append(
+                    f"- MOVED: Object with ID {stable_id} moved from {old_obj['position']} to {new_obj['position']}."
+                )
+            if old_obj['color'] != new_obj['color']:
+                changes.append(
+                    f"- RECOLOR: Object with ID {stable_id} at {new_obj['position']} changed color from {old_obj['color']} to {new_obj['color']}."
+                )
+
+        # Find objects that were removed
+        for stable_id in old_ids - new_ids:
+            obj = old_map[stable_id][0]
+            changes.append(f"- REMOVED: Object with ID {stable_id} at {obj['position']} has disappeared.")
+
+        # Find objects that are new
+        for stable_id in new_ids - old_ids:
+            obj = new_map[stable_id][0]
+            changes.append(f"- NEW: Object with ID {stable_id} has appeared at {obj['position']}.")
+
+        return changes
