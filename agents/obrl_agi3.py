@@ -19,6 +19,7 @@ class ObrlAgi3Agent(Agent):
         self.last_object_summary = []
         self.last_action_taken = None
         self.rule_hypotheses = {}
+        self.failure_contexts = {}
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -44,19 +45,31 @@ class ObrlAgi3Agent(Agent):
                     f"at position {obj['position']} with {obj['pixels']} pixels "
                     f"and shape fingerprint {obj['fingerprint']}."
                 )
-        # On subsequent turns, print the change log and then analyze the outcome.
+        # On subsequent turns, analyze the outcome of the previous action.
         else:
-            changes = self._log_changes(self.last_object_summary, current_summary)
-            
-            # First, always print the raw change log if anything happened.
+            prev_summary = self.last_object_summary
+            prev_action = self.last_action_taken
+            changes = self._log_changes(prev_summary, current_summary)
+
             if changes:
+                # --- Success Path ---
                 print("--- Change Log ---")
                 for change in changes:
                     print(change)
+                
+                if prev_action:
+                    self._analyze_and_report(prev_action.name, changes)
             
-            # Then, if there was a previous action, perform the analysis.
-            if self.last_action_taken and changes:
-                self._analyze_and_report(self.last_action_taken.name, changes)
+            elif prev_action:
+                # --- Failure Path ---
+                action_name = prev_action.name
+                # Only track failures for actions we've seen succeed before.
+                if action_name in self.rule_hypotheses:
+                    print(f"\n--- Failure Detected for Action {action_name} ---")
+                    print("Action produced no changes. Recording world state to learn failure conditions.")
+                    # Record the "before" state that led to the failure.
+                    self.failure_contexts.setdefault(action_name, []).append(prev_summary)
+                    self._analyze_failures(action_name)
 
         # Update the memory for the next turn.
         self.last_object_summary = current_summary
@@ -200,6 +213,56 @@ class ObrlAgi3Agent(Agent):
             if not found_any_rules:
                 print("No consistent properties remain.")
     
+    def _analyze_failures(self, action_name: str):
+        """Analyzes the contexts of an action's failures to find common preconditions."""
+        failure_summaries = self.failure_contexts.get(action_name, [])
+        num_failures = len(failure_summaries)
+
+        if num_failures < 2:
+            # We need at least two failures to find a pattern.
+            return
+
+        # --- Step 1: Create a "Grid Fingerprint" for each failure state ---
+        fingerprints = []
+        for summary in failure_summaries:
+            fingerprint = {'object_count': len(summary), 'colors_present': set()}
+            color_counts = {}
+            for obj in summary:
+                color = obj['color']
+                fingerprint['colors_present'].add(color)
+                color_counts[color] = color_counts.get(color, 0) + 1
+            fingerprint['color_counts'] = color_counts
+            fingerprints.append(fingerprint)
+
+        # --- Step 2: Intersect the fingerprints to find common conditions ---
+        # Start with the first failure as the base hypothesis
+        consistent_conditions = fingerprints[0]
+        for i in range(1, num_failures):
+            next_fp = fingerprints[i]
+            # Intersect simple values (like object_count)
+            if consistent_conditions['object_count'] != next_fp['object_count']:
+                consistent_conditions['object_count'] = None # Invalidate if not consistent
+            
+            # Intersect sets of present colors
+            consistent_conditions['colors_present'].intersection_update(next_fp['colors_present'])
+            
+            # Intersect dictionaries of color counts
+            consistent_conditions['color_counts'] = {
+                k: v for k, v in consistent_conditions['color_counts'].items()
+                if next_fp['color_counts'].get(k) == v
+            }
+
+        # --- Step 3: Report the findings ---
+        print(f"Analyzing {num_failures} failure instances for action '{action_name}'...")
+        found_any_conditions = False
+        for key, value in consistent_conditions.items():
+            if value is not None and value: # Check for invalidated properties or empty sets/dicts
+                print(f"- Common Failure Precondition: {key.replace('_', ' ').title()} -> {value}")
+                found_any_conditions = True
+        
+        if not found_any_conditions:
+            print("No consistent failure preconditions identified yet.")
+
     def _perceive_objects(self, frame: FrameData) -> list[dict]:
         """Scans the pixel grid to find all contiguous objects."""
         # The pixel grid is a 2D list of color numbers.
