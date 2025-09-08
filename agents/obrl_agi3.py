@@ -3,6 +3,7 @@ from .agent import Agent, FrameData
 from .structs import GameAction, GameState
 from collections import deque
 import copy
+import ast
 
 class ObrlAgi3Agent(Agent):
     """
@@ -16,6 +17,8 @@ class ObrlAgi3Agent(Agent):
         super().__init__(**kwargs)
         self.actions_printed = False
         self.last_object_summary = []
+        self.last_action_taken = None
+        self.rule_hypotheses = {}
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -41,13 +44,19 @@ class ObrlAgi3Agent(Agent):
                     f"at position {obj['position']} with {obj['pixels']} pixels "
                     f"and shape fingerprint {obj['fingerprint']}."
                 )
-        # On subsequent turns, print only the changes.
+        # On subsequent turns, print the change log and then analyze the outcome.
         else:
             changes = self._log_changes(self.last_object_summary, current_summary)
+            
+            # First, always print the raw change log if anything happened.
             if changes:
                 print("--- Change Log ---")
                 for change in changes:
                     print(change)
+            
+            # Then, if there was a previous action, perform the analysis.
+            if self.last_action_taken and changes:
+                self._analyze_and_report(self.last_action_taken.name, changes)
 
         # Update the memory for the next turn.
         self.last_object_summary = current_summary
@@ -76,46 +85,120 @@ class ObrlAgi3Agent(Agent):
             for obj in current_summary:
                 possible_moves.append({'type': click_action_template, 'object': obj})
 
-        # If we have any moves, choose one, set data for it, and return it.
+        action_to_return = None
+        # If we have any moves, choose one and prepare to return it.
         if possible_moves:
             choice = random.choice(possible_moves)
             action_template = choice['type']
             chosen_object = choice['object']
 
-            # If the chosen move is a click, use the set_data method.
             if chosen_object:
                 pos = chosen_object['position']
-                # Position is (row, column). Let's use the standard x=col, y=row.
-                click_y = pos[0]  # row
-                click_x = pos[1]  # column
-
+                click_y, click_x = pos[0], pos[1]
                 obj_id = chosen_object['id'].replace('obj_', 'id_')
                 print(f"Setting data for CLICK on object {obj_id} with dict: {{'x': {click_x}, 'y': {click_y}}}")
-
-                # Call the set_data method with a dictionary of coordinates.
                 action_template.set_data({'x': click_x, 'y': click_y})
-                return action_template
+                action_to_return = action_template
             else:
-                # For simple actions, return the template itself.
                 print(f"Agent chose action: {action_template.name}")
-                return action_template
+                action_to_return = action_template
+        
+        # Fallback logic if no primary action was chosen
+        if not action_to_return:
+            if click_action_template:
+                print("Agent chose generic ACTION6 (no objects to click).")
+                action_to_return = click_action_template
+            else:
+                fallback_options = [a for a in GameAction if a is not GameAction.RESET]
+                action_to_return = random.choice(fallback_options)
+                print(f"Agent chose fallback action: {action_to_return.name}")
 
-        # Fallback logic (if game_specific_actions only had ACTION6 but no objects were found)
-        if click_action_template:
-            print("Agent chose generic ACTION6 (no objects to click).")
-            return click_action_template
-
-        # Final fallback if no actions could be determined.
-        fallback_options = [a for a in GameAction if a is not GameAction.RESET]
-        chosen_action = random.choice(fallback_options)
-        print(f"Agent chose fallback action: {chosen_action.name}")
-        return chosen_action
+        # Before returning, store the chosen action for the next turn's analysis
+        self.last_action_taken = action_to_return
+        return action_to_return
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         """
         This method is called by the game to see if the agent thinks it is done.
         """
         return False
+    
+    def _analyze_and_report(self, action_name: str, changes: list[str]):
+        """Builds a summary of the current changes and refines the stored hypothesis for the action."""
+        
+        # --- Step 1: Create the "Blueprint" for the current turn's changes ---
+        current_blueprint = {
+            'event_counts': {}, 'move_vectors': set(), 'recolor_pairs': set(),
+            'moved_object_colors': set(), 'moved_object_sizes': set(),
+            'recolored_object_sizes': set(), 'shape_change_locations': set(), 'shape_change_colors': set(),
+        }
+
+        # Parse raw log strings into structured data and populate the blueprint
+        parsed_events = 0
+        for log_str in changes:
+            try:
+                change_type, details = log_str.replace('- ', '', 1).split(': ', 1)
+                current_blueprint['event_counts'][change_type] = current_blueprint['event_counts'].get(change_type, 0) + 1
+
+                if change_type == 'MOVED':
+                    parts = details.split(' moved from ')
+                    id_tuple = ast.literal_eval(parts[0].replace('Object with ID ', ''))
+                    pos_parts = parts[1].replace('.', '').split(' to ')
+                    start_pos, end_pos = ast.literal_eval(pos_parts[0]), ast.literal_eval(pos_parts[1])
+                    current_blueprint['move_vectors'].add((end_pos[0] - start_pos[0], end_pos[1] - start_pos[1]))
+                    current_blueprint['moved_object_colors'].add(id_tuple[1])
+                    current_blueprint['moved_object_sizes'].add(id_tuple[2])
+                
+                elif change_type == 'RECOLORED':
+                    parts = details.split(' ')
+                    size = tuple(map(int, parts[1].replace('x', ' ').split()))
+                    from_color, to_color = int(parts[-3]), int(parts[-1].replace('.', ''))
+                    current_blueprint['recolor_pairs'].add((from_color, to_color))
+                    current_blueprint['recolored_object_sizes'].add(size)
+
+                elif change_type == 'SHAPE_CHANGED':
+                    parts = details.split(' ')
+                    location = ast.literal_eval(parts[3])
+                    color = int(parts[5].replace(')', ''))
+                    current_blueprint['shape_change_locations'].add(location)
+                    current_blueprint['shape_change_colors'].add(color)
+                parsed_events += 1
+            except (ValueError, IndexError, SyntaxError):
+                continue
+        
+        if parsed_events == 0: return # Don't analyze if nothing was parsed
+
+        # --- Step 2: Refine the stored hypothesis for this action ---
+        existing_hypothesis = self.rule_hypotheses.get(action_name)
+
+        if not existing_hypothesis:
+            # First observation: the current blueprint becomes the initial hypothesis
+            self.rule_hypotheses[action_name] = current_blueprint
+            print(f"\n--- Initial Hypothesis for {action_name} ---")
+            for key, value in current_blueprint.items():
+                if value: print(f"- {key.replace('_', ' ').title()}: {value}")
+        else:
+            # Subsequent observation: find the intersection
+            # Intersect event counts
+            current_counts = existing_hypothesis['event_counts']
+            next_counts = current_blueprint['event_counts']
+            existing_hypothesis['event_counts'] = {
+                k: v for k, v in current_counts.items() if next_counts.get(k) == v
+            }
+            
+            # Intersect all other properties (which are sets)
+            for key in existing_hypothesis:
+                if isinstance(existing_hypothesis[key], set):
+                    existing_hypothesis[key].intersection_update(current_blueprint[key])
+            
+            print(f"\n--- Refined Hypothesis for {action_name} ---")
+            found_any_rules = False
+            for key, value in existing_hypothesis.items():
+                if value:
+                    found_any_rules = True
+                    print(f"- {key.replace('_', ' ').title()}: {value}")
+            if not found_any_rules:
+                print("No consistent properties remain.")
     
     def _perceive_objects(self, frame: FrameData) -> list[dict]:
         """Scans the pixel grid to find all contiguous objects."""
