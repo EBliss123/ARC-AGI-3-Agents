@@ -2,6 +2,7 @@ import random
 from .agent import Agent, FrameData
 from .structs import GameAction, GameState
 from collections import deque
+import copy
 
 class ObrlAgi3Agent(Agent):
     """
@@ -59,15 +60,56 @@ class ObrlAgi3Agent(Agent):
             print(f"Discovered game-specific actions: {[action.name for action in game_specific_actions]}")
             self.actions_printed = True
 
-        # If the game-specific list is available, choose from it.
-        if game_specific_actions:
-            return random.choice(game_specific_actions)
+        # --- Build a list of possible move DESCRIPTIONS ---
+        possible_moves = []
 
-        # FALLBACK: If the specific list is empty (e.g., first turn),
-        # choose from the master list of all actions to avoid a crash.
+        # Find the generic click action.
+        click_action_template = next((action for action in game_specific_actions if action.name == 'ACTION6'), None)
+
+        # Add descriptions for all non-click actions.
+        for action in game_specific_actions:
+            if action.name != 'ACTION6':
+                possible_moves.append({'type': action, 'object': None})
+
+        # Add descriptions for potential click actions, linking them to target objects.
+        if click_action_template and current_summary:
+            for obj in current_summary:
+                possible_moves.append({'type': click_action_template, 'object': obj})
+
+        # If we have any moves, choose one, set data for it, and return it.
+        if possible_moves:
+            choice = random.choice(possible_moves)
+            action_template = choice['type']
+            chosen_object = choice['object']
+
+            # If the chosen move is a click, use the set_data method.
+            if chosen_object:
+                pos = chosen_object['position']
+                # Position is (row, column). Let's use the standard x=col, y=row.
+                click_y = pos[0]  # row
+                click_x = pos[1]  # column
+
+                obj_id = chosen_object['id'].replace('obj_', 'id_')
+                print(f"Setting data for CLICK on object {obj_id} with dict: {{'x': {click_x}, 'y': {click_y}}}")
+
+                # Call the set_data method with a dictionary of coordinates.
+                action_template.set_data({'x': click_x, 'y': click_y})
+                return action_template
+            else:
+                # For simple actions, return the template itself.
+                print(f"Agent chose action: {action_template.name}")
+                return action_template
+
+        # Fallback logic (if game_specific_actions only had ACTION6 but no objects were found)
+        if click_action_template:
+            print("Agent chose generic ACTION6 (no objects to click).")
+            return click_action_template
+
+        # Final fallback if no actions could be determined.
         fallback_options = [a for a in GameAction if a is not GameAction.RESET]
-        return random.choice(fallback_options)
-
+        chosen_action = random.choice(fallback_options)
+        print(f"Agent chose fallback action: {chosen_action.name}")
+        return chosen_action
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         """
