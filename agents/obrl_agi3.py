@@ -138,80 +138,98 @@ class ObrlAgi3Agent(Agent):
         return objects
     
     def _log_changes(self, old_summary: list[dict], new_summary: list[dict]) -> list[str]:
-        """Compares summaries by identifying recolors, moves, and new/removed objects."""
+        """Compares summaries by identifying in-place changes, moves, and new/removed objects."""
         if not old_summary and not new_summary:
             return []
 
         changes = []
-        
-        # --- Pass 1: Identify stable and recolored objects ---
-        # Key: (position, fingerprint, size) -> Value: object dict
-        old_map_by_pos_shape = {(o['position'], o['fingerprint'], o['size']): o for o in old_summary}
-        new_map_by_pos_shape = {(n['position'], n['fingerprint'], n['size']): n for n in new_summary}
+        old_unexplained = list(old_summary)
+        new_unexplained = list(new_summary)
 
-        explained_old_keys = set()
-        explained_new_keys = set()
+        # --- Pass 1: Identify in-place changes (recolor, shape change, etc.) ---
+        matches_to_remove = []
+        processed_new_objs_in_pass1 = set()
 
-        for pos_shape_key, old_obj in old_map_by_pos_shape.items():
-            if pos_shape_key in new_map_by_pos_shape:
-                new_obj = new_map_by_pos_shape[pos_shape_key]
-                # Mark both as explained so they aren't processed in later passes
-                explained_old_keys.add(pos_shape_key)
-                explained_new_keys.add(pos_shape_key)
+        for old_obj in old_unexplained:
+            # Find a new object at the same position that hasn't been matched yet
+            for new_obj in new_unexplained:
+                if id(new_obj) in processed_new_objs_in_pass1:
+                    continue
                 
-                if old_obj['color'] != new_obj['color']:
-                    size_str = f"{old_obj['size'][0]}x{old_obj['size'][1]}"
-                    changes.append(
-                        f"- RECOLORED: A {size_str} object at {old_obj['position']} "
-                        f"changed color from {old_obj['color']} to {new_obj['color']}."
-                    )
+                if old_obj['position'] == new_obj['position']:
+                    color_changed = old_obj['color'] != new_obj['color']
+                    shape_changed = (old_obj['fingerprint'] != new_obj['fingerprint'] or
+                                     old_obj['size'] != new_obj['size'] or
+                                     old_obj['pixels'] != new_obj['pixels'])
+
+                    # If anything changed, it's an event. If not, it's stable.
+                    # In either case, we've explained this pair of objects.
+                    if color_changed and shape_changed:
+                        changes.append(
+                            f"- TRANSFORMED: Object at {old_obj['position']} changed shape and color "
+                            f"(from C:{old_obj['color']} to C:{new_obj['color']})."
+                        )
+                    elif color_changed:
+                        size_str = f"{old_obj['size'][0]}x{old_obj['size'][1]}"
+                        changes.append(
+                            f"- RECOLORED: A {size_str} object at {old_obj['position']} "
+                            f"changed color from {old_obj['color']} to {new_obj['color']}."
+                        )
+                    elif shape_changed:
+                        changes.append(
+                            f"- SHAPE_CHANGED: The object at {old_obj['position']} (Color: {old_obj['color']}) changed its shape."
+                        )
+
+                    matches_to_remove.append((old_obj, new_obj))
+                    processed_new_objs_in_pass1.add(id(new_obj))
+                    break  # Move to the next old_obj, as its position is now explained
         
+        # Remove the explained objects before the next pass
+        for old_match, new_match in matches_to_remove:
+            old_unexplained.remove(old_match)
+            new_unexplained.remove(new_match)
+
         # --- Pass 2: Identify moved objects from the remaining pool ---
-        # A stable ID for moving objects (location-independent)
         def get_stable_id(obj):
             return (obj['fingerprint'], obj['color'], obj['size'], obj['pixels'])
         
-        # Create maps of unexplained objects grouped by their stable move ID
-        unexplained_old_map = {}
-        for key, obj in old_map_by_pos_shape.items():
-            if key not in explained_old_keys:
-                stable_id = get_stable_id(obj)
-                if stable_id not in unexplained_old_map:
-                    unexplained_old_map[stable_id] = []
-                unexplained_old_map[stable_id].append(obj)
+        old_map_by_id = {}
+        for obj in old_unexplained:
+            stable_id = get_stable_id(obj)
+            old_map_by_id.setdefault(stable_id, []).append(obj)
+        
+        new_map_by_id = {}
+        for obj in new_unexplained:
+            stable_id = get_stable_id(obj)
+            new_map_by_id.setdefault(stable_id, []).append(obj)
 
-        unexplained_new_map = {}
-        for key, obj in new_map_by_pos_shape.items():
-            if key not in explained_new_keys:
-                stable_id = get_stable_id(obj)
-                if stable_id not in unexplained_new_map:
-                    unexplained_new_map[stable_id] = []
-                unexplained_new_map[stable_id].append(obj)
-
-        # Find common IDs that could have moved
-        movable_ids = set(unexplained_old_map.keys()) & set(unexplained_new_map.keys())
-
+        movable_ids = set(old_map_by_id.keys()) & set(new_map_by_id.keys())
+        
+        moves_to_remove = []
         for stable_id in movable_ids:
-            old_instances = unexplained_old_map[stable_id]
-            new_instances = unexplained_new_map[stable_id]
+            old_instances = old_map_by_id[stable_id]
+            new_instances = new_map_by_id[stable_id]
             
-            # Simple matching: pair up old and new instances to log them as moved
             num_matches = min(len(old_instances), len(new_instances))
             for _ in range(num_matches):
                 old_inst = old_instances.pop()
                 new_inst = new_instances.pop()
+                # A move is only a move if the position is different.
                 if old_inst['position'] != new_inst['position']:
                     changes.append(f"- MOVED: Object with ID {stable_id} moved from {old_inst['position']} to {new_inst['position']}.")
+                moves_to_remove.append((old_inst, new_inst))
+        
+        for old_match, new_match in moves_to_remove:
+            old_unexplained.remove(old_match)
+            new_unexplained.remove(new_match)
 
         # --- Pass 3: Log remaining objects as removed or new ---
-        # Anything left in unexplained_old_map was removed
-        for stable_id, remaining_objs in unexplained_old_map.items():
-            for obj in remaining_objs:
-                changes.append(f"- REMOVED: Object with ID {stable_id} at {obj['position']} has disappeared.")
+        for obj in old_unexplained:
+            stable_id = get_stable_id(obj)
+            changes.append(f"- REMOVED: Object with ID {stable_id} at {obj['position']} has disappeared.")
 
-        # Anything left in unexplained_new_map is new
-        for stable_id, remaining_objs in unexplained_new_map.items():
-            for obj in remaining_objs:
-                changes.append(f"- NEW: Object with ID {stable_id} has appeared at {obj['position']}.")
+        for obj in new_unexplained:
+            stable_id = get_stable_id(obj)
+            changes.append(f"- NEW: Object with ID {stable_id} has appeared at {obj['position']}.")
 
-        return changes
+        return sorted(changes)
