@@ -196,7 +196,36 @@ class ObrlAgi3Agent(Agent):
                         'to_fingerprint': int(to_fp_str)
                     })
                     events.append(event)
-            
+                
+                elif change_type in ['GROWTH', 'SHRINK', 'TRANSFORM']:
+                    start_pos_str = details.split(') ')[0] + ')'
+                    start_pos = ast.literal_eval(start_pos_str.split(' at ')[1])
+                    end_pos_str = details.split('now at ')[1].replace('.', '')
+                    end_pos = ast.literal_eval(end_pos_str)
+                    event.update({'start_position': start_pos, 'end_position': end_pos})
+                    
+                    if '(from ' in details: # Growth/Shrink have size details
+                        from_size_str = details.split('(from ')[1].split(' to ')[0]
+                        to_size_str = details.split(' to ')[1].split(')')[0]
+                        pixel_diff = int(details.split(' by ')[1].split(' pixels')[0])
+                        event.update({
+                            'from_size': ast.literal_eval(from_size_str.replace('x', ',')),
+                            'to_size': ast.literal_eval(to_size_str.replace('x', ',')),
+                            'pixel_delta': pixel_diff if change_type == 'GROWTH' else -pixel_diff
+                        })
+                    events.append(event)
+
+                elif change_type in ['NEW', 'REMOVED']:
+                    id_str = details.split(') ')[0] + ')'
+                    id_tuple = ast.literal_eval(id_str.split('ID ')[1])
+                    pos_str = '(' + details.split('(')[-1].replace('.', '')
+                    position = ast.literal_eval(pos_str)
+                    event.update({
+                        'position': position, 'fingerprint': id_tuple[0],
+                        'color': id_tuple[1], 'size': id_tuple[2], 'pixels': id_tuple[3]
+                    })
+                    events.append(event)
+
             except (ValueError, IndexError, SyntaxError):
                 continue
         return events
