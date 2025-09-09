@@ -50,19 +50,16 @@ class ObrlAgi3Agent(Agent):
             prev_summary = self.last_object_summary
             changes = self._log_changes(prev_summary, current_summary)
 
-            # Only perform learning if a previous action was actually taken.
             if self.last_action_context:
                 prev_action_name, prev_coords = self.last_action_context
-                # Generate a key that is coordinate-specific for CLICK actions.
                 learning_key = self._get_learning_key(prev_action_name, prev_coords)
-                
+
                 if changes:
                     # --- Success Path ---
                     print("--- Change Log ---")
                     for change in changes:
                         print(change)
                     self._analyze_and_report(learning_key, changes)
-                
                 else:
                     # --- Failure Path ---
                     if learning_key in self.rule_hypotheses:
@@ -71,7 +68,8 @@ class ObrlAgi3Agent(Agent):
                         self.failure_contexts.setdefault(learning_key, []).append(prev_summary)
                         self._analyze_failures(learning_key)
 
-            elif changes: # Case where changes occurred without a known previous action
+            elif changes:
+                # Fallback for when changes happen without a known previous action
                 print("--- Change Log ---")
                 for change in changes:
                     print(change)
@@ -152,83 +150,138 @@ class ObrlAgi3Agent(Agent):
             return f"{action_name}_({coords['x']},{coords['y']})"
         return action_name
     
-    def _analyze_and_report(self, action_name: str, changes: list[str]):
-        """Builds a summary of the current changes and refines the stored hypothesis for the action."""
-        
-        # --- Step 1: Create the "Blueprint" for the current turn's changes ---
-        current_blueprint = {
-            'event_counts': {}, 'move_vectors': set(), 'recolor_pairs': set(),
-            'moved_object_colors': set(), 'moved_object_sizes': set(),
-            'recolored_object_sizes': set(), 'shape_change_locations': set(), 'shape_change_colors': set(),
-        }
-
-        # Parse raw log strings into structured data and populate the blueprint
-        parsed_events = 0
+    def _parse_change_logs_to_events(self, changes: list[str]) -> list[dict]:
+        """Parses a list of human-readable change logs into a list of structured event dictionaries."""
+        events = []
         for log_str in changes:
             try:
                 change_type, details = log_str.replace('- ', '', 1).split(': ', 1)
-                current_blueprint['event_counts'][change_type] = current_blueprint['event_counts'].get(change_type, 0) + 1
+                event = {'type': change_type}
 
                 if change_type == 'MOVED':
                     parts = details.split(' moved from ')
                     id_tuple = ast.literal_eval(parts[0].replace('Object with ID ', ''))
                     pos_parts = parts[1].replace('.', '').split(' to ')
                     start_pos, end_pos = ast.literal_eval(pos_parts[0]), ast.literal_eval(pos_parts[1])
-                    current_blueprint['move_vectors'].add((end_pos[0] - start_pos[0], end_pos[1] - start_pos[1]))
-                    current_blueprint['moved_object_colors'].add(id_tuple[1])
-                    current_blueprint['moved_object_sizes'].add(id_tuple[2])
-                
+                    
+                    event.update({
+                        'vector': (end_pos[0] - start_pos[0], end_pos[1] - start_pos[1]),
+                        'fingerprint': id_tuple[0], 'color': id_tuple[1],
+                        'size': id_tuple[2], 'pixels': id_tuple[3]
+                    })
+                    events.append(event)
+
                 elif change_type == 'RECOLORED':
-                    parts = details.split(' ')
-                    size = tuple(map(int, parts[1].replace('x', ' ').split()))
-                    from_color, to_color = int(parts[-3]), int(parts[-1].replace('.', ''))
-                    current_blueprint['recolor_pairs'].add((from_color, to_color))
-                    current_blueprint['recolored_object_sizes'].add(size)
+                    # "A 1x1 object at (2, 2) changed color from 15 to 3."
+                    size_str = details.split(' object at ')[0].split(' ')[-1]
+                    position_str = details.split(' at ')[1].split(' changed color')[0]
+                    from_color_str = details.split(' from ')[1].split(' to ')[0]
+                    to_color_str = details.split(' to ')[1].replace('.', '')
 
+                    event.update({
+                        'size': ast.literal_eval(size_str.replace('x', ',')),
+                        'position': ast.literal_eval(position_str),
+                        'from_color': int(from_color_str),
+                        'to_color': int(to_color_str)
+                    })
+                    events.append(event)
+                
                 elif change_type == 'SHAPE_CHANGED':
-                    parts = details.split(' ')
-                    location = ast.literal_eval(parts[3])
-                    color = int(parts[5].replace(')', ''))
-                    current_blueprint['shape_change_locations'].add(location)
-                    current_blueprint['shape_change_colors'].add(color)
-                parsed_events += 1
-            except (ValueError, IndexError, SyntaxError):
-                continue
-        
-        if parsed_events == 0: return # Don't analyze if nothing was parsed
+                    # "The object at (8, 8) (Color: 3) changed shape (fingerprint: ... -> ...)."
+                    position_str = details.split(' (Color:')[0].split(' at ')[1]
+                    color_str = details.split('(Color: ')[1].split(')')[0]
+                    fp_part = details.split('fingerprint: ')[1]
+                    from_fp_str, to_fp_str = fp_part.replace(').','').split(' -> ')
 
-        # --- Step 2: Refine the stored hypothesis for this action ---
-        existing_hypothesis = self.rule_hypotheses.get(action_name)
+                    event.update({
+                        'position': ast.literal_eval(position_str),
+                        'color': int(color_str),
+                        'from_fingerprint': int(from_fp_str),
+                        'to_fingerprint': int(to_fp_str)
+                    })
+                    events.append(event)
+            
+            except (ValueError, IndexError, SyntaxError):
+                # This will catch any log string that doesn't match our expected formats
+                # and allow the agent to continue without crashing.
+                continue
+        return events
+
+    def _analyze_and_report(self, action_key: str, changes: list[str]):
+        """Builds a hypothesis from raw changes, refining from a 'case file' to an 'abstract rule'."""
+        
+        def create_blueprint_from_events(events: list[dict]) -> dict:
+            """Creates an abstract summary blueprint from a list of raw event dictionaries."""
+            blueprint = {
+                'event_counts': {}, 'move_vectors': set(), 'moved_object_colors': set(),
+                'moved_object_sizes': set(), 'moved_object_pixels': set()
+            }
+            event_types = [e['type'] for e in events]
+            blueprint['event_counts'] = {t: event_types.count(t) for t in set(event_types)}
+
+            for event in events:
+                if event['type'] == 'MOVED':
+                    blueprint['move_vectors'].add(event['vector'])
+                    blueprint['moved_object_colors'].add(event['color'])
+                    blueprint['moved_object_sizes'].add(event['size'])
+                    blueprint['moved_object_pixels'].add(event['pixels'])
+            return blueprint
+
+        # --- Step 1: Parse the current turn's changes into structured events ---
+        new_events = self._parse_change_logs_to_events(changes)
+        if not new_events: return
+
+        # --- Step 2: Retrieve existing hypothesis and update it ---
+        existing_hypothesis = self.rule_hypotheses.get(action_key)
 
         if not existing_hypothesis:
-            # First observation: the current blueprint becomes the initial hypothesis
-            self.rule_hypotheses[action_name] = current_blueprint
-            print(f"\n--- Initial Hypothesis for {action_name} ---")
-            for key, value in current_blueprint.items():
-                if value: print(f"- {key.replace('_', ' ').title()}: {value}")
-        else:
-            # Subsequent observation: find the intersection
-            # Intersect event counts
-            current_counts = existing_hypothesis['event_counts']
-            next_counts = current_blueprint['event_counts']
-            existing_hypothesis['event_counts'] = {
-                k: v for k, v in current_counts.items() if next_counts.get(k) == v
-            }
+            # --- Stage 1: First Observation -> Create the "Case File" ---
+            self.rule_hypotheses[action_key] = new_events
+            print(f"\n--- Initial Case File for {action_key} ---")
+            for event in new_events:
+                print(f"- Observed {event['type']} with details: { {k:v for k,v in event.items() if k != 'type'} }")
+        
+        elif isinstance(existing_hypothesis, list):
+            # --- Stage 2: Second Observation -> From "Case File" to "Abstract Rule" ---
+            old_blueprint = create_blueprint_from_events(existing_hypothesis)
+            new_blueprint = create_blueprint_from_events(new_events)
+
+            # Intersect the two blueprints to form the first abstract rule
+            for key in old_blueprint:
+                if isinstance(old_blueprint[key], set):
+                    old_blueprint[key].intersection_update(new_blueprint[key])
+                elif isinstance(old_blueprint[key], dict):
+                     old_blueprint[key] = {
+                         k: v for k, v in old_blueprint[key].items() if new_blueprint[key].get(k) == v
+                     }
             
-            # Intersect all other properties (which are sets)
+            self.rule_hypotheses[action_key] = old_blueprint # Promote the hypothesis to a dict
+            print(f"\n--- First Abstract Rule for {action_key} (from 2 observations) ---")
+            for key, value in old_blueprint.items():
+                if value: print(f"- {key.replace('_', ' ').title()}: {value}")
+
+        elif isinstance(existing_hypothesis, dict):
+            # --- Stage 3: Subsequent Observations -> Refine the "Abstract Rule" ---
+            new_blueprint = create_blueprint_from_events(new_events)
+            
+            # Intersect the new blueprint with the existing abstract rule
             for key in existing_hypothesis:
                 if isinstance(existing_hypothesis[key], set):
-                    existing_hypothesis[key].intersection_update(current_blueprint[key])
+                    existing_hypothesis[key].intersection_update(new_blueprint[key])
+                elif isinstance(existing_hypothesis[key], dict):
+                    existing_hypothesis[key] = {
+                        k: v for k, v in existing_hypothesis[key].items() if new_blueprint[key].get(k) == v
+                    }
             
-            print(f"\n--- Refined Hypothesis for {action_name} ---")
+            print(f"\n--- Refined Hypothesis for {action_key} ---")
             found_any_rules = False
             for key, value in existing_hypothesis.items():
                 if value:
                     found_any_rules = True
                     print(f"- {key.replace('_', ' ').title()}: {value}")
             if not found_any_rules:
-                print("No consistent properties remain.")
-    
+                print("No consistent properties remain in the hypothesis.")
+
     def _analyze_failures(self, action_name: str):
         """Analyzes the contexts of an action's failures to find common preconditions."""
         failure_summaries = self.failure_contexts.get(action_name, [])
