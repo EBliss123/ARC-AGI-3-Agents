@@ -341,6 +341,10 @@ class ObrlAgi3Agent(Agent):
 
         return objects
     
+    def _get_stable_id(self, obj):
+        """Creates a hashable, stable ID for an object based on its intrinsic properties."""
+        return (obj['fingerprint'], obj['color'], obj['size'], obj['pixels'])
+    
     def _log_changes(self, old_summary: list[dict], new_summary: list[dict]) -> list[str]:
         """Compares summaries by identifying in-place changes, moves, and new/removed objects."""
         if not old_summary and not new_summary:
@@ -394,17 +398,14 @@ class ObrlAgi3Agent(Agent):
             new_unexplained.remove(new_match)
 
         # --- Pass 2: Identify moved objects from the remaining pool ---
-        def get_stable_id(obj):
-            return (obj['fingerprint'], obj['color'], obj['size'], obj['pixels'])
-        
         old_map_by_id = {}
         for obj in old_unexplained:
-            stable_id = get_stable_id(obj)
+            stable_id = self._get_stable_id(obj)
             old_map_by_id.setdefault(stable_id, []).append(obj)
         
         new_map_by_id = {}
         for obj in new_unexplained:
-            stable_id = get_stable_id(obj)
+            stable_id = self._get_stable_id(obj)
             new_map_by_id.setdefault(stable_id, []).append(obj)
 
         movable_ids = set(old_map_by_id.keys()) & set(new_map_by_id.keys())
@@ -427,13 +428,52 @@ class ObrlAgi3Agent(Agent):
             old_unexplained.remove(old_match)
             new_unexplained.remove(new_match)
 
+        # --- Pass 3: Fuzzy Matching for GROWTH and SHRINK events ---
+        if old_unexplained and new_unexplained:
+            potential_pairs = []
+            for old_obj in old_unexplained:
+                for new_obj in new_unexplained:
+                    pos1 = old_obj['position']
+                    pos2 = new_obj['position']
+                    # Calculate Manhattan distance between corners
+                    distance = abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
+                    potential_pairs.append({'old': old_obj, 'new': new_obj, 'dist': distance})
+            
+            # Sort by distance to find the closest pairs first
+            potential_pairs.sort(key=lambda p: p['dist'])
+            
+            matched_old = set()
+            matched_new = set()
+            for pair in potential_pairs:
+                old_obj, new_obj = pair['old'], pair['new']
+                # If neither object in a close pair has been matched yet, match them.
+                if id(old_obj) not in matched_old and id(new_obj) not in matched_new:
+                    old_pixels = old_obj['pixels']
+                    new_pixels = new_obj['pixels']
+                    
+                    if new_pixels > old_pixels:
+                        event_type = "GROWTH"
+                    elif old_pixels > new_pixels:
+                        event_type = "SHRINK"
+                    else:
+                        event_type = "TRANSFORM" # Same pixel count, but other properties changed
+
+                    changes.append(f"- {event_type}: Object at {old_obj['position']} became a {new_obj['size'][0]}x{new_obj['size'][1]} object at {new_obj['position']}.")
+
+                    matched_old.add(id(old_obj))
+                    matched_new.add(id(new_obj))
+            
+            # Remove the newly matched objects from the unexplained lists
+            old_unexplained = [obj for obj in old_unexplained if id(obj) not in matched_old]
+            new_unexplained = [obj for obj in new_unexplained if id(obj) not in matched_new]
+
         # --- Pass 3: Log remaining objects as removed or new ---
         for obj in old_unexplained:
-            stable_id = get_stable_id(obj)
+            stable_id = self._get_stable_id(obj)
             changes.append(f"- REMOVED: Object with ID {stable_id} at {obj['position']} has disappeared.")
 
         for obj in new_unexplained:
-            stable_id = get_stable_id(obj)
+            stable_id = self._get_stable_id(obj)
             changes.append(f"- NEW: Object with ID {stable_id} has appeared at {obj['position']}.")
 
         return sorted(changes)
