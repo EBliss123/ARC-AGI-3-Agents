@@ -19,7 +19,7 @@ class ObrlAgi3Agent(Agent):
         self.last_object_summary = []
         self.last_action_context = None  # Will store a tuple of (action_name, coords_dict)
         self.rule_hypotheses = {}
-        self.failure_contexts = {}
+        self.last_success_contexts = {}
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -59,14 +59,17 @@ class ObrlAgi3Agent(Agent):
                     print("--- Change Log ---")
                     for change in changes:
                         print(change)
+                    
                     self._analyze_and_report(learning_key, changes)
+                    # Remember the state that led to this success
+                    self.last_success_contexts[learning_key] = prev_summary
+                
                 else:
                     # --- Failure Path ---
-                    if learning_key in self.rule_hypotheses:
+                    if learning_key in self.last_success_contexts:
                         print(f"\n--- Failure Detected for Action {learning_key} ---")
-                        print("Action produced no changes. Recording world state to learn failure conditions.")
-                        self.failure_contexts.setdefault(learning_key, []).append(prev_summary)
-                        self._analyze_failures(learning_key)
+                        last_success_summary = self.last_success_contexts[learning_key]
+                        self._analyze_failures(learning_key, last_success_summary, prev_summary)
 
             elif changes:
                 # Fallback for when changes happen without a known previous action
@@ -320,55 +323,19 @@ class ObrlAgi3Agent(Agent):
                 details = {k:v for k,v in rule.items() if k != 'type'}
                 print(f"- Confirmed Rule: A {rule['type']} event occurs with consistent properties: {details}")
 
-    def _analyze_failures(self, action_name: str):
-        """Analyzes the contexts of an action's failures to find common preconditions."""
-        failure_summaries = self.failure_contexts.get(action_name, [])
-        num_failures = len(failure_summaries)
-
-        if num_failures < 2:
-            # We need at least two failures to find a pattern.
-            return
-
-        # --- Step 1: Create a "Grid Fingerprint" for each failure state ---
-        fingerprints = []
-        for summary in failure_summaries:
-            fingerprint = {'object_count': len(summary), 'colors_present': set()}
-            color_counts = {}
-            for obj in summary:
-                color = obj['color']
-                fingerprint['colors_present'].add(color)
-                color_counts[color] = color_counts.get(color, 0) + 1
-            fingerprint['color_counts'] = color_counts
-            fingerprints.append(fingerprint)
-
-        # --- Step 2: Intersect the fingerprints to find common conditions ---
-        # Start with the first failure as the base hypothesis
-        consistent_conditions = fingerprints[0]
-        for i in range(1, num_failures):
-            next_fp = fingerprints[i]
-            # Intersect simple values (like object_count)
-            if consistent_conditions['object_count'] != next_fp['object_count']:
-                consistent_conditions['object_count'] = None # Invalidate if not consistent
-            
-            # Intersect sets of present colors
-            consistent_conditions['colors_present'].intersection_update(next_fp['colors_present'])
-            
-            # Intersect dictionaries of color counts
-            consistent_conditions['color_counts'] = {
-                k: v for k, v in consistent_conditions['color_counts'].items()
-                if next_fp['color_counts'].get(k) == v
-            }
-
-        # --- Step 3: Report the findings ---
-        print(f"Analyzing {num_failures} failure instances for action '{action_name}'...")
-        found_any_conditions = False
-        for key, value in consistent_conditions.items():
-            if value is not None and value: # Check for invalidated properties or empty sets/dicts
-                print(f"- Common Failure Precondition: {key.replace('_', ' ').title()} -> {value}")
-                found_any_conditions = True
+    def _analyze_failures(self, action_key: str, last_success_summary: list[dict], current_failure_summary: list[dict]):
+        """Compares a failure state to the last known success state to find differences."""
+        print("Comparing current state to last successful state to find potential failure preconditions...")
         
-        if not found_any_conditions:
-            print("No consistent failure preconditions identified yet.")
+        # We can reuse our powerful _log_changes function for this comparison
+        differences = self._log_changes(last_success_summary, current_failure_summary)
+        
+        if not differences:
+            print("No obvious differences found between this failure state and the last success state.")
+        else:
+            print("--- Failure Precondition Log (Differences from last success) ---")
+            for diff in differences:
+                print(diff)
 
     def _perceive_objects(self, frame: FrameData) -> list[dict]:
         """Scans the pixel grid to find all contiguous objects."""
