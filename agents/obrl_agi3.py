@@ -172,27 +172,23 @@ class ObrlAgi3Agent(Agent):
                     events.append(event)
 
                 elif change_type == 'RECOLORED':
-                    # "A 1x1 object at (2, 2) changed color from 15 to 3."
                     size_str = details.split(' object at ')[0].split(' ')[-1]
                     position_str = details.split(' at ')[1].split(' changed color')[0]
                     from_color_str = details.split(' from ')[1].split(' to ')[0]
                     to_color_str = details.split(' to ')[1].replace('.', '')
-
                     event.update({
-                        'size': ast.literal_eval(size_str.replace('x', ',')),
                         'position': ast.literal_eval(position_str),
+                        'size': ast.literal_eval(size_str.replace('x', ',')),
                         'from_color': int(from_color_str),
                         'to_color': int(to_color_str)
                     })
                     events.append(event)
                 
                 elif change_type == 'SHAPE_CHANGED':
-                    # "The object at (8, 8) (Color: 3) changed shape (fingerprint: ... -> ...)."
                     position_str = details.split(' (Color:')[0].split(' at ')[1]
                     color_str = details.split('(Color: ')[1].split(')')[0]
                     fp_part = details.split('fingerprint: ')[1]
                     from_fp_str, to_fp_str = fp_part.replace(').','').split(' -> ')
-
                     event.update({
                         'position': ast.literal_eval(position_str),
                         'color': int(color_str),
@@ -202,36 +198,39 @@ class ObrlAgi3Agent(Agent):
                     events.append(event)
             
             except (ValueError, IndexError, SyntaxError):
-                # This will catch any log string that doesn't match our expected formats
-                # and allow the agent to continue without crashing.
                 continue
         return events
 
     def _analyze_and_report(self, action_key: str, changes: list[str]):
-        """Builds a hypothesis from raw changes, refining from a 'case file' to an 'abstract rule'."""
+        """Compares new events with a stored hypothesis to find consistent, refined rules."""
         
-        def create_blueprint_from_events(events: list[dict]) -> dict:
-            """Creates an abstract summary blueprint from a list of raw event dictionaries."""
-            blueprint = {
-                'event_counts': {}, 'move_vectors': set(), 'moved_object_colors': set(),
-                'moved_object_sizes': set(), 'moved_object_pixels': set()
-            }
-            event_types = [e['type'] for e in events]
-            blueprint['event_counts'] = {t: event_types.count(t) for t in set(event_types)}
+        def find_best_match(event_to_match, candidate_list):
+            """Finds the best matching event from a list, returns it and removes it."""
+            # Prioritize matching by stable properties like fingerprint or position
+            key_props = ['fingerprint', 'position']
+            for prop in key_props:
+                if prop in event_to_match:
+                    for candidate in candidate_list:
+                        if event_to_match[prop] == candidate.get(prop) and event_to_match['type'] == candidate['type']:
+                            candidate_list.remove(candidate)
+                            return candidate
+            # If no key prop match, and only one of this type, it's an implicit match
+            if len(candidate_list) == 1 and candidate_list[0]['type'] == event_to_match['type']:
+                return candidate_list.pop(0)
+            return None
 
-            for event in events:
-                if event['type'] == 'MOVED':
-                    blueprint['move_vectors'].add(event['vector'])
-                    blueprint['moved_object_colors'].add(event['color'])
-                    blueprint['moved_object_sizes'].add(event['size'])
-                    blueprint['moved_object_pixels'].add(event['pixels'])
-            return blueprint
+        def refine_rule(old_rule, new_event):
+            """Intersects the properties of a rule and a new event, keeping only commonalities."""
+            refined = {}
+            for key, value in old_rule.items():
+                if key in new_event and new_event[key] == value:
+                    refined[key] = value
+            refined['type'] = old_rule['type'] # Always preserve the event type
+            return refined
 
-        # --- Step 1: Parse the current turn's changes into structured events ---
         new_events = self._parse_change_logs_to_events(changes)
         if not new_events: return
 
-        # --- Step 2: Retrieve existing hypothesis and update it ---
         existing_hypothesis = self.rule_hypotheses.get(action_key)
 
         if not existing_hypothesis:
@@ -239,48 +238,38 @@ class ObrlAgi3Agent(Agent):
             self.rule_hypotheses[action_key] = new_events
             print(f"\n--- Initial Case File for {action_key} ---")
             for event in new_events:
-                print(f"- Observed {event['type']} with details: { {k:v for k,v in event.items() if k != 'type'} }")
+                details = {k:v for k,v in event.items() if k != 'type'}
+                print(f"- Observed {event['type']} with details: {details}")
+            return
+
+        # --- Stage 2 & 3: Match events and refine the hypothesis ---
+        refined_hypothesis = []
+        # Group events by type to make matching manageable
+        new_events_by_type = {}
+        for event in new_events:
+            new_events_by_type.setdefault(event['type'], []).append(event)
+
+        # For each rule in our old hypothesis, try to find its twin in the new events
+        for old_rule in existing_hypothesis:
+            rule_type = old_rule['type']
+            candidates = new_events_by_type.get(rule_type, [])
+            
+            match = find_best_match(old_rule, candidates)
+            
+            if match:
+                # If we found a match, refine the rule by finding the intersection of properties
+                refined_rule = refine_rule(old_rule, match)
+                refined_hypothesis.append(refined_rule)
         
-        elif isinstance(existing_hypothesis, list):
-            # --- Stage 2: Second Observation -> From "Case File" to "Abstract Rule" ---
-            old_blueprint = create_blueprint_from_events(existing_hypothesis)
-            new_blueprint = create_blueprint_from_events(new_events)
-
-            # Intersect the two blueprints to form the first abstract rule
-            for key in old_blueprint:
-                if isinstance(old_blueprint[key], set):
-                    old_blueprint[key].intersection_update(new_blueprint[key])
-                elif isinstance(old_blueprint[key], dict):
-                     old_blueprint[key] = {
-                         k: v for k, v in old_blueprint[key].items() if new_blueprint[key].get(k) == v
-                     }
-            
-            self.rule_hypotheses[action_key] = old_blueprint # Promote the hypothesis to a dict
-            print(f"\n--- First Abstract Rule for {action_key} (from 2 observations) ---")
-            for key, value in old_blueprint.items():
-                if value: print(f"- {key.replace('_', ' ').title()}: {value}")
-
-        elif isinstance(existing_hypothesis, dict):
-            # --- Stage 3: Subsequent Observations -> Refine the "Abstract Rule" ---
-            new_blueprint = create_blueprint_from_events(new_events)
-            
-            # Intersect the new blueprint with the existing abstract rule
-            for key in existing_hypothesis:
-                if isinstance(existing_hypothesis[key], set):
-                    existing_hypothesis[key].intersection_update(new_blueprint[key])
-                elif isinstance(existing_hypothesis[key], dict):
-                    existing_hypothesis[key] = {
-                        k: v for k, v in existing_hypothesis[key].items() if new_blueprint[key].get(k) == v
-                    }
-            
-            print(f"\n--- Refined Hypothesis for {action_key} ---")
-            found_any_rules = False
-            for key, value in existing_hypothesis.items():
-                if value:
-                    found_any_rules = True
-                    print(f"- {key.replace('_', ' ').title()}: {value}")
-            if not found_any_rules:
-                print("No consistent properties remain in the hypothesis.")
+        self.rule_hypotheses[action_key] = refined_hypothesis
+        
+        print(f"\n--- Refined Hypothesis for {action_key} ---")
+        if not refined_hypothesis:
+            print("No consistent rules could be confirmed from the new observation.")
+        else:
+            for rule in refined_hypothesis:
+                details = {k:v for k,v in rule.items() if k != 'type'}
+                print(f"- Confirmed Rule: A {rule['type']} event occurs with consistent properties: {details}")
 
     def _analyze_failures(self, action_name: str):
         """Analyzes the contexts of an action's failures to find common preconditions."""
