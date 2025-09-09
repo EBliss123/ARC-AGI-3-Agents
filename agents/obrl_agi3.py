@@ -234,18 +234,38 @@ class ObrlAgi3Agent(Agent):
         """Compares new events with a stored hypothesis to find consistent, refined rules."""
         
         def find_best_match(event_to_match, candidate_list):
-            """Finds the best matching event from a list, returns it and removes it."""
-            # Prioritize matching by stable properties like fingerprint or position
-            key_props = ['fingerprint', 'position']
-            for prop in key_props:
-                if prop in event_to_match:
+            """Finds the best matching event from a list based on event type."""
+            event_type = event_to_match['type']
+
+            # Special logic to track objects that transform and move between turns
+            if event_type in ['GROWTH', 'SHRINK', 'TRANSFORM']:
+                # Match the END position of the old event with the START position of a new one
+                if 'end_position' in event_to_match:
                     for candidate in candidate_list:
-                        if event_to_match[prop] == candidate.get(prop) and event_to_match['type'] == candidate['type']:
+                        if event_to_match['end_position'] == candidate.get('start_position'):
                             candidate_list.remove(candidate)
                             return candidate
-            # If no key prop match, and only one of this type, it's an implicit match
-            if len(candidate_list) == 1 and candidate_list[0]['type'] == event_to_match['type']:
+            
+            # --- Existing logic for matching events by stable properties ---
+            match_key_map = {
+                'MOVED': 'fingerprint',
+                'SHAPE_CHANGED': 'position',
+                'RECOLORED': 'position',
+                'NEW': 'position',
+                'REMOVED': 'position',
+            }
+            match_key = match_key_map.get(event_type)
+
+            if match_key and match_key in event_to_match:
+                for candidate in candidate_list:
+                    if event_to_match[match_key] == candidate.get(match_key):
+                        candidate_list.remove(candidate)
+                        return candidate
+
+            # Fallback: if no direct match and only one candidate of this type, it must be the one.
+            if len(candidate_list) == 1 and candidate_list[0]['type'] == event_type:
                 return candidate_list.pop(0)
+
             return None
 
         def refine_rule(old_rule, new_event):
