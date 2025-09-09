@@ -374,8 +374,9 @@ class ObrlAgi3Agent(Agent):
                     # In either case, we've explained this pair of objects.
                     if color_changed and shape_changed:
                         changes.append(
-                            f"- TRANSFORMED: Object at {old_obj['position']} changed shape and color "
-                            f"(from C:{old_obj['color']} to C:{new_obj['color']})."
+                            f"- TRANSFORMED: Object at {old_obj['position']} changed shape "
+                            f"(fingerprint: {old_obj['fingerprint']} -> {new_obj['fingerprint']}) "
+                            f"and color (from C:{old_obj['color']} to C:{new_obj['color']})."
                         )
                     elif color_changed:
                         size_str = f"{old_obj['size'][0]}x{old_obj['size'][1]}"
@@ -385,7 +386,8 @@ class ObrlAgi3Agent(Agent):
                         )
                     elif shape_changed:
                         changes.append(
-                            f"- SHAPE_CHANGED: The object at {old_obj['position']} (Color: {old_obj['color']}) changed its shape."
+                            f"- SHAPE_CHANGED: The object at {old_obj['position']} (Color: {old_obj['color']}) changed shape "
+                            f"(fingerprint: {old_obj['fingerprint']} -> {new_obj['fingerprint']})."
                         )
 
                     matches_to_remove.append((old_obj, new_obj))
@@ -458,7 +460,18 @@ class ObrlAgi3Agent(Agent):
                     else:
                         event_type = "TRANSFORM" # Same pixel count, but other properties changed
 
-                    changes.append(f"- {event_type}: Object at {old_obj['position']} became a {new_obj['size'][0]}x{new_obj['size'][1]} object at {new_obj['position']}.")
+                    pixel_diff = abs(new_obj['pixels'] - old_obj['pixels'])
+                    old_size_str = f"{old_obj['size'][0]}x{old_obj['size'][1]}"
+                    new_size_str = f"{new_obj['size'][0]}x{new_obj['size'][1]}"
+                    
+                    if event_type == "GROWTH":
+                        details = f"grew by {pixel_diff} pixels (from {old_size_str} to {new_size_str})"
+                    elif event_type == "SHRINK":
+                        details = f"shrank by {pixel_diff} pixels (from {old_size_str} to {new_size_str})"
+                    else: # TRANSFORM
+                        details = f"transformed (size {old_size_str} -> {new_size_str})"
+
+                    changes.append(f"- {event_type}: Object at {old_obj['position']} {details}, now at {new_obj['position']}.")
 
                     matched_old.add(id(old_obj))
                     matched_new.add(id(new_obj))
