@@ -471,9 +471,9 @@ class ObrlAgi3Agent(Agent):
                     # In either case, we've explained this pair of objects.
                     if color_changed and shape_changed:
                         changes.append(
-                            f"- TRANSFORMED: Object at {old_obj['position']} changed shape "
+                            f"- TRANSFORM: Object at {old_obj['position']} changed shape "
                             f"(fingerprint: {old_obj['fingerprint']} -> {new_obj['fingerprint']}) "
-                            f"and color (from C:{old_obj['color']} to C:{new_obj['color']})."
+                            f"and color (from {old_obj['color']} to {new_obj['color']})."
                         )
                     elif color_changed:
                         size_str = f"{old_obj['size'][0]}x{old_obj['size'][1]}"
@@ -565,8 +565,22 @@ class ObrlAgi3Agent(Agent):
                         details = f"grew by {pixel_diff} pixels (from {old_size_str} to {new_size_str})"
                     elif event_type == "SHRINK":
                         details = f"shrank by {pixel_diff} pixels (from {old_size_str} to {new_size_str})"
-                    else: # TRANSFORM
-                        details = f"transformed (size {old_size_str} -> {new_size_str})"
+                    else:  # TRANSFORM
+                        # Figure out what exactly changed to make the log more descriptive
+                        changed_parts = []
+                        if old_obj['fingerprint'] != new_obj['fingerprint']:
+                            changed_parts.append("shape")
+                        if old_obj['color'] != new_obj['color']:
+                            changed_parts.append(f"color from {old_obj['color']} to {new_obj['color']}")
+                        
+                        size_changed = old_obj['size'] != new_obj['size']
+                        size_details = f" (size {old_size_str} -> {new_size_str})" if size_changed else ""
+
+                        if not changed_parts:
+                            # Handles rare cases, describe it as transformed with size info if relevant
+                            details = f"transformed{size_details}"
+                        else:
+                            details = f"changed { ' and '.join(changed_parts) }{size_details}"
 
                     changes.append(f"- {event_type}: Object at {old_obj['position']} {details}, now at {new_obj['position']}.")
 
