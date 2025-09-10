@@ -21,7 +21,7 @@ class ObrlAgi3Agent(Agent):
         self.rule_hypotheses = {}
         self.last_success_contexts = {}
         self.last_success_contexts = {}
-        self.last_relationships = set()
+        self.last_relationships = {}
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -51,8 +51,25 @@ class ObrlAgi3Agent(Agent):
 
             if current_relationships:
                 print("\n--- Relationship Analysis ---")
-                for line in sorted(list(current_relationships)):
+                output_lines = []
+                def format_id_list_str(id_set):
+                    id_list = sorted(list(id_set))
+                    if len(id_list) < 2:
+                        return f"Object {id_list[0]}"
+                    if len(id_list) == 2:
+                        return f"Objects {id_list[0]} and {id_list[1]}"
+                    return "Objects " + ", ".join(map(str, id_list[:-1])) + f", and {id_list[-1]}"
+
+                for rel_type, groups in sorted(current_relationships.items()):
+                    for value, ids in sorted(groups.items()):
+                        value_str = value
+                        if rel_type == 'Size':
+                            value_str = f"{value[0]}x{value[1]}"
+                        output_lines.append(f"- {rel_type} Group ({value_str}): {format_id_list_str(ids)}")
+                
+                for line in output_lines:
                     print(line)
+
         # On subsequent turns, analyze the outcome of the previous action.
         else:
             prev_summary = self.last_object_summary
@@ -387,73 +404,84 @@ class ObrlAgi3Agent(Agent):
                     )
                     print(desc)
 
-    def _analyze_relationships(self, object_summary: list[dict]) -> set[str]:
-        """Analyzes relationships between objects and returns them as a set of descriptive strings."""
+    def _analyze_relationships(self, object_summary: list[dict]) -> dict:
+        """Analyzes object relationships and returns a structured dictionary of groups."""
         if not object_summary or len(object_summary) < 2:
-            return set()
+            return {}
 
-        # --- Group objects by various characteristics ---
-        groups = {
-            'fingerprint': {},
-            'color': {},
-            'size': {},
-            'pixels': {}
+        # Use capitalized keys for cleaner log titles
+        rel_data = {
+            'Color': {},
+            'Shape': {},
+            'Size': {},
+            'Pixel': {}
         }
         for obj in object_summary:
-            groups['fingerprint'].setdefault(obj['fingerprint'], []).append(obj)
-            groups['color'].setdefault(obj['color'], []).append(obj)
-            groups['size'].setdefault(obj['size'], []).append(obj)
-            groups['pixels'].setdefault(obj['pixels'], []).append(obj)
+            obj_id = int(obj['id'].replace('obj_', ''))
+            
+            rel_data['Color'].setdefault(obj['color'], set()).add(obj_id)
+            rel_data['Shape'].setdefault(obj['fingerprint'], set()).add(obj_id)
+            rel_data['Size'].setdefault(obj['size'], set()).add(obj_id)
+            rel_data['Pixel'].setdefault(obj['pixels'], set()).add(obj_id)
+
+        # Filter out groups with only one member, as they don't represent a relationship
+        final_rels = {}
+        for rel_type, groups in rel_data.items():
+            final_rels[rel_type] = {
+                value: ids for value, ids in groups.items() if len(ids) > 1
+            }
         
+        # Clean up empty relationship types
+        final_rels = {k: v for k, v in final_rels.items() if v}
+        return final_rels
+    
+    def _log_relationship_changes(self, old_rels: dict, new_rels: dict):
+        """Compares two relationship dictionaries and logs which objects joined, left, or replaced others in groups."""
         output_lines = []
         
-        # Helper function to format the list of object IDs
-        def format_id_list(objects):
-            # Sort by ID number for consistent output
-            sorted_objects = sorted(objects, key=lambda o: int(o['id'].replace('obj_', '')))
-            obj_ids = [o['id'].replace('obj_', '') for o in sorted_objects]
+        def format_ids(id_set):
+            """Formats a set of object IDs into a human-readable string."""
+            if not id_set: return ""
+            id_list = sorted(list(id_set))
+            if len(id_list) == 1:
+                return f"object {id_list[0]}" # Lowercase 'o' for use in a sentence
+            return f"objects " + ", ".join(map(str, id_list))
 
-            if len(obj_ids) == 2:
-                return f"{obj_ids[0]} and {obj_ids[1]}"
-            else:
-                return ", ".join(obj_ids[:-1]) + f", and {obj_ids[-1]}"
+        all_rel_types = sorted(list(set(old_rels.keys()) | set(new_rels.keys())))
 
-        # --- Report on matches for each characteristic ---
-        for fp, objects in groups['fingerprint'].items():
-            if len(objects) > 1:
-                output_lines.append(f"- Shape Match: Objects {format_id_list(objects)} have a matching fingerprint ({fp}).")
-        for color, objects in groups['color'].items():
-            if len(objects) > 1:
-                output_lines.append(f"- Color Match: Objects {format_id_list(objects)} share the color {color}.")
-        for size, objects in groups['size'].items():
-            if len(objects) > 1:
-                size_str = f"{size[0]}x{size[1]}"
-                output_lines.append(f"- Size Match: Objects {format_id_list(objects)} share the size {size_str}.")
-        for pixel_count, objects in groups['pixels'].items():
-            if len(objects) > 1:
-                output_lines.append(f"- Pixel Match: Objects {format_id_list(objects)} have the same pixel count ({pixel_count}).")
+        for rel_type in all_rel_types:
+            old_groups = old_rels.get(rel_type, {})
+            new_groups = new_rels.get(rel_type, {})
+            all_values = set(old_groups.keys()) | set(new_groups.keys())
 
-        return set(output_lines)
-    
-    def _log_relationship_changes(self, old_rels: set[str], new_rels: set[str]):
-        """Compares two sets of relationships and logs the new and broken ones."""
-        newly_formed = new_rels - old_rels
-        broken = old_rels - new_rels
-        
-        if not newly_formed and not broken:
-            return
-            
-        print("\n--- Relationship Change Log ---")
-        
-        # Sort for consistent output
-        for rel in sorted(list(newly_formed)):
-            # lstrip to remove the leading '- ' for cleaner formatting
-            print(f"- FORMED: {rel.lstrip('- ')}")
-                
-        for rel in sorted(list(broken)):
-            print(f"- BROKEN: {rel.lstrip('- ')}")
+            for value in all_values:
+                old_ids = old_groups.get(value, set())
+                new_ids = new_groups.get(value, set())
 
-        print()
+                if old_ids == new_ids:
+                    continue
+
+                joined_ids = new_ids - old_ids
+                left_ids = old_ids - new_ids
+
+                value_str = value
+                if rel_type == 'Size':
+                    value_str = f"{value[0]}x{value[1]}"
+
+                # Only log changes for meaningful groups (size > 1)
+                if len(new_ids) > 1 or len(old_ids) > 1:
+                    if joined_ids and left_ids:
+                        output_lines.append(f"- {rel_type} Group ({value_str}): {format_ids(joined_ids).capitalize()} replaced {format_ids(left_ids)}.")
+                    elif joined_ids:
+                        output_lines.append(f"- {rel_type} Group ({value_str}): {format_ids(joined_ids).capitalize()} joined.")
+                    elif left_ids:
+                        output_lines.append(f"- {rel_type} Group ({value_str}): {format_ids(left_ids).capitalize()} left.")
+
+        if output_lines:
+            print("\n--- Relationship Change Log ---")
+            for line in sorted(output_lines):
+                print(line)
+            print()
 
     def _perceive_objects(self, frame: FrameData) -> list[dict]:
         """Scans the pixel grid to find all contiguous objects."""
