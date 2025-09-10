@@ -382,34 +382,64 @@ class ObrlAgi3Agent(Agent):
         if not object_summary or len(object_summary) < 2:
             return
 
-        # --- Group objects by fingerprint ---
-        fingerprint_groups = {}
+        # --- Group objects by various characteristics ---
+        groups = {
+            'fingerprint': {},
+            'color': {},
+            'size': {},
+            'pixels': {}
+        }
         for obj in object_summary:
-            fp = obj['fingerprint']
-            fingerprint_groups.setdefault(fp, []).append(obj)
+            groups['fingerprint'].setdefault(obj['fingerprint'], []).append(obj)
+            groups['color'].setdefault(obj['color'], []).append(obj)
+            groups['size'].setdefault(obj['size'], []).append(obj)
+            groups['pixels'].setdefault(obj['pixels'], []).append(obj)
         
         # --- Prepare the analysis output ---
-        found_relationships = False
         output_lines = []
         
-        # Report on fingerprint matches
-        for fp, objects in fingerprint_groups.items():
-            if len(objects) > 1:
-                found_relationships = True
-                # Sort by ID number for consistent output
-                sorted_objects = sorted(objects, key=lambda o: int(o['id'].replace('obj_', '')))
-                obj_ids = [o['id'].replace('obj_', '') for o in sorted_objects]
+        # Helper function to format the list of object IDs for printing
+        def format_id_list(objects):
+            # Sort by ID number for consistent output
+            sorted_objects = sorted(objects, key=lambda o: int(o['id'].replace('obj_', '')))
+            obj_ids = [o['id'].replace('obj_', '') for o in sorted_objects]
 
-                if len(obj_ids) == 2:
-                    id_list_str = f"{obj_ids[0]} and {obj_ids[1]}"
-                else:
-                    id_list_str = ", ".join(obj_ids[:-1]) + f", and {obj_ids[-1]}"
-                
+            if len(obj_ids) == 2:
+                return f"{obj_ids[0]} and {obj_ids[1]}"
+            else:
+                return ", ".join(obj_ids[:-1]) + f", and {obj_ids[-1]}"
+
+        # --- Report on matches for each characteristic ---
+        
+        # Shape (fingerprint) matches
+        for fp, objects in groups['fingerprint'].items():
+            if len(objects) > 1:
+                id_list_str = format_id_list(objects)
                 output_lines.append(f"- Shape Match: Objects {id_list_str} have a matching fingerprint ({fp}).")
 
-        if found_relationships:
+        # Color matches
+        for color, objects in groups['color'].items():
+            if len(objects) > 1:
+                id_list_str = format_id_list(objects)
+                output_lines.append(f"- Color Match: Objects {id_list_str} share the color {color}.")
+
+        # Size matches
+        for size, objects in groups['size'].items():
+            if len(objects) > 1:
+                size_str = f"{size[0]}x{size[1]}"
+                id_list_str = format_id_list(objects)
+                output_lines.append(f"- Size Match: Objects {id_list_str} share the size {size_str}.")
+
+        # Pixel count matches
+        for pixel_count, objects in groups['pixels'].items():
+            if len(objects) > 1:
+                id_list_str = format_id_list(objects)
+                output_lines.append(f"- Pixel Match: Objects {id_list_str} have the same pixel count ({pixel_count}).")
+
+        if output_lines:
             print("\n--- Relationship Analysis ---")
-            for line in output_lines:
+            # Sort lines alphabetically for consistent, readable output
+            for line in sorted(output_lines):
                 print(line)
 
     def _perceive_objects(self, frame: FrameData) -> list[dict]:
