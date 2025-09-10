@@ -333,9 +333,48 @@ class ObrlAgi3Agent(Agent):
         if not differences:
             print("No obvious differences found between this failure state and the last success state.")
         else:
+            # Create a lookup map of new objects by their position for easy access
+            new_objects_by_pos = {obj['position']: obj for obj in current_failure_summary}
+
             print("--- Failure Precondition Log (Differences from last success) ---")
             for diff in differences:
-                print(diff)
+                print(diff)  # Print the original change log
+
+                if 'REMOVED:' in diff:
+                    continue  # No new object to describe
+
+                # --- Try to parse the final position of the object from the log string ---
+                final_pos = None
+                try:
+                    # Case 1: Fuzzy match with "now at"
+                    if ' now at ' in diff:
+                        pos_str = diff.split(' now at ')[1].replace('.', '')
+                        final_pos = ast.literal_eval(pos_str)
+                    # Case 2: A move event with "to"
+                    elif ' moved from ' in diff and ' to ' in diff:
+                        pos_str = diff.split(' to ')[1].replace('.', '')
+                        final_pos = ast.literal_eval(pos_str)
+                    # Case 3: In-place changes or new objects with "at"
+                    elif ' at ' in diff:
+                        details_part = diff.split(' at ')[1]
+                        start = details_part.find('(')
+                        end = details_part.find(')')
+                        if start != -1 and end != -1:
+                            pos_str = details_part[start : end + 1]
+                            final_pos = ast.literal_eval(pos_str)
+                except (ValueError, IndexError, SyntaxError):
+                    # If parsing fails, we can't find the object, so just skip.
+                    continue
+                
+                # --- Find and print the object's full description ---
+                if final_pos and final_pos in new_objects_by_pos:
+                    obj = new_objects_by_pos[final_pos]
+                    size_str = f"{obj['size'][0]}x{obj['size'][1]}"
+                    desc = (
+                        f"  - Object is now {size_str} at {obj['position']} with color {obj['color']}, "
+                        f"{obj['pixels']} pixels, and fingerprint {obj['fingerprint']}."
+                    )
+                    print(desc)
 
     def _perceive_objects(self, frame: FrameData) -> list[dict]:
         """Scans the pixel grid to find all contiguous objects."""
