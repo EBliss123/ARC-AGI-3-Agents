@@ -74,7 +74,7 @@ def main() -> None:
         log_level = logging.DEBUG
 
     logger.setLevel(log_level)
-    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    formatter = logging.Formatter("***%(asctime)s | %(levelname)s | %(message)s***")
 
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setLevel(log_level)
