@@ -31,6 +31,7 @@ class ObrlAgi3Agent(Agent):
             return GameAction.RESET
         
         current_summary = self._perceive_objects(latest_frame)
+        self._analyze_relationships(current_summary)
 
         # If this is the first scan (last summary is empty), print the full summary.
         if not self.last_object_summary:
@@ -375,6 +376,41 @@ class ObrlAgi3Agent(Agent):
                         f"{obj['pixels']} pixels, and fingerprint {obj['fingerprint']}."
                     )
                     print(desc)
+
+    def _analyze_relationships(self, object_summary: list[dict]):
+        """Analyzes and prints spatial and property relationships between objects."""
+        if not object_summary or len(object_summary) < 2:
+            return
+
+        # --- Group objects by fingerprint ---
+        fingerprint_groups = {}
+        for obj in object_summary:
+            fp = obj['fingerprint']
+            fingerprint_groups.setdefault(fp, []).append(obj)
+        
+        # --- Prepare the analysis output ---
+        found_relationships = False
+        output_lines = []
+        
+        # Report on fingerprint matches
+        for fp, objects in fingerprint_groups.items():
+            if len(objects) > 1:
+                found_relationships = True
+                # Sort by ID number for consistent output
+                sorted_objects = sorted(objects, key=lambda o: int(o['id'].replace('obj_', '')))
+                obj_ids = [o['id'].replace('obj_', '') for o in sorted_objects]
+
+                if len(obj_ids) == 2:
+                    id_list_str = f"{obj_ids[0]} and {obj_ids[1]}"
+                else:
+                    id_list_str = ", ".join(obj_ids[:-1]) + f", and {obj_ids[-1]}"
+                
+                output_lines.append(f"- Shape Match: Objects {id_list_str} have a matching fingerprint ({fp}).")
+
+        if found_relationships:
+            print("\n--- Relationship Analysis ---")
+            for line in output_lines:
+                print(line)
 
     def _perceive_objects(self, frame: FrameData) -> list[dict]:
         """Scans the pixel grid to find all contiguous objects."""
