@@ -20,6 +20,8 @@ class ObrlAgi3Agent(Agent):
         self.last_action_context = None  # Will store a tuple of (action_name, coords_dict)
         self.rule_hypotheses = {}
         self.last_success_contexts = {}
+        self.last_success_contexts = {}
+        self.last_relationships = set()
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -31,7 +33,7 @@ class ObrlAgi3Agent(Agent):
             return GameAction.RESET
         
         current_summary = self._perceive_objects(latest_frame)
-        self._analyze_relationships(current_summary)
+        current_relationships = self._analyze_relationships(current_summary)
 
         # If this is the first scan (last summary is empty), print the full summary.
         if not self.last_object_summary:
@@ -46,10 +48,16 @@ class ObrlAgi3Agent(Agent):
                     f"at position {obj['position']} with {obj['pixels']} pixels "
                     f"and shape fingerprint {obj['fingerprint']}."
                 )
+
+            if current_relationships:
+                print("\n--- Relationship Analysis ---")
+                for line in sorted(list(current_relationships)):
+                    print(line)
         # On subsequent turns, analyze the outcome of the previous action.
         else:
             prev_summary = self.last_object_summary
             changes = self._log_changes(prev_summary, current_summary)
+            self._log_relationship_changes(self.last_relationships, current_relationships)
 
             if self.last_action_context:
                 prev_action_name, prev_coords = self.last_action_context
@@ -80,6 +88,7 @@ class ObrlAgi3Agent(Agent):
 
         # Update the memory for the next turn.
         self.last_object_summary = current_summary
+        self.last_relationships = current_relationships
 
         # This is the REAL list of actions for this specific game on this turn.
         game_specific_actions = latest_frame.available_actions
@@ -293,6 +302,7 @@ class ObrlAgi3Agent(Agent):
             for event in new_events:
                 details = {k:v for k,v in event.items() if k != 'type'}
                 print(f"- Observed {event['type']} with details: {details}")
+            print()
             return
 
         # --- Stage 2 & 3: Match events and refine the hypothesis ---
@@ -377,10 +387,10 @@ class ObrlAgi3Agent(Agent):
                     )
                     print(desc)
 
-    def _analyze_relationships(self, object_summary: list[dict]):
-        """Analyzes and prints spatial and property relationships between objects."""
+    def _analyze_relationships(self, object_summary: list[dict]) -> set[str]:
+        """Analyzes relationships between objects and returns them as a set of descriptive strings."""
         if not object_summary or len(object_summary) < 2:
-            return
+            return set()
 
         # --- Group objects by various characteristics ---
         groups = {
@@ -395,10 +405,9 @@ class ObrlAgi3Agent(Agent):
             groups['size'].setdefault(obj['size'], []).append(obj)
             groups['pixels'].setdefault(obj['pixels'], []).append(obj)
         
-        # --- Prepare the analysis output ---
         output_lines = []
         
-        # Helper function to format the list of object IDs for printing
+        # Helper function to format the list of object IDs
         def format_id_list(objects):
             # Sort by ID number for consistent output
             sorted_objects = sorted(objects, key=lambda o: int(o['id'].replace('obj_', '')))
@@ -410,37 +419,41 @@ class ObrlAgi3Agent(Agent):
                 return ", ".join(obj_ids[:-1]) + f", and {obj_ids[-1]}"
 
         # --- Report on matches for each characteristic ---
-        
-        # Shape (fingerprint) matches
         for fp, objects in groups['fingerprint'].items():
             if len(objects) > 1:
-                id_list_str = format_id_list(objects)
-                output_lines.append(f"- Shape Match: Objects {id_list_str} have a matching fingerprint ({fp}).")
-
-        # Color matches
+                output_lines.append(f"- Shape Match: Objects {format_id_list(objects)} have a matching fingerprint ({fp}).")
         for color, objects in groups['color'].items():
             if len(objects) > 1:
-                id_list_str = format_id_list(objects)
-                output_lines.append(f"- Color Match: Objects {id_list_str} share the color {color}.")
-
-        # Size matches
+                output_lines.append(f"- Color Match: Objects {format_id_list(objects)} share the color {color}.")
         for size, objects in groups['size'].items():
             if len(objects) > 1:
                 size_str = f"{size[0]}x{size[1]}"
-                id_list_str = format_id_list(objects)
-                output_lines.append(f"- Size Match: Objects {id_list_str} share the size {size_str}.")
-
-        # Pixel count matches
+                output_lines.append(f"- Size Match: Objects {format_id_list(objects)} share the size {size_str}.")
         for pixel_count, objects in groups['pixels'].items():
             if len(objects) > 1:
-                id_list_str = format_id_list(objects)
-                output_lines.append(f"- Pixel Match: Objects {id_list_str} have the same pixel count ({pixel_count}).")
+                output_lines.append(f"- Pixel Match: Objects {format_id_list(objects)} have the same pixel count ({pixel_count}).")
 
-        if output_lines:
-            print("\n--- Relationship Analysis ---")
-            # Sort lines alphabetically for consistent, readable output
-            for line in sorted(output_lines):
-                print(line)
+        return set(output_lines)
+    
+    def _log_relationship_changes(self, old_rels: set[str], new_rels: set[str]):
+        """Compares two sets of relationships and logs the new and broken ones."""
+        newly_formed = new_rels - old_rels
+        broken = old_rels - new_rels
+        
+        if not newly_formed and not broken:
+            return
+            
+        print("\n--- Relationship Change Log ---")
+        
+        # Sort for consistent output
+        for rel in sorted(list(newly_formed)):
+            # lstrip to remove the leading '- ' for cleaner formatting
+            print(f"- FORMED: {rel.lstrip('- ')}")
+                
+        for rel in sorted(list(broken)):
+            print(f"- BROKEN: {rel.lstrip('- ')}")
+
+        print()
 
     def _perceive_objects(self, frame: FrameData) -> list[dict]:
         """Scans the pixel grid to find all contiguous objects."""
