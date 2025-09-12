@@ -20,8 +20,9 @@ class ObrlAgi3Agent(Agent):
         self.last_action_context = None  # Will store a tuple of (action_name, coords_dict)
         self.rule_hypotheses = {}
         self.last_success_contexts = {}
-        self.last_success_contexts = {}
         self.last_relationships = {}
+        self.last_score = 0
+        self.is_new_level = True
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -30,24 +31,20 @@ class ObrlAgi3Agent(Agent):
         # If the game is over or hasn't started, the correct action is to reset.
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
             self.actions_printed = False  # Reset the print flag for the new game.
+            self.last_score = 0
+            self.is_new_level = True
             return GameAction.RESET
         
         current_summary = self._perceive_objects(latest_frame)
         current_relationships = self._analyze_relationships(current_summary)
 
         # If this is the first scan (last summary is empty), print the full summary.
-        if not self.last_object_summary:
+        if not self.last_object_summary or self.is_new_level:
             print("--- Initial Frame Summary ---")
+            self.is_new_level = False # We've handled the "new level" state, so turn the flag off.
             if not current_summary:
                 print("No objects found.")
-            for obj in current_summary:
-                obj_id = obj['id'].replace('obj_', 'id_')
-                size_str = f"{obj['size'][0]}x{obj['size'][1]}"
-                print(
-                    f"- Object {obj_id}: Found a {size_str} object of color {obj['color']} "
-                    f"at position {obj['position']} with {obj['pixels']} pixels "
-                    f"and shape fingerprint {obj['fingerprint']}."
-                )
+            self._print_full_summary(current_summary)
 
             if current_relationships:
                 print("\n--- Relationship Analysis ---")
@@ -102,6 +99,31 @@ class ObrlAgi3Agent(Agent):
                 print("--- Change Log ---")
                 for change in changes:
                     print(change)
+
+        # --- LEVEL CHANGE DETECTION & HANDLING ---
+        current_score = latest_frame.score
+        if current_score > self.last_score:
+            print(f"\n--- LEVEL CHANGE DETECTED (Score increased from {self.last_score} to {current_score}) ---")
+            
+            # Print summary of the old level's last frame (which is self.last_object_summary)
+            print("\n--- Final Frame Summary (Old Level) ---")
+            self._print_full_summary(self.last_object_summary)
+
+            # Print summary of the new level's first frame (which is current_summary)
+            print("\n--- First Frame Summary (New Level) ---")
+            self._print_full_summary(current_summary)
+            print() # Add a blank line for readability
+            # Reset agent's learning and memory for the new level
+            print("Resetting agent's memory for new level.")
+            
+            self.rule_hypotheses = {}
+            self.last_success_contexts = {}
+            self.last_relationships = {}
+            self.last_action_context = None
+            self.is_new_level = True
+
+        # Update the score tracker for the next turn.
+        self.last_score = current_score
 
         # Update the memory for the next turn.
         self.last_object_summary = current_summary
@@ -482,6 +504,21 @@ class ObrlAgi3Agent(Agent):
             for line in sorted(output_lines):
                 print(line)
             print()
+
+    def _print_full_summary(self, summary: list[dict]):
+        """Prints a formatted summary of all objects in a list."""
+        if not summary:
+            print("No objects found.")
+            return
+
+        for obj in summary:
+            obj_id = obj['id'].replace('obj_', 'id_')
+            size_str = f"{obj['size'][0]}x{obj['size'][1]}"
+            print(
+                f"- Object {obj_id}: Found a {size_str} object of color {obj['color']} "
+                f"at position {obj['position']} with {obj['pixels']} pixels "
+                f"and shape fingerprint {obj['fingerprint']}."
+            )
 
     def _perceive_objects(self, frame: FrameData) -> list[dict]:
         """Scans the pixel grid to find all contiguous objects."""
