@@ -23,7 +23,7 @@ class ObrlAgi3Agent(Agent):
         self.last_relationships = {}
         self.last_score = 0
         self.is_new_level = True
-        self.removed_objects_memory = set()
+        self.removed_objects_memory = {}
         self.object_id_counter = 0
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
@@ -79,41 +79,7 @@ class ObrlAgi3Agent(Agent):
         # On subsequent turns, analyze the outcome of the previous action.
         else:
             prev_summary = self.last_object_summary
-            changes = self._log_changes(prev_summary, current_summary)
-            
-            # --- Process changes to handle REAPPEAR events ---
-            processed_changes = []
-            for change_log in changes:
-                # Check for REMOVED events to populate memory
-                if 'REMOVED:' in change_log:
-                    try:
-                        # Extract the stable ID tuple from the string: "...(ID (...) at..."
-                        id_str = change_log.split('(ID ')[1].split(') at')[0]
-                        stable_id = ast.literal_eval(id_str)
-                        self.removed_objects_memory.add(stable_id)
-                    except (IndexError, SyntaxError, ValueError):
-                        pass  # Ignore if parsing fails
-                    processed_changes.append(change_log)
-
-                # Check for NEW events to potentially re-label them
-                elif 'NEW:' in change_log:
-                    try:
-                        # Extract the stable ID tuple: "...(ID (...) has appeared..."
-                        id_str = change_log.split('(ID ')[1].split(') has appeared')[0]
-                        stable_id = ast.literal_eval(id_str)
-
-                        if stable_id in self.removed_objects_memory:
-                            # It's a reappearance! Change the log message.
-                            reappeared_log = change_log.replace('- NEW:', '- REAPPEARED:').replace('has appeared', 'has reappeared')
-                            processed_changes.append(reappeared_log)
-                        else:
-                            processed_changes.append(change_log)
-                    except (IndexError, SyntaxError, ValueError):
-                        processed_changes.append(change_log)  # Append original if parsing fails
-                else:
-                    processed_changes.append(change_log)
-
-            changes = processed_changes  # Overwrite with the processed list
+            changes, current_summary = self._log_changes(prev_summary, current_summary)
             
             self._log_relationship_changes(self.last_relationships, current_relationships)
 
@@ -165,7 +131,7 @@ class ObrlAgi3Agent(Agent):
             self.last_relationships = {}
             self.last_action_context = None
             self.is_new_level = True
-            self.removed_objects_memory = set()
+            self.removed_objects_memory = {}
             self.object_id_counter = 0
 
         # Update the score tracker for the next turn.
@@ -632,7 +598,7 @@ class ObrlAgi3Agent(Agent):
         """Creates a hashable, stable ID for an object based on its intrinsic properties."""
         return (obj['fingerprint'], obj['color'], obj['size'], obj['pixels'])
     
-    def _log_changes(self, old_summary: list[dict], new_summary: list[dict]) -> list[str]:
+    def _log_changes(self, old_summary: list[dict], new_summary: list[dict]) -> tuple[list[str], list[dict]]:
         """Compares summaries by identifying in-place changes, moves, and new/removed objects."""
         if not old_summary and not new_summary:
             return []
@@ -656,6 +622,9 @@ class ObrlAgi3Agent(Agent):
                     shape_changed = (old_obj['fingerprint'] != new_obj['fingerprint'] or
                                      old_obj['size'] != new_obj['size'] or
                                      old_obj['pixels'] != new_obj['pixels'])
+
+                    # Propagate the persistent ID from the old object to its new version.
+                    new_obj['id'] = old_obj['id']
 
                     # If anything changed, it's an event. If not, it's stable.
                     # In either case, we've explained this pair of objects.
@@ -708,6 +677,8 @@ class ObrlAgi3Agent(Agent):
             for _ in range(num_matches):
                 old_inst = old_instances.pop()
                 new_inst = new_instances.pop()
+                # Propagate the persistent ID.
+                new_inst['id'] = old_inst['id']
                 # A move is only a move if the position is different.
                 if old_inst['position'] != new_inst['position']:
                     changes.append(f"- MOVED: Object {old_inst['id'].replace('obj_', 'id_')} (ID {stable_id}) moved from {old_inst['position']} to {new_inst['position']}.")
@@ -737,6 +708,8 @@ class ObrlAgi3Agent(Agent):
                 old_obj, new_obj = pair['old'], pair['new']
                 # If neither object in a close pair has been matched yet, match them.
                 if id(old_obj) not in matched_old and id(new_obj) not in matched_new:
+                    # Propagate the persistent ID.
+                    new_obj['id'] = old_obj['id']
                     old_pixels = old_obj['pixels']
                     new_pixels = new_obj['pixels']
                     
@@ -781,13 +754,26 @@ class ObrlAgi3Agent(Agent):
             old_unexplained = [obj for obj in old_unexplained if id(obj) not in matched_old]
             new_unexplained = [obj for obj in new_unexplained if id(obj) not in matched_new]
 
-        # --- Pass 3: Log remaining objects as removed or new ---
+        # --- Final Pass: Log remaining as REMOVED, NEW, or REAPPEARED ---
         for obj in old_unexplained:
             stable_id = self._get_stable_id(obj)
             changes.append(f"- REMOVED: Object {obj['id'].replace('obj_', 'id_')} (ID {stable_id}) at {obj['position']} has disappeared.")
+            # Update memory with the persistent ID of the removed object.
+            self.removed_objects_memory[stable_id] = obj['id']
 
         for obj in new_unexplained:
             stable_id = self._get_stable_id(obj)
-            changes.append(f"- NEW: Object {obj['id'].replace('obj_', 'id_')} (ID {stable_id}) has appeared at {obj['position']}.")
 
-        return sorted(changes)
+            # Check if this object is a reappearance of a previously removed one.
+            if stable_id in self.removed_objects_memory:
+                persistent_id = self.removed_objects_memory.pop(stable_id)
+                obj['id'] = persistent_id
+                changes.append(f"- REAPPEARED: Object {persistent_id.replace('obj_', 'id_')} (ID {stable_id}) has reappeared at {obj['position']}.")
+            else:
+                # This is a genuinely new object, so assign a new persistent ID.
+                self.object_id_counter += 1
+                new_id = f'obj_{self.object_id_counter}'
+                obj['id'] = new_id
+                changes.append(f"- NEW: Object {new_id.replace('obj_', 'id_')} (ID {stable_id}) has appeared at {obj['position']}.")
+
+        return sorted(changes), new_summary
