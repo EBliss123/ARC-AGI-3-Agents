@@ -24,6 +24,7 @@ class ObrlAgi3Agent(Agent):
         self.last_score = 0
         self.is_new_level = True
         self.removed_objects_memory = set()
+        self.object_id_counter = 0
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -43,6 +44,13 @@ class ObrlAgi3Agent(Agent):
         if not self.last_object_summary or self.is_new_level:
             print("--- Initial Frame Summary ---")
             self.is_new_level = False # We've handled the "new level" state, so turn the flag off.
+            
+            # Assign initial persistent IDs to all objects discovered on the first frame.
+            self.object_id_counter = 0
+            for obj in current_summary:
+                self.object_id_counter += 1
+                obj['id'] = f'obj_{self.object_id_counter}'
+            
             if not current_summary:
                 print("No objects found.")
             self._print_full_summary(current_summary)
@@ -158,6 +166,7 @@ class ObrlAgi3Agent(Agent):
             self.last_action_context = None
             self.is_new_level = True
             self.removed_objects_memory = set()
+            self.object_id_counter = 0
 
         # Update the score tracker for the next turn.
         self.last_score = current_score
