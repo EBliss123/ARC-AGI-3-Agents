@@ -681,7 +681,7 @@ class ObrlAgi3Agent(Agent):
                 new_inst['id'] = old_inst['id']
                 # A move is only a move if the position is different.
                 if old_inst['position'] != new_inst['position']:
-                    changes.append(f"- MOVED: Object {old_inst['id'].replace('obj_', 'id_')} (ID {stable_id}) moved from {old_inst['position']} to {new_inst['position']}.")
+                    changes.append(f"- MOVED: Object {old_inst['id'].replace('obj_', 'id_')} moved from {old_inst['position']} to {new_inst['position']}.")
                 moves_to_remove.append((old_inst, new_inst))
         
         for old_match, new_match in moves_to_remove:
