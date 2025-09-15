@@ -23,6 +23,7 @@ class ObrlAgi3Agent(Agent):
         self.last_relationships = {}
         self.last_score = 0
         self.is_new_level = True
+        self.removed_objects_memory = set()
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -71,6 +72,41 @@ class ObrlAgi3Agent(Agent):
         else:
             prev_summary = self.last_object_summary
             changes = self._log_changes(prev_summary, current_summary)
+            
+            # --- Process changes to handle REAPPEAR events ---
+            processed_changes = []
+            for change_log in changes:
+                # Check for REMOVED events to populate memory
+                if 'REMOVED:' in change_log:
+                    try:
+                        # Extract the stable ID tuple from the string: "...(ID (...) at..."
+                        id_str = change_log.split('(ID ')[1].split(') at')[0]
+                        stable_id = ast.literal_eval(id_str)
+                        self.removed_objects_memory.add(stable_id)
+                    except (IndexError, SyntaxError, ValueError):
+                        pass  # Ignore if parsing fails
+                    processed_changes.append(change_log)
+
+                # Check for NEW events to potentially re-label them
+                elif 'NEW:' in change_log:
+                    try:
+                        # Extract the stable ID tuple: "...(ID (...) has appeared..."
+                        id_str = change_log.split('(ID ')[1].split(') has appeared')[0]
+                        stable_id = ast.literal_eval(id_str)
+
+                        if stable_id in self.removed_objects_memory:
+                            # It's a reappearance! Change the log message.
+                            reappeared_log = change_log.replace('- NEW:', '- REAPPEARED:').replace('has appeared', 'has reappeared')
+                            processed_changes.append(reappeared_log)
+                        else:
+                            processed_changes.append(change_log)
+                    except (IndexError, SyntaxError, ValueError):
+                        processed_changes.append(change_log)  # Append original if parsing fails
+                else:
+                    processed_changes.append(change_log)
+
+            changes = processed_changes  # Overwrite with the processed list
+            
             self._log_relationship_changes(self.last_relationships, current_relationships)
 
             if self.last_action_context:
@@ -121,6 +157,7 @@ class ObrlAgi3Agent(Agent):
             self.last_relationships = {}
             self.last_action_context = None
             self.is_new_level = True
+            self.removed_objects_memory = set()
 
         # Update the score tracker for the next turn.
         self.last_score = current_score
