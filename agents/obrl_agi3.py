@@ -615,19 +615,19 @@ class ObrlAgi3Agent(Agent):
                     # In either case, we've explained this pair of objects.
                     if color_changed and shape_changed:
                         changes.append(
-                            f"- TRANSFORM: Object at {old_obj['position']} changed shape "
+                            f"- TRANSFORM: Object {old_obj['id'].replace('obj_', 'id_')} at {old_obj['position']} changed shape "
                             f"(fingerprint: {old_obj['fingerprint']} -> {new_obj['fingerprint']}) "
                             f"and color (from {old_obj['color']} to {new_obj['color']})."
                         )
                     elif color_changed:
                         size_str = f"{old_obj['size'][0]}x{old_obj['size'][1]}"
                         changes.append(
-                            f"- RECOLORED: A {size_str} object at {old_obj['position']} "
+                            f"- RECOLORED: Object {old_obj['id'].replace('obj_', 'id_')} ({size_str}) at {old_obj['position']} "
                             f"changed color from {old_obj['color']} to {new_obj['color']}."
                         )
                     elif shape_changed:
                         changes.append(
-                            f"- SHAPE_CHANGED: The object at {old_obj['position']} (Color: {old_obj['color']}) changed shape "
+                            f"- SHAPE_CHANGED: Object {old_obj['id'].replace('obj_', 'id_')} at {old_obj['position']} (Color: {old_obj['color']}) changed shape "
                             f"(fingerprint: {old_obj['fingerprint']} -> {new_obj['fingerprint']})."
                         )
 
@@ -664,7 +664,7 @@ class ObrlAgi3Agent(Agent):
                 new_inst = new_instances.pop()
                 # A move is only a move if the position is different.
                 if old_inst['position'] != new_inst['position']:
-                    changes.append(f"- MOVED: Object with ID {stable_id} moved from {old_inst['position']} to {new_inst['position']}.")
+                    changes.append(f"- MOVED: Object {old_inst['id'].replace('obj_', 'id_')} (ID {stable_id}) moved from {old_inst['position']} to {new_inst['position']}.")
                 moves_to_remove.append((old_inst, new_inst))
         
         for old_match, new_match in moves_to_remove:
@@ -726,7 +726,7 @@ class ObrlAgi3Agent(Agent):
                         else:
                             details = f"changed { ' and '.join(changed_parts) }{size_details}"
 
-                    changes.append(f"- {event_type}: Object at {old_obj['position']} {details}, now at {new_obj['position']}.")
+                    changes.append(f"- {event_type}: Object {old_obj['id'].replace('obj_', 'id_')} at {old_obj['position']} {details}, now at {new_obj['position']}.")
 
                     matched_old.add(id(old_obj))
                     matched_new.add(id(new_obj))
@@ -738,10 +738,10 @@ class ObrlAgi3Agent(Agent):
         # --- Pass 3: Log remaining objects as removed or new ---
         for obj in old_unexplained:
             stable_id = self._get_stable_id(obj)
-            changes.append(f"- REMOVED: Object with ID {stable_id} at {obj['position']} has disappeared.")
+            changes.append(f"- REMOVED: Object {obj['id'].replace('obj_', 'id_')} (ID {stable_id}) at {obj['position']} has disappeared.")
 
         for obj in new_unexplained:
             stable_id = self._get_stable_id(obj)
-            changes.append(f"- NEW: Object with ID {stable_id} has appeared at {obj['position']}.")
+            changes.append(f"- NEW: Object {obj['id'].replace('obj_', 'id_')} (ID {stable_id}) has appeared at {obj['position']}.")
 
         return sorted(changes)
