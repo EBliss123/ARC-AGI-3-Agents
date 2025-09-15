@@ -390,7 +390,7 @@ class ObrlAgi3Agent(Agent):
         print("Comparing current state to last successful state to find potential failure preconditions...")
         
         # We can reuse our powerful _log_changes function for this comparison
-        differences = self._log_changes(last_success_summary, current_failure_summary)
+        differences, _ = self._log_changes(last_success_summary, current_failure_summary)
         
         if not differences:
             print("No obvious differences found between this failure state and the last success state.")
