@@ -758,15 +758,21 @@ class ObrlAgi3Agent(Agent):
         for obj in old_unexplained:
             stable_id = self._get_stable_id(obj)
             changes.append(f"- REMOVED: Object {obj['id'].replace('obj_', 'id_')} (ID {stable_id}) at {obj['position']} has disappeared.")
-            # Update memory with the persistent ID of the removed object.
-            self.removed_objects_memory[stable_id] = obj['id']
+            # Update memory with the persistent ID, storing a list for each stable ID type.
+            if stable_id not in self.removed_objects_memory:
+                self.removed_objects_memory[stable_id] = deque()
+            self.removed_objects_memory[stable_id].append(obj['id'])
 
         for obj in new_unexplained:
             stable_id = self._get_stable_id(obj)
 
             # Check if this object is a reappearance of a previously removed one.
             if stable_id in self.removed_objects_memory:
-                persistent_id = self.removed_objects_memory.pop(stable_id)
+                # Pop the oldest ID for this object type from the queue.
+                persistent_id = self.removed_objects_memory[stable_id].popleft()
+                # If the queue for this stable_id is now empty, remove it from the memory.
+                if not self.removed_objects_memory[stable_id]:
+                    del self.removed_objects_memory[stable_id]
                 obj['id'] = persistent_id
                 changes.append(f"- REAPPEARED: Object {persistent_id.replace('obj_', 'id_')} (ID {stable_id}) has reappeared at {obj['position']}.")
             else:
