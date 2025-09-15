@@ -630,19 +630,19 @@ class ObrlAgi3Agent(Agent):
                     # In either case, we've explained this pair of objects.
                     if color_changed and shape_changed:
                         changes.append(
-                            f"- TRANSFORM: Object {old_obj['id'].replace('obj_', 'id_')} at {old_obj['position']} changed shape "
+                            f"- TRANSFORM: Object {old_obj['id'].replace('obj_', 'id_')} changed shape "
                             f"(fingerprint: {old_obj['fingerprint']} -> {new_obj['fingerprint']}) "
                             f"and color (from {old_obj['color']} to {new_obj['color']})."
                         )
                     elif color_changed:
                         size_str = f"{old_obj['size'][0]}x{old_obj['size'][1]}"
                         changes.append(
-                            f"- RECOLORED: Object {old_obj['id'].replace('obj_', 'id_')} ({size_str}) at {old_obj['position']} "
+                            f"- RECOLORED: Object {old_obj['id'].replace('obj_', 'id_')} "
                             f"changed color from {old_obj['color']} to {new_obj['color']}."
                         )
                     elif shape_changed:
                         changes.append(
-                            f"- SHAPE_CHANGED: Object {old_obj['id'].replace('obj_', 'id_')} at {old_obj['position']} (Color: {old_obj['color']}) changed shape "
+                            f"- SHAPE_CHANGED: Object {old_obj['id'].replace('obj_', 'id_')} changed shape "
                             f"(fingerprint: {old_obj['fingerprint']} -> {new_obj['fingerprint']})."
                         )
 
