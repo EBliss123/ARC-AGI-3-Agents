@@ -390,7 +390,7 @@ class ObrlAgi3Agent(Agent):
         print("Comparing current state to last successful state to find potential failure preconditions...")
         
         # We can reuse our powerful _log_changes function for this comparison
-        differences, _ = self._log_changes(last_success_summary, current_failure_summary)
+        differences, _ = self._log_changes(last_success_summary, current_failure_summary, assign_new_ids=False)
         
         if not differences:
             print("No obvious differences found between this failure state and the last success state.")
@@ -598,7 +598,7 @@ class ObrlAgi3Agent(Agent):
         """Creates a hashable, stable ID for an object based on its intrinsic properties."""
         return (obj['fingerprint'], obj['color'], obj['size'], obj['pixels'])
     
-    def _log_changes(self, old_summary: list[dict], new_summary: list[dict]) -> tuple[list[str], list[dict]]:
+    def _log_changes(self, old_summary: list[dict], new_summary: list[dict], assign_new_ids=True) -> tuple[list[str], list[dict]]:
         """Compares summaries by identifying in-place changes, moves, and new/removed objects."""
         if not old_summary and not new_summary:
             return []
@@ -766,20 +766,21 @@ class ObrlAgi3Agent(Agent):
         for obj in new_unexplained:
             stable_id = self._get_stable_id(obj)
 
-            # Check if this object is a reappearance of a previously removed one.
-            if stable_id in self.removed_objects_memory:
-                # Pop the oldest ID for this object type from the queue.
-                persistent_id = self.removed_objects_memory[stable_id].popleft()
-                # If the queue for this stable_id is now empty, remove it from the memory.
-                if not self.removed_objects_memory[stable_id]:
-                    del self.removed_objects_memory[stable_id]
-                obj['id'] = persistent_id
-                changes.append(f"- REAPPEARED: Object {persistent_id.replace('obj_', 'id_')} (ID {stable_id}) has reappeared at {obj['position']}.")
+            if assign_new_ids:
+                # Live mode: Check for reappearance or assign a new persistent ID.
+                if stable_id in self.removed_objects_memory:
+                    persistent_id = self.removed_objects_memory[stable_id].popleft()
+                    if not self.removed_objects_memory[stable_id]:
+                        del self.removed_objects_memory[stable_id]
+                    obj['id'] = persistent_id
+                    changes.append(f"- REAPPEARED: Object {persistent_id.replace('obj_', 'id_')} (ID {stable_id}) has reappeared at {obj['position']}.")
+                else:
+                    self.object_id_counter += 1
+                    new_id = f'obj_{self.object_id_counter}'
+                    obj['id'] = new_id
+                    changes.append(f"- NEW: Object {new_id.replace('obj_', 'id_')} (ID {stable_id}) has appeared at {obj['position']}.")
             else:
-                # This is a genuinely new object, so assign a new persistent ID.
-                self.object_id_counter += 1
-                new_id = f'obj_{self.object_id_counter}'
-                obj['id'] = new_id
-                changes.append(f"- NEW: Object {new_id.replace('obj_', 'id_')} (ID {stable_id}) has appeared at {obj['position']}.")
+                # Analysis mode: Do not assign a new ID. Log with the object's existing ID.
+                changes.append(f"- NEW: Object {obj['id'].replace('obj_', 'id_')} (ID {stable_id}) has appeared at {obj['position']}.")
 
         return sorted(changes), new_summary
