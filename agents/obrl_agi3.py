@@ -119,10 +119,6 @@ class ObrlAgi3Agent(Agent):
             print("\n--- Final Frame Summary (Old Level) ---")
             self._print_full_summary(self.last_object_summary)
 
-            # Print summary of the new level's first frame (which is current_summary)
-            print("\n--- First Frame Summary (New Level) ---")
-            self._print_full_summary(current_summary)
-            print() # Add a blank line for readability
             # Reset agent's learning and memory for the new level
             print("Resetting agent's memory for new level.")
             
