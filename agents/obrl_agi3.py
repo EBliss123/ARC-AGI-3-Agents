@@ -33,6 +33,7 @@ class ObrlAgi3Agent(Agent):
         self.is_waiting_for_stability = False
         self.visited_states = set()
         self.seen_object_states = set()
+        self.recent_effect_patterns = deque(maxlen=20)
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -898,6 +899,40 @@ class ObrlAgi3Agent(Agent):
              # If no new objects were created AND no changes happened, it was a wasted turn.
              # This overlaps with the inaction penalty but reinforces it.
              reward -= 2
+
+        # --- Repetition Penalty ---
+        # Get the key for the action we just took.
+        prev_action_name, prev_coords = self.last_action_context
+        prev_action_key = self._get_learning_key(prev_action_name, prev_coords)
+
+        # Check if the action was a "discovery" (i.e., created new object states).
+        was_discovery = novel_object_count > 0
+        if not was_discovery:
+            # If it wasn't a discovery, penalize it based on how many times we've tried it.
+            # The count is for the PREVIOUS state-action pair, before the update.
+            repetition_count = self.action_counts.get((self.last_state_key, prev_action_key), 0)
+            # The penalty increases with each repetition of the unproductive action.
+            reward -= repetition_count
+
+        # --- Effect Pattern Novelty Reward ---
+        if changes:
+            # Create a "fingerprint" of the outcome based on the types of changes.
+            change_types = sorted([log.split(':')[0].replace('- ', '') for log in changes])
+            effect_pattern_key = tuple(change_types)
+            
+            # Check how many times this exact pattern has occurred recently.
+            pattern_count_in_history = self.recent_effect_patterns.count(effect_pattern_key)
+            
+            if pattern_count_in_history == 0:
+                # This is a brand new type of outcome we haven't seen recently.
+                reward += 20 # Large bonus for discovering a new mechanism.
+            else:
+                # We've seen this pattern before, so it's less interesting.
+                # Apply a penalty that increases the more we repeat the pattern.
+                reward -= pattern_count_in_history * 2
+
+            # Add the new pattern to our recent history.
+            self.recent_effect_patterns.append(effect_pattern_key)
 
         # 2. Estimate the best possible Q-value from the new state
         max_q_for_next_state = 0
