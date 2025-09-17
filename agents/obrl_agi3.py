@@ -400,27 +400,33 @@ class ObrlAgi3Agent(Agent):
         new_events = self._parse_change_logs_to_events(changes)
         if not new_events: return
 
-        existing_hypothesis = self.rule_hypotheses.get(action_key)
+        hypothesis = self.rule_hypotheses.get(action_key)
 
-        if not existing_hypothesis:
-            # --- Stage 1: First Observation -> Create the "Case File" ---
-            self.rule_hypotheses[action_key] = new_events
-            print(f"\n--- Initial Case File for {action_key} ---")
+        if not hypothesis:
+            # First observation: create the hypothesis with initial confidence.
+            self.rule_hypotheses[action_key] = {
+                'rules': new_events,
+                'attempts': 1,
+                'confirmations': 1,
+                'confidence': 1.0
+            }
+            print(f"\n--- Initial Case File for {action_key} (Confidence: 100%) ---")
             for event in new_events:
                 details = {k:v for k,v in event.items() if k != 'type'}
                 print(f"- Observed {event['type']} with details: {details}")
-            print()
             return
+        
+        hypothesis['attempts'] += 1
 
         # --- Stage 2 & 3: Match events and refine the hypothesis ---
-        refined_hypothesis = []
+        refined_rules = []
         # Group events by type to make matching manageable
         new_events_by_type = {}
         for event in new_events:
             new_events_by_type.setdefault(event['type'], []).append(event)
 
         # For each rule in our old hypothesis, try to find its twin in the new events
-        for old_rule in existing_hypothesis:
+        for old_rule in hypothesis['rules']:
             rule_type = old_rule['type']
             candidates = new_events_by_type.get(rule_type, [])
             
@@ -429,15 +435,20 @@ class ObrlAgi3Agent(Agent):
             if match:
                 # If we found a match, refine the rule by finding the intersection of properties
                 refined_rule = refine_rule(old_rule, match)
-                refined_hypothesis.append(refined_rule)
+                refined_rules.append(refined_rule)
+
+        if refined_rules:
+            hypothesis['confirmations'] += 1
         
-        self.rule_hypotheses[action_key] = refined_hypothesis
+        hypothesis['rules'] = refined_rules
+        hypothesis['confidence'] = hypothesis['confirmations'] / hypothesis['attempts']
         
-        print(f"\n--- Refined Hypothesis for {action_key} ---")
-        if not refined_hypothesis:
+        confidence_percent = hypothesis['confidence'] * 100
+        print(f"\n--- Refined Hypothesis for {action_key} (Confidence: {confidence_percent:.0f}%) ---")
+        if not refined_rules:
             print("No consistent rules could be confirmed from the new observation.")
         else:
-            for rule in refined_hypothesis:
+            for rule in refined_rules:
                 details = {k:v for k,v in rule.items() if k != 'type'}
                 print(f"- Confirmed Rule: A {rule['type']} event occurs with consistent properties: {details}")
 
@@ -934,10 +945,10 @@ class ObrlAgi3Agent(Agent):
 
         # --- Target Object & Relationship Features (if it's a click) ---
         if target_object:
-            features['target_color'] = target_object['color']
-            features['target_pixels'] = target_object['pixels'] / 100.0 # Normalize
-            features['target_size_w'] = target_object['size'][1]
-            features['target_size_h'] = target_object['size'][0]
+            features['target_color'] = target_object['color'] / 15.0 # Max colors ~15
+            features['target_pixels'] = target_object['pixels'] / 4096.0 # Max pixels is 64*64
+            features['target_size_w'] = target_object['size'][1] / 64.0 # Max grid width
+            features['target_size_h'] = target_object['size'][0] / 64.0 # Max grid height
             
             # Relationship features
             color_group_size = 0
@@ -956,13 +967,26 @@ class ObrlAgi3Agent(Agent):
                     shape_group_size = len(group)
                     break
             
-            features['target_in_color_group_size'] = color_group_size
-            features['target_in_shape_group_size'] = shape_group_size
+            # Normalizing by max possible objects in a group (e.g., 50) is still a good heuristic
+            features['target_in_color_group_size'] = color_group_size / 50.0 
+            features['target_in_shape_group_size'] = shape_group_size / 50.0
 
         # --- Global State Features ---
-        features['total_objects'] = len(summary)
+        features['total_objects'] = len(summary) / 50.0 # Max objects
         if summary:
             unique_colors = len(set(obj['color'] for obj in summary))
-            features['unique_colors'] = unique_colors
+            features['unique_colors'] = unique_colors / 15.0 # Max colors
         
+        # --- Curiosity & Knowledge Features ---
+        coords_for_key = {'x': target_object['position'][1], 'y': target_object['position'][0]} if target_object else None
+        action_key = self._get_learning_key(action_template.name, coords_for_key)
+        
+        hypothesis = self.rule_hypotheses.get(action_key)
+        if hypothesis:
+            features['rule_confidence'] = hypothesis['confidence']
+            features['is_novel_action'] = 0.0 # We have a rule for it, so it's not novel
+        else:
+            features['rule_confidence'] = 0.0 # No rule exists, confidence is zero
+            features['is_novel_action'] = 1.0 # This action has never been tried and resulted in a change
+
         return features
