@@ -31,6 +31,8 @@ class ObrlAgi3Agent(Agent):
         self.learning_rate = 0.1  # Alpha
         self.discount_factor = 0.9 # Gamma
         self.is_waiting_for_stability = False
+        self.visited_states = set()
+        self.seen_object_states = set()
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -87,6 +89,29 @@ class ObrlAgi3Agent(Agent):
             prev_summary = self.last_object_summary
             changes, current_summary = self._log_changes(prev_summary, current_summary)
 
+            # --- LEVEL CHANGE DETECTION & HANDLING ---
+            current_score = latest_frame.score
+            if current_score > self.last_score:
+                print(f"\n--- LEVEL CHANGE DETECTED (Score increased from {self.last_score} to {current_score}) ---")
+                
+                # Print summary of the old level's last frame (which is self.last_object_summary)
+                print("\n--- Final Frame Summary (Old Level) ---")
+                self._print_full_summary(self.last_object_summary)
+
+                # Reset agent's learning and memory for the new level
+                print("Resetting agent's memory for new level.")
+                
+                self.rule_hypotheses = {}
+                self.last_success_contexts = {}
+                self.last_relationships = {}
+                self.last_action_context = None
+                self.is_new_level = True
+                self.removed_objects_memory = {}
+                self.object_id_counter = 0
+
+            # Update the score tracker for the next turn.
+            self.last_score = current_score
+
             if self.is_waiting_for_stability:
                 if changes:
                     print("Animation in progress, observing...")
@@ -131,29 +156,6 @@ class ObrlAgi3Agent(Agent):
                 print("--- Change Log ---")
                 for change in changes:
                     print(change)
-
-        # --- LEVEL CHANGE DETECTION & HANDLING ---
-        current_score = latest_frame.score
-        if current_score > self.last_score:
-            print(f"\n--- LEVEL CHANGE DETECTED (Score increased from {self.last_score} to {current_score}) ---")
-            
-            # Print summary of the old level's last frame (which is self.last_object_summary)
-            print("\n--- Final Frame Summary (Old Level) ---")
-            self._print_full_summary(self.last_object_summary)
-
-            # Reset agent's learning and memory for the new level
-            print("Resetting agent's memory for new level.")
-            
-            self.rule_hypotheses = {}
-            self.last_success_contexts = {}
-            self.last_relationships = {}
-            self.last_action_context = None
-            self.is_new_level = True
-            self.removed_objects_memory = {}
-            self.object_id_counter = 0
-
-        # Update the score tracker for the next turn.
-        self.last_score = current_score
 
         # Update the memory for the next turn.
         self.last_object_summary = current_summary
@@ -876,6 +878,26 @@ class ObrlAgi3Agent(Agent):
         else:
             # The penalty for an action that does nothing remains.
             reward -= 5
+
+        # --- Object-Level Novelty Reward ---
+        novel_object_count = 0
+        if new_summary:
+            for obj in new_summary:
+                # We use the stable ID to represent a unique object state
+                object_stable_id = self._get_stable_id(obj)
+                if object_stable_id not in self.seen_object_states:
+                    novel_object_count += 1
+                    # Add the new object state to our long-term memory
+                    self.seen_object_states.add(object_stable_id)
+        
+        if novel_object_count > 0:
+            # The reward is proportional to how many new object types were created.
+            # We can tune the multiplier (e.g., 3) as needed.
+            reward += novel_object_count * 3
+        elif not changes:
+             # If no new objects were created AND no changes happened, it was a wasted turn.
+             # This overlaps with the inaction penalty but reinforces it.
+             reward -= 2
 
         # 2. Estimate the best possible Q-value from the new state
         max_q_for_next_state = 0
