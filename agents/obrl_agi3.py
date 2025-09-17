@@ -25,6 +25,11 @@ class ObrlAgi3Agent(Agent):
         self.is_new_level = True
         self.removed_objects_memory = {}
         self.object_id_counter = 0
+        self.q_values = {}
+        self.action_counts = {}
+        self.last_state_key = None
+        self.learning_rate = 0.1  # Alpha
+        self.discount_factor = 0.9 # Gamma
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -82,6 +87,9 @@ class ObrlAgi3Agent(Agent):
             changes, current_summary = self._log_changes(prev_summary, current_summary)
             
             self._log_relationship_changes(self.last_relationships, current_relationships)
+
+            # --- RL: Learn from the outcome of the last action ---
+            self._learn_from_outcome(latest_frame, changes, current_summary)
 
             if self.last_action_context:
                 prev_action_name, prev_coords = self.last_action_context
@@ -161,38 +169,68 @@ class ObrlAgi3Agent(Agent):
             for obj in current_summary:
                 possible_moves.append({'type': click_action_template, 'object': obj})
 
-        action_to_return = None
-        coords_for_context = None  # Variable to hold click coordinates for our internal memory
+        # --- RL: Score and select the best action ---
+        current_state_key = self._get_state_key(current_summary)
+        best_move = None
+        best_score = -float('inf')
 
-        # If we have any moves, choose one and prepare to return it.
-        if possible_moves:
-            choice = random.choice(possible_moves)
-            action_template = choice['type']
-            chosen_object = choice['object']
+        if not possible_moves:
+             # If there are no possible moves, we might need a fallback.
+             # For now, let's try to use a generic click or another default.
+             possible_moves.append({'type': random.choice([a for a in GameAction if a is not GameAction.RESET]), 'object': None})
 
-            if chosen_object:
-                pos = chosen_object['position']
-                click_y, click_x = pos[0], pos[1]
-                obj_id = chosen_object['id'].replace('obj_', 'id_')
-                print(f"Setting data for CLICK on object {obj_id} with dict: {{'x': {click_x}, 'y': {click_y}}}")
-                action_template.set_data({'x': click_x, 'y': click_y})
-                action_to_return = action_template
-                
-                # Capture the coordinates at the moment we decide on them
-                coords_for_context = {'x': click_x, 'y': click_y}
+        all_scores_debug = []
+        for move in possible_moves:
+            action_template = move['type']
+            target_object = move['object']
+            coords_for_context = None
+
+            if target_object:
+                pos = target_object['position']
+                coords_for_context = {'x': pos[1], 'y': pos[0]}
+
+            action_key = self._get_learning_key(action_template.name, coords_for_context)
+
+            # Get the learned value (Q-value) for this state-action pair
+            q_value = self.q_values.get((current_state_key, action_key), 0.0)
+
+            # Calculate an exploration bonus (lower count = higher bonus)
+            action_count = self.action_counts.get((current_state_key, action_key), 0)
+            exploration_bonus = 1.0 / (1.0 + action_count) # Encourages trying new things
+
+            score = q_value + exploration_bonus
+
+            if score > best_score:
+                best_score = score
+                best_move = move
+
+            # Create a user-friendly name for the debug log
+            if target_object:
+                obj_id = target_object['id'].replace('obj_', 'id_')
+                debug_name = f"CLICK on {obj_id}"
             else:
-                print(f"Agent chose action: {action_template.name}")
-                action_to_return = action_template
+                debug_name = action_template.name
+            all_scores_debug.append(f"{debug_name} (Score: {score:.2f})")
         
-        # Fallback logic if no primary action was chosen
-        if not action_to_return:
-            if click_action_template:
-                print("Agent chose generic ACTION6 (no objects to click).")
-                action_to_return = click_action_template
-            else:
-                fallback_options = [a for a in GameAction if a is not GameAction.RESET]
-                action_to_return = random.choice(fallback_options)
-                print(f"Agent chose fallback action: {action_to_return.name}")
+        # --- Prepare the chosen action to be returned ---
+        chosen_template = best_move['type']
+        chosen_object = best_move['object']
+        coords_for_context = None
+
+        debug_scores_str = "{ " + ", ".join(sorted(all_scores_debug)) + " }"
+
+        if chosen_object:
+            pos = chosen_object['position']
+            click_y, click_x = pos[0], pos[1]
+            coords_for_context = {'x': click_x, 'y': click_y}
+            obj_id = chosen_object['id'].replace('obj_', 'id_')
+            print(f"RL Agent chose CLICK on object {obj_id} (Score: {best_score:.2f}) {debug_scores_str}")
+            chosen_template.set_data(coords_for_context)
+        else:
+            print(f"RL Agent chose action: {chosen_template.name} (Score: {best_score:.2f}) {debug_scores_str}")
+        
+        action_to_return = chosen_template
+        self.last_state_key = current_state_key # Remember the state for the next learning cycle
 
         # Before returning, store the context of the chosen action for the next turn's analysis.
         self.last_action_context = (action_to_return.name, coords_for_context)
@@ -780,3 +818,57 @@ class ObrlAgi3Agent(Agent):
                 changes.append(f"- NEW: Object {obj['id'].replace('obj_', 'id_')} (ID {stable_id}) has appeared at {obj['position']}.")
 
         return sorted(changes), new_summary
+    
+    def _get_state_key(self, object_summary: list[dict]) -> str:
+        """Creates a stable, hashable key representing the current state."""
+        if not object_summary:
+            return "empty"
+        # Create a tuple of stable object IDs, sorted to ensure consistency
+        state_tuple = tuple(sorted(self._get_stable_id(obj) for obj in object_summary))
+        return str(hash(state_tuple))
+    
+    def _learn_from_outcome(self, latest_frame: FrameData, changes: list[str], new_summary: list[dict]):
+        """Calculates reward and updates Q-values based on the last action's outcome."""
+        if not self.last_state_key or not self.last_action_context:
+            return # Cannot learn without a previous state or action
+
+        # 1. Calculate the immediate reward from the last action
+        reward = 0
+        if latest_frame.score > self.last_score:
+            reward += 100  # Large reward for scoring
+        if changes:
+            reward += 10   # Reward for causing any change
+        
+        # Small penalty for every action to encourage efficiency
+        reward -= 1
+
+        # 2. Get the best Q-value possible from the *new* state (Future Potential)
+        new_state_key = self._get_state_key(new_summary)
+        
+        # Find all possible actions from the new state to estimate future rewards
+        next_possible_actions = [self._get_learning_key(a.name, None) for a in latest_frame.available_actions if a.name != 'ACTION6']
+        for obj in new_summary:
+            coords = {'x': obj['position'][1], 'y': obj['position'][0]}
+            next_possible_actions.append(self._get_learning_key('ACTION6', coords))
+
+        max_q_for_next_state = 0
+        if next_possible_actions:
+            max_q_for_next_state = max(
+                [self.q_values.get((new_state_key, next_action), 0.0) for next_action in next_possible_actions],
+                default=0.0
+            )
+
+        # 3. Update the Q-value for the action we *just took*
+        prev_state_key = self.last_state_key
+        prev_action_key = self._get_learning_key(self.last_action_context[0], self.last_action_context[1])
+
+        old_q_value = self.q_values.get((prev_state_key, prev_action_key), 0.0)
+        
+        # The Q-learning formula
+        temporal_difference = reward + (self.discount_factor * max_q_for_next_state) - old_q_value
+        new_q_value = old_q_value + (self.learning_rate * temporal_difference)
+        
+        self.q_values[(prev_state_key, prev_action_key)] = new_q_value
+        
+        # Update the action count for exploration
+        self.action_counts[(prev_state_key, prev_action_key)] = self.action_counts.get((prev_state_key, prev_action_key), 0) + 1
