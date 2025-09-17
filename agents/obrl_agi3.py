@@ -870,8 +870,11 @@ class ObrlAgi3Agent(Agent):
         if latest_frame.score > self.last_score:
             reward += 100
         if changes:
-            reward += 5
+            # Reward is now proportional to the number of changes caused.
+            # An action that causes more things to happen is considered more valuable.
+            reward += len(changes)
         else:
+            # The penalty for an action that does nothing remains.
             reward -= 5
 
         # 2. Estimate the best possible Q-value from the new state
