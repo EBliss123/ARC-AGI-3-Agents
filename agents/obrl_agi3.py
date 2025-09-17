@@ -111,19 +111,6 @@ class ObrlAgi3Agent(Agent):
 
             # Update the score tracker for the next turn.
             self.last_score = current_score
-
-            if self.is_waiting_for_stability:
-                if changes:
-                    print("Animation in progress, observing...")
-                    # Update our memory to check against the next frame
-                    self.last_object_summary = current_summary
-                    self.last_relationships = current_relationships
-                    # Return a default, benign action and end the turn
-                    return latest_frame.available_actions[0] if latest_frame.available_actions else GameAction.RESET
-                else:
-                    # The world is now stable, so we can proceed with a new action.
-                    print("Stability reached. Resuming control.")
-                    self.is_waiting_for_stability = False
             
             self._log_relationship_changes(self.last_relationships, current_relationships)
 
@@ -156,6 +143,19 @@ class ObrlAgi3Agent(Agent):
                 print("--- Change Log ---")
                 for change in changes:
                     print(change)
+
+            if self.is_waiting_for_stability:
+                if changes:
+                    print("Animation in progress, observing...")
+                    # Update our memory to check against the next frame
+                    self.last_object_summary = current_summary
+                    self.last_relationships = current_relationships
+                    # Return a default, benign action and end the turn
+                    return latest_frame.available_actions[0] if latest_frame.available_actions else GameAction.RESET
+                else:
+                    # The world is now stable, so we can proceed with a new action.
+                    print("Stability reached. Resuming control.")
+                    self.is_waiting_for_stability = False
 
         # Update the memory for the next turn.
         self.last_object_summary = current_summary
