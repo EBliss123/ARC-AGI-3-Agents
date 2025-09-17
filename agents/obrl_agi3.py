@@ -25,7 +25,7 @@ class ObrlAgi3Agent(Agent):
         self.is_new_level = True
         self.removed_objects_memory = {}
         self.object_id_counter = 0
-        self.q_values = {}
+        self.weights = {}
         self.action_counts = {}
         self.last_state_key = None
         self.learning_rate = 0.1  # Alpha
@@ -189,14 +189,18 @@ class ObrlAgi3Agent(Agent):
                 pos = target_object['position']
                 coords_for_context = {'x': pos[1], 'y': pos[0]}
 
+            features = self._extract_features(current_summary, move)
+            
+            # Calculate Q-value as the dot product of features and weights
+            q_value = 0.0
+            for feature, value in features.items():
+                q_value += self.weights.get(feature, 0.0) * value
+            
+            # A simple exploration bonus for trying new things
+            # (can be replaced with a more advanced strategy later)
             action_key = self._get_learning_key(action_template.name, coords_for_context)
-
-            # Get the learned value (Q-value) for this state-action pair
-            q_value = self.q_values.get((current_state_key, action_key), 0.0)
-
-            # Calculate an exploration bonus (lower count = higher bonus)
             action_count = self.action_counts.get((current_state_key, action_key), 0)
-            exploration_bonus = 1.0 / (1.0 + action_count) # Encourages trying new things
+            exploration_bonus = 1.0 / (1.0 + action_count)
 
             score = q_value + exploration_bonus
 
@@ -828,47 +832,119 @@ class ObrlAgi3Agent(Agent):
         return str(hash(state_tuple))
     
     def _learn_from_outcome(self, latest_frame: FrameData, changes: list[str], new_summary: list[dict]):
-        """Calculates reward and updates Q-values based on the last action's outcome."""
+        """Calculates reward and updates model weights based on the last action's outcome."""
         if not self.last_state_key or not self.last_action_context:
-            return # Cannot learn without a previous state or action
+            return
 
-        # 1. Calculate the immediate reward from the last action
+        # 1. Calculate reward (same as before)
         reward = 0
         if latest_frame.score > self.last_score:
-            reward += 100  # Large reward for scoring
+            reward += 100
         if changes:
-            reward += 10   # Reward for causing any change
-        
-        # Small penalty for every action to encourage efficiency
-        reward -= 1
+            reward += 5
+        else:
+            reward -= 5
 
-        # 2. Get the best Q-value possible from the *new* state (Future Potential)
-        new_state_key = self._get_state_key(new_summary)
-        
-        # Find all possible actions from the new state to estimate future rewards
-        next_possible_actions = [self._get_learning_key(a.name, None) for a in latest_frame.available_actions if a.name != 'ACTION6']
-        for obj in new_summary:
-            coords = {'x': obj['position'][1], 'y': obj['position'][0]}
-            next_possible_actions.append(self._get_learning_key('ACTION6', coords))
-
+        # 2. Estimate the best possible Q-value from the new state
         max_q_for_next_state = 0
-        if next_possible_actions:
-            max_q_for_next_state = max(
-                [self.q_values.get((new_state_key, next_action), 0.0) for next_action in next_possible_actions],
-                default=0.0
-            )
+        
+        # We need to construct the possible moves for the *new* state to evaluate them
+        next_possible_moves = []
+        click_action_template = next((action for action in latest_frame.available_actions if action.name == 'ACTION6'), None)
+        for action in latest_frame.available_actions:
+            if action.name != 'ACTION6':
+                next_possible_moves.append({'type': action, 'object': None})
+        if click_action_template and new_summary:
+            for obj in new_summary:
+                next_possible_moves.append({'type': click_action_template, 'object': obj})
+        
+        if next_possible_moves:
+            q_values_for_next_state = []
+            for move in next_possible_moves:
+                features = self._extract_features(new_summary, move)
+                next_q = sum(self.weights.get(f, 0.0) * v for f, v in features.items())
+                q_values_for_next_state.append(next_q)
+            max_q_for_next_state = max(q_values_for_next_state)
 
-        # 3. Update the Q-value for the action we *just took*
-        prev_state_key = self.last_state_key
-        prev_action_key = self._get_learning_key(self.last_action_context[0], self.last_action_context[1])
+        # 3. Calculate the prediction error (Temporal Difference)
+        prev_action_name, prev_coords = self.last_action_context
+        prev_move_mock = {'type': GameAction[prev_action_name], 'object': self._find_object_by_coords(prev_coords)}
+        
+        # We need the summary from the *previous* state to get the old features
+        prev_summary = self.last_object_summary 
+        prev_features = self._extract_features(prev_summary, prev_move_mock)
+        
+        old_q_prediction = sum(self.weights.get(f, 0.0) * v for f, v in prev_features.items())
+        
+        temporal_difference = reward + (self.discount_factor * max_q_for_next_state) - old_q_prediction
 
-        old_q_value = self.q_values.get((prev_state_key, prev_action_key), 0.0)
+        # 4. Update the weights
+        for feature, value in prev_features.items():
+            # The update rule: adjust weight in proportion to the error and the feature's value
+            self.weights[feature] = self.weights.get(feature, 0.0) + (self.learning_rate * temporal_difference * value)
         
-        # The Q-learning formula
-        temporal_difference = reward + (self.discount_factor * max_q_for_next_state) - old_q_value
-        new_q_value = old_q_value + (self.learning_rate * temporal_difference)
+        # Update action count for exploration bonus
+        prev_action_key = self._get_learning_key(prev_action_name, prev_coords)
+        self.action_counts[(self.last_state_key, prev_action_key)] = self.action_counts.get((self.last_state_key, prev_action_key), 0) + 1
+
+    def _find_object_by_coords(self, coords: dict | None) -> dict | None:
+        """Helper to find an object in the last summary based on click coordinates."""
+        if not coords:
+            return None
+        for obj in self.last_object_summary:
+            # This is a simplification; a more robust check would see if the click is within the object's bounds.
+            if obj['position'] == (coords.get('y'), coords.get('x')):
+                return obj
+        return None
+
+    def _extract_features(self, summary: list[dict], move: dict) -> dict:
+        """
+        Extracts a dictionary of features for a given state and action (move).
+        The model will learn a weight for each feature.
+        """
+        features = {}
+        action_template = move['type']
+        target_object = move['object']
+
+        # --- Bias Feature (always on) ---
+        features['bias'] = 1.0
+
+        # --- Action Type Features ---
+        for action_type in GameAction:
+            # Is this action the one we are considering?
+            features[f'action_is_{action_type.name}'] = 1.0 if action_template.name == action_type.name else 0.0
+
+        # --- Target Object & Relationship Features (if it's a click) ---
+        if target_object:
+            features['target_color'] = target_object['color']
+            features['target_pixels'] = target_object['pixels'] / 100.0 # Normalize
+            features['target_size_w'] = target_object['size'][1]
+            features['target_size_h'] = target_object['size'][0]
+            
+            # Relationship features
+            color_group_size = 0
+            shape_group_size = 0
+            
+            # Find the size of the groups the target object belongs to
+            rels = self._analyze_relationships(summary)
+            target_id = int(target_object['id'].replace('obj_',''))
+            
+            for group in rels.get('Color', {}).values():
+                if target_id in group:
+                    color_group_size = len(group)
+                    break
+            for group in rels.get('Shape', {}).values():
+                 if target_id in group:
+                    shape_group_size = len(group)
+                    break
+            
+            features['target_in_color_group_size'] = color_group_size
+            features['target_in_shape_group_size'] = shape_group_size
+
+        # --- Global State Features ---
+        features['total_objects'] = len(summary)
+        if summary:
+            unique_colors = len(set(obj['color'] for obj in summary))
+            features['unique_colors'] = unique_colors
         
-        self.q_values[(prev_state_key, prev_action_key)] = new_q_value
-        
-        # Update the action count for exploration
-        self.action_counts[(prev_state_key, prev_action_key)] = self.action_counts.get((prev_state_key, prev_action_key), 0) + 1
+        return features
