@@ -30,6 +30,7 @@ class ObrlAgi3Agent(Agent):
         self.last_state_key = None
         self.learning_rate = 0.1  # Alpha
         self.discount_factor = 0.9 # Gamma
+        self.is_waiting_for_stability = False
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -85,6 +86,19 @@ class ObrlAgi3Agent(Agent):
         else:
             prev_summary = self.last_object_summary
             changes, current_summary = self._log_changes(prev_summary, current_summary)
+
+            if self.is_waiting_for_stability:
+                if changes:
+                    print("Animation in progress, observing...")
+                    # Update our memory to check against the next frame
+                    self.last_object_summary = current_summary
+                    self.last_relationships = current_relationships
+                    # Return a default, benign action and end the turn
+                    return latest_frame.available_actions[0] if latest_frame.available_actions else GameAction.RESET
+                else:
+                    # The world is now stable, so we can proceed with a new action.
+                    print("Stability reached. Resuming control.")
+                    self.is_waiting_for_stability = False
             
             self._log_relationship_changes(self.last_relationships, current_relationships)
 
@@ -238,6 +252,10 @@ class ObrlAgi3Agent(Agent):
 
         # Before returning, store the context of the chosen action for the next turn's analysis.
         self.last_action_context = (action_to_return.name, coords_for_context)
+        
+        # After deciding on a real action, enter the waiting state for the next turn.
+        self.is_waiting_for_stability = True
+        
         return action_to_return
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
