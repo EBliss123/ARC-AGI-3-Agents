@@ -142,6 +142,11 @@ class ObrlAgi3Agent(Agent):
                     if self.failed_action_blacklist:
                         print("A successful action was found, clearing the failure blacklist.")
                         self.failed_action_blacklist.clear()
+                    
+                    # Calculate the key for the successful action
+                    prev_action_name, prev_coords = self.last_action_context
+                    learning_key = self._get_learning_key(prev_action_name, prev_coords)
+                    
                     # Success Path: Calculate how many unique states were created
                     affected_object_ids = set()
                     for change_str in changes:
@@ -186,8 +191,13 @@ class ObrlAgi3Agent(Agent):
                         for msg in sorted(unique_log_messages):
                             print(msg)
 
-                    prev_action_name, prev_coords = self.last_action_context
-                    learning_key = self._get_learning_key(prev_action_name, prev_coords)
+                    # --- Intelligent Stability Check ---
+                    # Only wait if the outcome was a surprise (i.e., we have no existing rule for it yet).
+                    # This prevents wasting a turn on known, single-frame changes.
+                    if learning_key not in self.rule_hypotheses:
+                        print("Action produced a novel outcome. Waiting to check for animation.")
+                        self.is_waiting_for_stability = True
+
                     self._analyze_and_report(learning_key, changes)
                     self.last_success_contexts[learning_key] = prev_summary
                 
@@ -213,6 +223,7 @@ class ObrlAgi3Agent(Agent):
                     # Update our memory to check against the next frame
                     self.last_object_summary = current_summary
                     self.last_relationships = current_relationships
+                    self.last_action_context = None
                     # Return a default, benign action and end the turn
                     return latest_frame.available_actions[0] if latest_frame.available_actions else GameAction.RESET
                 else:
@@ -320,9 +331,6 @@ class ObrlAgi3Agent(Agent):
 
         # Before returning, store the context of the chosen action for the next turn's analysis.
         self.last_action_context = (action_to_return.name, coords_for_context)
-        
-        # After deciding on a real action, enter the waiting state for the next turn.
-        self.is_waiting_for_stability = True
         
         return action_to_return
 
