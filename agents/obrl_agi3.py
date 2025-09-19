@@ -37,6 +37,7 @@ class ObrlAgi3Agent(Agent):
         self.seen_configurations = set()
         self.total_unique_changes = 0
         self.total_moves = 0
+        self.failed_action_blacklist = set()
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -128,6 +129,9 @@ class ObrlAgi3Agent(Agent):
                 
                 # Determine the outcomes first
                 if changes:
+                    if self.failed_action_blacklist:
+                        print("A successful action was found, clearing the failure blacklist.")
+                        self.failed_action_blacklist.clear()
                     # Success Path: Calculate how many unique states were created
                     affected_object_ids = set()
                     for change_str in changes:
@@ -178,6 +182,9 @@ class ObrlAgi3Agent(Agent):
                     self.last_success_contexts[learning_key] = prev_summary
                 
                 elif is_failure_case:
+                    self.failed_action_blacklist.add(learning_key)
+                    print(f"Action {learning_key} has been blacklisted until a success occurs.")
+                    
                     prev_action_name, prev_coords = self.last_action_context
                     learning_key = self._get_learning_key(prev_action_name, prev_coords)
                     print(f"\n--- Failure Detected for Action {learning_key} ---")
@@ -251,6 +258,12 @@ class ObrlAgi3Agent(Agent):
                 pos = target_object['position']
                 coords_for_context = {'x': pos[1], 'y': pos[0]}
 
+            action_key = self._get_learning_key(action_template.name, coords_for_context)
+
+            # --- Check if the action is currently blacklisted ---
+            if action_key in self.failed_action_blacklist:
+                continue # Skip this action
+
             features = self._extract_features(current_summary, move)
             
             # Calculate Q-value as the dot product of features and weights
@@ -258,9 +271,6 @@ class ObrlAgi3Agent(Agent):
             for feature, value in features.items():
                 q_value += self.weights.get(feature, 0.0) * value
             
-            # A simple exploration bonus for trying new things
-            # (can be replaced with a more advanced strategy later)
-            action_key = self._get_learning_key(action_template.name, coords_for_context)
             action_count = self.action_counts.get((current_state_key, action_key), 0)
             exploration_bonus = 1.0 / (1.0 + action_count)
 
