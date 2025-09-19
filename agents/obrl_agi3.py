@@ -34,6 +34,7 @@ class ObrlAgi3Agent(Agent):
         self.visited_states = set()
         self.seen_object_states = set()
         self.recent_effect_patterns = deque(maxlen=20)
+        self.seen_configurations = set()
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -112,7 +113,7 @@ class ObrlAgi3Agent(Agent):
 
             # Update the score tracker for the next turn.
             self.last_score = current_score
-            
+
             self._log_relationship_changes(self.last_relationships, current_relationships)
 
             # --- RL: Learn from the outcome of the last action ---
@@ -127,6 +128,34 @@ class ObrlAgi3Agent(Agent):
                     print("--- Change Log ---")
                     for change in changes:
                         print(change)
+
+                # --- Unique State Log (for changed objects only) ---
+                affected_object_ids = set()
+                for change_str in changes:
+                    if "Object id_" in change_str:
+                        # Extracts the number from "id_X" and rebuilds the internal 'obj_X' format
+                        id_num_str = change_str.split('id_')[1].split()[0]
+                        affected_object_ids.add(f"obj_{id_num_str}")
+
+                unique_log_messages = []
+                # Find the full object details from the current summary for the affected objects
+                for obj in current_summary:
+                    if obj['id'] in affected_object_ids:
+                        state_fingerprint = (obj['id'], self._get_stable_id(obj), obj['position'])
+                        if state_fingerprint not in self.seen_configurations:
+                            self.seen_configurations.add(state_fingerprint)
+                            obj_id_str = obj['id'].replace('obj_', 'id_')
+                            size_str = f"{obj['size'][0]}x{obj['size'][1]}"
+                            log_msg = (
+                                f"- Unique State: Object {obj_id_str} recorded in new state "
+                                f"(Color: {obj['color']}, Size: {size_str}, Pos: {obj['position']})."
+                            )
+                            unique_log_messages.append(log_msg)
+
+                if unique_log_messages:
+                    print("\n--- Unique Change Log ---")
+                    for msg in sorted(unique_log_messages):
+                        print(msg)
                     
                     self._analyze_and_report(learning_key, changes)
                     # Remember the state that led to this success
