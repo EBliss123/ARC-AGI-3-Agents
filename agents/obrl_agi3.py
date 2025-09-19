@@ -113,6 +113,16 @@ class ObrlAgi3Agent(Agent):
                 self.is_new_level = True
                 self.removed_objects_memory = {}
                 self.object_id_counter = 0
+                
+                # --- Reset core RL knowledge ---
+                self.weights = {}
+                self.action_counts = {}
+
+                # --- Reset performance trackers and blacklists ---
+                self.total_unique_changes = 0
+                self.total_moves = 0
+                self.failed_action_blacklist.clear()
+                self.seen_configurations.clear()
 
             # Update the score tracker for the next turn.
             self.last_score = current_score
