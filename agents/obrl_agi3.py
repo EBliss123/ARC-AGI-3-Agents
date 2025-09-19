@@ -35,6 +35,8 @@ class ObrlAgi3Agent(Agent):
         self.seen_object_states = set()
         self.recent_effect_patterns = deque(maxlen=20)
         self.seen_configurations = set()
+        self.total_unique_changes = 0
+        self.total_moves = 0
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -116,64 +118,70 @@ class ObrlAgi3Agent(Agent):
 
             self._log_relationship_changes(self.last_relationships, current_relationships)
 
-            # --- Calculate unique states resulting from the last action ---
-            unique_log_messages = []
-            if changes:
-                affected_object_ids = set()
-                for change_str in changes:
-                    if "Object id_" in change_str:
-                        id_num_str = change_str.split('id_')[1].split()[0]
-                        affected_object_ids.add(f"obj_{id_num_str}")
+            # --- Prepare for Learning & Rule Analysis ---
+            current_state_key = self._get_state_key(current_summary)
 
-                for obj in current_summary:
-                    if obj['id'] in affected_object_ids:
-                        state_fingerprint = (obj['id'], self._get_stable_id(obj), obj['position'])
-                        if state_fingerprint not in self.seen_configurations:
-                            self.seen_configurations.add(state_fingerprint)
-                            obj_id_str = obj['id'].replace('obj_', 'id_')
-                            size_str = f"{obj['size'][0]}x{obj['size'][1]}"
-                            log_msg = (
-                                f"- Unique State: Object {obj_id_str} recorded in new state "
-                                f"(Color: {obj['color']}, Size: {size_str}, Pos: {obj['position']})."
-                            )
-                            unique_log_messages.append(log_msg)
-            is_failure_case = False
-            novel_state_count = len(unique_log_messages)
-
-            # --- RL: Learn from the outcome of the last action ---
-            self._learn_from_outcome(latest_frame, changes, current_summary, novel_state_count, is_failure_case)
-
-            # --- Logging and Rule Analysis ---
             if self.last_action_context:
-                prev_action_name, prev_coords = self.last_action_context
-                learning_key = self._get_learning_key(prev_action_name, prev_coords)
-
+                # --- Analyze the outcome of the previous action ---
+                is_failure_case = False
+                novel_state_count = 0
+                
+                # Determine the outcomes first
                 if changes:
-                    # --- Success Path ---
+                    # Success Path: Calculate how many unique states were created
+                    affected_object_ids = set()
+                    for change_str in changes:
+                        if "Object id_" in change_str:
+                            id_num_str = change_str.split('id_')[1].split()[0]
+                            affected_object_ids.add(f"obj_{id_num_str}")
+
+                    unique_log_messages = []
+                    for obj in current_summary:
+                        if obj['id'] in affected_object_ids:
+                            state_fingerprint = (obj['id'], self._get_stable_id(obj), obj['position'])
+                            if state_fingerprint not in self.seen_configurations:
+                                self.seen_configurations.add(state_fingerprint)
+                                obj_id_str = obj['id'].replace('obj_', 'id_')
+                                size_str = f"{obj['size'][0]}x{obj['size'][1]}"
+                                log_msg = (
+                                    f"- Unique State: Object {obj_id_str} recorded in new state "
+                                    f"(Color: {obj['color']}, Size: {size_str}, Pos: {obj['position']})."
+                                )
+                                unique_log_messages.append(log_msg)
+                    novel_state_count = len(unique_log_messages)
+                
+                else:
+                    # No changes occurred. Check if this constitutes a "failure".
+                    prev_action_name, prev_coords = self.last_action_context
+                    learning_key = self._get_learning_key(prev_action_name, prev_coords)
+                    if learning_key in self.last_success_contexts:
+                        is_failure_case = True
+
+                # --- Now, with all outcomes known, learn from the last action ---
+                self._learn_from_outcome(latest_frame, changes, current_summary, novel_state_count, is_failure_case)
+
+                # --- Handle all Logging and Rule Analysis *after* learning ---
+                if changes:
                     print("--- Change Log ---")
                     for change in changes:
                         print(change)
-                
-                if unique_log_messages:
-                    print("\n--- Unique Change Log ---")
-                    for msg in sorted(unique_log_messages):
-                        print(msg)
-                
-                    self._analyze_and_report(learning_key, changes)
-                    # Remember the state that led to this success
-                    self.last_success_contexts[learning_key] = prev_summary
-                
-                elif changes: # If there were changes but none were unique states
-                    self._analyze_and_report(learning_key, changes)
-                    self.last_success_contexts[learning_key] = prev_summary
+                    
+                    if unique_log_messages:
+                        print("\n--- Unique Change Log ---")
+                        for msg in sorted(unique_log_messages):
+                            print(msg)
 
-                else:
-                    is_failure_case = True
-                    # --- Failure Path ---
-                    if learning_key in self.last_success_contexts:
-                        print(f"\n--- Failure Detected for Action {learning_key} ---")
-                        last_success_summary = self.last_success_contexts[learning_key]
-                        self._analyze_failures(learning_key, last_success_summary, prev_summary)
+                    prev_action_name, prev_coords = self.last_action_context
+                    learning_key = self._get_learning_key(prev_action_name, prev_coords)
+                    self._analyze_and_report(learning_key, changes)
+                    self.last_success_contexts[learning_key] = prev_summary
+                
+                elif is_failure_case:
+                    prev_action_name, prev_coords = self.last_action_context
+                    learning_key = self._get_learning_key(prev_action_name, prev_coords)
+                    print(f"\n--- Failure Detected for Action {learning_key} ---")
+                    last_success_summary = self.last_success_contexts[learning_key]
+                    self._analyze_failures(learning_key, last_success_summary, prev_summary)
                         
             elif changes:
                 # Fallback for when changes happen without a known previous action
@@ -906,9 +914,16 @@ class ObrlAgi3Agent(Agent):
 
         # 1. Calculate reward (same as before)
         reward = 0
-        # --- Reward for discovering unique object states ---
-        # A higher multiplier makes this a stronger incentive.
-        reward += novel_state_count * 10
+        # --- Normalized reward for unique state discovery ---
+        self.total_moves += 1
+        self.total_unique_changes += novel_state_count
+
+        # Calculate the running average of unique changes per move.
+        average_unique_change = self.total_unique_changes / self.total_moves if self.total_moves > 0 else 0
+
+        # Reward actions that perform better than average, penalize those that do worse.
+        performance_vs_average = novel_state_count - average_unique_change
+        reward += performance_vs_average * 15 # Multiplier makes this a strong signal
 
         # --- Specific penalty for unexpected failures ---
         if is_failure:
