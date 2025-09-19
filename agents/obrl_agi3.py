@@ -145,7 +145,8 @@ class ObrlAgi3Agent(Agent):
                                 size_str = f"{obj['size'][0]}x{obj['size'][1]}"
                                 log_msg = (
                                     f"- Unique State: Object {obj_id_str} recorded in new state "
-                                    f"(Color: {obj['color']}, Size: {size_str}, Pos: {obj['position']})."
+                                    f"(Color: {obj['color']}, Size: {size_str}, Pos: {obj['position']}, "
+                                    f"Fingerprint: {obj['fingerprint']})."
                                 )
                                 unique_log_messages.append(log_msg)
                     novel_state_count = len(unique_log_messages)
