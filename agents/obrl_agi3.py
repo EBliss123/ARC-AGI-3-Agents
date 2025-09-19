@@ -116,29 +116,15 @@ class ObrlAgi3Agent(Agent):
 
             self._log_relationship_changes(self.last_relationships, current_relationships)
 
-            # --- RL: Learn from the outcome of the last action ---
-            self._learn_from_outcome(latest_frame, changes, current_summary)
-
-            if self.last_action_context:
-                prev_action_name, prev_coords = self.last_action_context
-                learning_key = self._get_learning_key(prev_action_name, prev_coords)
-
-                if changes:
-                    # --- Success Path ---
-                    print("--- Change Log ---")
-                    for change in changes:
-                        print(change)
-
-                # --- Unique State Log (for changed objects only) ---
+            # --- Calculate unique states resulting from the last action ---
+            unique_log_messages = []
+            if changes:
                 affected_object_ids = set()
                 for change_str in changes:
                     if "Object id_" in change_str:
-                        # Extracts the number from "id_X" and rebuilds the internal 'obj_X' format
                         id_num_str = change_str.split('id_')[1].split()[0]
                         affected_object_ids.add(f"obj_{id_num_str}")
 
-                unique_log_messages = []
-                # Find the full object details from the current summary for the affected objects
                 for obj in current_summary:
                     if obj['id'] in affected_object_ids:
                         state_fingerprint = (obj['id'], self._get_stable_id(obj), obj['position'])
@@ -151,23 +137,44 @@ class ObrlAgi3Agent(Agent):
                                 f"(Color: {obj['color']}, Size: {size_str}, Pos: {obj['position']})."
                             )
                             unique_log_messages.append(log_msg)
+            is_failure_case = False
+            novel_state_count = len(unique_log_messages)
 
+            # --- RL: Learn from the outcome of the last action ---
+            self._learn_from_outcome(latest_frame, changes, current_summary, novel_state_count, is_failure_case)
+
+            # --- Logging and Rule Analysis ---
+            if self.last_action_context:
+                prev_action_name, prev_coords = self.last_action_context
+                learning_key = self._get_learning_key(prev_action_name, prev_coords)
+
+                if changes:
+                    # --- Success Path ---
+                    print("--- Change Log ---")
+                    for change in changes:
+                        print(change)
+                
                 if unique_log_messages:
                     print("\n--- Unique Change Log ---")
                     for msg in sorted(unique_log_messages):
                         print(msg)
-                    
+                
                     self._analyze_and_report(learning_key, changes)
                     # Remember the state that led to this success
                     self.last_success_contexts[learning_key] = prev_summary
                 
+                elif changes: # If there were changes but none were unique states
+                    self._analyze_and_report(learning_key, changes)
+                    self.last_success_contexts[learning_key] = prev_summary
+
                 else:
+                    is_failure_case = True
                     # --- Failure Path ---
                     if learning_key in self.last_success_contexts:
                         print(f"\n--- Failure Detected for Action {learning_key} ---")
                         last_success_summary = self.last_success_contexts[learning_key]
                         self._analyze_failures(learning_key, last_success_summary, prev_summary)
-
+                        
             elif changes:
                 # Fallback for when changes happen without a known previous action
                 print("--- Change Log ---")
@@ -892,13 +899,21 @@ class ObrlAgi3Agent(Agent):
         state_tuple = tuple(sorted(self._get_stable_id(obj) for obj in object_summary))
         return str(hash(state_tuple))
     
-    def _learn_from_outcome(self, latest_frame: FrameData, changes: list[str], new_summary: list[dict]):
+    def _learn_from_outcome(self, latest_frame: FrameData, changes: list[str], new_summary: list[dict], novel_state_count: int, is_failure: bool):
         """Calculates reward and updates model weights based on the last action's outcome."""
         if not self.last_state_key or not self.last_action_context:
             return
 
         # 1. Calculate reward (same as before)
         reward = 0
+        # --- Reward for discovering unique object states ---
+        # A higher multiplier makes this a stronger incentive.
+        reward += novel_state_count * 10
+
+        # --- Specific penalty for unexpected failures ---
+        if is_failure:
+            reward -= 15 # Heavy penalty for an action that should have worked but didn't.
+
         if latest_frame.score > self.last_score:
             reward += 100
         if changes:
@@ -958,7 +973,7 @@ class ObrlAgi3Agent(Agent):
             else:
                 # We've seen this pattern before, so it's less interesting.
                 # Apply a penalty that increases the more we repeat the pattern.
-                reward -= pattern_count_in_history * 2
+                reward -= pattern_count_in_history * 5 # Increased penalty for unoriginal outcomes
 
             # Add the new pattern to our recent history.
             self.recent_effect_patterns.append(effect_pattern_key)
