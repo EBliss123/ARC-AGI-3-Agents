@@ -174,7 +174,7 @@ class ObrlAgi3Agent(Agent):
                     # No changes occurred. Check if this constitutes a "failure".
                     prev_action_name, prev_coords = self.last_action_context
                     learning_key = self._get_learning_key(prev_action_name, prev_coords)
-                    if learning_key in self.last_success_contexts:
+                    if learning_key in self.last_success_contexts or self.action_counts.get((self.last_state_key, learning_key), 0) > 0:
                         is_failure_case = True
 
                 # --- Now, with all outcomes known, learn from the last action ---
@@ -202,14 +202,18 @@ class ObrlAgi3Agent(Agent):
                     self.last_success_contexts[learning_key] = prev_summary
                 
                 elif is_failure_case:
+                    # Blacklist the action, regardless of its history.
                     self.failed_action_blacklist.add(learning_key)
                     print(f"Action {learning_key} has been blacklisted until a success occurs.")
                     
-                    prev_action_name, prev_coords = self.last_action_context
-                    learning_key = self._get_learning_key(prev_action_name, prev_coords)
-                    print(f"\n--- Failure Detected for Action {learning_key} ---")
-                    last_success_summary = self.last_success_contexts[learning_key]
-                    self._analyze_failures(learning_key, last_success_summary, prev_summary)
+                    # Only perform failure analysis if we have a past success to compare against.
+                    if learning_key in self.last_success_contexts:
+                        print(f"\n--- Failure Detected for Action {learning_key} ---")
+                        last_success_summary = self.last_success_contexts[learning_key]
+                        self._analyze_failures(learning_key, last_success_summary, prev_summary)
+                    else:
+                        # This is for a repeated, unproductive action that has never been successful.
+                        print(f"Action {learning_key} is unproductive, but has no prior success record to analyze.")
                         
             elif changes:
                 # Fallback for when changes happen without a known previous action
