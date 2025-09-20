@@ -38,6 +38,7 @@ class ObrlAgi3Agent(Agent):
         self.total_unique_changes = 0
         self.total_moves = 0
         self.failed_action_blacklist = set()
+        self.turns_without_discovery = 0
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -134,6 +135,7 @@ class ObrlAgi3Agent(Agent):
 
             if self.last_action_context:
                 # --- Analyze the outcome of the previous action ---
+                just_finished_waiting = False
                 is_failure_case = False
                 novel_state_count = 0
                 
@@ -171,11 +173,12 @@ class ObrlAgi3Agent(Agent):
                     novel_state_count = len(unique_log_messages)
                 
                 else:
-                    # No changes occurred. Check if this constitutes a "failure".
-                    prev_action_name, prev_coords = self.last_action_context
-                    learning_key = self._get_learning_key(prev_action_name, prev_coords)
-                    if learning_key in self.last_success_contexts or self.action_counts.get((self.last_state_key, learning_key), 0) > 0:
-                        is_failure_case = True
+                    # No changes occurred. Check if this is a failure, but NOT if we just finished waiting.
+                    if not just_finished_waiting:
+                        prev_action_name, prev_coords = self.last_action_context
+                        learning_key = self._get_learning_key(prev_action_name, prev_coords)
+                        if learning_key in self.last_success_contexts or self.action_counts.get((self.last_state_key, learning_key), 0) > 0:
+                            is_failure_case = True
 
                 # --- Now, with all outcomes known, learn from the last action ---
                 self._learn_from_outcome(latest_frame, changes, current_summary, novel_state_count, is_failure_case)
@@ -227,13 +230,13 @@ class ObrlAgi3Agent(Agent):
                     # Update our memory to check against the next frame
                     self.last_object_summary = current_summary
                     self.last_relationships = current_relationships
-                    self.last_action_context = None
                     # Return a default, benign action and end the turn
                     return latest_frame.available_actions[0] if latest_frame.available_actions else GameAction.RESET
                 else:
                     # The world is now stable, so we can proceed with a new action.
                     print("Stability reached. Resuming control.")
                     self.is_waiting_for_stability = False
+                    just_finished_waiting = True
 
         # Update the memory for the next turn.
         self.last_object_summary = current_summary
@@ -313,6 +316,12 @@ class ObrlAgi3Agent(Agent):
                 debug_name = action_template.name
             all_scores_debug.append(f"{debug_name} (Score: {score:.2f})")
         
+        # --- Fallback if all available actions were blacklisted ---
+        if best_move is None and possible_moves:
+            print("Warning: All available actions were blacklisted. Clearing blacklist to break deadlock.")
+            self.failed_action_blacklist.clear()
+            best_move = possible_moves[0] # Force select the first available action
+
         # --- Prepare the chosen action to be returned ---
         chosen_template = best_move['type']
         chosen_object = best_move['object']
@@ -961,6 +970,15 @@ class ObrlAgi3Agent(Agent):
         # --- Specific penalty for unexpected failures ---
         if is_failure:
             reward -= 15 # Heavy penalty for an action that should have worked but didn't.
+
+        # --- Escalating penalty for being in an unproductive loop ---
+        if novel_state_count > 0:
+            # A discovery was made, so the drought is over.
+            self.turns_without_discovery = 0
+        else:
+            # No discovery, the drought continues and the penalty increases.
+            self.turns_without_discovery += 10
+            reward -= self.turns_without_discovery
 
         if latest_frame.score > self.last_score:
             reward += 100
