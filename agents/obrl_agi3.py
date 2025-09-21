@@ -135,6 +135,8 @@ class ObrlAgi3Agent(Agent):
 
             if self.last_action_context:
                 # --- Analyze the outcome of the previous action ---
+                prev_action_name, prev_coords = self.last_action_context
+                learning_key = self._get_learning_key(prev_action_name, prev_coords)
                 just_finished_waiting = False
                 is_failure_case = False
                 novel_state_count = 0
@@ -145,9 +147,26 @@ class ObrlAgi3Agent(Agent):
                         print("A successful action was found, clearing the failure blacklist.")
                         self.failed_action_blacklist.clear()
                     
-                    # Calculate the key for the successful action
-                    prev_action_name, prev_coords = self.last_action_context
-                    learning_key = self._get_learning_key(prev_action_name, prev_coords)
+                    # --- Create a specific, per-object learning key for each change ---
+                    per_object_keys = []
+                    prev_summary_map = {obj['id']: obj for obj in prev_summary}
+
+                    for change_str in changes:
+                        if "Object id_" in change_str:
+                            id_num_str = change_str.split('id_')[1].split()[0]
+                            obj_id = f"obj_{id_num_str}"
+                            
+                            if obj_id in prev_summary_map:
+                                target_in_prev_state = prev_summary_map[obj_id]
+                                prev_action_name, _ = self.last_action_context
+                                base_action_key = self._get_learning_key(prev_action_name, None)
+                                
+                                # Create the object's complete state description (properties + position)
+                                object_state = (self._get_stable_id(target_in_prev_state), target_in_prev_state['position'])
+                                
+                                # The new key is (ACTION, OBJECT_ID, OBJECT_STATE)
+                                contextual_key = (base_action_key, target_in_prev_state['id'], object_state)
+                                per_object_keys.append(contextual_key)
                     
                     # Success Path: Calculate how many unique states were created
                     affected_object_ids = set()
@@ -197,11 +216,14 @@ class ObrlAgi3Agent(Agent):
                     # --- Intelligent Stability Check ---
                     # Only wait if the outcome was a surprise (i.e., we have no existing rule for it yet).
                     # This prevents wasting a turn on known, single-frame changes.
-                    if learning_key not in self.rule_hypotheses:
+                    if any(key not in self.rule_hypotheses for key in per_object_keys):
                         print("Action produced a novel outcome. Waiting to check for animation.")
                         self.is_waiting_for_stability = True
 
-                    self._analyze_and_report(learning_key, changes)
+                    # Report each change under its own per-object contextual key
+                    for i, key in enumerate(per_object_keys):
+                        # Pass only the single relevant change string
+                        self._analyze_and_report(key, [changes[i]])
                     self.last_success_contexts[learning_key] = prev_summary
                 
                 elif is_failure_case:
@@ -369,41 +391,31 @@ class ObrlAgi3Agent(Agent):
 
                 if change_type == 'MOVED':
                     parts = details.split(' moved from ')
-                    id_tuple = ast.literal_eval(parts[0].replace('Object with ID ', ''))
                     pos_parts = parts[1].replace('.', '').split(' to ')
                     start_pos, end_pos = ast.literal_eval(pos_parts[0]), ast.literal_eval(pos_parts[1])
-                    
                     event.update({
-                        'vector': (end_pos[0] - start_pos[0], end_pos[1] - start_pos[1]),
-                        'fingerprint': id_tuple[0], 'color': id_tuple[1],
-                        'size': id_tuple[2], 'pixels': id_tuple[3]
+                        'vector': (end_pos[0] - start_pos[0], end_pos[1] - start_pos[1])
                     })
+                    events.append(event)
                     events.append(event)
 
                 elif change_type == 'RECOLORED':
-                    size_str = details.split(' object at ')[0].split(' ')[-1]
-                    position_str = details.split(' at ')[1].split(' changed color')[0]
                     from_color_str = details.split(' from ')[1].split(' to ')[0]
                     to_color_str = details.split(' to ')[1].replace('.', '')
                     event.update({
-                        'position': ast.literal_eval(position_str),
-                        'size': ast.literal_eval(size_str.replace('x', ',')),
                         'from_color': int(from_color_str),
                         'to_color': int(to_color_str)
                     })
                     events.append(event)
                 
                 elif change_type == 'SHAPE_CHANGED':
-                    position_str = details.split(' (Color:')[0].split(' at ')[1]
-                    color_str = details.split('(Color: ')[1].split(')')[0]
                     fp_part = details.split('fingerprint: ')[1]
                     from_fp_str, to_fp_str = fp_part.replace(').','').split(' -> ')
                     event.update({
-                        'position': ast.literal_eval(position_str),
-                        'color': int(color_str),
                         'from_fingerprint': int(from_fp_str),
                         'to_fingerprint': int(to_fp_str)
                     })
+                    events.append(event)
                     events.append(event)
                 
                 elif change_type in ['GROWTH', 'SHRINK', 'TRANSFORM']:
@@ -1149,7 +1161,15 @@ class ObrlAgi3Agent(Agent):
         
         # --- Curiosity & Knowledge Features ---
         coords_for_key = {'x': target_object['position'][1], 'y': target_object['position'][0]} if target_object else None
-        action_key = self._get_learning_key(action_template.name, coords_for_key)
+        base_action_key = self._get_learning_key(action_template.name, coords_for_key)
+        contextual_id_part = None
+        contextual_state_part = None
+        if target_object:
+            # The context includes both the specific ID and the object's current state.
+            contextual_id_part = target_object['id']
+            object_state = (self._get_stable_id(target_object), target_object['position'])
+            contextual_state_part = object_state
+        action_key = (base_action_key, contextual_id_part, contextual_state_part)
         
         hypothesis = self.rule_hypotheses.get(action_key)
         if hypothesis:
