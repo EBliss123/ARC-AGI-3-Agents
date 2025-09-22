@@ -60,7 +60,6 @@ class ObrlAgi3Agent(Agent):
             self.is_new_level = False # We've handled the "new level" state, so turn the flag off.
             
             # Assign initial persistent IDs to all objects discovered on the first frame.
-            self.object_id_counter = 0
             for obj in current_summary:
                 self.object_id_counter += 1
                 obj['id'] = f'obj_{self.object_id_counter}'
