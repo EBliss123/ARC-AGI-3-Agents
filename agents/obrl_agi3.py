@@ -213,13 +213,7 @@ class ObrlAgi3Agent(Agent):
                         for msg in sorted(unique_log_messages):
                             print(msg)
 
-                    # --- Intelligent Stability Check ---
-                    # Only wait if the outcome was a surprise (i.e., we have no existing rule for it yet).
-                    # This prevents wasting a turn on known, single-frame changes.
-                    if any(key not in self.rule_hypotheses for key in per_object_keys):
-                        print("Action produced a novel outcome. Waiting to check for animation.")
-                        self.is_waiting_for_stability = True
-
+                    
                     # Report each change under its own per-object contextual key
                     for i, key in enumerate(per_object_keys):
                         # Pass only the single relevant change string
@@ -365,14 +359,25 @@ class ObrlAgi3Agent(Agent):
             # --- Boring Penalty ---
             # Penalize actions that are known to lead to non-unique states.
             boring_penalty = 0.0
-            hypothesis = self.rule_hypotheses.get(action_key)
-            if hypothesis and hypothesis.get('is_boring', False):
-                boring_penalty = -20.0 # Heavy penalty for known unproductive loops
-                
-                # Add this line to print the agent's thought process
-                action_name = move['type'].name
-                obj_id = move['object']['id'].replace('obj_', 'id_') if move['object'] else "global"
-                print(f"Heuristic: Predicting a 'boring' outcome for {action_name} on object {obj_id}. Applying penalty.")
+            if target_object:
+                # Case 1: This is a CLICK action on a specific object.
+                hypothesis = self.rule_hypotheses.get(action_key)
+                if hypothesis and hypothesis.get('is_boring', False):
+                    boring_penalty = -20.0
+                    obj_id = target_object['id'].replace('obj_', 'id_')
+                    print(f"Heuristic: Predicting a 'boring' outcome for {action_key[0]} on object {obj_id}. Applying penalty.")
+            else:
+                # Case 2: This is a GLOBAL action. Scan all objects for potential boring outcomes.
+                action_name = action_template.name
+                for obj in current_summary:
+                    # Construct the specific key for this global action + this object
+                    obj_action_key = (action_name, obj['id'], (self._get_stable_id(obj), obj['position']))
+                    hypothesis = self.rule_hypotheses.get(obj_action_key)
+                    if hypothesis and hypothesis.get('is_boring', False):
+                        # Add a penalty for each predicted boring outcome
+                        boring_penalty -= 20.0
+                        obj_id = obj['id'].replace('obj_', 'id_')
+                        print(f"Heuristic: Predicting a 'boring' outcome for {action_name} on object {obj_id}. Applying penalty.")
 
             score = q_value + exploration_bonus + boring_penalty
 
