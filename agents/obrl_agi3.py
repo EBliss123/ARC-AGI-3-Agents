@@ -1166,9 +1166,10 @@ class ObrlAgi3Agent(Agent):
         features = {}
         action_template = move['type']
         target_object = move['object']
+        action_name = self._get_learning_key(action_template.name, {'x': target_object['position'][1], 'y': target_object['position'][0]} if target_object else None)
 
-        # --- Bias Feature (always on) ---
-        features['bias'] = 1.0
+        # --- Action-Specific Bias Feature ---
+        features[f'bias_for_{action_name}'] = 1.0
 
         # --- Action Type Features ---
         for action_type in GameAction:
@@ -1188,18 +1189,7 @@ class ObrlAgi3Agent(Agent):
             features[f'target_size_h_for_{obj_id}'] = target_object['size'][0] / 64.0
             
             # --- We intentionally DO NOT use generic or relational features for clicks ---
-            
-        else: # This is a non-click, global action
-            # --- Action Type Features ---
-            for action_type in GameAction:
-                features[f'action_is_{action_type.name}'] = 1.0 if action_template.name == action_type.name else 0.0
-
-            # --- Global State Features ---
-            features['total_objects'] = len(summary) / 50.0 # Max objects
-            if summary:
-                unique_colors = len(set(obj['color'] for obj in summary))
-                features['unique_colors'] = unique_colors / 15.0 # Max colors
-        
+                
         # --- Curiosity & Knowledge Features ---
         coords_for_key = {'x': target_object['position'][1], 'y': target_object['position'][0]} if target_object else None
         base_action_key = self._get_learning_key(action_template.name, coords_for_key)
@@ -1214,10 +1204,9 @@ class ObrlAgi3Agent(Agent):
         
         hypothesis = self.rule_hypotheses.get(action_key)
         if hypothesis:
-            features['rule_confidence'] = hypothesis['confidence']
-            features['is_novel_action'] = 0.0 # We have a rule for it, so it's not novel
+            features[f'rule_confidence_for_{action_name}'] = hypothesis['confidence']
+            features[f'is_novel_action_for_{action_name}'] = 0.0
         else:
-            features['rule_confidence'] = 0.0 # No rule exists, confidence is zero
-            features['is_novel_action'] = 1.0 # This action has never been tried and resulted in a change
-
+            features[f'rule_confidence_for_{action_name}'] = 0.0
+            features[f'is_novel_action_for_{action_name}'] = 1.0
         return features
