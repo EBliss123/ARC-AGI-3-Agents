@@ -379,7 +379,25 @@ class ObrlAgi3Agent(Agent):
                         obj_id = obj['id'].replace('obj_', 'id_')
                         print(f"Heuristic: Predicting a 'boring' outcome for {action_name} on object {obj_id}. Applying penalty.")
 
-            score = q_value + exploration_bonus + boring_penalty
+            # --- Click Probing Bonus ---
+            # Heuristic to encourage the agent to "test" all clickable objects once.
+            click_probing_bonus = 0.0
+            if target_object: # This bonus only applies to click actions
+                # Note: 'action_key' is the full 3-part contextual key for the rulebook
+                # 'simple_action_key' is the simpler key used for action counts
+                simple_action_key = self._get_learning_key(action_template.name, coords_for_context)
+                
+                has_been_tried = self.action_counts.get((current_state_key, simple_action_key), 0) > 0
+                has_rule = action_key in self.rule_hypotheses
+
+                if not has_been_tried:
+                    click_probing_bonus = 50.0 # Untried, high priority to test
+                elif has_rule:
+                    click_probing_bonus = -5.0 # Known success, slight penalty to encourage exploring other objects
+                else: # Has been tried, but has no rule (i.e., known failure)
+                    click_probing_bonus = -50.0 # Known failure, heavy penalty
+
+            score = q_value + exploration_bonus + boring_penalty + click_probing_bonus
 
             if score > best_score:
                 best_score = score
@@ -1144,7 +1162,6 @@ class ObrlAgi3Agent(Agent):
             self.weights[feature] = self.weights.get(feature, 0.0) + (self.learning_rate * temporal_difference * value)
         
         # Update action count for exploration bonus
-        prev_action_key = self._get_learning_key(prev_action_name, prev_coords)
         self.action_counts[(self.last_state_key, learning_key)] = self.action_counts.get((self.last_state_key, learning_key), 0) + 1
 
     def _find_object_by_coords(self, coords: dict | None) -> dict | None:
@@ -1176,10 +1193,15 @@ class ObrlAgi3Agent(Agent):
 
         # --- Target Object & Relationship Features (if it's a click) ---
         if target_object:
-            features['target_color'] = target_object['color'] / 15.0 # Max colors ~15
-            features['target_pixels'] = target_object['pixels'] / 4096.0 # Max pixels is 64*64
-            features['target_size_w'] = target_object['size'][1] / 64.0 # Max grid width
-            features['target_size_h'] = target_object['size'][0] / 64.0 # Max grid height
+            obj_id = target_object['id']
+            
+            # --- Object-Specific Features ---
+            # By including the object's unique ID in the feature name, we ensure
+            # that learning from one object does not affect the Q-value of another.
+            features[f'target_color_for_{obj_id}'] = target_object['color'] / 15.0
+            features[f'target_pixels_for_{obj_id}'] = target_object['pixels'] / 4096.0
+            features[f'target_size_w_for_{obj_id}'] = target_object['size'][1] / 64.0
+            features[f'target_size_h_for_{obj_id}'] = target_object['size'][0] / 64.0
             
             # Relationship features
             color_group_size = 0
