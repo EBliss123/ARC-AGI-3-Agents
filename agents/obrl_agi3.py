@@ -200,7 +200,7 @@ class ObrlAgi3Agent(Agent):
                             is_failure_case = True
 
                 # --- Now, with all outcomes known, learn from the last action ---
-                self._learn_from_outcome(latest_frame, changes, current_summary, novel_state_count, is_failure_case)
+                self._learn_from_outcome(latest_frame, changes, current_summary, novel_state_count, is_failure_case, learning_key)
 
                 # --- Handle all Logging and Rule Analysis *after* learning ---
                 if changes:
@@ -226,6 +226,23 @@ class ObrlAgi3Agent(Agent):
                         self._analyze_and_report(key, [changes[i]])
                     self.last_success_contexts[learning_key] = prev_summary
                 
+                    # --- Tag rules that led to non-unique outcomes ---
+                    if changes and not is_failure_case:
+                        # First, get the set of IDs for objects that had a unique change
+                        unique_object_ids = set()
+                        for msg in unique_log_messages:
+                            if "Object id_" in msg:
+                                id_num_str = msg.split('id_')[1].split()[0]
+                                unique_object_ids.add(f"obj_{id_num_str}")
+
+                        # Now, tag the rules for any changed object that was NOT unique
+                        for key in per_object_keys:
+                            # key = (base_action_key, object_id, object_state)
+                            obj_id_from_key = key[1]
+                            if obj_id_from_key not in unique_object_ids:
+                                if key in self.rule_hypotheses:
+                                    self.rule_hypotheses[key]['is_boring'] = True
+
                 elif is_failure_case:
                     # Blacklist the action, regardless of its history.
                     self.failed_action_blacklist.add(learning_key)
@@ -288,6 +305,27 @@ class ObrlAgi3Agent(Agent):
             for obj in current_summary:
                 possible_moves.append({'type': click_action_template, 'object': obj})
 
+        # --- Proactive "Boring" Move Scan ---
+        boring_predictions = []
+        for obj in current_summary:
+            for action_template in game_specific_actions:
+                # Create the specific 3-part key for this potential object/action pair
+                coords_for_key = {'x': obj['position'][1], 'y': obj['position'][0]} if 'CLICK' in action_template.name or action_template.name == 'ACTION6' else None
+                base_action_key = self._get_learning_key(action_template.name, coords_for_key)
+                object_state = (self._get_stable_id(obj), obj['position'])
+                action_key = (base_action_key, obj['id'], object_state)
+
+                hypothesis = self.rule_hypotheses.get(action_key)
+                if hypothesis and hypothesis.get('is_boring', False):
+                    obj_id_str = obj['id'].replace('obj_', 'id_')
+                    boring_predictions.append(f"- Object {obj_id_str}: Action {base_action_key} is predicted to be boring.")
+
+        if boring_predictions:
+            print("\n--- Boring Move Predictions ---")
+            # Use set() to remove any duplicate predictions before printing
+            for prediction in sorted(list(set(boring_predictions))):
+                print(prediction)
+
         # --- RL: Score and select the best action ---
         current_state_key = self._get_state_key(current_summary)
         best_move = None
@@ -324,7 +362,19 @@ class ObrlAgi3Agent(Agent):
             action_count = self.action_counts.get((current_state_key, action_key), 0)
             exploration_bonus = 1.0 / (1.0 + action_count)
 
-            score = q_value + exploration_bonus
+            # --- Boring Penalty ---
+            # Penalize actions that are known to lead to non-unique states.
+            boring_penalty = 0.0
+            hypothesis = self.rule_hypotheses.get(action_key)
+            if hypothesis and hypothesis.get('is_boring', False):
+                boring_penalty = -20.0 # Heavy penalty for known unproductive loops
+                
+                # Add this line to print the agent's thought process
+                action_name = move['type'].name
+                obj_id = move['object']['id'].replace('obj_', 'id_') if move['object'] else "global"
+                print(f"Heuristic: Predicting a 'boring' outcome for {action_name} on object {obj_id}. Applying penalty.")
+
+            score = q_value + exploration_bonus + boring_penalty
 
             if score > best_score:
                 best_score = score
@@ -507,7 +557,8 @@ class ObrlAgi3Agent(Agent):
                 'rules': new_events,
                 'attempts': 1,
                 'confirmations': 1,
-                'confidence': 1.0
+                'confidence': 1.0,
+                'is_boring': False,
             }
             print(f"\n--- Initial Case File for {action_key} (Confidence: 100%) ---")
             for event in new_events:
@@ -959,7 +1010,7 @@ class ObrlAgi3Agent(Agent):
         state_tuple = tuple(sorted(self._get_stable_id(obj) for obj in object_summary))
         return str(hash(state_tuple))
     
-    def _learn_from_outcome(self, latest_frame: FrameData, changes: list[str], new_summary: list[dict], novel_state_count: int, is_failure: bool):
+    def _learn_from_outcome(self, latest_frame: FrameData, changes: list[str], new_summary: list[dict], novel_state_count: int, is_failure: bool, learning_key: str):
         """Calculates reward and updates model weights based on the last action's outcome."""
         if not self.last_state_key or not self.last_action_context:
             return
@@ -1019,18 +1070,13 @@ class ObrlAgi3Agent(Agent):
              # If no new objects were created AND no changes happened, it was a wasted turn.
              # This overlaps with the inaction penalty but reinforces it.
              reward -= 2
-
-        # --- Repetition Penalty ---
-        # Get the key for the action we just took.
-        prev_action_name, prev_coords = self.last_action_context
-        prev_action_key = self._get_learning_key(prev_action_name, prev_coords)
-
+        
         # Check if the action was a "discovery" (i.e., created new object states).
         was_discovery = novel_object_count > 0
         if not was_discovery:
             # If it wasn't a discovery, penalize it based on how many times we've tried it.
             # The count is for the PREVIOUS state-action pair, before the update.
-            repetition_count = self.action_counts.get((self.last_state_key, prev_action_key), 0)
+            repetition_count = self.action_counts.get((self.last_state_key, learning_key), 0)
             # The penalty increases with each repetition of the unproductive action.
             reward -= repetition_count
 
@@ -1094,7 +1140,7 @@ class ObrlAgi3Agent(Agent):
         
         # Update action count for exploration bonus
         prev_action_key = self._get_learning_key(prev_action_name, prev_coords)
-        self.action_counts[(self.last_state_key, prev_action_key)] = self.action_counts.get((self.last_state_key, prev_action_key), 0) + 1
+        self.action_counts[(self.last_state_key, learning_key)] = self.action_counts.get((self.last_state_key, learning_key), 0) + 1
 
     def _find_object_by_coords(self, coords: dict | None) -> dict | None:
         """Helper to find an object in the last summary based on click coordinates."""
