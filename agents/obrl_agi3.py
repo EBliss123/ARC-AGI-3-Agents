@@ -431,6 +431,28 @@ class ObrlAgi3Agent(Agent):
         This method is called by the game to see if the agent thinks it is done.
         """
         return False
+
+    def _find_single_property_change_match(self, new_obj):
+        """Finds a removed object that matches the new object in all but one property."""
+        new_stable_id = self._get_stable_id(new_obj)
+        
+        for old_stable_id in self.removed_objects_memory.keys():
+            diffs = {}
+            # old_stable_id = (fingerprint, color, size, pixels)
+            if new_stable_id[0] != old_stable_id[0]:
+                diffs['shape'] = (old_stable_id[0], new_stable_id[0])
+            if new_stable_id[1] != old_stable_id[1]:
+                diffs['color'] = (old_stable_id[1], new_stable_id[1])
+            if new_stable_id[2] != old_stable_id[2]:
+                diffs['size'] = (old_stable_id[2], new_stable_id[2])
+            if new_stable_id[3] != old_stable_id[3]:
+                diffs['pixels'] = (old_stable_id[3], new_stable_id[3])
+
+            if len(diffs) == 1:
+                # We found a match with exactly one property change.
+                return old_stable_id, diffs
+                
+        return None, None
     
     def _get_learning_key(self, action_name: str, coords: dict | None) -> str:
         """Generates a unique key for learning, specific to coordinates for CLICK actions."""
@@ -978,34 +1000,52 @@ class ObrlAgi3Agent(Agent):
             old_unexplained = [obj for obj in old_unexplained if id(obj) not in matched_old]
             new_unexplained = [obj for obj in new_unexplained if id(obj) not in matched_new]
 
-        # --- Final Pass: Log remaining as REMOVED, NEW, or REAPPEARED ---
+        # --- Final Pass: Log remaining as REMOVED, and then handle NEW, REAPPEARED, or TRANSFORMED ---
         for obj in old_unexplained:
             stable_id = self._get_stable_id(obj)
             changes.append(f"- REMOVED: Object {obj['id'].replace('obj_', 'id_')} (ID {stable_id}) at {obj['position']} has disappeared.")
-            # Update memory with the persistent ID, storing a list for each stable ID type.
-            if stable_id not in self.removed_objects_memory:
-                self.removed_objects_memory[stable_id] = deque()
-            self.removed_objects_memory[stable_id].append(obj['id'])
+            self.removed_objects_memory.setdefault(stable_id, deque()).append(obj['id'])
 
-        for obj in new_unexplained:
-            stable_id = self._get_stable_id(obj)
-
-            if assign_new_ids:
-                # Live mode: Check for reappearance or assign a new persistent ID.
+        if assign_new_ids:
+            unmatched_new = []
+            # Step 1: Check for perfect matches (REAPPEARED) first.
+            for obj in new_unexplained:
+                stable_id = self._get_stable_id(obj)
                 if stable_id in self.removed_objects_memory:
                     persistent_id = self.removed_objects_memory[stable_id].popleft()
                     if not self.removed_objects_memory[stable_id]:
                         del self.removed_objects_memory[stable_id]
                     obj['id'] = persistent_id
-                    changes.append(f"- REAPPEARED: Object {persistent_id.replace('obj_', 'id_')} (ID {stable_id}) has reappeared at {obj['position']}.")
+                    changes.append(f"- REAPPEARED: Object {persistent_id.replace('obj_', 'id_')} (ID {stable_id}) reappeared at {obj['position']}.")
                 else:
-                    self.object_id_counter += 1
-                    new_id = f'obj_{self.object_id_counter}'
-                    obj['id'] = new_id
-                    changes.append(f"- NEW: Object {new_id.replace('obj_', 'id_')} (ID {stable_id}) has appeared at {obj['position']}.")
-            else:
-                # Analysis mode: Do not assign a new ID. Log with the object's existing ID.
-                changes.append(f"- NEW: Object {obj['id'].replace('obj_', 'id_')} (ID {stable_id}) has appeared at {obj['position']}.")
+                    unmatched_new.append(obj)
+            
+            # Step 2: For the remainder, check for fuzzy matches (TRANSFORMED).
+            still_unmatched = []
+            for obj in unmatched_new:
+                old_match_id, changed_properties = self._find_single_property_change_match(obj)
+                if old_match_id:
+                    persistent_id = self.removed_objects_memory[old_match_id].popleft()
+                    if not self.removed_objects_memory[old_match_id]:
+                        del self.removed_objects_memory[old_match_id]
+                    obj['id'] = persistent_id
+                    
+                    prop_name, (old_val, new_val) = list(changed_properties.items())[0]
+                    changes.append(f"- REAPPEARED & TRANSFORMED: Object {persistent_id.replace('obj_', 'id_')} reappeared, changing {prop_name} from {old_val} to {new_val}, now at {obj['position']}.")
+                else:
+                    still_unmatched.append(obj)
+
+            # Step 3: Anything left is truly NEW.
+            for obj in still_unmatched:
+                self.object_id_counter += 1
+                new_id = f'obj_{self.object_id_counter}'
+                obj['id'] = new_id
+                stable_id = self._get_stable_id(obj)
+                changes.append(f"- NEW: Object {new_id.replace('obj_', 'id_')} (ID {stable_id}) appeared at {obj['position']}.")
+        else: # Analysis mode (assign_new_ids=False)
+            for obj in new_unexplained:
+                stable_id = self._get_stable_id(obj)
+                changes.append(f"- NEW: Object {obj['id'].replace('obj_', 'id_')} (ID {stable_id}) appeared at {obj['position']}.")
 
         return sorted(changes), new_summary
     
