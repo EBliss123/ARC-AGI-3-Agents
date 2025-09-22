@@ -49,6 +49,7 @@ class ObrlAgi3Agent(Agent):
             self.actions_printed = False  # Reset the print flag for the new game.
             self.last_score = 0
             self.is_new_level = True
+            self.object_id_counter = 0
             return GameAction.RESET
         
         current_summary = self._perceive_objects(latest_frame)
