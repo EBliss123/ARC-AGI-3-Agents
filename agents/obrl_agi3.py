@@ -354,7 +354,10 @@ class ObrlAgi3Agent(Agent):
                 q_value += self.weights.get(feature, 0.0) * value
             
             action_count = self.action_counts.get((current_state_key, action_key), 0)
-            exploration_bonus = 1.0 / (1.0 + action_count)
+            if action_count == 0:
+                exploration_bonus = 25.0 # Large bonus to encourage trying a new action
+            else:
+                exploration_bonus = 1.0 / (1.0 + action_count) # Smaller bonus for less-used actions
 
             # --- Boring Penalty ---
             # Penalize actions that are known to lead to non-unique states.
@@ -1195,40 +1198,26 @@ class ObrlAgi3Agent(Agent):
         if target_object:
             obj_id = target_object['id']
             
-            # --- Object-Specific Features ---
-            # By including the object's unique ID in the feature name, we ensure
-            # that learning from one object does not affect the Q-value of another.
+            # --- Object-Specific Features ONLY ---
+            # By including the object's unique ID in the feature name and removing all
+            # global or relational features, we achieve perfect isolation.
             features[f'target_color_for_{obj_id}'] = target_object['color'] / 15.0
             features[f'target_pixels_for_{obj_id}'] = target_object['pixels'] / 4096.0
             features[f'target_size_w_for_{obj_id}'] = target_object['size'][1] / 64.0
             features[f'target_size_h_for_{obj_id}'] = target_object['size'][0] / 64.0
             
-            # Relationship features
-            color_group_size = 0
-            shape_group_size = 0
+            # --- We intentionally DO NOT use generic or relational features for clicks ---
             
-            # Find the size of the groups the target object belongs to
-            rels = self._analyze_relationships(summary)
-            target_id = int(target_object['id'].replace('obj_',''))
-            
-            for group in rels.get('Color', {}).values():
-                if target_id in group:
-                    color_group_size = len(group)
-                    break
-            for group in rels.get('Shape', {}).values():
-                 if target_id in group:
-                    shape_group_size = len(group)
-                    break
-            
-            # Normalizing by max possible objects in a group (e.g., 50) is still a good heuristic
-            features['target_in_color_group_size'] = color_group_size / 50.0 
-            features['target_in_shape_group_size'] = shape_group_size / 50.0
+        else: # This is a non-click, global action
+            # --- Action Type Features ---
+            for action_type in GameAction:
+                features[f'action_is_{action_type.name}'] = 1.0 if action_template.name == action_type.name else 0.0
 
-        # --- Global State Features ---
-        features['total_objects'] = len(summary) / 50.0 # Max objects
-        if summary:
-            unique_colors = len(set(obj['color'] for obj in summary))
-            features['unique_colors'] = unique_colors / 15.0 # Max colors
+            # --- Global State Features ---
+            features['total_objects'] = len(summary) / 50.0 # Max objects
+            if summary:
+                unique_colors = len(set(obj['color'] for obj in summary))
+                features['unique_colors'] = unique_colors / 15.0 # Max colors
         
         # --- Curiosity & Knowledge Features ---
         coords_for_key = {'x': target_object['position'][1], 'y': target_object['position'][0]} if target_object else None
