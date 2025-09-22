@@ -397,7 +397,6 @@ class ObrlAgi3Agent(Agent):
                         'vector': (end_pos[0] - start_pos[0], end_pos[1] - start_pos[1])
                     })
                     events.append(event)
-                    events.append(event)
 
                 elif change_type == 'RECOLORED':
                     from_color_str = details.split(' from ')[1].split(' to ')[0]
@@ -415,7 +414,6 @@ class ObrlAgi3Agent(Agent):
                         'from_fingerprint': int(from_fp_str),
                         'to_fingerprint': int(to_fp_str)
                     })
-                    events.append(event)
                     events.append(event)
                 
                 elif change_type in ['GROWTH', 'SHRINK', 'TRANSFORM']:
