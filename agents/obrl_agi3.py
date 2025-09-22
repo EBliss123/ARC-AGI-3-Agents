@@ -39,6 +39,8 @@ class ObrlAgi3Agent(Agent):
         self.total_moves = 0
         self.failed_action_blacklist = set()
         self.turns_without_discovery = 0
+        self.turns_without_discovery = 0
+        self.action_history = {}
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -134,8 +136,8 @@ class ObrlAgi3Agent(Agent):
 
             if self.last_action_context:
                 # --- Analyze the outcome of the previous action ---
-                prev_action_name, prev_coords = self.last_action_context
-                learning_key = self._get_learning_key(prev_action_name, prev_coords)
+                prev_action_name, prev_target_id = self.last_action_context
+                learning_key = self._get_learning_key(prev_action_name, prev_target_id)
                 just_finished_waiting = False
                 is_failure_case = False
                 novel_state_count = 0
@@ -193,8 +195,7 @@ class ObrlAgi3Agent(Agent):
                 else:
                     # No changes occurred. Check if this is a failure, but NOT if we just finished waiting.
                     if not just_finished_waiting:
-                        prev_action_name, prev_coords = self.last_action_context
-                        learning_key = self._get_learning_key(prev_action_name, prev_coords)
+                        # We already have the correct learning_key from the top of the block.
                         if learning_key in self.last_success_contexts or self.action_counts.get((self.last_state_key, learning_key), 0) > 0:
                             is_failure_case = True
 
@@ -422,7 +423,8 @@ class ObrlAgi3Agent(Agent):
         self.last_state_key = current_state_key # Remember the state for the next learning cycle
 
         # Before returning, store the context of the chosen action for the next turn's analysis.
-        self.last_action_context = (action_to_return.name, coords_for_context)
+        target_id_for_context = chosen_object['id'] if chosen_object else None
+        self.last_action_context = (action_to_return.name, target_id_for_context)
         
         return action_to_return
 
@@ -454,10 +456,10 @@ class ObrlAgi3Agent(Agent):
                 
         return None, None
     
-    def _get_learning_key(self, action_name: str, coords: dict | None) -> str:
-        """Generates a unique key for learning, specific to coordinates for CLICK actions."""
-        if action_name == 'ACTION6' and coords:
-            return f"{action_name}_({coords['x']},{coords['y']})"
+    def _get_learning_key(self, action_name: str, target_id: str | None) -> str:
+        """Generates a unique key for learning, specific to an object ID for CLICK actions."""
+        if action_name == 'ACTION6' and target_id:
+            return f"{action_name}_{target_id}"
         return action_name
     
     def _parse_change_logs_to_events(self, changes: list[str]) -> list[dict]:
@@ -1095,8 +1097,15 @@ class ObrlAgi3Agent(Agent):
             # An action that causes more things to happen is considered more valuable.
             reward += len(changes)
         else:
-            # The penalty for an action that does nothing remains.
+            # Apply a small base penalty for doing nothing.
             reward -= 5
+            # Check the action's lifetime history.
+            history = self.action_history.get(learning_key)
+            if history and history['successes'] == 0:
+                # This action has a history of ONLY ever failing. Punish it exponentially.
+                failed_attempts = history['attempts']
+                exponential_penalty = (10 ** failed_attempts) - 1
+                reward -= exponential_penalty
 
         # --- Object-Level Novelty Reward ---
         novel_object_count = 0
@@ -1169,8 +1178,10 @@ class ObrlAgi3Agent(Agent):
             max_q_for_next_state = max(q_values_for_next_state)
 
         # 3. Calculate the prediction error (Temporal Difference)
-        prev_action_name, prev_coords = self.last_action_context
-        prev_move_mock = {'type': GameAction[prev_action_name], 'object': self._find_object_by_coords(prev_coords)}
+        prev_action_name, prev_target_id = self.last_action_context
+        # Find the object in the previous summary by its persistent ID
+        prev_object = next((obj for obj in self.last_object_summary if obj['id'] == prev_target_id), None)
+        prev_move_mock = {'type': GameAction[prev_action_name], 'object': prev_object}
         
         # We need the summary from the *previous* state to get the old features
         prev_summary = self.last_object_summary 
@@ -1187,6 +1198,12 @@ class ObrlAgi3Agent(Agent):
         
         # Update action count for exploration bonus
         self.action_counts[(self.last_state_key, learning_key)] = self.action_counts.get((self.last_state_key, learning_key), 0) + 1
+
+        # Update the lifetime action history
+        history = self.action_history.setdefault(learning_key, {'attempts': 0, 'successes': 0})
+        history['attempts'] += 1
+        if changes:
+            history['successes'] += 1
 
     def _find_object_by_coords(self, coords: dict | None) -> dict | None:
         """Helper to find an object in the last summary based on click coordinates."""
@@ -1206,15 +1223,10 @@ class ObrlAgi3Agent(Agent):
         features = {}
         action_template = move['type']
         target_object = move['object']
-        action_name = self._get_learning_key(action_template.name, {'x': target_object['position'][1], 'y': target_object['position'][0]} if target_object else None)
+        action_name = self._get_learning_key(action_template.name, target_object['id'] if target_object else None)
 
         # --- Action-Specific Bias Feature ---
         features[f'bias_for_{action_name}'] = 1.0
-
-        # --- Action Type Features ---
-        for action_type in GameAction:
-            # Is this action the one we are considering?
-            features[f'action_is_{action_type.name}'] = 1.0 if action_template.name == action_type.name else 0.0
 
         # --- Target Object & Relationship Features (if it's a click) ---
         if target_object:
@@ -1229,10 +1241,15 @@ class ObrlAgi3Agent(Agent):
             features[f'target_size_h_for_{obj_id}'] = target_object['size'][0] / 64.0
             
             # --- We intentionally DO NOT use generic or relational features for clicks ---
-                
+
+        else: # This is a non-click, global action
+            # --- Action Type Features ---
+            for action_type in GameAction:
+                features[f'action_is_{action_type.name}'] = 1.0 if action_template.name == action_type.name else 0.0
+
         # --- Curiosity & Knowledge Features ---
-        coords_for_key = {'x': target_object['position'][1], 'y': target_object['position'][0]} if target_object else None
-        base_action_key = self._get_learning_key(action_template.name, coords_for_key)
+        target_id_for_key = target_object['id'] if target_object else None
+        base_action_key = self._get_learning_key(action_template.name, target_id_for_key)
         contextual_id_part = None
         contextual_state_part = None
         if target_object:
