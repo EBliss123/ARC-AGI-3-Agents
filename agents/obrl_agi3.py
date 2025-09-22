@@ -4,6 +4,7 @@ from .structs import GameAction, GameState
 from collections import deque
 import copy
 import ast
+import math
 
 class ObrlAgi3Agent(Agent):
     """
@@ -158,8 +159,7 @@ class ObrlAgi3Agent(Agent):
                             
                             if obj_id in prev_summary_map:
                                 target_in_prev_state = prev_summary_map[obj_id]
-                                prev_action_name, _ = self.last_action_context
-                                base_action_key = self._get_learning_key(prev_action_name, None)
+                                base_action_key = learning_key
                                 
                                 # Create the object's complete state description (properties + position)
                                 object_state = (self._get_stable_id(target_in_prev_state), target_in_prev_state['position'])
@@ -324,95 +324,78 @@ class ObrlAgi3Agent(Agent):
         current_state_key = self._get_state_key(current_summary)
         best_move = None
         best_score = -float('inf')
-
-        if not possible_moves:
-             # If there are no possible moves, we might need a fallback.
-             # For now, let's try to use a generic click or another default.
-             possible_moves.append({'type': random.choice([a for a in GameAction if a is not GameAction.RESET]), 'object': None})
-
         all_scores_debug = []
+
+        # --- Pass 1: Pre-calculate Q-values and find the best score among KNOWN actions ---
+        move_data = []
+        max_q_of_known_actions = -float('inf')
+
         for move in possible_moves:
             action_template = move['type']
             target_object = move['object']
-            coords_for_context = None
+            coords_for_context = {'x': target_object['position'][1], 'y': target_object['position'][0]} if target_object else None
+            
+            # Get the simple key for action counts
+            simple_action_key = self._get_learning_key(action_template.name, coords_for_context)
+            if simple_action_key in self.failed_action_blacklist:
+                continue
 
-            if target_object:
-                pos = target_object['position']
-                coords_for_context = {'x': pos[1], 'y': pos[0]}
+            # Get the full contextual key for rule lookups
+            base_action_key = simple_action_key
+            contextual_id_part = target_object['id'] if target_object else None
+            contextual_state_part = (self._get_stable_id(target_object), target_object['position']) if target_object else None
+            contextual_action_key = (base_action_key, contextual_id_part, contextual_state_part)
 
-            action_key = self._get_learning_key(action_template.name, coords_for_context)
-
-            # --- Check if the action is currently blacklisted ---
-            if action_key in self.failed_action_blacklist:
-                continue # Skip this action
-
+            # Calculate Q-Value
             features = self._extract_features(current_summary, move)
+            q_value = sum(self.weights.get(f, 0.0) * v for f, v in features.items())
             
-            # Calculate Q-value as the dot product of features and weights
-            q_value = 0.0
-            for feature, value in features.items():
-                q_value += self.weights.get(feature, 0.0) * value
+            action_count = self.action_counts.get((current_state_key, simple_action_key), 0)
             
-            action_count = self.action_counts.get((current_state_key, action_key), 0)
-            if action_count == 0:
-                exploration_bonus = 25.0 # Large bonus to encourage trying a new action
-            else:
-                exploration_bonus = 1.0 / (1.0 + action_count) # Smaller bonus for less-used actions
-
-            # --- Boring Penalty ---
-            # Penalize actions that are known to lead to non-unique states.
+            # Check for boring penalty
             boring_penalty = 0.0
-            if target_object:
-                # Case 1: This is a CLICK action on a specific object.
-                hypothesis = self.rule_hypotheses.get(action_key)
-                if hypothesis and hypothesis.get('is_boring', False):
-                    boring_penalty = -20.0
-                    obj_id = target_object['id'].replace('obj_', 'id_')
-                    print(f"Heuristic: Predicting a 'boring' outcome for {action_key[0]} on object {obj_id}. Applying penalty.")
+            hypothesis = self.rule_hypotheses.get(contextual_action_key)
+            if hypothesis and hypothesis.get('is_boring', False):
+                boring_penalty = -20.0
+                obj_id = target_object['id'].replace('obj_', 'id_') if target_object else "global"
+                print(f"Heuristic: Predicting a 'boring' outcome for {base_action_key} on object {obj_id}. Applying penalty.")
+
+            final_q = q_value + boring_penalty
+            move_data.append({'move': move, 'q': final_q, 'count': action_count, 'name': ""})
+            
+            if action_count > 0:
+                if final_q > max_q_of_known_actions:
+                    max_q_of_known_actions = final_q
+
+        # If no actions were ever tried, default to 0 to avoid a negative bonus
+        if max_q_of_known_actions == -float('inf'):
+            max_q_of_known_actions = 0.0
+
+        # --- Pass 2: Calculate final scores using the dynamic novelty bonus ---
+        # The bonus is calculated to be slightly higher than the best known option.
+        novelty_bonus = max(0, -max_q_of_known_actions) + 1.0
+
+        for data in move_data:
+            score = 0
+            if data['count'] == 0:
+                # This is an untested action. Its score is the powerful novelty bonus.
+                score = novelty_bonus
             else:
-                # Case 2: This is a GLOBAL action. Scan all objects for potential boring outcomes.
-                action_name = action_template.name
-                for obj in current_summary:
-                    # Construct the specific key for this global action + this object
-                    obj_action_key = (action_name, obj['id'], (self._get_stable_id(obj), obj['position']))
-                    hypothesis = self.rule_hypotheses.get(obj_action_key)
-                    if hypothesis and hypothesis.get('is_boring', False):
-                        # Add a penalty for each predicted boring outcome
-                        boring_penalty -= 20.0
-                        obj_id = obj['id'].replace('obj_', 'id_')
-                        print(f"Heuristic: Predicting a 'boring' outcome for {action_name} on object {obj_id}. Applying penalty.")
-
-            # --- Click Probing Bonus ---
-            # Heuristic to encourage the agent to "test" all clickable objects once.
-            click_probing_bonus = 0.0
-            if target_object: # This bonus only applies to click actions
-                # Note: 'action_key' is the full 3-part contextual key for the rulebook
-                # 'simple_action_key' is the simpler key used for action counts
-                simple_action_key = self._get_learning_key(action_template.name, coords_for_context)
-                
-                has_been_tried = self.action_counts.get((current_state_key, simple_action_key), 0) > 0
-                has_rule = action_key in self.rule_hypotheses
-
-                if not has_been_tried:
-                    click_probing_bonus = 50.0 # Untried, high priority to test
-                elif has_rule:
-                    click_probing_bonus = -5.0 # Known success, slight penalty to encourage exploring other objects
-                else: # Has been tried, but has no rule (i.e., known failure)
-                    click_probing_bonus = -50.0 # Known failure, heavy penalty
-
-            score = q_value + exploration_bonus + boring_penalty + click_probing_bonus
+                # This is a known action. Its score is its learned Q-value.
+                score = data['q']
 
             if score > best_score:
                 best_score = score
-                best_move = move
-
+                best_move = data['move']
+            
             # Create a user-friendly name for the debug log
+            target_object = data['move']['object']
             if target_object:
                 obj_id = target_object['id'].replace('obj_', 'id_')
-                debug_name = f"CLICK on {obj_id}"
+                data['name'] = f"CLICK on {obj_id}"
             else:
-                debug_name = action_template.name
-            all_scores_debug.append(f"{debug_name} (Score: {score:.2f})")
+                data['name'] = data['move']['type'].name
+            all_scores_debug.append(f"{data['name']} (Score: {score:.2f})")
         
         # --- Fallback if all available actions were blacklisted ---
         if best_move is None and possible_moves:
