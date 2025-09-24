@@ -162,7 +162,12 @@ class ObrlAgi3Agent(Agent):
             current_score = latest_frame.score
             if current_score > self.last_score:
                 print(f"\n--- LEVEL CHANGE DETECTED (Score increased from {self.last_score} to {current_score}) ---")
-                print("Saving final frame for cross-level object matching.")
+                
+                # Print the full summary of the final frame of the level that was just won.
+                print("\n--- Final Frame Summary (Old Level) ---")
+                self._print_full_summary(self.last_object_summary)
+
+                print("\nSaving final frame for cross-level object matching.")
                 # Save the final summary of the completed level for comparison.
                 self.final_summary_before_level_change = self.last_object_summary
                 # Signal that the next frame is the start of a new level, but preserve all memory.
