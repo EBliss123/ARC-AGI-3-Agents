@@ -41,6 +41,8 @@ class ObrlAgi3Agent(Agent):
         self.turns_without_discovery = 0
         self.turns_without_discovery = 0
         self.action_history = {}
+        self.is_new_level = True
+        self.final_summary_before_level_change = None
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -58,14 +60,71 @@ class ObrlAgi3Agent(Agent):
 
         # If this is the first scan (last summary is empty), print the full summary.
         if not self.last_object_summary or self.is_new_level:
-            print("--- Initial Frame Summary ---")
-            self.is_new_level = False # We've handled the "new level" state, so turn the flag off.
+            self.is_new_level = False
+
+            id_map = {} # To store {old_id: new_id} mappings
+            new_obj_to_old_id_map = {} # Initialize our map to handle the first frame case
             
-            # Assign initial persistent IDs to all objects discovered on the first frame.
-            for obj in current_summary:
+            # If we have a saved frame, perform correlation before final ID assignment.
+            if self.final_summary_before_level_change is not None:
+                print("--- Correlating Objects Across Levels ---")
+                
+                # This temporary map will link a new object to its old ID.
+                new_obj_to_old_id_map = {}
+
+                # --- Two-Pass Matching to find correspondences ---
+                unmatched_old = list(self.final_summary_before_level_change)
+                unmatched_new = list(current_summary)
+                
+                # Pass 1: Strict Matching
+                old_strict_map = {(self._get_stable_id(obj), obj['position']): obj for obj in unmatched_old}
+                pass1_newly_matched = []
+                for new_obj in unmatched_new:
+                    strict_key = (self._get_stable_id(new_obj), new_obj['position'])
+                    if strict_key in old_strict_map:
+                        old_obj = old_strict_map[strict_key]
+                        new_obj_to_old_id_map[id(new_obj)] = old_obj['id']
+                        pass1_newly_matched.append(new_obj)
+                        unmatched_old.remove(old_obj)
+                unmatched_new = [obj for obj in unmatched_new if obj not in pass1_newly_matched]
+
+                # Pass 2: Flexible Matching
+                if unmatched_old and unmatched_new:
+                    old_flexible_map = {}
+                    for obj in unmatched_old:
+                        old_flexible_map.setdefault(self._get_stable_id(obj), deque()).append(obj)
+                    for new_obj in unmatched_new:
+                        stable_id = self._get_stable_id(new_obj)
+                        if stable_id in old_flexible_map and old_flexible_map[stable_id]:
+                            old_obj = old_flexible_map[stable_id].popleft()
+                            new_obj_to_old_id_map[id(new_obj)] = old_obj['id']
+
+                self.final_summary_before_level_change = None
+
+            # --- Final Re-Numbering and Memory Migration ---
+            print("--- Finalizing Frame with Sequential IDs ---")
+            self.object_id_counter = 0
+            
+            # Sort by position for a clean, predictable order.
+            sorted_summary = sorted(current_summary, key=lambda o: (o['position'][0], o['position'][1]))
+            
+            for obj in sorted_summary:
                 self.object_id_counter += 1
-                obj['id'] = f'obj_{self.object_id_counter}'
+                new_id = f'obj_{self.object_id_counter}'
+                
+                # If this object was matched, record the mapping from its old ID to its new one.
+                if id(obj) in new_obj_to_old_id_map:
+                    old_id = new_obj_to_old_id_map[id(obj)]
+                    id_map[old_id] = new_id
+                
+                obj['id'] = new_id # Assign the new, clean ID.
             
+            current_summary = sorted_summary
+
+            if id_map:
+                self._remap_memory(id_map)
+
+            print("--- Initial Frame Summary ---")
             if not current_summary:
                 print("No objects found.")
             self._print_full_summary(current_summary)
@@ -100,31 +159,11 @@ class ObrlAgi3Agent(Agent):
             current_score = latest_frame.score
             if current_score > self.last_score:
                 print(f"\n--- LEVEL CHANGE DETECTED (Score increased from {self.last_score} to {current_score}) ---")
-                
-                # Print summary of the old level's last frame (which is self.last_object_summary)
-                print("\n--- Final Frame Summary (Old Level) ---")
-                self._print_full_summary(self.last_object_summary)
-
-                # Reset agent's learning and memory for the new level
-                print("Resetting agent's memory for new level.")
-                
-                self.rule_hypotheses = {}
-                self.last_success_contexts = {}
-                self.last_relationships = {}
-                self.last_action_context = None
+                print("Saving final frame for cross-level object matching.")
+                # Save the final summary of the completed level for comparison.
+                self.final_summary_before_level_change = self.last_object_summary
+                # Signal that the next frame is the start of a new level, but preserve all memory.
                 self.is_new_level = True
-                self.removed_objects_memory = {}
-                self.object_id_counter = 0
-                
-                # --- Reset core RL knowledge ---
-                self.weights = {}
-                self.action_counts = {}
-
-                # --- Reset performance trackers and blacklists ---
-                self.total_unique_changes = 0
-                self.total_moves = 0
-                self.failed_action_blacklist.clear()
-                self.seen_configurations.clear()
 
             # Update the score tracker for the next turn.
             self.last_score = current_score
@@ -455,6 +494,37 @@ class ObrlAgi3Agent(Agent):
                 return old_stable_id, diffs
                 
         return None, None
+    
+    def _remap_memory(self, id_map: dict[str, str]):
+        """Updates all learning structures to use new IDs after a re-numbering."""
+        print(f"Remapping memory for {len(id_map)} objects...")
+
+        def remap_key(key):
+            if isinstance(key, str) and '_' in key:
+                parts = key.split('_')
+                action_part, old_id_part = parts[0], '_'.join(parts[1:])
+                if old_id_part in id_map:
+                    return f"{action_part}_{id_map[old_id_part]}"
+            return key
+
+        # Remap weights, action_counts, and action_history
+        for memory_dict in [self.weights, self.action_counts, self.action_history]:
+            keys_to_remap = [k for k in memory_dict.keys() if any(old_id in str(k) for old_id in id_map)]
+            for old_key in keys_to_remap:
+                new_key = remap_key(old_key) if isinstance(old_key, str) else \
+                          (remap_key(old_key[0]), remap_key(old_key[1]))
+                if new_key != old_key:
+                    memory_dict[new_key] = memory_dict.pop(old_key)
+
+        # Remap rule_hypotheses, which have a more complex key structure
+        keys_to_remap = [k for k in self.rule_hypotheses.keys()]
+        for old_key in keys_to_remap:
+            # old_key = (base_action_key, object_id, object_state)
+            base_action, old_id, obj_state = old_key
+            if old_id in id_map:
+                new_id = id_map[old_id]
+                new_key = (base_action, new_id, obj_state)
+                self.rule_hypotheses[new_key] = self.rule_hypotheses.pop(old_key)
     
     def _get_learning_key(self, action_name: str, target_id: str | None) -> str:
         """Generates a unique key for learning, specific to an object ID for CLICK actions."""
