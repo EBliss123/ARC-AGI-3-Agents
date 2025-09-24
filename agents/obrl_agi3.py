@@ -127,7 +127,10 @@ class ObrlAgi3Agent(Agent):
             print("--- Initial Frame Summary ---")
             if not current_summary:
                 print("No objects found.")
-            self._print_full_summary(current_summary)
+            
+            # Create an inverse map for logging purposes.
+            new_to_old_id_map = {v: k for k, v in id_map.items()}
+            self._print_full_summary(current_summary, new_to_old_id_map)
 
             if current_relationships:
                 print("\n--- Relationship Analysis ---")
@@ -835,8 +838,8 @@ class ObrlAgi3Agent(Agent):
                 print(line)
             print()
 
-    def _print_full_summary(self, summary: list[dict]):
-        """Prints a formatted summary of all objects in a list."""
+    def _print_full_summary(self, summary: list[dict], new_to_old_map: dict = None):
+        """Prints a formatted summary of all objects, noting previous IDs if available."""
         if not summary:
             print("No objects found.")
             return
@@ -844,8 +847,15 @@ class ObrlAgi3Agent(Agent):
         for obj in summary:
             obj_id = obj['id'].replace('obj_', 'id_')
             size_str = f"{obj['size'][0]}x{obj['size'][1]}"
+            
+            # Check if this object was remapped and add its former ID to the log.
+            formerly_str = ""
+            if new_to_old_map and obj['id'] in new_to_old_map:
+                old_id = new_to_old_map[obj['id']].replace('obj_', 'id_')
+                formerly_str = f" (formerly {old_id})"
+
             print(
-                f"- Object {obj_id}: Found a {size_str} object of color {obj['color']} "
+                f"- Object {obj_id}{formerly_str}: Found a {size_str} object of color {obj['color']} "
                 f"at position {obj['position']} with {obj['pixels']} pixels "
                 f"and shape fingerprint {obj['fingerprint']}."
             )
