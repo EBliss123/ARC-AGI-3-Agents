@@ -984,9 +984,10 @@ class ObrlAgi3Agent(Agent):
                     break  # Move to the next old_obj, as its position is now explained
         
         # Remove the explained objects before the next pass
-        for old_match, new_match in matches_to_remove:
-            old_unexplained.remove(old_match)
-            new_unexplained.remove(new_match)
+        matched_old_in_pass1 = {id(o) for o, n in matches_to_remove}
+        matched_new_in_pass1 = {id(n) for o, n in matches_to_remove}
+        old_unexplained = [obj for obj in old_unexplained if id(obj) not in matched_old_in_pass1]
+        new_unexplained = [obj for obj in new_unexplained if id(obj) not in matched_new_in_pass1]
 
         # --- Pass 2: Identify moved objects from the remaining pool ---
         old_map_by_id = {}
@@ -1017,9 +1018,10 @@ class ObrlAgi3Agent(Agent):
                     changes.append(f"- MOVED: Object {old_inst['id'].replace('obj_', 'id_')} moved from {old_inst['position']} to {new_inst['position']}.")
                 moves_to_remove.append((old_inst, new_inst))
         
-        for old_match, new_match in moves_to_remove:
-            old_unexplained.remove(old_match)
-            new_unexplained.remove(new_match)
+        matched_old_in_pass2 = {id(o) for o, n in moves_to_remove}
+        matched_new_in_pass2 = {id(n) for o, n in moves_to_remove}
+        old_unexplained = [obj for obj in old_unexplained if id(obj) not in matched_old_in_pass2]
+        new_unexplained = [obj for obj in new_unexplained if id(obj) not in matched_new_in_pass2]
 
         # --- Pass 3: Fuzzy Matching for GROWTH and SHRINK events ---
         if old_unexplained and new_unexplained:
@@ -1088,6 +1090,8 @@ class ObrlAgi3Agent(Agent):
             new_unexplained = [obj for obj in new_unexplained if id(obj) not in matched_new]
 
         # --- Final Pass: Log remaining as REMOVED, and then handle NEW, REAPPEARED, or TRANSFORMED ---
+        used_persistent_ids = set() # Safeguard to prevent using the same revived ID twice in one turn.
+
         for obj in old_unexplained:
             stable_id = self._get_stable_id(obj)
             changes.append(f"- REMOVED: Object {obj['id'].replace('obj_', 'id_')} (ID {stable_id}) at {obj['position']} has disappeared.")
@@ -1099,11 +1103,23 @@ class ObrlAgi3Agent(Agent):
             for obj in new_unexplained:
                 stable_id = self._get_stable_id(obj)
                 if stable_id in self.removed_objects_memory:
-                    persistent_id = self.removed_objects_memory[stable_id].popleft()
-                    if not self.removed_objects_memory[stable_id]:
+                    id_deque = self.removed_objects_memory[stable_id]
+                    found_id = None
+                    while id_deque:
+                        candidate_id = id_deque.popleft()
+                        if candidate_id not in used_persistent_ids:
+                            found_id = candidate_id
+                            break
+                    
+                    if found_id:
+                        obj['id'] = found_id
+                        used_persistent_ids.add(found_id)
+                        changes.append(f"- REAPPEARED: Object {found_id.replace('obj_', 'id_')} (ID {stable_id}) reappeared at {obj['position']}.")
+                    else:
+                        unmatched_new.append(obj)
+
+                    if not id_deque:
                         del self.removed_objects_memory[stable_id]
-                    obj['id'] = persistent_id
-                    changes.append(f"- REAPPEARED: Object {persistent_id.replace('obj_', 'id_')} (ID {stable_id}) reappeared at {obj['position']}.")
                 else:
                     unmatched_new.append(obj)
             
@@ -1111,14 +1127,25 @@ class ObrlAgi3Agent(Agent):
             still_unmatched = []
             for obj in unmatched_new:
                 old_match_id, changed_properties = self._find_single_property_change_match(obj)
-                if old_match_id:
-                    persistent_id = self.removed_objects_memory[old_match_id].popleft()
-                    if not self.removed_objects_memory[old_match_id]:
-                        del self.removed_objects_memory[old_match_id]
-                    obj['id'] = persistent_id
+                if old_match_id and old_match_id in self.removed_objects_memory:
+                    id_deque = self.removed_objects_memory[old_match_id]
+                    found_id = None
+                    while id_deque:
+                        candidate_id = id_deque.popleft()
+                        if candidate_id not in used_persistent_ids:
+                            found_id = candidate_id
+                            break
                     
-                    prop_name, (old_val, new_val) = list(changed_properties.items())[0]
-                    changes.append(f"- REAPPEARED & TRANSFORMED: Object {persistent_id.replace('obj_', 'id_')} reappeared, changing {prop_name} from {old_val} to {new_val}, now at {obj['position']}.")
+                    if found_id:
+                        obj['id'] = found_id
+                        used_persistent_ids.add(found_id)
+                        prop_name, (old_val, new_val) = list(changed_properties.items())[0]
+                        changes.append(f"- REAPPEARED & TRANSFORMED: Object {found_id.replace('obj_', 'id_')} reappeared, changing {prop_name} from {old_val} to {new_val}, now at {obj['position']}.")
+                    else:
+                        still_unmatched.append(obj)
+
+                    if not id_deque:
+                        del self.removed_objects_memory[old_match_id]
                 else:
                     still_unmatched.append(obj)
 
@@ -1129,10 +1156,22 @@ class ObrlAgi3Agent(Agent):
                 obj['id'] = new_id
                 stable_id = self._get_stable_id(obj)
                 changes.append(f"- NEW: Object {new_id.replace('obj_', 'id_')} (ID {stable_id}) appeared at {obj['position']}.")
-        else: # Analysis mode (assign_new_ids=False)
-            for obj in new_unexplained:
-                stable_id = self._get_stable_id(obj)
-                changes.append(f"- NEW: Object {obj['id'].replace('obj_', 'id_')} (ID {stable_id}) appeared at {obj['position']}.")
+
+        # --- Final Counter Synchronization ---
+        # After all IDs are assigned, ensure the global counter tracks the
+        # highest ID ever used to prevent any future collisions.
+        max_current_id = 0
+        for obj in new_summary:
+            try:
+                id_num = int(obj['id'].replace('obj_', ''))
+                if id_num > max_current_id:
+                    max_current_id = id_num
+            except (ValueError, AttributeError):
+                continue
+        
+        # The counter should only ever increase to match the highest ID seen.
+        if self.object_id_counter < max_current_id:
+            self.object_id_counter = max_current_id
 
         return sorted(changes), new_summary
     
