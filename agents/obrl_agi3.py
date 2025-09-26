@@ -99,6 +99,31 @@ class ObrlAgi3Agent(Agent):
                             old_obj = old_flexible_map[stable_id].popleft()
                             new_obj_to_old_id_map[id(new_obj)] = old_obj['id']
 
+                # Pass 3: Transformation Matching (e.g., color change at same position)
+                if unmatched_old and unmatched_new:
+                    old_pos_map = {obj['position']: obj for obj in unmatched_old}
+                    pass3_newly_matched = []
+                    
+                    for new_obj in unmatched_new:
+                        if new_obj['position'] in old_pos_map:
+                            old_obj = old_pos_map[new_obj['position']]
+                            
+                            # Check for a color change with the same shape/size
+                            if (old_obj['fingerprint'] == new_obj['fingerprint'] and
+                                old_obj['size'] == new_obj['size'] and
+                                old_obj['color'] != new_obj['color']):
+                                
+                                # This is a match. Store old ID and the change info.
+                                change_info = f"recolored from color {old_obj['color']} to {new_obj['color']}"
+                                new_obj['cross_level_change_info'] = change_info
+                                new_obj_to_old_id_map[id(new_obj)] = old_obj['id']
+                                
+                                pass3_newly_matched.append(new_obj)
+                                unmatched_old.remove(old_obj)
+                                del old_pos_map[new_obj['position']] # Prevent re-matching
+                    
+                    unmatched_new = [obj for obj in unmatched_new if obj not in pass3_newly_matched]
+
                 self.final_summary_before_level_change = None
 
             # --- Final Re-Numbering and Memory Migration ---
@@ -853,11 +878,18 @@ class ObrlAgi3Agent(Agent):
             obj_id = obj['id'].replace('obj_', 'id_')
             size_str = f"{obj['size'][0]}x{obj['size'][1]}"
             
-            # Check if this object was remapped and add its former ID to the log.
-            formerly_str = ""
+            # --- Build the descriptive formerly string ---
+            formerly_parts = []
             if new_to_old_map and obj['id'] in new_to_old_map:
                 old_id = new_to_old_map[obj['id']].replace('obj_', 'id_')
-                formerly_str = f" (formerly {old_id})"
+                formerly_parts.append(f"formerly {old_id}")
+            
+            if 'cross_level_change_info' in obj:
+                formerly_parts.append(obj['cross_level_change_info'])
+            
+            formerly_str = ""
+            if formerly_parts:
+                formerly_str = f" ({', '.join(formerly_parts)})"
 
             print(
                 f"- Object {obj_id}{formerly_str}: Found a {size_str} object of color {obj['color']} "
