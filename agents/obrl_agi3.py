@@ -88,16 +88,30 @@ class ObrlAgi3Agent(Agent):
                         unmatched_old.remove(old_obj)
                 unmatched_new = [obj for obj in unmatched_new if obj not in pass1_newly_matched]
 
-                # Pass 2: Flexible Matching
+                # Pass 2: Flexible Matching (Moves)
                 if unmatched_old and unmatched_new:
                     old_flexible_map = {}
                     for obj in unmatched_old:
                         old_flexible_map.setdefault(self._get_stable_id(obj), deque()).append(obj)
+                    
+                    pass2_newly_matched = []
+                    newly_matched_old_in_pass2 = []
                     for new_obj in unmatched_new:
                         stable_id = self._get_stable_id(new_obj)
                         if stable_id in old_flexible_map and old_flexible_map[stable_id]:
                             old_obj = old_flexible_map[stable_id].popleft()
+                            
                             new_obj_to_old_id_map[id(new_obj)] = old_obj['id']
+                            info = f"moved from {old_obj['position']} to {new_obj['position']}"
+                            new_obj['cross_level_change_info'] = info
+                            
+                            pass2_newly_matched.append(new_obj)
+                            newly_matched_old_in_pass2.append(old_obj)
+
+                    if pass2_newly_matched:
+                        unmatched_new = [obj for obj in unmatched_new if obj not in pass2_newly_matched]
+                        old_ids_to_remove = {id(obj) for obj in newly_matched_old_in_pass2}
+                        unmatched_old = [obj for obj in unmatched_old if id(obj) not in old_ids_to_remove]
 
                 # Pass 3: Transformation Matching (e.g., color change at same position)
                 if unmatched_old and unmatched_new:
@@ -123,6 +137,59 @@ class ObrlAgi3Agent(Agent):
                                 del old_pos_map[new_obj['position']] # Prevent re-matching
                     
                     unmatched_new = [obj for obj in unmatched_new if obj not in pass3_newly_matched]
+
+                # Pass 4: Resize/Reshape Matching (allows moves)
+                if unmatched_old and unmatched_new:
+                    potential_pairs = []
+                    for old_obj in unmatched_old:
+                        for new_obj in unmatched_new:
+                            # Match condition: must have same color, but different shape/size.
+                            if (old_obj['color'] == new_obj['color'] and
+                                (old_obj['fingerprint'] != new_obj['fingerprint'] or old_obj['pixels'] != new_obj['pixels'])):
+                                
+                                pos1, pos2 = old_obj['position'], new_obj['position']
+                                distance = abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
+                                potential_pairs.append({'old': old_obj, 'new': new_obj, 'dist': distance})
+                    
+                    # Sort by distance to greedily match the closest pairs first
+                    potential_pairs.sort(key=lambda p: p['dist'])
+                    
+                    pass4_matched_old = set()
+                    pass4_matched_new = set()
+                    for pair in potential_pairs:
+                        old_obj, new_obj = pair['old'], pair['new']
+                        # If either object in this pair has already been matched, skip.
+                        if id(old_obj) in pass4_matched_old or id(new_obj) in pass4_matched_new:
+                            continue
+                        
+                        # This is our best match for these two objects.
+                        new_obj_to_old_id_map[id(new_obj)] = old_obj['id']
+                        
+                        # --- Generate a descriptive string ---
+                        old_size_str = f"{old_obj['size'][0]}x{old_obj['size'][1]}"
+                        new_size_str = f"{new_obj['size'][0]}x{new_obj['size'][1]}"
+                        info_parts = []
+                        
+                        if new_obj['pixels'] > old_obj['pixels']:
+                            info_parts.append(f"grew from {old_size_str} to {new_size_str}")
+                        elif new_obj['pixels'] < old_obj['pixels']:
+                            info_parts.append(f"shrank from {old_size_str} to {new_size_str}")
+                        elif old_obj['fingerprint'] != new_obj['fingerprint']:
+                            info_parts.append("changed shape")
+                        
+                        if old_obj['position'] != new_obj['position']:
+                            info_parts.append(f"moved to {new_obj['position']}")
+                            
+                        new_obj['cross_level_change_info'] = ", ".join(info_parts)
+                        
+                        # Add to matched sets to prevent re-matching
+                        pass4_matched_old.add(id(old_obj))
+                        pass4_matched_new.add(id(new_obj))
+                        
+                    # Clean up the master lists
+                    if pass4_matched_old:
+                        unmatched_old = [obj for obj in unmatched_old if id(obj) not in pass4_matched_old]
+                        unmatched_new = [obj for obj in unmatched_new if id(obj) not in pass4_matched_new]
 
                 self.final_summary_before_level_change = None
 
