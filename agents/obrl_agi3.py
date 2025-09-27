@@ -43,6 +43,7 @@ class ObrlAgi3Agent(Agent):
         self.action_history = {}
         self.is_new_level = True
         self.final_summary_before_level_change = None
+        self.last_adjacencies = {}
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -278,6 +279,7 @@ class ObrlAgi3Agent(Agent):
             self.last_score = current_score
 
             self._log_relationship_changes(self.last_relationships, current_relationships)
+            self._log_adjacency_changes(self.last_adjacencies, current_adjacencies)
 
             # --- Prepare for Learning & Rule Analysis ---
             current_state_key = self._get_state_key(current_summary)
@@ -421,6 +423,7 @@ class ObrlAgi3Agent(Agent):
 
         # Update the memory for the next turn.
         self.last_object_summary = current_summary
+        self.last_adjacencies = current_adjacencies
         self.last_relationships = current_relationships
 
         # This is the REAL list of actions for this specific game on this turn.
@@ -989,6 +992,35 @@ class ObrlAgi3Agent(Agent):
         if output_lines:
             print("\n--- Relationship Change Log ---")
             for line in sorted(output_lines):
+                print(line)
+            print()
+
+    def _log_adjacency_changes(self, old_adj: dict, new_adj: dict):
+        """Compares two simplified adjacency maps and logs the differences."""
+        if old_adj == new_adj:
+            return
+
+        output_lines = []
+        all_ids = set(old_adj.keys()) | set(new_adj.keys())
+
+        for obj_id in sorted(list(all_ids), key=lambda x: int(x.split('_')[1])):
+            old_contacts = old_adj.get(obj_id, ['na'] * 4)
+            new_contacts = new_adj.get(obj_id, ['na'] * 4)
+
+            if old_contacts != new_contacts:
+                clean_id = obj_id.replace('obj_', 'id_')
+                
+                old_ids = [c.replace('obj_', '') if 'obj_' in c else c for c in old_contacts]
+                new_ids = [c.replace('obj_', '') if 'obj_' in c else c for c in new_contacts]
+                
+                old_str = f"({', '.join(old_ids)})"
+                new_str = f"({', '.join(new_ids)})"
+                
+                output_lines.append(f"- Adjacency Change for Object {clean_id}: contacts changed from {old_str} to {new_str}.")
+        
+        if output_lines:
+            print("\n--- Adjacency Change Log ---")
+            for line in output_lines:
                 print(line)
             print()
 
