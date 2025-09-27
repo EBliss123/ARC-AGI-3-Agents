@@ -19,7 +19,8 @@ class ObrlAgi3Agent(Agent):
         self.last_object_summary = []
         self.last_action_context = None  # Will store a tuple of (action_name, coords_dict)
         self.rule_hypotheses = {}
-        self.last_success_contexts = {}
+        self.success_contexts = {}
+        self.failure_contexts = {}
         self.last_relationships = {}
         self.last_score = 0
         self.is_new_level = True
@@ -346,7 +347,7 @@ class ObrlAgi3Agent(Agent):
                     # No changes occurred. Check if this is a failure, but NOT if we just finished waiting.
                     if not just_finished_waiting:
                         # We already have the correct learning_key from the top of the block.
-                        if learning_key in self.last_success_contexts or self.action_counts.get((self.last_state_key, learning_key), 0) > 0:
+                        if learning_key in self.success_contexts or self.action_counts.get((self.last_state_key, learning_key), 0) > 0:
                             is_failure_case = True
 
                 # --- Now, with all outcomes known, learn from the last action ---
@@ -368,7 +369,12 @@ class ObrlAgi3Agent(Agent):
                     for i, key in enumerate(per_object_keys):
                         # Pass only the single relevant change string
                         self._analyze_and_report(key, [changes[i]])
-                    self.last_success_contexts[learning_key] = prev_summary
+                    success_context = {
+                        'summary': prev_summary,
+                        'rels': self.last_relationships,
+                        'adj': self.last_adjacencies
+                    }
+                    self.success_contexts.setdefault(learning_key, []).append(success_context)
                 
                     # --- Tag rules that led to non-unique outcomes ---
                     if changes and not is_failure_case:
@@ -392,14 +398,21 @@ class ObrlAgi3Agent(Agent):
                     self.failed_action_blacklist.add(learning_key)
                     print(f"Action {learning_key} has been blacklisted until a success occurs.")
                     
-                    # Only perform failure analysis if we have a past success to compare against.
-                    if learning_key in self.last_success_contexts:
-                        print(f"\n--- Failure Detected for Action {learning_key} ---")
-                        last_success_summary = self.last_success_contexts[learning_key]
-                        self._analyze_failures(learning_key, last_success_summary, prev_summary)
-                    else:
-                        # This is for a repeated, unproductive action that has never been successful.
-                        print(f"Action {learning_key} is unproductive, but has no prior success record to analyze.")
+                    print(f"\n--- Failure Detected for Action {learning_key} ---")
+                    # Store the context of this failure before analyzing
+                    failure_context = {
+                        'summary': prev_summary,
+                        'rels': self.last_relationships,
+                        'adj': self.last_adjacencies
+                    }
+                    self.failure_contexts.setdefault(learning_key, []).append(failure_context)
+
+                    # Get all history for this action
+                    successes = self.success_contexts.get(learning_key, [])
+                    failures = self.failure_contexts.get(learning_key, [])
+
+                    # Perform the new, advanced analysis
+                    self._analyze_failures(learning_key, successes, failures, failure_context)
                         
             elif changes:
                 # Fallback for when changes happen without a known previous action
@@ -815,58 +828,139 @@ class ObrlAgi3Agent(Agent):
                 details = {k:v for k,v in rule.items() if k != 'type'}
                 print(f"- Confirmed Rule: A {rule['type']} event occurs with consistent properties: {details}")
 
-    def _analyze_failures(self, action_key: str, last_success_summary: list[dict], current_failure_summary: list[dict]):
-        """Compares a failure state to the last known success state to find differences."""
-        print("Comparing current state to last successful state to find potential failure preconditions...")
+    def _find_common_context(self, contexts: list[dict]) -> dict:
+        """
+        Finds the common context across a list of attempts, using wildcard 'x' for
+        inconsistent adjacency properties.
+        """
+        if not contexts:
+            return {'adj': {}, 'rels': {}}
+
+        # --- Adjacency Analysis with Wildcards ---
+        # Start with the first case as the baseline pattern. Convert to lists for mutability.
+        master_adj = {obj_id: list(contacts) for obj_id, contacts in contexts[0].get('adj', {}).items()}
         
-        # We can reuse our powerful _log_changes function for this comparison
-        differences, _ = self._log_changes(last_success_summary, current_failure_summary, assign_new_ids=False)
-        
-        if not differences:
-            print("No obvious differences found between this failure state and the last success state.")
-        else:
-            # Create a lookup map of new objects by their position for easy access
-            new_objects_by_pos = {obj['position']: obj for obj in current_failure_summary}
-
-            print("--- Failure Precondition Log (Differences from last success) ---")
-            for diff in differences:
-                print(diff)  # Print the original change log
-
-                if 'REMOVED:' in diff:
-                    continue  # No new object to describe
-
-                # --- Try to parse the final position of the object from the log string ---
-                final_pos = None
-                try:
-                    # Case 1: Fuzzy match with "now at"
-                    if ' now at ' in diff:
-                        pos_str = diff.split(' now at ')[1].replace('.', '')
-                        final_pos = ast.literal_eval(pos_str)
-                    # Case 2: A move event with "to"
-                    elif ' moved from ' in diff and ' to ' in diff:
-                        pos_str = diff.split(' to ')[1].replace('.', '')
-                        final_pos = ast.literal_eval(pos_str)
-                    # Case 3: In-place changes or new objects with "at"
-                    elif ' at ' in diff:
-                        details_part = diff.split(' at ')[1]
-                        start = details_part.find('(')
-                        end = details_part.find(')')
-                        if start != -1 and end != -1:
-                            pos_str = details_part[start : end + 1]
-                            final_pos = ast.literal_eval(pos_str)
-                except (ValueError, IndexError, SyntaxError):
-                    # If parsing fails, we can't find the object, so just skip.
+        # Iteratively refine the master pattern against all other contexts
+        for i in range(1, len(contexts)):
+            next_adj = contexts[i].get('adj', {})
+            
+            # Use list(master_adj.keys()) to iterate safely while potentially deleting keys
+            for obj_id in list(master_adj.keys()):
+                master_pattern = master_adj[obj_id]
+                next_contacts = next_adj.get(obj_id)
+                
+                # If the object doesn't exist in the next context, the pattern is broken.
+                if not next_contacts:
+                    del master_adj[obj_id]
                     continue
                 
-                # --- Find and print the object's full description ---
-                if final_pos and final_pos in new_objects_by_pos:
-                    obj = new_objects_by_pos[final_pos]
-                    size_str = f"{obj['size'][0]}x{obj['size'][1]}"
-                    desc = (
-                        f"  - Object is now {size_str} at {obj['position']} with color {obj['color']}, "
-                        f"{obj['pixels']} pixels, and fingerprint {obj['fingerprint']}."
-                    )
-                    print(desc)
+                # Compare each direction (top, right, bottom, left)
+                for i in range(4):
+                    # If a direction is already a wildcard, it stays a wildcard.
+                    if master_pattern[i] == 'x':
+                        continue
+                    # If the contacts for this direction differ, it becomes a wildcard.
+                    if master_pattern[i] != next_contacts[i]:
+                        master_pattern[i] = 'x'
+                
+                # If the whole pattern has become wildcards, it's not useful information.
+                if all(d == 'x' for d in master_pattern):
+                    del master_adj[obj_id]
+
+        # Convert lists back to tuples for the final result
+        common_adj = {obj_id: tuple(pattern) for obj_id, pattern in master_adj.items()}
+
+        # --- Relationship Analysis (Strict Intersection - logic is unchanged) ---
+        common_rels = copy.deepcopy(contexts[0].get('rels', {}))
+        for i in range(1, len(contexts)):
+            next_rels = contexts[i].get('rels', {})
+            temp_common_rels = {}
+            common_rel_types = set(common_rels.keys()) & set(next_rels.keys())
+            for rel_type in common_rel_types:
+                groups1, groups2 = common_rels[rel_type], next_rels[rel_type]
+                common_values = set(groups1.keys()) & set(groups2.keys())
+                for value in common_values:
+                    if groups1[value] == groups2[value]:
+                        temp_common_rels.setdefault(rel_type, {})[value] = groups1[value]
+            common_rels = temp_common_rels
+        
+        return {'adj': common_adj, 'rels': common_rels}
+
+    def _analyze_failures(self, action_key: str, all_success_contexts: list[dict], all_failure_contexts: list[dict], current_failure_context: dict):
+        """
+        Analyzes failures by finding conditions that are consistent across all failures
+        AND have never been observed in any past success.
+        """
+        
+        if not all_success_contexts or not all_failure_contexts:
+            print("\n--- Failure Analysis ---")
+            print("Cannot perform differential analysis: insufficient history of successes or failures.")
+            return
+
+        print("\n--- Failure Analysis: Consistent Differentiating Conditions ---")
+        
+        # 1. Find the common context for all successes and all failures.
+        common_success_context = self._find_common_context(all_success_contexts)
+        common_failure_context = self._find_common_context(all_failure_contexts)
+        
+        # 2. Build a comprehensive set of ALL states ever observed in ANY success case.
+        # This will be used to veto any differences that aren't exclusive to failures.
+        observed_in_any_success_adj = set()
+        observed_in_any_success_rels = set()
+        for context in all_success_contexts:
+            for obj_id, contacts in context.get('adj', {}).items():
+                observed_in_any_success_adj.add((obj_id, tuple(contacts)))
+            for rel_type, groups in context.get('rels', {}).items():
+                for value, ids in groups.items():
+                    observed_in_any_success_rels.add((rel_type, value, frozenset(ids)))
+
+        diffs_found = False
+
+        # 3. Compare the master contexts, applying the veto check.
+        # Adjacency Differences
+        adj_s = common_success_context['adj']
+        adj_f = common_failure_context['adj']
+        all_adj_ids = set(adj_s.keys()) | set(adj_f.keys())
+
+        for obj_id in sorted(list(all_adj_ids), key=lambda x: int(x.split('_')[1])):
+            contacts_s = tuple(adj_s.get(obj_id, ['na']*4))
+            contacts_f = tuple(adj_f.get(obj_id, ['na']*4))
+
+            if contacts_s != contacts_f:
+                # VETO CHECK: Is this failure condition truly novel, or did it appear in at least one success?
+                if (obj_id, contacts_f) not in observed_in_any_success_adj:
+                    diffs_found = True
+                    failure_pattern = []
+                    for i in range(4):
+                        if contacts_s[i] == contacts_f[i]:
+                            failure_pattern.append('x')
+                        else:
+                            contact = contacts_f[i]
+                            failure_pattern.append(contact.replace('obj_', '') if 'obj_' in contact else contact)
+                    
+                    pattern_str = f"({', '.join(failure_pattern)})"
+                    clean_id = obj_id.replace('obj_', 'id_')
+                    print(f"- Adjacency Difference for {clean_id}: Failures consistently exhibit pattern {pattern_str}, which has never occurred in a success.")
+
+        # Relationship Differences
+        rels_s = common_success_context['rels']
+        rels_f = common_failure_context['rels']
+        all_rel_types = set(rels_s.keys()) | set(rels_f.keys())
+
+        for rel_type in all_rel_types:
+            groups_s, groups_f = rels_s.get(rel_type, {}), rels_f.get(rel_type, {})
+            all_values = set(groups_s.keys()) | set(groups_f.keys())
+            for value in all_values:
+                ids_s, ids_f = groups_s.get(value, set()), groups_f.get(value, set())
+                if ids_s != ids_f:
+                    # VETO CHECK:
+                    if (rel_type, value, frozenset(ids_f)) not in observed_in_any_success_rels:
+                        diffs_found = True
+                        value_str = f"{value[0]}x{value[1]}" if rel_type == 'Size' else value
+                        print(f"- {rel_type} Group ({value_str}) Difference: Failures consistently have members {sorted(list(ids_f))}, which has never occurred in a success.")
+        
+        if not diffs_found:
+            print("No conditions found that are both consistent across all failures and unique to them.")
 
     def _analyze_relationships(self, object_summary: list[dict]) -> dict:
         """Analyzes object relationships and returns a structured dictionary of groups."""
