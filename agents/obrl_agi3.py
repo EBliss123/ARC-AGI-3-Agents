@@ -45,6 +45,7 @@ class ObrlAgi3Agent(Agent):
         self.is_new_level = True
         self.final_summary_before_level_change = None
         self.last_adjacencies = {}
+        self.failure_patterns = {}
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -548,6 +549,32 @@ class ObrlAgi3Agent(Agent):
 
             score = q_value + exploration_bonus + boring_penalty
 
+            # --- Failure Prediction Penalty ---
+            failure_penalty = 0.0
+            known_failure_pattern = self.failure_patterns.get(action_key)
+            if known_failure_pattern:
+                is_match = True # Assume the current state matches the pattern until proven otherwise.
+                
+                # Check Adjacency Patterns
+                pattern_adj = known_failure_pattern.get('adj', {})
+                for obj_id, pattern_contacts in pattern_adj.items():
+                    current_contacts = tuple(current_adjacencies.get(obj_id, ['na']*4))
+                    # Compare the current state against the pattern, ignoring wildcards ('x')
+                    for i in range(4):
+                        if pattern_contacts[i] != 'x' and pattern_contacts[i] != current_contacts[i]:
+                            is_match = False
+                            break
+                    if not is_match:
+                        break
+                
+                # (Future enhancement: Could add checks for relationship patterns here as well)
+
+                if is_match:
+                    failure_penalty = -50.0 # Apply a heavy penalty for a predicted failure
+                    print(f"Heuristic: Current state matches a known failure pattern for {action_key}. Applying penalty.")
+
+            score += failure_penalty
+
             if score > best_score:
                 best_score = score
                 best_move = move
@@ -959,6 +986,11 @@ class ObrlAgi3Agent(Agent):
                         value_str = f"{value[0]}x{value[1]}" if rel_type == 'Size' else value
                         print(f"- {rel_type} Group ({value_str}) Difference: Failures consistently have members {sorted(list(ids_f))}, which has never occurred in a success.")
         
+        if diffs_found:
+            # This is a key insight. Store the common failure context that was successfully
+            # differentiated from all successes. This becomes our new theory for why this action fails.
+            self.failure_patterns[action_key] = common_failure_context
+
         if not diffs_found:
             print("No conditions found that are both consistent across all failures and unique to them.")
 
