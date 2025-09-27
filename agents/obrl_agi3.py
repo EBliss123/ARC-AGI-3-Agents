@@ -56,7 +56,7 @@ class ObrlAgi3Agent(Agent):
             return GameAction.RESET
         
         current_summary = self._perceive_objects(latest_frame)
-        current_relationships = self._analyze_relationships(current_summary)
+        current_relationships, current_adjacencies = self._analyze_relationships(current_summary)
 
         # If this is the first scan (last summary is empty), print the full summary.
         if not self.last_object_summary or self.is_new_level:
@@ -244,6 +244,15 @@ class ObrlAgi3Agent(Agent):
                 
                 for line in output_lines:
                     print(line)
+
+                if current_adjacencies:
+                    print("\n--- Initial Adjacency Analysis (Top, Right, Bottom, Left) ---")
+                    for obj_id, contacts in sorted(current_adjacencies.items(), key=lambda item: int(item[0].split('_')[1])):
+                        # Format the contact list into the desired string
+                        contact_ids = [c.replace('obj_', '') if 'obj_' in c else c for c in contacts]
+                        contact_tuple_str = ", ".join(contact_ids)
+                        clean_obj_id = obj_id.replace('obj_', 'id_')
+                        print(f"- Object {clean_obj_id} ({contact_tuple_str})")
 
         # On subsequent turns, analyze the outcome of the previous action.
         else:
@@ -882,10 +891,58 @@ class ObrlAgi3Agent(Agent):
             final_rels[rel_type] = {
                 value: ids for value, ids in groups.items() if len(ids) > 1
             }
+
+        # --- Pixel-Perfect Adjacency Analysis ---
+        temp_adj = {}
+        # Create a quick lookup map of pixel coordinates to object IDs
+        pixel_map = {}
+        for obj in object_summary:
+            for pixel in obj['pixel_coords']:
+                pixel_map[pixel] = obj['id']
+
+        # Pass 1: Collect all contacts for every object using the pixel map
+        for obj_a in object_summary:
+            a_id = obj_a['id']
+            for r, c in obj_a['pixel_coords']:
+                # Check neighbors (top, right, bottom, left)
+                neighbors = {
+                    'top': (r - 1, c),
+                    'bottom': (r + 1, c),
+                    'left': (r, c - 1),
+                    'right': (r, c + 1)
+                }
+                for direction, coord in neighbors.items():
+                    if coord in pixel_map:
+                        b_id = pixel_map[coord]
+                        if a_id != b_id:
+                            # Reverse the direction for obj_a's perspective
+                            # If B is on top of A's pixel, then B is a 'top' contact for A.
+                            temp_adj.setdefault(a_id, {}).setdefault(direction, set()).add(b_id)
+
+        # Pass 2: Simplify contacts into the final format (top, right, bottom, left)
+        adjacency_map = {}
+        for obj_id, contacts in temp_adj.items():
+            result = ['na'] * 4 # [top, right, bottom, left]
+            
+            top_contacts = contacts.get('top', set())
+            if len(top_contacts) == 1: result[0] = top_contacts.pop()
+
+            right_contacts = contacts.get('right', set())
+            if len(right_contacts) == 1: result[1] = right_contacts.pop()
+
+            bottom_contacts = contacts.get('bottom', set())
+            if len(bottom_contacts) == 1: result[2] = bottom_contacts.pop()
+            
+            left_contacts = contacts.get('left', set())
+            if len(left_contacts) == 1: result[3] = left_contacts.pop()
+
+            # Only add to the map if there's at least one unique contact
+            if any(res != 'na' for res in result):
+                adjacency_map[obj_id] = result
         
         # Clean up empty relationship types
         final_rels = {k: v for k, v in final_rels.items() if v}
-        return final_rels
+        return final_rels, adjacency_map
     
     def _log_relationship_changes(self, old_rels: dict, new_rels: dict):
         """Compares two relationship dictionaries and logs which objects joined, left, or replaced others in groups."""
@@ -1020,7 +1077,8 @@ class ObrlAgi3Agent(Agent):
                     'pixels': len(object_pixels),
                     'position': (min_r, min_c),  # Top-left corner
                     'size': (max_r - min_r + 1, max_c - min_c + 1),
-                    'fingerprint': shape_fingerprint
+                    'fingerprint': shape_fingerprint,
+                    'pixel_coords': frozenset(object_pixels),
                 }
                 objects.append(obj)
 
