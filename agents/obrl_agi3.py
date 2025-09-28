@@ -46,6 +46,7 @@ class ObrlAgi3Agent(Agent):
         self.final_summary_before_level_change = None
         self.last_adjacencies = {}
         self.failure_patterns = {}
+        self.last_match_groups = {}
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -259,18 +260,45 @@ class ObrlAgi3Agent(Agent):
 
                 if current_match_groups:
                     print("\n--- Object Match Type Analysis ---")
-                    # Define a specific order for printing for consistency
                     print_order = ['Exact', 'Color', 'Fingerprint', 'Size', 'Pixels']
+                    group_counter = 1
                     for match_type in print_order:
                         if match_type in current_match_groups:
-                            groups = current_match_groups[match_type]
+                            groups_dict = current_match_groups[match_type]
                             label = f"Exact Matches" if match_type == "Exact" else f"Matches (Except {match_type})"
                             print(f"- {label}:")
-                            for i, group in enumerate(groups):
-                                # Sort IDs numerically for clean output
+                            
+                            for props, group in groups_dict.items():
                                 sorted_ids = sorted(group, key=int)
                                 id_list_str = ", ".join([f"id_{id_num}" for id_num in sorted_ids])
-                                print(f"  - Group {i+1}: {id_list_str}")
+                                
+                                # Add property details to the group title
+                                props_str_parts = []
+                                if match_type == 'Exact':
+                                    props_str_parts.append(f"Color:{props[0]}")
+                                    props_str_parts.append(f"Fingerprint:{props[1]}")
+                                    props_str_parts.append(f"Size:{props[2][0]}x{props[2][1]}")
+                                    props_str_parts.append(f"Pixels:{props[3]}")
+                                elif match_type == 'Color':
+                                    props_str_parts.append(f"Fingerprint:{props[0]}")
+                                    props_str_parts.append(f"Size:{props[1][0]}x{props[1][1]}")
+                                    props_str_parts.append(f"Pixels:{props[2]}")
+                                elif match_type == 'Fingerprint':
+                                    props_str_parts.append(f"Color:{props[0]}")
+                                    props_str_parts.append(f"Size:{props[1][0]}x{props[1][1]}")
+                                    props_str_parts.append(f"Pixels:{props[2]}")
+                                elif match_type == 'Size':
+                                    props_str_parts.append(f"Color:{props[0]}")
+                                    props_str_parts.append(f"Fingerprint:{props[1]}")
+                                    props_str_parts.append(f"Pixels:{props[2]}")
+                                elif match_type == 'Pixels':
+                                    props_str_parts.append(f"Color:{props[0]}")
+                                    props_str_parts.append(f"Fingerprint:{props[1]}")
+                                    props_str_parts.append(f"Size:{props[2][0]}x{props[2][1]}")
+                                
+                                props_str = f" ({', '.join(props_str_parts)})" if props_str_parts else ""
+                                print(f"  - Group {group_counter}{props_str}: {id_list_str}")
+                                group_counter += 1
 
         # On subsequent turns, analyze the outcome of the previous action.
         else:
@@ -297,6 +325,7 @@ class ObrlAgi3Agent(Agent):
 
             self._log_relationship_changes(self.last_relationships, current_relationships)
             self._log_adjacency_changes(self.last_adjacencies, current_adjacencies)
+            self._log_match_type_changes(self.last_match_groups, current_match_groups)
 
             # --- Prepare for Learning & Rule Analysis ---
             current_state_key = self._get_state_key(current_summary)
@@ -454,6 +483,7 @@ class ObrlAgi3Agent(Agent):
         self.last_object_summary = current_summary
         self.last_adjacencies = current_adjacencies
         self.last_relationships = current_relationships
+        self.last_match_groups = current_match_groups
 
         # This is the REAL list of actions for this specific game on this turn.
         game_specific_actions = latest_frame.available_actions
@@ -1097,10 +1127,10 @@ class ObrlAgi3Agent(Agent):
         for obj in object_summary:
             temp_groups.setdefault(exact_match_key(obj), []).append(int(obj['id'].replace('obj_', '')))
         
-        exact_groups = [group for group in temp_groups.values() if len(group) > 1]
-        if exact_groups:
-            match_groups['Exact'] = exact_groups
-            for group in exact_groups:
+        exact_groups_dict = {key: group for key, group in temp_groups.items() if len(group) > 1}
+        if exact_groups_dict:
+            match_groups['Exact'] = exact_groups_dict
+            for group in exact_groups_dict.values():
                 processed_ids.update(group)
 
         # Subsequent Passes: Find partial matches, excluding objects already in a more specific match group.
@@ -1119,10 +1149,10 @@ class ObrlAgi3Agent(Agent):
             for obj in unprocessed_objects:
                 temp_groups.setdefault(key_func(obj), []).append(int(obj['id'].replace('obj_', '')))
             
-            partial_groups = [group for group in temp_groups.values() if len(group) > 1]
-            if partial_groups:
-                match_groups[match_type] = partial_groups
-                for group in partial_groups:
+            partial_groups_dict = {key: group for key, group in temp_groups.items() if len(group) > 1}
+            if partial_groups_dict:
+                match_groups[match_type] = partial_groups_dict
+                for group in partial_groups_dict.values():
                     processed_ids.update(group)
         
         return final_rels, adjacency_map, match_groups
@@ -1201,6 +1231,81 @@ class ObrlAgi3Agent(Agent):
         if output_lines:
             print("\n--- Adjacency Change Log ---")
             for line in output_lines:
+                print(line)
+            print()
+
+    def _log_match_type_changes(self, old_matches: dict, new_matches: dict):
+        """Compares two match group dictionaries and logs group-level changes."""
+        if old_matches == new_matches:
+            return
+
+        output_lines = []
+        all_match_types = sorted(list(set(old_matches.keys()) | set(new_matches.keys())))
+
+        def format_ids(id_set):
+            id_list = sorted(list(id_set))
+            if len(id_list) == 1: return f"object id_{id_list[0]}"
+            return f"objects " + ", ".join([f"id_{i}" for i in id_list])
+
+        def format_props(match_type, props):
+            """Builds a descriptive string of the shared properties that define a group."""
+            parts = []
+            if match_type == 'Exact':
+                # props = (color, fingerprint, size, pixels)
+                parts.append(f"Color:{props[0]}")
+                parts.append(f"Fingerprint:{props[1]}")
+                parts.append(f"Size:{props[2][0]}x{props[2][1]}")
+                parts.append(f"Pixels:{props[3]}")
+            elif match_type == 'Color': # This means "Except Color"
+                # props = (fingerprint, size, pixels)
+                parts.append(f"Fingerprint:{props[0]}")
+                parts.append(f"Size:{props[1][0]}x{props[1][1]}")
+                parts.append(f"Pixels:{props[2]}")
+            elif match_type == 'Fingerprint':
+                # props = (color, size, pixels)
+                parts.append(f"Color:{props[0]}")
+                parts.append(f"Size:{props[1][0]}x{props[1][1]}")
+                parts.append(f"Pixels:{props[2]}")
+            elif match_type == 'Size':
+                # props = (color, fingerprint, pixels)
+                parts.append(f"Color:{props[0]}")
+                parts.append(f"Fingerprint:{props[1]}")
+                parts.append(f"Pixels:{props[2]}")
+            elif match_type == 'Pixels':
+                # props = (color, fingerprint, size)
+                parts.append(f"Color:{props[0]}")
+                parts.append(f"Fingerprint:{props[1]}")
+                parts.append(f"Size:{props[2][0]}x{props[2][1]}")
+            
+            return f" ({', '.join(parts)})" if parts else ""
+
+        for match_type in all_match_types:
+            old_groups = old_matches.get(match_type, {})
+            new_groups = new_matches.get(match_type, {})
+            all_props = set(old_groups.keys()) | set(new_groups.keys())
+            
+            label = f"Exact Match" if match_type == "Exact" else f"Except {match_type} Match"
+
+            for props in all_props:
+                old_ids = set(old_groups.get(props, []))
+                new_ids = set(new_groups.get(props, []))
+
+                if old_ids == new_ids: continue
+
+                joined = new_ids - old_ids
+                left = old_ids - new_ids
+                props_str = format_props(match_type, props)
+
+                if joined and left:
+                    output_lines.append(f"- {label} Group {props_str}: {format_ids(joined).capitalize()} replaced {format_ids(left)}.")
+                elif joined:
+                    output_lines.append(f"- {label} Group {props_str}: {format_ids(joined).capitalize()} joined.")
+                elif left:
+                    output_lines.append(f"- {label} Group {props_str}: {format_ids(left).capitalize()} left.")
+
+        if output_lines:
+            print("\n--- Match Type Change Log ---")
+            for line in sorted(output_lines):
                 print(line)
             print()
 
