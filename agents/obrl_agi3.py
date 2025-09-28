@@ -47,6 +47,8 @@ class ObrlAgi3Agent(Agent):
         self.last_adjacencies = {}
         self.failure_patterns = {}
         self.last_match_groups = {}
+        self.level_state_history = []
+        self.win_condition_hypotheses = []
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -64,6 +66,7 @@ class ObrlAgi3Agent(Agent):
 
         # If this is the first scan (last summary is empty), print the full summary.
         if not self.last_object_summary or self.is_new_level:
+            self.level_state_history = []
             self.is_new_level = False
 
             id_map = {} # To store {old_id: new_id} mappings
@@ -309,6 +312,12 @@ class ObrlAgi3Agent(Agent):
             current_score = latest_frame.score
             if current_score > self.last_score:
                 print(f"\n--- LEVEL CHANGE DETECTED (Score increased from {self.last_score} to {current_score}) ---")
+                
+                # Analyze what was unique about the winning state compared to the rest of the level
+                if self.level_state_history:
+                    winning_context = self.level_state_history[-1] # The last state before the score change
+                    historical_contexts = self.level_state_history[:-1]
+                    self._analyze_win_condition(winning_context, historical_contexts)
                 
                 # Print the full summary of the final frame of the level that was just won.
                 print("\n--- Final Frame Summary (Old Level) ---")
@@ -620,6 +629,9 @@ class ObrlAgi3Agent(Agent):
 
             score += failure_penalty
 
+            goal_bonus = self._calculate_goal_bonus(action_key)
+            score += goal_bonus
+
             if score > best_score:
                 best_score = score
                 best_move = move
@@ -662,6 +674,15 @@ class ObrlAgi3Agent(Agent):
         target_id_for_context = chosen_object['id'] if chosen_object else None
         self.last_action_context = (action_to_return.name, target_id_for_context)
         
+        # Store the current state for the level history before ending the turn
+        current_context = {
+            'summary': current_summary,
+            'rels': current_relationships,
+            'adj': current_adjacencies,
+            'match': current_match_groups
+        }
+        self.level_state_history.append(current_context)
+
         return action_to_return
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
@@ -1038,6 +1059,96 @@ class ObrlAgi3Agent(Agent):
 
         if not diffs_found:
             print("No conditions found that are both consistent across all failures and unique to them.")
+
+    def _analyze_win_condition(self, winning_context: dict, historical_contexts: list[dict]):
+        """Compares the winning state to all previous states in the level to find unique properties."""
+        if not historical_contexts:
+            return # Cannot analyze without a history
+
+        print("\n--- Win Condition Analysis ---")
+        
+        # Create a set of all previously seen relationship and adjacency states for quick lookups
+        seen_rels = set()
+        seen_adjs = set()
+        for context in historical_contexts:
+            for rel_type, groups in context.get('rels', {}).items():
+                for value, ids in groups.items():
+                    seen_rels.add((rel_type, value, frozenset(ids)))
+            for obj_id, contacts in context.get('adj', {}).items():
+                seen_adjs.add((obj_id, tuple(contacts)))
+
+        # Now, find what's unique in the winning context
+        win_rels = winning_context.get('rels', {})
+        win_adjs = winning_context.get('adj', {})
+        new_hypotheses = []
+
+        for rel_type, groups in win_rels.items():
+            for value, ids in groups.items():
+                win_pattern = (rel_type, value, frozenset(ids))
+                if win_pattern not in seen_rels:
+                    hypothesis = {'type': 'Relationship', 'pattern': win_pattern}
+                    new_hypotheses.append(hypothesis)
+                    print(f"Found unique winning condition: A '{rel_type}' group for value '{value}' with members {sorted(list(ids))}.")
+
+        for obj_id, contacts in win_adjs.items():
+            win_pattern = (obj_id, tuple(contacts))
+            if win_pattern not in seen_adjs:
+                hypothesis = {'type': 'Adjacency', 'pattern': win_pattern}
+                new_hypotheses.append(hypothesis)
+                print(f"Found unique winning condition: Adjacency for {obj_id.replace('obj_','id_')} of {tuple(contacts)}.")
+        
+        if new_hypotheses:
+            # We use a set to avoid storing duplicate hypotheses across different wins
+            existing_hyp_set = {str(h) for h in self.win_condition_hypotheses}
+            for h in new_hypotheses:
+                if str(h) not in existing_hyp_set:
+                    self.win_condition_hypotheses.append(h)
+
+    def _calculate_goal_bonus(self, action_key: str) -> float:
+        """
+        Calculates a score bonus if an action is known to help achieve any type of
+        win condition hypothesis in a general way.
+        """
+        if not self.win_condition_hypotheses or not self.rule_hypotheses:
+            return 0.0
+
+        bonus = 0.0
+        
+        # 1. Find all known effects for the given action
+        action_effects = set()
+        for rule_key, hypothesis in self.rule_hypotheses.items():
+            rule_action, _, _ = rule_key
+            if rule_action == action_key and hypothesis.get('rules'):
+                for event in hypothesis['rules']:
+                    # Generalize the effect into a searchable format
+                    if event.get('type') == 'RECOLORED':
+                        action_effects.add(f"creates_color_{event.get('to_color')}")
+                    elif event.get('type') == 'SHAPE_CHANGED':
+                        action_effects.add(f"creates_fingerprint_{event.get('to_fingerprint')}")
+                    elif event.get('type') in ['GROWTH', 'SHRINK', 'TRANSFORM'] and 'to_size' in event:
+                        action_effects.add(f"creates_size_{event.get('to_size')}")
+
+        if not action_effects:
+            return 0.0
+
+        # 2. Find all required conditions from our win hypotheses
+        required_conditions = set()
+        for win_hyp in self.win_condition_hypotheses:
+            if win_hyp['type'] == 'Relationship':
+                win_rel_type, win_value, _ = win_hyp['pattern']
+                if win_rel_type == 'Color':
+                    required_conditions.add(f"creates_color_{win_value}")
+                elif win_rel_type == 'Shape':
+                    required_conditions.add(f"creates_fingerprint_{win_value}")
+                elif win_rel_type == 'Size':
+                    required_conditions.add(f"creates_size_{win_value}")
+        
+        # 3. If there is any overlap, apply a bonus
+        if action_effects.intersection(required_conditions):
+            bonus = 15.0  # Large bonus for actions that are known to create winning properties
+            print(f"Goal-Seeking Bonus: Action {action_key} may help achieve a known win condition. Applying bonus.")
+
+        return bonus
 
     def _analyze_relationships(self, object_summary: list[dict]) -> tuple[dict, dict, dict]:
         """Analyzes object relationships and returns a structured dictionary of groups."""
