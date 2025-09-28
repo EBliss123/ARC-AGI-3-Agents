@@ -355,8 +355,8 @@ class ObrlAgi3Agent(Agent):
                             
                             if obj_id in prev_summary_map:
                                 target_in_prev_state = prev_summary_map[obj_id]
-                                prev_action_name, _ = self.last_action_context
-                                base_action_key = self._get_learning_key(prev_action_name, None)
+                                prev_action_name, prev_target_id = self.last_action_context
+                                base_action_key = self._get_learning_key(prev_action_name, prev_target_id)
                                 
                                 # Create the object's complete state description (properties + position)
                                 object_state = (self._get_stable_id(target_in_prev_state), target_in_prev_state['position'])
