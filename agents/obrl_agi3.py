@@ -59,7 +59,7 @@ class ObrlAgi3Agent(Agent):
             return GameAction.RESET
         
         current_summary = self._perceive_objects(latest_frame)
-        current_relationships, current_adjacencies = self._analyze_relationships(current_summary)
+        current_relationships, current_adjacencies, current_match_groups = self._analyze_relationships(current_summary)
 
         # If this is the first scan (last summary is empty), print the full summary.
         if not self.last_object_summary or self.is_new_level:
@@ -256,6 +256,21 @@ class ObrlAgi3Agent(Agent):
                         contact_tuple_str = ", ".join(contact_ids)
                         clean_obj_id = obj_id.replace('obj_', 'id_')
                         print(f"- Object {clean_obj_id} ({contact_tuple_str})")
+
+                if current_match_groups:
+                    print("\n--- Object Match Type Analysis ---")
+                    # Define a specific order for printing for consistency
+                    print_order = ['Exact', 'Color', 'Fingerprint', 'Size', 'Pixels']
+                    for match_type in print_order:
+                        if match_type in current_match_groups:
+                            groups = current_match_groups[match_type]
+                            label = f"Exact Matches" if match_type == "Exact" else f"Matches (Except {match_type})"
+                            print(f"- {label}:")
+                            for i, group in enumerate(groups):
+                                # Sort IDs numerically for clean output
+                                sorted_ids = sorted(group, key=int)
+                                id_list_str = ", ".join([f"id_{id_num}" for id_num in sorted_ids])
+                                print(f"  - Group {i+1}: {id_list_str}")
 
         # On subsequent turns, analyze the outcome of the previous action.
         else:
@@ -994,10 +1009,10 @@ class ObrlAgi3Agent(Agent):
         if not diffs_found:
             print("No conditions found that are both consistent across all failures and unique to them.")
 
-    def _analyze_relationships(self, object_summary: list[dict]) -> dict:
+    def _analyze_relationships(self, object_summary: list[dict]) -> tuple[dict, dict, dict]:
         """Analyzes object relationships and returns a structured dictionary of groups."""
         if not object_summary or len(object_summary) < 2:
-            return {}
+            return {}, {}, {}
 
         # Use capitalized keys for cleaner log titles
         rel_data = {
@@ -1071,7 +1086,46 @@ class ObrlAgi3Agent(Agent):
         
         # Clean up empty relationship types
         final_rels = {k: v for k, v in final_rels.items() if v}
-        return final_rels, adjacency_map
+        
+        # --- Match Type Analysis ---
+        match_groups = {}
+        processed_ids = set()
+
+        # Pass 1: Find Exact Matches
+        exact_match_key = lambda o: (o['color'], o['fingerprint'], o['size'], o['pixels'])
+        temp_groups = {}
+        for obj in object_summary:
+            temp_groups.setdefault(exact_match_key(obj), []).append(int(obj['id'].replace('obj_', '')))
+        
+        exact_groups = [group for group in temp_groups.values() if len(group) > 1]
+        if exact_groups:
+            match_groups['Exact'] = exact_groups
+            for group in exact_groups:
+                processed_ids.update(group)
+
+        # Subsequent Passes: Find partial matches, excluding objects already in a more specific match group.
+        partial_match_definitions = {
+            "Color":       lambda o: (o['fingerprint'], o['size'], o['pixels']),
+            "Fingerprint": lambda o: (o['color'], o['size'], o['pixels']),
+            "Size":        lambda o: (o['color'], o['fingerprint'], o['pixels']),
+            "Pixels":      lambda o: (o['color'], o['fingerprint'], o['size']),
+        }
+
+        for match_type, key_func in partial_match_definitions.items():
+            temp_groups = {}
+            # Only consider objects not yet processed
+            unprocessed_objects = [o for o in object_summary if int(o['id'].replace('obj_', '')) not in processed_ids]
+            
+            for obj in unprocessed_objects:
+                temp_groups.setdefault(key_func(obj), []).append(int(obj['id'].replace('obj_', '')))
+            
+            partial_groups = [group for group in temp_groups.values() if len(group) > 1]
+            if partial_groups:
+                match_groups[match_type] = partial_groups
+                for group in partial_groups:
+                    processed_ids.update(group)
+        
+        return final_rels, adjacency_map, match_groups
     
     def _log_relationship_changes(self, old_rels: dict, new_rels: dict):
         """Compares two relationship dictionaries and logs which objects joined, left, or replaced others in groups."""
