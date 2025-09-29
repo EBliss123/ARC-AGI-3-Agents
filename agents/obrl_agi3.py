@@ -40,7 +40,6 @@ class ObrlAgi3Agent(Agent):
         self.total_moves = 0
         self.failed_action_blacklist = set()
         self.turns_without_discovery = 0
-        self.turns_without_discovery = 0
         self.action_history = {}
         self.is_new_level = True
         self.final_summary_before_level_change = None
