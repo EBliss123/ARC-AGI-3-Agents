@@ -47,6 +47,7 @@ class ObrlAgi3Agent(Agent):
         self.failure_patterns = {}
         self.last_match_groups = {}
         self.level_state_history = []
+        self.current_plan = []
         self.win_condition_hypotheses = {}
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
@@ -62,6 +63,16 @@ class ObrlAgi3Agent(Agent):
         
         current_summary = self._perceive_objects(latest_frame)
         current_relationships, current_adjacencies, current_match_groups = self._analyze_relationships(current_summary)
+
+        # If we aren't executing a plan, see if we can generate a new one.
+        if not self.current_plan:
+            current_context = {
+                'summary': current_summary,
+                'rels': current_relationships,
+                'adj': current_adjacencies,
+                'match': current_match_groups
+            }
+            self._generate_plan(current_context)
 
         # If this is the first scan (last summary is empty), print the full summary.
         if not self.last_object_summary or self.is_new_level:
@@ -500,6 +511,35 @@ class ObrlAgi3Agent(Agent):
         if game_specific_actions and not self.actions_printed:
             print(f"Discovered game-specific actions: {[action.name for action in game_specific_actions]}")
             self.actions_printed = True
+
+        # --- Plan Execution ---
+        if self.current_plan:
+            next_action_key = self.current_plan.pop(0) # Get and remove the next step
+            print(f"--- Executing Plan ---")
+            print(f"Chose planned action: {next_action_key}")
+            
+            # Deconstruct the action key to create the GameAction
+            action_name_parts = next_action_key.split('_')
+            action_name = action_name_parts[0]
+            action_to_return = GameAction[action_name]
+            
+            target_id_for_context = None
+            if len(action_name_parts) > 1:
+                target_obj_id = '_'.join(action_name_parts[1:])
+                target_object = next((obj for obj in current_summary if obj['id'] == target_obj_id), None)
+                if target_object:
+                    pos = target_object['position']
+                    coords = {'x': pos[1], 'y': pos[0]}
+                    action_to_return.set_data(coords)
+                    target_id_for_context = target_object['id']
+            
+            self.last_action_context = (action_to_return.name, target_id_for_context)
+            self.last_state_key = self._get_state_key(current_summary)
+            # We must still save history before returning
+            final_context = { 'summary': current_summary, 'rels': current_relationships, 'adj': current_adjacencies, 'match': current_match_groups }
+            self.level_state_history.append(final_context)
+            
+            return action_to_return
 
         # --- Build a list of possible move DESCRIPTIONS ---
         possible_moves = []
@@ -1237,6 +1277,95 @@ class ObrlAgi3Agent(Agent):
             print(f"Goal-Seeking Bonus: Action {action_key} may help achieve a known win condition. Applying bonus.")
 
         return bonus
+
+    def _generate_plan(self, current_context: dict):
+        """
+        Top-level planner that uses the Solution Graph to find the next logical step
+        in a known winning causal chain.
+        """
+        if not self.win_condition_hypotheses:
+            return
+
+        current_properties = self._get_all_state_properties(current_context)
+
+        # Iterate through all known terminal events and the paths that lead to them.
+        for terminal_event, paths in self.win_condition_hypotheses.items():
+            for path in paths:
+                # A path consists of a chain of precondition steps and the terminal events.
+                chain = path.get('chain', [])
+                
+                # Find the first step in the chain whose preconditions are NOT met.
+                next_sub_goal = None
+                if chain:
+                    all_prior_preconditions_met = True
+                    for i, step in enumerate(chain):
+                        preconditions = step['preconditions']
+                        # issubset checks if all precondition facts are present in the current state
+                        if not preconditions.issubset(current_properties):
+                            # This is the first set of unmet preconditions. This is our goal.
+                            next_sub_goal = preconditions
+                            all_prior_preconditions_met = False
+                            # print(f"DEBUG: Goal is to satisfy Precondition Step {i+1}")
+                            break
+                    
+                    # If all preconditions in the chain are met, the goal is now to trigger the terminal event.
+                    if all_prior_preconditions_met:
+                        # We are in the "setup state". The goal is now the terminal event.
+                        # For now, we'll represent this as a special goal type.
+                        next_sub_goal = {'type': 'TERMINAL_EVENT', 'events': path['terminal_events']}
+                        # print("DEBUG: All preconditions met. Goal is to trigger terminal event.")
+                
+                # If we have a goal, find a plan for it.
+                if next_sub_goal:
+                    plan = self._find_plan_for_goal(next_sub_goal, current_context)
+                    if plan:
+                        self.current_plan = plan
+                        print(f"\n--- New Plan Generated to satisfy sub-goal ---")
+                        print(f"Plan: {self.current_plan}")
+                        return
+
+    def _find_plan_for_goal(self, goal: set | dict, current_context: dict) -> list:
+        """
+        Searches for a single-step plan to achieve a specific sub-goal (a set of precondition facts).
+        """
+        # Search all known rules to see if any can produce one of the facts in our goal set.
+        for rule_key, hypothesis in self.rule_hypotheses.items():
+            action_key, affected_obj_id, precondition_state = rule_key
+            
+            # Check if this rule's precondition is currently met.
+            current_summary_map = {obj['id']: obj for obj in current_context['summary']}
+            if affected_obj_id in current_summary_map:
+                obj_in_current_state = current_summary_map[affected_obj_id]
+                current_obj_state_tuple = (self._get_stable_id(obj_in_current_state), obj_in_current_state['position'])
+                
+                if current_obj_state_tuple != precondition_state:
+                    continue # This rule is not applicable in the current state.
+            else:
+                continue # The object this rule applies to isn't on the board.
+
+            # If the rule is applicable, check if its effect matches our goal.
+            for event in hypothesis.get('rules', []):
+                # Translate the event into a "fact" that it would create.
+                # This is a simplified check. A more advanced version would predict the full next state.
+                effect_fact = None
+                if event.get('type') == 'RECOLORED':
+                    # This logic is complex: a recolor changes an object's 'Relationship' fact.
+                    # We will keep this part simple for now and focus on the structure.
+                    # A 'creates_color_X' check could be added here like in the goal bonus.
+                    pass
+                
+                # Check if the goal is to trigger a terminal event, and if this rule's action matches it.
+                if isinstance(goal, dict) and goal.get('type') == 'TERMINAL_EVENT':
+                    # A terminal event is a change log string. We need to check if this rule's action
+                    # corresponds to the action that created the terminal event in the past.
+                    # This requires storing the action key with the hypothesis. Let's simplify for now.
+                    # For now, we assume if all preconditions are met, any action is a good guess.
+                    # This is a placeholder for a more robust trigger matching logic.
+                    if hypothesis['confidence'] > 0.9:
+                        print(f"DEBUG: All preconditions met. Found high-confidence action {action_key} to trigger terminal event.")
+                        return [action_key]
+
+        return [] # No single-step plan found
 
     def _analyze_relationships(self, object_summary: list[dict]) -> tuple[dict, dict, dict]:
         """Analyzes object relationships and returns a structured dictionary of groups."""
