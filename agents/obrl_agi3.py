@@ -47,8 +47,7 @@ class ObrlAgi3Agent(Agent):
         self.failure_patterns = {}
         self.last_match_groups = {}
         self.level_state_history = []
-        self.current_plan = []
-        self.win_condition_hypotheses = {}
+        self.win_condition_hypotheses = []
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -63,16 +62,6 @@ class ObrlAgi3Agent(Agent):
         
         current_summary = self._perceive_objects(latest_frame)
         current_relationships, current_adjacencies, current_match_groups = self._analyze_relationships(current_summary)
-
-        # If we aren't executing a plan, see if we can generate a new one.
-        if not self.current_plan:
-            current_context = {
-                'summary': current_summary,
-                'rels': current_relationships,
-                'adj': current_adjacencies,
-                'match': current_match_groups
-            }
-            self._generate_plan(current_context)
 
         # If this is the first scan (last summary is empty), print the full summary.
         if not self.last_object_summary or self.is_new_level:
@@ -511,35 +500,6 @@ class ObrlAgi3Agent(Agent):
         if game_specific_actions and not self.actions_printed:
             print(f"Discovered game-specific actions: {[action.name for action in game_specific_actions]}")
             self.actions_printed = True
-
-        # --- Plan Execution ---
-        if self.current_plan:
-            next_action_key = self.current_plan.pop(0) # Get and remove the next step
-            print(f"--- Executing Plan ---")
-            print(f"Chose planned action: {next_action_key}")
-            
-            # Deconstruct the action key to create the GameAction
-            action_name_parts = next_action_key.split('_')
-            action_name = action_name_parts[0]
-            action_to_return = GameAction[action_name]
-            
-            target_id_for_context = None
-            if len(action_name_parts) > 1:
-                target_obj_id = '_'.join(action_name_parts[1:])
-                target_object = next((obj for obj in current_summary if obj['id'] == target_obj_id), None)
-                if target_object:
-                    pos = target_object['position']
-                    coords = {'x': pos[1], 'y': pos[0]}
-                    action_to_return.set_data(coords)
-                    target_id_for_context = target_object['id']
-            
-            self.last_action_context = (action_to_return.name, target_id_for_context)
-            self.last_state_key = self._get_state_key(current_summary)
-            # We must still save history before returning
-            final_context = { 'summary': current_summary, 'rels': current_relationships, 'adj': current_adjacencies, 'match': current_match_groups }
-            self.level_state_history.append(final_context)
-            
-            return action_to_return
 
         # --- Build a list of possible move DESCRIPTIONS ---
         possible_moves = []
@@ -1099,124 +1059,49 @@ class ObrlAgi3Agent(Agent):
         if not diffs_found:
             print("No conditions found that are both consistent across all failures and unique to them.")
 
-    def _get_all_state_properties(self, context: dict) -> set:
-        """
-        Creates a "fingerprint" of a game state by converting all known properties
-        (relationships, adjacencies, matches, globals) into a set of hashable facts.
-        """
-        properties = set()
-        
-        # Add Relationship facts
-        for rel_type, groups in context.get('rels', {}).items():
-            for value, ids in groups.items():
-                properties.add(('Relationship', rel_type, value, frozenset(ids)))
-
-        # Add Adjacency facts
-        for obj_id, contacts in context.get('adj', {}).items():
-            properties.add(('Adjacency', obj_id, tuple(contacts)))
-            
-        # Add Match Type facts
-        for match_type, groups_dict in context.get('match', {}).items():
-            for props, ids in groups_dict.items():
-                properties.add(('Match', match_type, props, frozenset(ids)))
-        
-        return properties
-
-    def _find_causal_chain_recursively(self, target_state_index: int, history: list[dict]) -> list[dict]:
-        """
-        Recursively works backward from a target state to find a chain of unique preconditions.
-        """
-        # Base case: If we've reached the beginning of the level, the chain ends.
-        if target_state_index <= 0:
-            return []
-
-        setup_state_index = target_state_index - 1
-        setup_context = history[setup_state_index]
-
-        # Build a set of all properties that occurred *before* the setup state.
-        properties_before_setup = set()
-        for i in range(setup_state_index):
-            properties_before_setup.update(self._get_all_state_properties(history[i]))
-
-        # Find what was unique about the setup state compared to everything before it.
-        setup_properties = self._get_all_state_properties(setup_context)
-        unique_preconditions = setup_properties - properties_before_setup
-
-        if not unique_preconditions:
-            # If nothing was unique about this state, this branch of the causal chain ends here.
-            return []
-        
-        # This step is significant. Now, recurse to find out what caused this setup state.
-        prior_chain = self._find_causal_chain_recursively(setup_state_index, history)
-
-        # Combine the prior chain with the step we just found.
-        current_step = {
-            'preconditions': unique_preconditions,
-            'trigger_state_index': setup_state_index
-        }
-        return prior_chain + [current_step]
-
     def _analyze_win_condition(self, winning_context: dict, historical_contexts: list[dict]):
-        """
-        Performs a deep, recursive causal analysis to find the multi-step chain of events
-        that led to a win, and stores it in the Solution Graph.
-        """
-        history = historical_contexts + [winning_context]
-        if len(history) < 2:
-            return
+        """Compares the winning state to all previous states in the level to find unique properties."""
+        if not historical_contexts:
+            return # Cannot analyze without a history
 
-        print("\n--- Causal Chain Win Analysis ---")
+        print("\n--- Win Condition Analysis ---")
+        
+        # Create a set of all previously seen relationship and adjacency states for quick lookups
+        seen_rels = set()
+        seen_adjs = set()
+        for context in historical_contexts:
+            for rel_type, groups in context.get('rels', {}).items():
+                for value, ids in groups.items():
+                    seen_rels.add((rel_type, value, frozenset(ids)))
+            for obj_id, contacts in context.get('adj', {}).items():
+                seen_adjs.add((obj_id, tuple(contacts)))
 
-        # 1. Identify the Terminal Event (the final change that caused the win)
-        setup_context = history[-2]
-        final_context = history[-1]
-        terminal_events, _ = self._log_changes(setup_context['summary'], final_context['summary'], assign_new_ids=False)
-        
-        if not terminal_events:
-            print("Win detected, but no terminal event found. Cannot analyze.")
-            return
+        # Now, find what's unique in the winning context
+        win_rels = winning_context.get('rels', {})
+        win_adjs = winning_context.get('adj', {})
+        new_hypotheses = []
 
-        terminal_event_fingerprint = tuple(sorted(terminal_events))
-        
-        # 2. Find the recursive chain of preconditions leading to the setup state.
-        causal_chain = self._find_causal_chain_recursively(len(history) - 1, history)
+        for rel_type, groups in win_rels.items():
+            for value, ids in groups.items():
+                win_pattern = (rel_type, value, frozenset(ids))
+                if win_pattern not in seen_rels:
+                    hypothesis = {'type': 'Relationship', 'pattern': win_pattern}
+                    new_hypotheses.append(hypothesis)
+                    print(f"Found unique winning condition: A '{rel_type}' group for value '{value}' with members {sorted(list(ids))}.")
 
-        # 3. ADDED: Find the unique properties of the final winning state itself.
-        properties_before_final = set()
-        for i in range(len(history) - 1):
-            properties_before_final.update(self._get_all_state_properties(history[i]))
+        for obj_id, contacts in win_adjs.items():
+            win_pattern = (obj_id, tuple(contacts))
+            if win_pattern not in seen_adjs:
+                hypothesis = {'type': 'Adjacency', 'pattern': win_pattern}
+                new_hypotheses.append(hypothesis)
+                print(f"Found unique winning condition: Adjacency for {obj_id.replace('obj_','id_')} of {tuple(contacts)}.")
         
-        final_properties = self._get_all_state_properties(final_context)
-        unique_outcomes = final_properties - properties_before_final
-        
-        # We must have at least a precondition chain or a unique outcome to form a hypothesis.
-        if not causal_chain and not unique_outcomes:
-            print("Could not identify a unique causal chain or a unique final outcome.")
-            return
-
-        # 4. Store the newly discovered path in the Solution Graph.
-        new_path = {
-            'chain': causal_chain,
-            'terminal_events': terminal_events,
-            'unique_outcomes': unique_outcomes
-        }
-
-        new_path_str = str(new_path)
-        existing_paths = self.win_condition_hypotheses.setdefault(terminal_event_fingerprint, [])
-        
-        is_duplicate = any(str(path) == new_path_str for path in existing_paths)
-        
-        if not is_duplicate:
-            existing_paths.append(new_path)
-            print("New causal path to victory discovered and saved to Solution Graph.")
-            if causal_chain:
-                for i, step in enumerate(causal_chain):
-                    print(f"  - Precondition Step {i+1}: Achieved {len(step['preconditions'])} unique condition(s).")
-            print(f"  - Terminal Step: Triggered {len(terminal_events)} event(s).")
-            if unique_outcomes:
-                print(f"  - Final Result: Produced {len(unique_outcomes)} unique outcome property/properties.")
-        else:
-            print("Re-confirmed an existing causal path to victory.")
+        if new_hypotheses:
+            # We use a set to avoid storing duplicate hypotheses across different wins
+            existing_hyp_set = {str(h) for h in self.win_condition_hypotheses}
+            for h in new_hypotheses:
+                if str(h) not in existing_hyp_set:
+                    self.win_condition_hypotheses.append(h)
 
     def _calculate_goal_bonus(self, action_key: str) -> float:
         """
@@ -1245,127 +1130,24 @@ class ObrlAgi3Agent(Agent):
         if not action_effects:
             return 0.0
 
-        # 2. Find all required conditions from our new Solution Graph hypotheses
+        # 2. Find all required conditions from our win hypotheses
         required_conditions = set()
-        # The top level of the graph are the terminal events (the keys)
-        # The values are lists of different paths that lead to that event.
-        for paths in self.win_condition_hypotheses.values():
-            for path in paths:
-                # A path contains a 'chain' of preconditions and 'unique_outcomes'
-                # We check both for things we might want to create.
-                
-                # Check preconditions from the causal chain
-                for step in path.get('chain', []):
-                    for precondition in step.get('preconditions', []):
-                        if precondition[0] == 'Relationship':
-                            _, rel_type, value, _ = precondition
-                            if rel_type == 'Color': required_conditions.add(f"creates_color_{value}")
-                            elif rel_type == 'Shape': required_conditions.add(f"creates_fingerprint_{value}")
-                            elif rel_type == 'Size': required_conditions.add(f"creates_size_{value}")
-                
-                # Check unique outcomes of the final state
-                for outcome in path.get('unique_outcomes', []):
-                    if outcome[0] == 'Relationship':
-                        _, rel_type, value, _ = outcome
-                        if rel_type == 'Color': required_conditions.add(f"creates_color_{value}")
-                        elif rel_type == 'Shape': required_conditions.add(f"creates_fingerprint_{value}")
-                        elif rel_type == 'Size': required_conditions.add(f"creates_size_{value}")
+        for win_hyp in self.win_condition_hypotheses:
+            if win_hyp['type'] == 'Relationship':
+                win_rel_type, win_value, _ = win_hyp['pattern']
+                if win_rel_type == 'Color':
+                    required_conditions.add(f"creates_color_{win_value}")
+                elif win_rel_type == 'Shape':
+                    required_conditions.add(f"creates_fingerprint_{win_value}")
+                elif win_rel_type == 'Size':
+                    required_conditions.add(f"creates_size_{win_value}")
         
-        # 3. If there is any overlap between what the action does and what a win requires, apply a bonus.
+        # 3. If there is any overlap, apply a bonus
         if action_effects.intersection(required_conditions):
-            bonus = 75.0
+            bonus = 15.0  # Large bonus for actions that are known to create winning properties
             print(f"Goal-Seeking Bonus: Action {action_key} may help achieve a known win condition. Applying bonus.")
 
         return bonus
-
-    def _generate_plan(self, current_context: dict):
-        """
-        Top-level planner that uses the Solution Graph to find the next logical step
-        in a known winning causal chain.
-        """
-        if not self.win_condition_hypotheses:
-            return
-
-        current_properties = self._get_all_state_properties(current_context)
-
-        # Iterate through all known terminal events and the paths that lead to them.
-        for terminal_event, paths in self.win_condition_hypotheses.items():
-            for path in paths:
-                # A path consists of a chain of precondition steps and the terminal events.
-                chain = path.get('chain', [])
-                
-                # Find the first step in the chain whose preconditions are NOT met.
-                next_sub_goal = None
-                if chain:
-                    all_prior_preconditions_met = True
-                    for i, step in enumerate(chain):
-                        preconditions = step['preconditions']
-                        # issubset checks if all precondition facts are present in the current state
-                        if not preconditions.issubset(current_properties):
-                            # This is the first set of unmet preconditions. This is our goal.
-                            next_sub_goal = preconditions
-                            all_prior_preconditions_met = False
-                            # print(f"DEBUG: Goal is to satisfy Precondition Step {i+1}")
-                            break
-                    
-                    # If all preconditions in the chain are met, the goal is now to trigger the terminal event.
-                    if all_prior_preconditions_met:
-                        # We are in the "setup state". The goal is now the terminal event.
-                        # For now, we'll represent this as a special goal type.
-                        next_sub_goal = {'type': 'TERMINAL_EVENT', 'events': path['terminal_events']}
-                        # print("DEBUG: All preconditions met. Goal is to trigger terminal event.")
-                
-                # If we have a goal, find a plan for it.
-                if next_sub_goal:
-                    plan = self._find_plan_for_goal(next_sub_goal, current_context)
-                    if plan:
-                        self.current_plan = plan
-                        print(f"\n--- New Plan Generated to satisfy sub-goal ---")
-                        print(f"Plan: {self.current_plan}")
-                        return
-
-    def _find_plan_for_goal(self, goal: set | dict, current_context: dict) -> list:
-        """
-        Searches for a single-step plan to achieve a specific sub-goal (a set of precondition facts).
-        """
-        # Search all known rules to see if any can produce one of the facts in our goal set.
-        for rule_key, hypothesis in self.rule_hypotheses.items():
-            action_key, affected_obj_id, precondition_state = rule_key
-            
-            # Check if this rule's precondition is currently met.
-            current_summary_map = {obj['id']: obj for obj in current_context['summary']}
-            if affected_obj_id in current_summary_map:
-                obj_in_current_state = current_summary_map[affected_obj_id]
-                current_obj_state_tuple = (self._get_stable_id(obj_in_current_state), obj_in_current_state['position'])
-                
-                if current_obj_state_tuple != precondition_state:
-                    continue # This rule is not applicable in the current state.
-            else:
-                continue # The object this rule applies to isn't on the board.
-
-            # If the rule is applicable, check if its effect matches our goal.
-            for event in hypothesis.get('rules', []):
-                # Translate the event into a "fact" that it would create.
-                # This is a simplified check. A more advanced version would predict the full next state.
-                effect_fact = None
-                if event.get('type') == 'RECOLORED':
-                    # This logic is complex: a recolor changes an object's 'Relationship' fact.
-                    # We will keep this part simple for now and focus on the structure.
-                    # A 'creates_color_X' check could be added here like in the goal bonus.
-                    pass
-                
-                # Check if the goal is to trigger a terminal event, and if this rule's action matches it.
-                if isinstance(goal, dict) and goal.get('type') == 'TERMINAL_EVENT':
-                    # A terminal event is a change log string. We need to check if this rule's action
-                    # corresponds to the action that created the terminal event in the past.
-                    # This requires storing the action key with the hypothesis. Let's simplify for now.
-                    # For now, we assume if all preconditions are met, any action is a good guess.
-                    # This is a placeholder for a more robust trigger matching logic.
-                    if hypothesis['confidence'] > 0.9:
-                        print(f"DEBUG: All preconditions met. Found high-confidence action {action_key} to trigger terminal event.")
-                        return [action_key]
-
-        return [] # No single-step plan found
 
     def _analyze_relationships(self, object_summary: list[dict]) -> tuple[dict, dict, dict]:
         """Analyzes object relationships and returns a structured dictionary of groups."""
