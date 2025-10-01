@@ -1150,18 +1150,17 @@ class ObrlAgi3Agent(Agent):
                     'conditions': pattern_list
                 })
 
-        # Recipe 2: The "Major Milestone" - based on the chapter with the most changes.
+        # Recipe 2: "Individual Milestone" hypotheses - one for each significant chapter.
         if level_chapters:
-            # Find the chapter with the most new relationship groups formed.
-            major_milestone_chapter = max(level_chapters, key=lambda c: sum(len(v) for v in c['delta']['new_rels'].values()))
-            pattern_list = self._format_delta_as_pattern_list(major_milestone_chapter['delta'])
-            if pattern_list:
-                hyp_counter += 1
-                new_hypotheses.append({
-                    'id': f'hyp_{hyp_counter}', 'type': 'static_pattern', 'confidence': 1.0,
-                    'description': f"Major Milestone (from turn {major_milestone_chapter['start']})",
-                    'conditions': pattern_list
-                })
+            for chapter in level_chapters:
+                pattern_list = self._format_delta_as_pattern_list(chapter['delta'])
+                if pattern_list:
+                    hyp_counter += 1
+                    new_hypotheses.append({
+                        'id': f'hyp_{hyp_counter}', 'type': 'static_pattern', 'confidence': 1.0,
+                        'description': f"Event at turn {chapter['start']}",
+                        'conditions': pattern_list
+                    })
         
         # Recipe 3: The "Full Recipe" - a sequential pattern of all chapter deltas.
         if len(level_chapters) > 1:
