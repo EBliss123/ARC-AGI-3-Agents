@@ -1135,18 +1135,86 @@ class ObrlAgi3Agent(Agent):
             print("No significant deltas found between key moments.")
 
         # --- Step 2: Formulate Competing Hypotheses (The "Recipes") ---
-        # TODO: Based on the chapter analysis, generate the list of competing hypotheses
-        # in the new dictionary format.
-        #   - The "Full Recipe" (chaining all milestone deltas together).
-        #   - The "Simple Recipe" (based only on the final Start -> Win delta).
-        #   - The "Final Step" Recipe (based only on the last milestone -> Win delta).
+        new_hypotheses = []
+        hyp_counter = 0
 
-        # --- Step 3: Store the new hypotheses ---
-        # TODO: Create the new list of hypothesis dictionaries and assign it to self.win_condition_hypotheses.
-        # Remember each hypothesis needs an ID, type, confidence, and conditions.
+        # Recipe 1: The "Final Step" - based on the very last significant chapter.
+        if level_chapters:
+            last_chapter = level_chapters[-1]
+            pattern_list = self._format_delta_as_pattern_list(last_chapter['delta'])
+            if pattern_list:
+                hyp_counter += 1
+                new_hypotheses.append({
+                    'id': f'hyp_{hyp_counter}', 'type': 'static_pattern', 'confidence': 1.0,
+                    'description': f"Final Step (from turn {last_chapter['start']})",
+                    'conditions': pattern_list
+                })
+
+        # Recipe 2: The "Major Milestone" - based on the chapter with the most changes.
+        if level_chapters:
+            # Find the chapter with the most new relationship groups formed.
+            major_milestone_chapter = max(level_chapters, key=lambda c: sum(len(v) for v in c['delta']['new_rels'].values()))
+            pattern_list = self._format_delta_as_pattern_list(major_milestone_chapter['delta'])
+            if pattern_list:
+                hyp_counter += 1
+                new_hypotheses.append({
+                    'id': f'hyp_{hyp_counter}', 'type': 'static_pattern', 'confidence': 1.0,
+                    'description': f"Major Milestone (from turn {major_milestone_chapter['start']})",
+                    'conditions': pattern_list
+                })
         
-        # For now, we'll just print a placeholder message.
-        print("Analysis complete. Hypotheses will be generated in the next implementation step.")
+        # Recipe 3: The "Full Recipe" - a sequential pattern of all chapter deltas.
+        if len(level_chapters) > 1:
+            full_recipe_steps = []
+            for chapter in level_chapters:
+                step_patterns = self._format_delta_as_pattern_list(chapter['delta'])
+                if step_patterns:
+                    full_recipe_steps.append({
+                        'description': f"Step from turn {chapter['start']}",
+                        'patterns': step_patterns
+                    })
+            if full_recipe_steps:
+                hyp_counter += 1
+                new_hypotheses.append({
+                    'id': f'hyp_{hyp_counter}', 'type': 'sequential_pattern', 'confidence': 1.0,
+                    'description': 'Full sequence of events',
+                    'conditions': full_recipe_steps
+                })
+
+        # Recipe 4: The "Start-to-Finish" Recipe - a simple delta of the whole level.
+        start_context = level_history[0]
+        end_context = level_history[winning_state_index]
+        overall_delta = self._get_context_delta(start_context, end_context)
+        pattern_list = self._format_delta_as_pattern_list(overall_delta)
+        if pattern_list:
+            hyp_counter += 1
+            new_hypotheses.append({
+                'id': f'hyp_{hyp_counter}', 'type': 'static_pattern', 'confidence': 1.0,
+                'description': 'Overall level goal',
+                'conditions': pattern_list
+            })
+
+        # --- Step 3: Remove duplicate hypotheses and store them ---
+        unique_hypotheses = []
+        seen_conditions = set()
+        for hyp in new_hypotheses:
+            # Create a hashable representation of the conditions to check for duplicates
+            conditions_str = str(sorted(hyp['conditions'], key=lambda x: str(x)))
+            if conditions_str not in seen_conditions:
+                unique_hypotheses.append(hyp)
+                seen_conditions.add(conditions_str)
+        
+        self.win_condition_hypotheses = unique_hypotheses
+        
+        print(f"\n--- Generated {len(self.win_condition_hypotheses)} Competing Hypotheses ---")
+        for hyp in self.win_condition_hypotheses:
+            condition_summary = []
+            if hyp['type'] == 'static_pattern':
+                for cond in hyp['conditions']:
+                    condition_summary.append(f"form a '{cond['property']}' group for value '{cond['value']}'")
+                print(f"- {hyp['id']} ({hyp['type']}, {hyp['description']}): Goal is to {', '.join(condition_summary)}.")
+            elif hyp['type'] == 'sequential_pattern':
+                print(f"- {hyp['id']} ({hyp['type']}, {hyp['description']}): Requires completing {len(hyp['conditions'])} steps.")
 
     def _get_context_delta(self, start_context: dict, end_context: dict) -> dict:
         """Finds the significant changes (deltas) between a start and end context."""
@@ -1165,6 +1233,18 @@ class ObrlAgi3Agent(Agent):
                     delta['new_rels'].setdefault(rel_type, []).append({'value': value, 'members': end_ids})
         
         return delta
+    
+    def _format_delta_as_pattern_list(self, delta: dict) -> list[dict]:
+        """Converts a delta dictionary into a list of pattern condition dictionaries."""
+        patterns = []
+        for rel_type, changes in delta.get('new_rels', {}).items():
+            for change in changes:
+                patterns.append({
+                    'type': 'group',
+                    'property': rel_type,
+                    'value': change['value']
+                })
+        return patterns
 
     def _calculate_goal_bonus(self, action_key: str) -> float:
         """
