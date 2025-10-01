@@ -1105,9 +1105,34 @@ class ObrlAgi3Agent(Agent):
         print(f"Analyzing level based on {len(key_indices)} key moments at indices: {key_indices}")
 
         # --- Step 1: Analyze the "chapters" between key moments ---
-        # TODO: Implement logic to find the "delta" or significant changes between each key state.
-        # For example, analyze the change from state 0 to the first milestone, then from the
-        # first milestone to the second, and so on.
+        level_chapters = []
+        print("\n--- Chapter Analysis ---")
+        for i in range(len(key_indices) - 1):
+            start_index = key_indices[i]
+            end_index = key_indices[i+1]
+
+            start_context = level_history[start_index]
+            end_context = level_history[end_index]
+            
+            delta = self._get_context_delta(start_context, end_context)
+            
+            # Only store and report on chapters that had a significant change.
+            if delta.get('new_rels'):
+                chapter_info = {
+                    'start': start_index,
+                    'end': end_index,
+                    'delta': delta
+                }
+                level_chapters.append(chapter_info)
+                # For logging, create a summary of the delta
+                delta_summary = []
+                for rel_type, changes in delta['new_rels'].items():
+                    for change in changes:
+                        delta_summary.append(f"new '{rel_type}' group for value '{change['value']}'")
+                print(f"- Chapter ({start_index} -> {end_index}): Delta includes {', '.join(delta_summary)}.")
+
+        if not level_chapters:
+            print("No significant deltas found between key moments.")
 
         # --- Step 2: Formulate Competing Hypotheses (The "Recipes") ---
         # TODO: Based on the chapter analysis, generate the list of competing hypotheses
@@ -1122,6 +1147,24 @@ class ObrlAgi3Agent(Agent):
         
         # For now, we'll just print a placeholder message.
         print("Analysis complete. Hypotheses will be generated in the next implementation step.")
+
+    def _get_context_delta(self, start_context: dict, end_context: dict) -> dict:
+        """Finds the significant changes (deltas) between a start and end context."""
+        delta = {'new_rels': {}}
+
+        start_rels = start_context.get('rels', {})
+        end_rels = end_context.get('rels', {})
+
+        for rel_type, end_groups in end_rels.items():
+            start_groups = start_rels.get(rel_type, {})
+            for value, end_ids in end_groups.items():
+                start_ids = start_groups.get(value, set())
+                # If the group in the end state is a superset of the start state's group
+                # and has grown, it's a significant change.
+                if end_ids > start_ids:
+                    delta['new_rels'].setdefault(rel_type, []).append({'value': value, 'members': end_ids})
+        
+        return delta
 
     def _calculate_goal_bonus(self, action_key: str) -> float:
         """
