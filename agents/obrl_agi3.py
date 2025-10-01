@@ -1150,16 +1150,27 @@ class ObrlAgi3Agent(Agent):
                     'conditions': pattern_list
                 })
 
-        # Recipe 2: "Individual Milestone" hypotheses - one for each significant chapter.
-        if level_chapters:
-            for chapter in level_chapters:
-                pattern_list = self._format_delta_as_pattern_list(chapter['delta'])
-                if pattern_list:
+        # Recipe 2: "Causal Chain" hypotheses - connecting key milestones to the final step.
+        if len(level_chapters) > 1:
+            last_chapter = level_chapters[-1]
+            final_step_patterns = self._format_delta_as_pattern_list(last_chapter['delta'])
+            
+            # Create a sequential hypothesis for each milestone, treating it as a prerequisite to the final step.
+            # We iterate up to the second-to-last chapter, as the last one is handled separately.
+            for chapter in level_chapters[:-1]:
+                milestone_patterns = self._format_delta_as_pattern_list(chapter['delta'])
+                
+                if milestone_patterns and final_step_patterns:
                     hyp_counter += 1
                     new_hypotheses.append({
-                        'id': f'hyp_{hyp_counter}', 'type': 'static_pattern', 'confidence': 1.0,
-                        'description': f"Event at turn {chapter['start']}",
-                        'conditions': pattern_list
+                        'id': f'hyp_{hyp_counter}',
+                        'type': 'sequential_pattern',
+                        'confidence': 1.0,
+                        'description': f"Event at turn {chapter['start']} followed by Final Step",
+                        'conditions': [
+                            {'description': f"Step from turn {chapter['start']}", 'patterns': milestone_patterns},
+                            {'description': f"Step from turn {last_chapter['start']}", 'patterns': final_step_patterns}
+                        ]
                     })
         
         # Recipe 3: The "Full Recipe" - a sequential pattern of all chapter deltas.
