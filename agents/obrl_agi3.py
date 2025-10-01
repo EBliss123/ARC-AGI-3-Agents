@@ -48,6 +48,8 @@ class ObrlAgi3Agent(Agent):
         self.last_match_groups = {}
         self.level_state_history = []
         self.win_condition_hypotheses = []
+        self.level_milestones = []
+        self.seen_event_types_in_level = set()
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -67,6 +69,8 @@ class ObrlAgi3Agent(Agent):
         if not self.last_object_summary or self.is_new_level:
             self.level_state_history = []
             self.is_new_level = False
+            self.level_milestones = []
+            self.seen_event_types_in_level = set()
 
             id_map = {} # To store {old_id: new_id} mappings
             new_obj_to_old_id_map = {} # Initialize our map to handle the first frame case
@@ -316,7 +320,7 @@ class ObrlAgi3Agent(Agent):
                 if self.level_state_history:
                     winning_context = self.level_state_history[-1] # The last state before the score change
                     historical_contexts = self.level_state_history[:-1]
-                    self._analyze_win_condition(winning_context, historical_contexts)
+                    self._analyze_win_condition(self.level_state_history, self.level_milestones)
                 
                 # Print the full summary of the final frame of the level that was just won.
                 print("\n--- Final Frame Summary (Old Level) ---")
@@ -395,7 +399,29 @@ class ObrlAgi3Agent(Agent):
                                 )
                                 unique_log_messages.append(log_msg)
                     novel_state_count = len(unique_log_messages)
-                
+
+                    # --- Milestone Detection ---
+                    # A milestone is any turn with a unique change, OR the discovery of a new game mechanic.
+                    is_milestone = False
+                    if novel_state_count > 0:
+                        is_milestone = True
+
+                    # Check for new mechanic discovery
+                    current_event_types = {log.split(':')[0].replace('- ', '') for log in changes}
+                    newly_discovered_types = current_event_types - self.seen_event_types_in_level
+                    if newly_discovered_types:
+                        is_milestone = True
+                        self.seen_event_types_in_level.update(newly_discovered_types)
+                        print(f"Milestone Discovery: New event types observed: {sorted(list(newly_discovered_types))}")
+                    
+                    if is_milestone:
+                        # The current state will be appended to the history at the end of this method.
+                        # Its index will be the current length of the history.
+                        milestone_index = len(self.level_state_history)
+                        self.level_milestones.append(milestone_index)
+                        print(f"Logging Milestone at state index {milestone_index}.")
+
+
                 else:
                     # No changes occurred. Check if this is a failure, but NOT if we just finished waiting.
                     if not just_finished_waiting:
@@ -1059,49 +1085,43 @@ class ObrlAgi3Agent(Agent):
         if not diffs_found:
             print("No conditions found that are both consistent across all failures and unique to them.")
 
-    def _analyze_win_condition(self, winning_context: dict, historical_contexts: list[dict]):
-        """Compares the winning state to all previous states in the level to find unique properties."""
-        if not historical_contexts:
-            return # Cannot analyze without a history
+    def _analyze_win_condition(self, level_history: list[dict], milestone_indices: list[int]):
+        """
+        Analyzes a completed level by breaking it into chapters based on milestones
+        and generating competing hypotheses about the winning "recipe".
+        """
+        print("\n--- Win Condition Analysis (V2) ---")
+        if len(level_history) < 2:
+            print("Insufficient history for analysis.")
+            return
 
-        print("\n--- Win Condition Analysis ---")
+        # The final state is always the last one in the history before the win.
+        winning_state_index = len(level_history) - 1
         
-        # Create a set of all previously seen relationship and adjacency states for quick lookups
-        seen_rels = set()
-        seen_adjs = set()
-        for context in historical_contexts:
-            for rel_type, groups in context.get('rels', {}).items():
-                for value, ids in groups.items():
-                    seen_rels.add((rel_type, value, frozenset(ids)))
-            for obj_id, contacts in context.get('adj', {}).items():
-                seen_adjs.add((obj_id, tuple(contacts)))
-
-        # Now, find what's unique in the winning context
-        win_rels = winning_context.get('rels', {})
-        win_adjs = winning_context.get('adj', {})
-        new_hypotheses = []
-
-        for rel_type, groups in win_rels.items():
-            for value, ids in groups.items():
-                win_pattern = (rel_type, value, frozenset(ids))
-                if win_pattern not in seen_rels:
-                    hypothesis = {'type': 'Relationship', 'pattern': win_pattern}
-                    new_hypotheses.append(hypothesis)
-                    print(f"Found unique winning condition: A '{rel_type}' group for value '{value}' with members {sorted(list(ids))}.")
-
-        for obj_id, contacts in win_adjs.items():
-            win_pattern = (obj_id, tuple(contacts))
-            if win_pattern not in seen_adjs:
-                hypothesis = {'type': 'Adjacency', 'pattern': win_pattern}
-                new_hypotheses.append(hypothesis)
-                print(f"Found unique winning condition: Adjacency for {obj_id.replace('obj_','id_')} of {tuple(contacts)}.")
+        # Combine the start, milestones, and end into a list of key moments.
+        # Ensure the start (index 0) and end are always included and the list is sorted with no duplicates.
+        key_indices = sorted(list(set([0] + milestone_indices + [winning_state_index])))
         
-        if new_hypotheses:
-            # We use a set to avoid storing duplicate hypotheses across different wins
-            existing_hyp_set = {str(h) for h in self.win_condition_hypotheses}
-            for h in new_hypotheses:
-                if str(h) not in existing_hyp_set:
-                    self.win_condition_hypotheses.append(h)
+        print(f"Analyzing level based on {len(key_indices)} key moments at indices: {key_indices}")
+
+        # --- Step 1: Analyze the "chapters" between key moments ---
+        # TODO: Implement logic to find the "delta" or significant changes between each key state.
+        # For example, analyze the change from state 0 to the first milestone, then from the
+        # first milestone to the second, and so on.
+
+        # --- Step 2: Formulate Competing Hypotheses (The "Recipes") ---
+        # TODO: Based on the chapter analysis, generate the list of competing hypotheses
+        # in the new dictionary format.
+        #   - The "Full Recipe" (chaining all milestone deltas together).
+        #   - The "Simple Recipe" (based only on the final Start -> Win delta).
+        #   - The "Final Step" Recipe (based only on the last milestone -> Win delta).
+
+        # --- Step 3: Store the new hypotheses ---
+        # TODO: Create the new list of hypothesis dictionaries and assign it to self.win_condition_hypotheses.
+        # Remember each hypothesis needs an ID, type, confidence, and conditions.
+        
+        # For now, we'll just print a placeholder message.
+        print("Analysis complete. Hypotheses will be generated in the next implementation step.")
 
     def _calculate_goal_bonus(self, action_key: str) -> float:
         """
