@@ -1294,17 +1294,18 @@ class ObrlAgi3Agent(Agent):
                     for cond in hyp['conditions']:
                         cond_type = cond.get('type')
                         if cond_type == 'group':
-                            condition_summary.append(f"form a '{cond.get('property')}' group for value '{cond.get('value')}'")
+                            condition_summary.append(f"form a '{cond.get('property')}' group")
                         elif cond_type == 'adjacency':
-                            obj_id = cond.get('obj_id', '').replace('obj_', 'id_')
-                            condition_summary.append(f"create an adjacency for {obj_id}")
+                            condition_summary.append("create an adjacency")
                         elif cond_type == 'alignment':
-                            condition_summary.append(f"create an '{cond.get('align_type')}' alignment at {cond.get('coord')}")
+                            condition_summary.append(f"create a '{cond.get('align_type')}' alignment")
                         elif cond_type == 'object_appeared':
                             condition_summary.append("cause a new object to appear")
                         elif cond_type == 'event':
-                            condition_summary.append(f"cause event '{cond.get('description', '')}'")
+                            condition_summary.append(f"cause a '{cond.get('event_type')}' event")
                     
+                    # Sort the summary for consistent output and remove duplicates
+                    condition_summary = sorted(list(set(condition_summary)))
                     print(f"- {hyp['id']} ({hyp['description']}) [Conf: {hyp['confidence']:.0%}]: Goal is to {', '.join(condition_summary)}.")
                 
                 elif hyp['type'] == 'sequential_pattern':
@@ -1377,31 +1378,32 @@ class ObrlAgi3Agent(Agent):
         return delta
     
     def _format_delta_as_pattern_list(self, delta: dict) -> list[dict]:
-        """Converts a delta dictionary into a list of pattern condition dictionaries."""
+        """Converts a delta dictionary into a list of GENERALIZED pattern dictionaries."""
         patterns = []
-        # Format relationship patterns
-        for rel_type, changes in delta.get('rels', {}).items():
-            for change in changes:
-                patterns.append({'type': 'group', 'property': rel_type, 'value': change['value']})
+        # Generalize relationship patterns by type, not value
+        for rel_type in delta.get('rels', {}):
+            patterns.append({'type': 'group', 'property': rel_type})
         
-        # Format adjacency patterns
-        for adj_change in delta.get('adjs', []):
-            patterns.append({'type': 'adjacency', 'obj_id': adj_change['obj_id'], 'contacts': adj_change['contacts']})
+        # Generalize adjacency patterns
+        if 'adjs' in delta:
+            patterns.append({'type': 'adjacency'})
 
-        # Format alignment patterns
-        for align_type, changes in delta.get('aligns', {}).items():
-            for change in changes:
-                patterns.append({'type': 'alignment', 'align_type': align_type, 'coord': change['coord']})
+        # Generalize alignment patterns by type, not coordinate
+        for align_type in delta.get('aligns', {}):
+            patterns.append({'type': 'alignment', 'align_type': align_type})
 
-        # Format new object patterns (we care about what was added)
-        for obj in delta.get('objs', {}).get('added', []):
-            patterns.append({'type': 'object_appeared', 'properties': self._get_stable_id(obj)})
-
-        # Format direct event patterns
+        # Generalize object appearance
+        if delta.get('objs', {}).get('added'):
+            patterns.append({'type': 'object_appeared'})
+        
+        # Generalize events by their type (MOVED, GROWTH, etc.)
         for event_str in delta.get('events', []):
-            patterns.append({'type': 'event', 'description': event_str})
+            event_type = event_str.split(':')[0].replace('- ', '')
+            patterns.append({'type': 'event', 'event_type': event_type})
 
-        return patterns
+        # Remove duplicates by converting to a set of tuples and back to dicts
+        unique_patterns = {tuple(p.items()) for p in patterns}
+        return [dict(t) for t in unique_patterns]
 
     def _calculate_goal_bonus(self, move: dict) -> float:
         """
@@ -1462,39 +1464,46 @@ class ObrlAgi3Agent(Agent):
         return total_bonus
     
     def _check_hypothesis_against_level(self, hypothesis: dict, level_chapters: list[dict]) -> bool:
-        """Checks if a given hypothesis is consistent with the events of a completed level."""
+        """Checks if a given GENERALIZED hypothesis is consistent with the events of a completed level."""
         hyp_type = hypothesis['type']
         hyp_conditions = hypothesis['conditions']
 
         if not hyp_conditions:
             return False
 
+        # Get a flat list of all unique abstract patterns that occurred in the entire level
+        level_patterns_observed = set()
+        for chapter in level_chapters:
+            chapter_patterns = self._format_delta_as_pattern_list(chapter['delta'])
+            for p in chapter_patterns:
+                level_patterns_observed.add(tuple(p.items()))
+        
+        # Convert set of tuples back to list of dicts for easy lookup
+        level_patterns_observed_list = [dict(t) for t in level_patterns_observed]
+
         if hyp_type == 'static_pattern':
-            # For a static pattern, we just need to see if the required pattern
-            # appeared in ANY chapter of the level.
-            for chapter in level_chapters:
-                chapter_patterns = self._format_delta_as_pattern_list(chapter['delta'])
-                # Check if all required conditions are a subset of the chapter's patterns
-                if all(cond in chapter_patterns for cond in hyp_conditions):
-                    return True # The pattern was found, the hypothesis is consistent.
-            return False # The required pattern never appeared.
+            # Check if all required abstract conditions were observed at least once in the level.
+            return all(cond in level_patterns_observed_list for cond in hyp_conditions)
 
         elif hyp_type == 'sequential_pattern':
-            # For a sequence, we need to find all steps in the correct order.
+            # For a sequence, check if the steps' abstract patterns appeared in the correct order.
             chapter_idx = 0
             for step in hyp_conditions:
-                step_patterns = step['patterns']
+                # The patterns required for this specific step in the recipe
+                step_required_patterns = step['patterns']
                 found_step = False
-                # Search for this step starting from the current point in the level's story
+                # Search for a chapter in the level that satisfies this step's requirements
                 while chapter_idx < len(level_chapters):
-                    chapter_patterns = self._format_delta_as_pattern_list(level_chapters[chapter_idx]['delta'])
+                    # Get the abstract patterns for the current chapter
+                    chapter_patterns_in_step = self._format_delta_as_pattern_list(level_chapters[chapter_idx]['delta'])
                     chapter_idx += 1
-                    if all(cond in chapter_patterns for cond in step_patterns):
+                    # Check if this chapter satisfies all conditions for the current step in the recipe
+                    if all(cond in chapter_patterns_in_step for cond in step_required_patterns):
                         found_step = True
-                        break # Found this step, move on to the next one
+                        break # Found this step, move on to the next one in the recipe
                 
                 if not found_step:
-                    return False # A required step in the sequence was not found.
+                    return False # A required step was not found in order.
             
             return True # All steps were found in the correct order.
         
