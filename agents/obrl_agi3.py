@@ -50,6 +50,7 @@ class ObrlAgi3Agent(Agent):
         self.win_condition_hypotheses = []
         self.level_milestones = []
         self.seen_event_types_in_level = set()
+        self.last_alignments = {}
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -65,6 +66,7 @@ class ObrlAgi3Agent(Agent):
         
         current_summary = self._perceive_objects(latest_frame)
         current_relationships, current_adjacencies, current_match_groups = self._analyze_relationships(current_summary)
+        current_alignments = self._analyze_alignments(current_summary)
 
         # If this is the first scan (last summary is empty), print the full summary.
         if not self.last_object_summary or self.is_new_level:
@@ -72,6 +74,7 @@ class ObrlAgi3Agent(Agent):
             self.is_new_level = False
             self.level_milestones = []
             self.seen_event_types_in_level = set()
+            self.last_alignments = {}
 
             id_map = {} # To store {old_id: new_id} mappings
             new_obj_to_old_id_map = {} # Initialize our map to handle the first frame case
@@ -265,6 +268,18 @@ class ObrlAgi3Agent(Agent):
                         clean_obj_id = obj_id.replace('obj_', 'id_')
                         print(f"- Object {clean_obj_id} ({contact_tuple_str})")
 
+                if current_alignments:
+                    print("\n--- Initial Alignment Analysis ---")
+                    def format_align_ids(id_set):
+                        id_list = sorted(list(id_set))
+                        if len(id_list) < 2: return f"Object {id_list[0]}"
+                        if len(id_list) == 2: return f"Objects {id_list[0]} and {id_list[1]}"
+                        return "Objects " + ", ".join(map(str, id_list[:-1])) + f", and {id_list[-1]}"
+                    
+                    for align_type, groups in sorted(current_alignments.items()):
+                        for coord, ids in sorted(groups.items()):
+                            print(f"- '{align_type}' Alignment at {coord}: {format_align_ids(ids)}")
+
                 if current_match_groups:
                     print("\n--- Object Match Type Analysis ---")
                     print_order = ['Exact', 'Color', 'Fingerprint', 'Size', 'Pixels']
@@ -339,6 +354,7 @@ class ObrlAgi3Agent(Agent):
 
             self._log_relationship_changes(self.last_relationships, current_relationships)
             self._log_adjacency_changes(self.last_adjacencies, current_adjacencies)
+            self._log_alignment_changes(self.last_alignments, current_alignments)
             self._log_match_type_changes(self.last_match_groups, current_match_groups)
 
             # --- Prepare for Learning & Rule Analysis ---
@@ -519,6 +535,7 @@ class ObrlAgi3Agent(Agent):
         self.last_object_summary = current_summary
         self.last_adjacencies = current_adjacencies
         self.last_relationships = current_relationships
+        self.last_alignments = current_alignments
         self.last_match_groups = current_match_groups
 
         # This is the REAL list of actions for this specific game on this turn.
@@ -707,6 +724,7 @@ class ObrlAgi3Agent(Agent):
             'rels': current_relationships,
             'adj': current_adjacencies,
             'match': current_match_groups,
+            'align': current_alignments,
             'events': changes 
         }
         if self.last_action_context:
@@ -1141,6 +1159,10 @@ class ObrlAgi3Agent(Agent):
             if 'adjs' in delta:
                 for adj_change in delta['adjs']:
                     delta_summary.append(f"new adjacency for id_{adj_change['obj_id'].split('_')[1]}")
+            if 'aligns' in delta:
+                for align_type, changes in delta['aligns'].items():
+                    for change in changes:
+                        delta_summary.append(f"new '{align_type}' alignment at {change['coord']}")
             if 'objs' in delta:
                 if 'added' in delta['objs']:
                     delta_summary.append(f"{len(delta['objs']['added'])} new object(s) appeared")
@@ -1276,6 +1298,8 @@ class ObrlAgi3Agent(Agent):
                         elif cond_type == 'adjacency':
                             obj_id = cond.get('obj_id', '').replace('obj_', 'id_')
                             condition_summary.append(f"create an adjacency for {obj_id}")
+                        elif cond_type == 'alignment':
+                            condition_summary.append(f"create an '{cond.get('align_type')}' alignment at {cond.get('coord')}")
                         elif cond_type == 'object_appeared':
                             condition_summary.append("cause a new object to appear")
                         elif cond_type == 'event':
@@ -1314,6 +1338,19 @@ class ObrlAgi3Agent(Agent):
         if new_adjs:
             delta['adjs'] = new_adjs
 
+        # --- Alignment Deltas ---
+        new_aligns = {}
+        start_aligns = start_context.get('align', {})
+        end_aligns = end_context.get('align', {})
+        for align_type, end_groups in end_aligns.items():
+            start_groups = start_aligns.get(align_type, {})
+            for coord, end_ids in end_groups.items():
+                start_ids = start_groups.get(coord, set())
+                if end_ids > start_ids: # An alignment group appeared or grew
+                    new_aligns.setdefault(align_type, []).append({'coord': coord, 'members': end_ids})
+        if new_aligns:
+            delta['aligns'] = new_aligns
+
         # --- 3. Individual Object Deltas (New/Removed) ---
         changed_objs = {}
         start_summary = start_context.get('summary', [])
@@ -1350,6 +1387,11 @@ class ObrlAgi3Agent(Agent):
         # Format adjacency patterns
         for adj_change in delta.get('adjs', []):
             patterns.append({'type': 'adjacency', 'obj_id': adj_change['obj_id'], 'contacts': adj_change['contacts']})
+
+        # Format alignment patterns
+        for align_type, changes in delta.get('aligns', {}).items():
+            for change in changes:
+                patterns.append({'type': 'alignment', 'align_type': align_type, 'coord': change['coord']})
 
         # Format new object patterns (we care about what was added)
         for obj in delta.get('objs', {}).get('added', []):
@@ -1576,6 +1618,40 @@ class ObrlAgi3Agent(Agent):
         
         return final_rels, adjacency_map, match_groups
     
+    def _analyze_alignments(self, object_summary: list[dict]) -> dict:
+        """Analyzes and groups objects based on horizontal and vertical alignments."""
+        if len(object_summary) < 2:
+            return {}
+
+        # Pre-calculate alignment coordinates for each object
+        for obj in object_summary:
+            y, x = obj['position']
+            h, w = obj['size']
+            obj['top_y'] = y
+            obj['bottom_y'] = y + h - 1
+            obj['left_x'] = x
+            obj['right_x'] = x + w - 1
+            obj['center_y'] = y + h // 2
+            obj['center_x'] = x + w // 2
+
+        alignment_types = ['top_y', 'bottom_y', 'center_y', 'left_x', 'right_x', 'center_x']
+        alignment_groups = {align_type: {} for align_type in alignment_types}
+
+        for align_type in alignment_types:
+            for obj in object_summary:
+                coord = obj[align_type]
+                obj_id = int(obj['id'].replace('obj_', ''))
+                alignment_groups[align_type].setdefault(coord, set()).add(obj_id)
+
+        # Filter out groups with only one member
+        final_alignments = {}
+        for align_type, groups in alignment_groups.items():
+            filtered_groups = {coord: ids for coord, ids in groups.items() if len(ids) > 1}
+            if filtered_groups:
+                final_alignments[align_type] = filtered_groups
+        
+        return final_alignments
+
     def _log_relationship_changes(self, old_rels: dict, new_rels: dict):
         """Compares two relationship dictionaries and logs which objects joined, left, or replaced others in groups."""
         output_lines = []
@@ -1650,6 +1726,47 @@ class ObrlAgi3Agent(Agent):
         if output_lines:
             print("\n--- Adjacency Change Log ---")
             for line in output_lines:
+                print(line)
+            print()
+
+    def _log_alignment_changes(self, old_aligns: dict, new_aligns: dict):
+        """Compares two alignment dictionaries and logs the differences."""
+        if old_aligns == new_aligns:
+            return
+
+        output_lines = []
+        all_align_types = sorted(list(set(old_aligns.keys()) | set(new_aligns.keys())))
+
+        def format_ids(id_set):
+            id_list = sorted(list(id_set))
+            if len(id_list) == 1: return f"object {id_list[0]}"
+            return f"objects " + ", ".join(map(str, id_list))
+
+        for align_type in all_align_types:
+            old_groups = old_aligns.get(align_type, {})
+            new_groups = new_aligns.get(align_type, {})
+            all_coords = set(old_groups.keys()) | set(new_groups.keys())
+
+            for coord in all_coords:
+                old_ids = old_groups.get(coord, set())
+                new_ids = new_groups.get(coord, set())
+
+                if old_ids == new_ids:
+                    continue
+
+                joined = new_ids - old_ids
+                left = old_ids - new_ids
+
+                if joined and left:
+                    output_lines.append(f"- '{align_type}' Alignment at {coord}: {format_ids(joined).capitalize()} replaced {format_ids(left)}.")
+                elif joined:
+                    output_lines.append(f"- '{align_type}' Alignment at {coord}: {format_ids(joined).capitalize()} joined.")
+                elif left:
+                    output_lines.append(f"- '{align_type}' Alignment at {coord}: {format_ids(left).capitalize()} left.")
+
+        if output_lines:
+            print("\n--- Alignment Change Log ---")
+            for line in sorted(output_lines):
                 print(line)
             print()
 
