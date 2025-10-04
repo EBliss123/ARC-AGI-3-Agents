@@ -656,7 +656,7 @@ class ObrlAgi3Agent(Agent):
 
             score += failure_penalty
 
-            goal_bonus = self._calculate_goal_bonus(action_key)
+            goal_bonus = self._calculate_goal_bonus(move)
             score += goal_bonus
 
             if score > best_score:
@@ -1361,51 +1361,63 @@ class ObrlAgi3Agent(Agent):
 
         return patterns
 
-    def _calculate_goal_bonus(self, action_key: str) -> float:
+    def _calculate_goal_bonus(self, move: dict) -> float:
         """
-        Calculates a score bonus if an action is known to help achieve any type of
-        win condition hypothesis in a general way.
+        Calculates a score bonus based on how well a potential move helps achieve
+        any of the current win condition hypotheses. This acts as the "Scoreboard" system.
         """
         if not self.win_condition_hypotheses or not self.rule_hypotheses:
             return 0.0
 
-        bonus = 0.0
-        
-        # 1. Find all known effects for the given action
-        action_effects = set()
-        for rule_key, hypothesis in self.rule_hypotheses.items():
-            rule_action, _, _ = rule_key
-            if rule_action == action_key and hypothesis.get('rules'):
-                for event in hypothesis['rules']:
-                    # Generalize the effect into a searchable format
-                    if event.get('type') == 'RECOLORED':
-                        action_effects.add(f"creates_color_{event.get('to_color')}")
-                    elif event.get('type') == 'SHAPE_CHANGED':
-                        action_effects.add(f"creates_fingerprint_{event.get('to_fingerprint')}")
-                    elif event.get('type') in ['GROWTH', 'SHRINK', 'TRANSFORM'] and 'to_size' in event:
-                        action_effects.add(f"creates_size_{event.get('to_size')}")
+        total_bonus = 0.0
+        action_template = move['type']
+        target_object = move['object']
 
-        if not action_effects:
+        # Determine the base action key for looking up rules.
+        coords_for_key = {'x': target_object['position'][1], 'y': target_object['position'][0]} if target_object else None
+        base_action_key = self._get_learning_key(action_template.name, coords_for_key)
+        
+        # --- Step 1: Predict the Action's Outcome ---
+        # Find all known effects for this specific action from our rule hypotheses.
+        known_effects = set()
+        for rule_key, hypothesis in self.rule_hypotheses.items():
+            rule_base_key = rule_key[0]
+            # We only consider rules with high confidence to make reliable predictions
+            if rule_base_key == base_action_key and hypothesis.get('confidence', 0.0) > 0.75:
+                # The rule_key is a tuple: (base_action_key, object_id, object_state)
+                # We need to ensure the rule applies to the object we're targeting.
+                if target_object and rule_key[1] == target_object['id']:
+                    for event in hypothesis.get('rules', []):
+                        # Generalize the effect into a searchable "creates_property_value" format
+                        if event.get('type') == 'RECOLORED': known_effects.add(f"creates_Color_{event.get('to_color')}")
+                        elif event.get('type') == 'SHAPE_CHANGED': known_effects.add(f"creates_Shape_{event.get('to_fingerprint')}")
+                        elif 'to_size' in event: known_effects.add(f"creates_Size_{event.get('to_size')}")
+
+        if not known_effects:
             return 0.0
 
-        # 2. Find all required conditions from our win hypotheses
-        required_conditions = set()
-        for win_hyp in self.win_condition_hypotheses:
-            if win_hyp['type'] == 'Relationship':
-                win_rel_type, win_value, _ = win_hyp['pattern']
-                if win_rel_type == 'Color':
-                    required_conditions.add(f"creates_color_{win_value}")
-                elif win_rel_type == 'Shape':
-                    required_conditions.add(f"creates_fingerprint_{win_value}")
-                elif win_rel_type == 'Size':
-                    required_conditions.add(f"creates_size_{win_value}")
-        
-        # 3. If there is any overlap, apply a bonus
-        if action_effects.intersection(required_conditions):
-            bonus = 15.0  # Large bonus for actions that are known to create winning properties
-            print(f"Goal-Seeking Bonus: Action {action_key} may help achieve a known win condition. Applying bonus.")
+        # --- Step 2: Check Predictions Against Each Hypothesis ---
+        for hyp in self.win_condition_hypotheses:
+            required_patterns = []
+            if hyp['type'] == 'static_pattern':
+                required_patterns = hyp['conditions']
+            elif hyp['type'] == 'sequential_pattern' and hyp['conditions']:
+                # For a sequence, focus on achieving the first step.
+                required_patterns = hyp['conditions'][0].get('patterns', [])
 
-        return bonus
+            for pattern in required_patterns:
+                if pattern.get('type') == 'group':
+                    prop = pattern.get('property')
+                    val = pattern.get('value')
+                    required_effect = f"creates_{prop}_{val}"
+                    
+                    if required_effect in known_effects:
+                        # --- Step 3: Calculate a Confidence-Weighted Bonus ---
+                        bonus = 25.0 * hyp['confidence']
+                        total_bonus += bonus
+                        print(f"Goal-Seeking Bonus: Action on {target_object['id']} helps '{hyp['description']}' (Confidence: {hyp['confidence']:.0%}). Adding {bonus:.2f} bonus.")
+        
+        return total_bonus
     
     def _check_hypothesis_against_level(self, hypothesis: dict, level_chapters: list[dict]) -> bool:
         """Checks if a given hypothesis is consistent with the events of a completed level."""
