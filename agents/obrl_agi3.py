@@ -1111,6 +1111,90 @@ class ObrlAgi3Agent(Agent):
         if not diffs_found:
             print("No conditions found that are both consistent across all failures and unique to them.")
 
+    def _generate_hypotheses_from_history(self, level_history: list[dict], level_chapters: list[dict]) -> list[dict]:
+        """Takes a level's history and chapters and returns a list of competing hypotheses."""
+        new_hypotheses = []
+        hyp_counter = 0
+        winning_state_index = len(level_history) - 1
+
+        # Recipe 1: The "Final Step" - based on the very last significant chapter.
+        if level_chapters:
+            last_chapter = level_chapters[-1]
+            pattern_list = self._format_delta_as_pattern_list(last_chapter['delta'])
+            if pattern_list:
+                hyp_counter += 1
+                new_hypotheses.append({
+                    'id': f'hyp_{hyp_counter}', 'type': 'static_pattern', 'confidence': 1.0,
+                    'description': f"Final Step (from turn {last_chapter['start']})",
+                    'conditions': pattern_list
+                })
+
+        # Recipe 2: "Causal Chain" hypotheses - connecting key milestones to the final step.
+        if len(level_chapters) > 1:
+            last_chapter = level_chapters[-1]
+            final_step_patterns = self._format_delta_as_pattern_list(last_chapter['delta'])
+            
+            # Create a sequential hypothesis for each milestone, treating it as a prerequisite to the final step.
+            # We iterate up to the second-to-last chapter, as the last one is handled separately.
+            for chapter in level_chapters[:-1]:
+                milestone_patterns = self._format_delta_as_pattern_list(chapter['delta'])
+                
+                if milestone_patterns and final_step_patterns:
+                    hyp_counter += 1
+                    new_hypotheses.append({
+                        'id': f'hyp_{hyp_counter}',
+                        'type': 'sequential_pattern',
+                        'confidence': 1.0,
+                        'description': f"Event at turn {chapter['start']} followed by Final Step",
+                        'conditions': [
+                            {'description': f"Step from turn {chapter['start']}", 'patterns': milestone_patterns},
+                            {'description': f"Step from turn {last_chapter['start']}", 'patterns': final_step_patterns}
+                        ]
+                    })
+        
+        # Recipe 3: The "Full Recipe" - a sequential pattern of all chapter deltas.
+        if len(level_chapters) > 1:
+            full_recipe_steps = []
+            for chapter in level_chapters:
+                step_patterns = self._format_delta_as_pattern_list(chapter['delta'])
+                if step_patterns:
+                    full_recipe_steps.append({
+                        'description': f"Step from turn {chapter['start']}",
+                        'patterns': step_patterns
+                    })
+            if full_recipe_steps:
+                hyp_counter += 1
+                new_hypotheses.append({
+                    'id': f'hyp_{hyp_counter}', 'type': 'sequential_pattern', 'confidence': 1.0,
+                    'description': 'Full sequence of events',
+                    'conditions': full_recipe_steps
+                })
+
+        # Recipe 4: The "Start-to-Finish" Recipe - a simple delta of the whole level.
+        start_context = level_history[0]
+        end_context = level_history[winning_state_index]
+        overall_delta = self._get_context_delta(start_context, end_context)
+        pattern_list = self._format_delta_as_pattern_list(overall_delta)
+        if pattern_list:
+            hyp_counter += 1
+            new_hypotheses.append({
+                'id': f'hyp_{hyp_counter}', 'type': 'static_pattern', 'confidence': 1.0,
+                'description': 'Overall level goal',
+                'conditions': pattern_list
+            })
+
+            # --- Step 3: Remove duplicate hypotheses and store them ---
+        unique_hypotheses = []
+        seen_conditions = set()
+        for hyp in new_hypotheses:
+            # Create a hashable representation of the conditions to check for duplicates
+            conditions_str = str(sorted(hyp['conditions'], key=lambda x: str(x)))
+            if conditions_str not in seen_conditions:
+                unique_hypotheses.append(hyp)
+                seen_conditions.add(conditions_str)
+        
+        return unique_hypotheses 
+
     def _analyze_win_condition(self, level_history: list[dict], milestone_indices: list[int]):
         """
         Analyzes a completed level by breaking it into chapters based on milestones
@@ -1175,112 +1259,53 @@ class ObrlAgi3Agent(Agent):
         if not level_chapters:
             print("No significant deltas found between key moments.")
 
+        # Generate a fresh set of hypotheses based on the level just played.
+        newly_generated_hypotheses = self._generate_hypotheses_from_history(level_history, level_chapters)
+
+        # --- MODE SWITCH: Are we generating or performing meta-analysis? ---
         if not self.win_condition_hypotheses:
-            # --- Step 2: Formulate Competing Hypotheses (The "Recipes") ---
-            new_hypotheses = []
-            hyp_counter = 0
-
-            # Recipe 1: The "Final Step" - based on the very last significant chapter.
-            if level_chapters:
-                last_chapter = level_chapters[-1]
-                pattern_list = self._format_delta_as_pattern_list(last_chapter['delta'])
-                if pattern_list:
-                    hyp_counter += 1
-                    new_hypotheses.append({
-                        'id': f'hyp_{hyp_counter}', 'type': 'static_pattern', 'confidence': 1.0,
-                        'description': f"Final Step (from turn {last_chapter['start']})",
-                        'conditions': pattern_list
-                    })
-
-            # Recipe 2: "Causal Chain" hypotheses - connecting key milestones to the final step.
-            if len(level_chapters) > 1:
-                last_chapter = level_chapters[-1]
-                final_step_patterns = self._format_delta_as_pattern_list(last_chapter['delta'])
-                
-                # Create a sequential hypothesis for each milestone, treating it as a prerequisite to the final step.
-                # We iterate up to the second-to-last chapter, as the last one is handled separately.
-                for chapter in level_chapters[:-1]:
-                    milestone_patterns = self._format_delta_as_pattern_list(chapter['delta'])
-                    
-                    if milestone_patterns and final_step_patterns:
-                        hyp_counter += 1
-                        new_hypotheses.append({
-                            'id': f'hyp_{hyp_counter}',
-                            'type': 'sequential_pattern',
-                            'confidence': 1.0,
-                            'description': f"Event at turn {chapter['start']} followed by Final Step",
-                            'conditions': [
-                                {'description': f"Step from turn {chapter['start']}", 'patterns': milestone_patterns},
-                                {'description': f"Step from turn {last_chapter['start']}", 'patterns': final_step_patterns}
-                            ]
-                        })
-            
-            # Recipe 3: The "Full Recipe" - a sequential pattern of all chapter deltas.
-            if len(level_chapters) > 1:
-                full_recipe_steps = []
-                for chapter in level_chapters:
-                    step_patterns = self._format_delta_as_pattern_list(chapter['delta'])
-                    if step_patterns:
-                        full_recipe_steps.append({
-                            'description': f"Step from turn {chapter['start']}",
-                            'patterns': step_patterns
-                        })
-                if full_recipe_steps:
-                    hyp_counter += 1
-                    new_hypotheses.append({
-                        'id': f'hyp_{hyp_counter}', 'type': 'sequential_pattern', 'confidence': 1.0,
-                        'description': 'Full sequence of events',
-                        'conditions': full_recipe_steps
-                    })
-
-            # Recipe 4: The "Start-to-Finish" Recipe - a simple delta of the whole level.
-            start_context = level_history[0]
-            end_context = level_history[winning_state_index]
-            overall_delta = self._get_context_delta(start_context, end_context)
-            pattern_list = self._format_delta_as_pattern_list(overall_delta)
-            if pattern_list:
-                hyp_counter += 1
-                new_hypotheses.append({
-                    'id': f'hyp_{hyp_counter}', 'type': 'static_pattern', 'confidence': 1.0,
-                    'description': 'Overall level goal',
-                    'conditions': pattern_list
-                })
-
-             # --- Step 3: Remove duplicate hypotheses and store them ---
-            unique_hypotheses = []
-            seen_conditions = set()
-            for hyp in new_hypotheses:
-                # Create a hashable representation of the conditions to check for duplicates
-                conditions_str = str(sorted(hyp['conditions'], key=lambda x: str(x)))
-                if conditions_str not in seen_conditions:
-                    unique_hypotheses.append(hyp)
-                    seen_conditions.add(conditions_str)
-            
-            self.win_condition_hypotheses = unique_hypotheses
-
+            # --- GENERATION MODE (After Level 1) ---
+            print(f"No existing hypotheses. Adopting {len(newly_generated_hypotheses)} new theories.")
+            self.win_condition_hypotheses = newly_generated_hypotheses
         else:
-            # --- PRUNING MODE (After Level 2+) ---
-            print(f"\n--- Pruning {len(self.win_condition_hypotheses)} Hypotheses Based on New Evidence ---")
-            surviving_hypotheses = []
+            # --- META-ANALYSIS MODE (After Level 2+) ---
+            print(f"\n--- Meta-Analysis: Comparing {len(self.win_condition_hypotheses)} old theories with {len(newly_generated_hypotheses)} new ones ---")
             
-            for hyp in self.win_condition_hypotheses:
-                is_consistent = self._check_hypothesis_against_level(hyp, level_chapters)
-                
-                if is_consistent:
-                    # Reinforce confidence for consistent theories
-                    hyp['confidence'] = min(1.0, hyp['confidence'] + 0.25)
-                    surviving_hypotheses.append(hyp)
-                    print(f"- {hyp['id']} ({hyp['description']}) was CONSISTENT. Confidence -> {hyp['confidence']:.0%}")
-                else:
-                    # Penalize inconsistent theories (Confidence Decay)
-                    hyp['confidence'] *= 0.5
-                    if hyp['confidence'] >= 0.25: # Confidence threshold
-                        surviving_hypotheses.append(hyp)
-                        print(f"- {hyp['id']} ({hyp['description']}) was INCONSISTENT. Confidence -> {hyp['confidence']:.0%}")
+            old_hyps = self.win_condition_hypotheses
+            
+            # Use string representations of conditions for easy comparison
+            old_conds = {str(sorted(h['conditions'], key=lambda x: str(x))): h for h in old_hyps}
+            new_conds = {str(sorted(h['conditions'], key=lambda x: str(x))): h for h in newly_generated_hypotheses}
+            
+            common_conds = set(old_conds.keys()) & set(new_conds.keys())
+            
+            refined_hypotheses = []
+
+            # 1. Reinforce common theories that appeared in both level wins
+            for cond_str in common_conds:
+                old_hyp = old_conds[cond_str]
+                old_hyp['confidence'] = min(1.0, old_hyp['confidence'] + 0.5) # Significant boost
+                refined_hypotheses.append(old_hyp)
+                print(f"- Commonality Found: '{old_hyp['description']}' was re-confirmed. Confidence -> {old_hyp['confidence']:.0%}")
+
+            # 2. Penalize old theories that did NOT reappear (Confidence Decay)
+            for cond_str, old_hyp in old_conds.items():
+                if cond_str not in common_conds:
+                    old_hyp['confidence'] *= 0.5
+                    if old_hyp['confidence'] >= 0.25:
+                        refined_hypotheses.append(old_hyp)
+                        print(f"- Old Theory Penalized: '{old_hyp['description']}' did not reoccur. Confidence -> {old_hyp['confidence']:.0%}")
                     else:
-                        print(f"- {hyp['id']} ({hyp['description']}) was DELETED. Confidence fell below threshold.")
+                        print(f"- Old Theory Deleted: '{old_hyp['description']}' confidence fell below threshold.")
             
-            self.win_condition_hypotheses = surviving_hypotheses
+            # 3. Add brand new theories discovered in the latest level
+            for cond_str, new_hyp in new_conds.items():
+                if cond_str not in common_conds:
+                    # Add with standard confidence. It's a new lead.
+                    refined_hypotheses.append(new_hyp)
+                    print(f"- New Theory Discovered: Adding '{new_hyp['description']}' to the list.")
+
+            self.win_condition_hypotheses = refined_hypotheses
         
         # --- Final Report ---
         if self.win_condition_hypotheses:
