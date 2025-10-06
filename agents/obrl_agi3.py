@@ -51,6 +51,7 @@ class ObrlAgi3Agent(Agent):
         self.level_milestones = []
         self.seen_event_types_in_level = set()
         self.last_alignments = {}
+        self.current_level_id_map = {}
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -208,6 +209,7 @@ class ObrlAgi3Agent(Agent):
                 self.final_summary_before_level_change = None
 
             # --- Final Re-Numbering and Memory Migration ---
+            self.current_level_id_map = id_map
             print("--- Finalizing Frame with Sequential IDs ---")
             self.object_id_counter = 0
             
@@ -337,7 +339,7 @@ class ObrlAgi3Agent(Agent):
                 if self.level_state_history:
                     winning_context = self.level_state_history[-1] # The last state before the score change
                     historical_contexts = self.level_state_history[:-1]
-                    self._analyze_win_condition(self.level_state_history, self.level_milestones)
+                    self._analyze_win_condition(self.level_state_history, self.level_milestones, self.current_level_id_map)
                 
                 # Print the full summary of the final frame of the level that was just won.
                 print("\n--- Final Frame Summary (Old Level) ---")
@@ -1111,230 +1113,117 @@ class ObrlAgi3Agent(Agent):
         if not diffs_found:
             print("No conditions found that are both consistent across all failures and unique to them.")
 
-    def _generate_hypotheses_from_history(self, level_history: list[dict], level_chapters: list[dict]) -> list[dict]:
-        """Takes a level's history and chapters and returns a list of competing hypotheses."""
-        new_hypotheses = []
-        hyp_counter = 0
-        winning_state_index = len(level_history) - 1
-
-        # Recipe 1: The "Final Step" - based on the very last significant chapter.
-        if level_chapters:
-            last_chapter = level_chapters[-1]
-            pattern_list = self._format_delta_as_pattern_list(last_chapter['delta'])
-            if pattern_list:
-                hyp_counter += 1
-                new_hypotheses.append({
-                    'id': f'hyp_{hyp_counter}', 'type': 'static_pattern', 'confidence': 1.0,
-                    'description': f"Final Step (from turn {last_chapter['start']})",
-                    'conditions': pattern_list
-                })
-
-        # Recipe 2: "Causal Chain" hypotheses - connecting key milestones to the final step.
-        if len(level_chapters) > 1:
-            last_chapter = level_chapters[-1]
-            final_step_patterns = self._format_delta_as_pattern_list(last_chapter['delta'])
-            
-            # Create a sequential hypothesis for each milestone, treating it as a prerequisite to the final step.
-            # We iterate up to the second-to-last chapter, as the last one is handled separately.
-            for chapter in level_chapters[:-1]:
-                milestone_patterns = self._format_delta_as_pattern_list(chapter['delta'])
-                
-                if milestone_patterns and final_step_patterns:
-                    hyp_counter += 1
-                    new_hypotheses.append({
-                        'id': f'hyp_{hyp_counter}',
-                        'type': 'sequential_pattern',
-                        'confidence': 1.0,
-                        'description': f"Event at turn {chapter['start']} followed by Final Step",
-                        'conditions': [
-                            {'description': f"Step from turn {chapter['start']}", 'patterns': milestone_patterns},
-                            {'description': f"Step from turn {last_chapter['start']}", 'patterns': final_step_patterns}
-                        ]
-                    })
-        
-        # Recipe 3: The "Full Recipe" - a sequential pattern of all chapter deltas.
-        if len(level_chapters) > 1:
-            full_recipe_steps = []
-            for chapter in level_chapters:
-                step_patterns = self._format_delta_as_pattern_list(chapter['delta'])
-                if step_patterns:
-                    full_recipe_steps.append({
-                        'description': f"Step from turn {chapter['start']}",
-                        'patterns': step_patterns
-                    })
-            if full_recipe_steps:
-                hyp_counter += 1
-                new_hypotheses.append({
-                    'id': f'hyp_{hyp_counter}', 'type': 'sequential_pattern', 'confidence': 1.0,
-                    'description': 'Full sequence of events',
-                    'conditions': full_recipe_steps
-                })
-
-        # Recipe 4: The "Start-to-Finish" Recipe - a simple delta of the whole level.
-        start_context = level_history[0]
-        end_context = level_history[winning_state_index]
-        overall_delta = self._get_context_delta(start_context, end_context)
-        pattern_list = self._format_delta_as_pattern_list(overall_delta)
-        if pattern_list:
-            hyp_counter += 1
-            new_hypotheses.append({
-                'id': f'hyp_{hyp_counter}', 'type': 'static_pattern', 'confidence': 1.0,
-                'description': 'Overall level goal',
-                'conditions': pattern_list
-            })
-
-            # --- Step 3: Remove duplicate hypotheses and store them ---
-        unique_hypotheses = []
-        seen_conditions = set()
-        for hyp in new_hypotheses:
-            # Create a hashable representation of the conditions to check for duplicates
-            conditions_str = str(sorted(hyp['conditions'], key=lambda x: str(x)))
-            if conditions_str not in seen_conditions:
-                unique_hypotheses.append(hyp)
-                seen_conditions.add(conditions_str)
-        
-        return unique_hypotheses 
-
-    def _analyze_win_condition(self, level_history: list[dict], milestone_indices: list[int]):
+    def _analyze_win_condition(self, level_history: list[dict], milestone_indices: list[int], id_map: dict = None):
         """
-        Analyzes a completed level by breaking it into chapters based on milestones
-        and generating competing hypotheses about the winning "recipe".
+        Analyzes the final winning state. Creates a multi-layered "Master Checklist"
+        and refines it by finding the best possible match (ID, Property, or Abstract)
+        between level wins.
         """
-        print("\n--- Win Condition Analysis (V2) ---")
-        if len(level_history) < 2:
-            print("Insufficient history for analysis.")
-            return
+        print("\n--- Win Condition Analysis (V4 - Multi-Layered) ---")
+        if not level_history: return
+        if id_map is None: id_map = {}
 
-        # The final state is always the last one in the history before the win.
-        winning_state_index = len(level_history) - 1
-        
-        # Combine the start, milestones, and end into a list of key moments.
-        # Ensure the start (index 0) and end are always included and the list is sorted with no duplicates.
-        key_indices = sorted(list(set([0] + milestone_indices + [winning_state_index])))
-        
-        print(f"Analyzing level based on {len(key_indices)} key moments at indices: {key_indices}")
+        winning_context = level_history[-1]
+        newly_observed_patterns = self._extract_patterns_from_context(winning_context)
 
-        # --- Step 1: Analyze the "chapters" between key moments ---
-        level_chapters = []
-        print("\n--- Chapter Analysis ---")
-        for i in range(len(key_indices) - 1):
-            start_index = key_indices[i]
-            end_index = key_indices[i+1]
-
-            start_context = level_history[start_index]
-            end_context = level_history[end_index]
-            
-            delta = self._get_context_delta(start_context, end_context)
-            
-            # Only store and report on chapters that had a significant change.
-            if delta:
-                chapter_info = {
-                    'start': start_index,
-                    'end': end_index,
-                    'delta': delta
-                }
-                level_chapters.append(chapter_info)
-                # For logging, create a summary of the delta
-            delta_summary = []
-            if 'rels' in delta:
-                for rel_type, changes in delta['rels'].items():
-                    for change in changes:
-                        delta_summary.append(f"new '{rel_type}' group for value '{change['value']}'")
-            if 'adjs' in delta:
-                for adj_change in delta['adjs']:
-                    delta_summary.append(f"new adjacency for id_{adj_change['obj_id'].split('_')[1]}")
-            if 'aligns' in delta:
-                for align_type, changes in delta['aligns'].items():
-                    for change in changes:
-                        delta_summary.append(f"new '{align_type}' alignment at {change['coord']}")
-            if 'objs' in delta:
-                if 'added' in delta['objs']:
-                    delta_summary.append(f"{len(delta['objs']['added'])} new object(s) appeared")
-                if 'removed' in delta['objs']:
-                    delta_summary.append(f"{len(delta['objs']['removed'])} object(s) were removed")
-            
-            if delta_summary:
-                print(f"- Chapter ({start_index} -> {end_index}): Delta includes {', '.join(delta_summary)}.")
-
-        if not level_chapters:
-            print("No significant deltas found between key moments.")
-
-        # Generate a fresh set of hypotheses based on the level just played.
-        newly_generated_hypotheses = self._generate_hypotheses_from_history(level_history, level_chapters)
-
-        # --- MODE SWITCH: Are we generating or performing meta-analysis? ---
         if not self.win_condition_hypotheses:
-            # --- GENERATION MODE (After Level 1) ---
-            print(f"No existing hypotheses. Adopting {len(newly_generated_hypotheses)} new theories.")
-            self.win_condition_hypotheses = newly_generated_hypotheses
+            # --- CREATION MODE (After Level 1) ---
+            print(f"No Master Checklist found. Creating initial checklist from {len(newly_observed_patterns)} multi-layered patterns.")
+            self.win_condition_hypotheses = [{'id': 'master_checklist', 'type': 'win_state_checklist', 'conditions': newly_observed_patterns}]
+
         else:
-            # --- META-ANALYSIS MODE (After Level 2+) ---
-            print(f"\n--- Meta-Analysis: Comparing {len(self.win_condition_hypotheses)} old theories with {len(newly_generated_hypotheses)} new ones ---")
+            # --- REFINING MODE (After Level 2+) ---
+            old_checklist = self.win_condition_hypotheses[0]
+            old_patterns = old_checklist['conditions']
             
-            old_hyps = self.win_condition_hypotheses
+            print(f"\n--- Refining Master Checklist: Comparing {len(old_patterns)} old patterns with {len(newly_observed_patterns)} new ones ---")
             
-            # Use string representations of conditions for easy comparison
-            old_conds = {str(sorted(h['conditions'], key=lambda x: str(x))): h for h in old_hyps}
-            new_conds = {str(sorted(h['conditions'], key=lambda x: str(x))): h for h in newly_generated_hypotheses}
+            refined_patterns = []
             
-            common_conds = set(old_conds.keys()) & set(new_conds.keys())
-            
-            refined_hypotheses = []
+            # --- 3-Layer Fallback Matching ---
+            temp_new_patterns = list(newly_observed_patterns) # Create a copy to consume from
 
-            # 1. Reinforce common theories that appeared in both level wins
-            for cond_str in common_conds:
-                old_hyp = old_conds[cond_str]
-                old_hyp['confidence'] = min(1.0, old_hyp['confidence'] + 0.5) # Significant boost
-                refined_hypotheses.append(old_hyp)
-                print(f"- Commonality Found: '{old_hyp['description']}' was re-confirmed. Confidence -> {old_hyp['confidence']:.0%}")
-
-            # 2. Penalize old theories that did NOT reappear (Confidence Decay)
-            for cond_str, old_hyp in old_conds.items():
-                if cond_str not in common_conds:
-                    old_hyp['confidence'] *= 0.5
-                    if old_hyp['confidence'] >= 0.25:
-                        refined_hypotheses.append(old_hyp)
-                        print(f"- Old Theory Penalized: '{old_hyp['description']}' did not reoccur. Confidence -> {old_hyp['confidence']:.0%}")
-                    else:
-                        print(f"- Old Theory Deleted: '{old_hyp['description']}' confidence fell below threshold.")
+            for old_p in old_patterns:
+                best_match_found = None
+                
+                # Layer 1: Try for a perfect Identity Match
+                old_ids = old_p['object_ids']
+                # Remap old IDs to their new IDs in the current level
+                remapped_ids = {int(id_map.get(f"obj_{i}", "obj_-1").replace("obj_","")) for i in old_ids}
+                if -1 in remapped_ids: # If any object wasn't found, ID match is impossible
+                    pass
+                else:
+                    for new_p in temp_new_patterns:
+                        if old_p['pattern_type'] == new_p['pattern_type'] and old_p['sub_type'] == new_p['sub_type'] and remapped_ids == new_p['object_ids']:
+                            best_match_found = ('ID', new_p)
+                            break
+                
+                # Layer 2: Fallback to Property Match
+                if not best_match_found:
+                    for new_p in temp_new_patterns:
+                        if (old_p['pattern_type'] == new_p['pattern_type'] and 
+                            old_p['sub_type'] == new_p['sub_type'] and 
+                            old_p['common_properties'] and # Ensure there are properties to match
+                            old_p['common_properties'] == new_p['common_properties']):
+                            best_match_found = ('Property', new_p)
+                            break
+                
+                # Layer 3: Fallback to Abstract Match
+                if not best_match_found:
+                    for new_p in temp_new_patterns:
+                        if old_p['pattern_type'] == new_p['pattern_type'] and old_p['sub_type'] == new_p['sub_type']:
+                            best_match_found = ('Abstract', new_p)
+                            break
+                
+                if best_match_found:
+                    match_level, matched_new_p = best_match_found
+                    # This pattern survived! Add it to the refined list.
+                    refined_patterns.append(old_p)
+                    # Remove the matched pattern from the new list so it can't be matched again
+                    temp_new_patterns.remove(matched_new_p)
+                    print(f"- Pattern Re-confirmed via {match_level} Match: {old_p['sub_type']} involving objects {old_p['object_ids']}")
+                else:
+                    print(f"- Pattern Pruned: {old_p['sub_type']} involving objects {old_p['object_ids']} did not reoccur.")
             
-            # 3. Add brand new theories discovered in the latest level
-            for cond_str, new_hyp in new_conds.items():
-                if cond_str not in common_conds:
-                    # Add with standard confidence. It's a new lead.
-                    refined_hypotheses.append(new_hyp)
-                    print(f"- New Theory Discovered: Adding '{new_hyp['description']}' to the list.")
+            pruned_count = len(old_patterns) - len(refined_patterns)
+            print(f"Pruned {pruned_count} inconsistent patterns.")
+            
+            old_checklist['conditions'] = refined_patterns
+            self.win_condition_hypotheses = [old_checklist]
 
-            self.win_condition_hypotheses = refined_hypotheses
-        
         # --- Final Report ---
         if self.win_condition_hypotheses:
-            print(f"\n--- Current Top Hypotheses ({len(self.win_condition_hypotheses)} total) ---")
-            # Sort by confidence to see the best theories first
-            sorted_hyps = sorted(self.win_condition_hypotheses, key=lambda x: x['confidence'], reverse=True)
-            for hyp in sorted_hyps[:5]: # Log top 5
+            checklist = self.win_condition_hypotheses[0]
+            patterns = checklist['conditions']
+            print(f"\n--- Current Master Checklist ({len(patterns)} patterns) ---")
+            
+            # Sort for consistent, readable output
+            sorted_patterns = sorted(patterns, key=lambda p: (p['pattern_type'], p['sub_type']))
+
+            for pattern in sorted_patterns:
+                p_type = pattern['pattern_type']
+                sub_type = pattern['sub_type']
                 
-                if hyp['type'] == 'static_pattern':
-                    condition_summary = []
-                    for cond in hyp['conditions']:
-                        cond_type = cond.get('type')
-                        if cond_type == 'group':
-                            condition_summary.append(f"form a '{cond.get('property')}' group")
-                        elif cond_type == 'adjacency':
-                            condition_summary.append("create an adjacency")
-                        elif cond_type == 'alignment':
-                            condition_summary.append(f"create a '{cond.get('align_type')}' alignment")
-                        elif cond_type == 'object_appeared':
-                            condition_summary.append("cause a new object to appear")
-                        elif cond_type == 'event':
-                            condition_summary.append(f"cause a '{cond.get('event_type')}' event")
-                    
-                    # Sort the summary for consistent output and remove duplicates
-                    condition_summary = sorted(list(set(condition_summary)))
-                    print(f"- {hyp['id']} ({hyp['description']}) [Conf: {hyp['confidence']:.0%}]: Goal is to {', '.join(condition_summary)}.")
+                # Build a description based on the pattern's structure
+                desc = f"A '{sub_type}' pattern" # Default description
+                if p_type == 'rels':
+                    desc = f"A '{sub_type}' group exists"
+                elif p_type == 'aligns':
+                    desc = f"An '{sub_type}' alignment exists"
+                elif p_type == 'conjs':
+                    desc = f"A '{sub_type}' conjunction exists"
+                elif p_type == 'adjacency':
+                    desc = "An adjacency pattern exists"
+                elif p_type == 'event':
+                    desc = f"A '{sub_type}' event occurs"
                 
-                elif hyp['type'] == 'sequential_pattern':
-                    print(f"- {hyp['id']} ({hyp['description']}) [Conf: {hyp['confidence']:.0%}]: Requires completing {len(hyp['conditions'])} steps.")
+                # Add details about the objects involved
+                obj_ids = sorted(list(pattern['object_ids']))
+                props = pattern['common_properties']
+                
+                prop_str = ", ".join([f"{k}:{v}" for k,v in props.items()]) if props else "any properties"
+                
+                print(f"- {desc} involving objects like {obj_ids} with common properties: [{prop_str}]")
 
     def _get_context_delta(self, start_context: dict, end_context: dict) -> dict:
         """Finds significant changes (deltas) between a start and end context."""
@@ -1488,51 +1377,86 @@ class ObrlAgi3Agent(Agent):
         
         return total_bonus
     
-    def _check_hypothesis_against_level(self, hypothesis: dict, level_chapters: list[dict]) -> bool:
-        """Checks if a given GENERALIZED hypothesis is consistent with the events of a completed level."""
-        hyp_type = hypothesis['type']
-        hyp_conditions = hypothesis['conditions']
-
-        if not hyp_conditions:
-            return False
-
-        # Get a flat list of all unique abstract patterns that occurred in the entire level
-        level_patterns_observed = set()
-        for chapter in level_chapters:
-            chapter_patterns = self._format_delta_as_pattern_list(chapter['delta'])
-            for p in chapter_patterns:
-                level_patterns_observed.add(tuple(p.items()))
+    def _extract_patterns_from_context(self, context: dict) -> list[dict]:
+        """
+        Scans a single context and returns a list of multi-layered patterns,
+        each including abstract, property, and identity information.
+        """
+        patterns = []
+        summary = context.get('summary', [])
+        if not summary: return []
         
-        # Convert set of tuples back to list of dicts for easy lookup
-        level_patterns_observed_list = [dict(t) for t in level_patterns_observed]
+        summary_map = {int(obj['id'].replace('obj_', '')): obj for obj in summary}
 
-        if hyp_type == 'static_pattern':
-            # Check if all required abstract conditions were observed at least once in the level.
-            return all(cond in level_patterns_observed_list for cond in hyp_conditions)
-
-        elif hyp_type == 'sequential_pattern':
-            # For a sequence, check if the steps' abstract patterns appeared in the correct order.
-            chapter_idx = 0
-            for step in hyp_conditions:
-                # The patterns required for this specific step in the recipe
-                step_required_patterns = step['patterns']
-                found_step = False
-                # Search for a chapter in the level that satisfies this step's requirements
-                while chapter_idx < len(level_chapters):
-                    # Get the abstract patterns for the current chapter
-                    chapter_patterns_in_step = self._format_delta_as_pattern_list(level_chapters[chapter_idx]['delta'])
-                    chapter_idx += 1
-                    # Check if this chapter satisfies all conditions for the current step in the recipe
-                    if all(cond in chapter_patterns_in_step for cond in step_required_patterns):
-                        found_step = True
-                        break # Found this step, move on to the next one in the recipe
-                
-                if not found_step:
-                    return False # A required step was not found in order.
+        def get_common_properties(obj_ids: set) -> dict:
+            """Finds the shared properties among a set of object IDs."""
+            if not obj_ids: return {}
             
-            return True # All steps were found in the correct order.
+            first_obj = summary_map.get(list(obj_ids)[0])
+            if not first_obj: return {}
+
+            common = {
+                'color': first_obj['color'],
+                'shape': first_obj['fingerprint'],
+                'size': first_obj['size']
+            }
+            
+            for obj_id in list(obj_ids)[1:]:
+                obj = summary_map.get(obj_id)
+                if not obj: return {}
+                if obj['color'] != common.get('color'): common.pop('color', None)
+                if obj['fingerprint'] != common.get('shape'): common.pop('shape', None)
+                if obj['size'] != common.get('size'): common.pop('size', None)
+            
+            return {k: v for k, v in common.items() if v is not None}
+
+        # --- Process Relationships, Alignments, and Conjunctions ---
+        perception_modules = {
+            'rels': context.get('rels', {}),
+            'aligns': context.get('align', {}),
+            'conjs': context.get('conj', {})
+        }
+
+        for module_name, module_data in perception_modules.items():
+            for group_type, groups in module_data.items():
+                for value, obj_ids_int in groups.items():
+                    common_props = get_common_properties(obj_ids_int)
+                    patterns.append({
+                        'pattern_type': module_name,
+                        'sub_type': group_type,
+                        'object_ids': frozenset(obj_ids_int),
+                        'common_properties': common_props
+                    })
         
-        return False
+        # --- Process Adjacencies ---
+        for obj_id_str, contacts in context.get('adj', {}).items():
+            obj_id_int = int(obj_id_str.replace('obj_',''))
+            contact_ids_int = {int(c.replace('obj_','')) for c in contacts if 'obj_' in c}
+            all_ids = {obj_id_int} | contact_ids_int
+            
+            patterns.append({
+                'pattern_type': 'adjacency',
+                'sub_type': 'contact',
+                'object_ids': frozenset(all_ids),
+                'common_properties': get_common_properties(all_ids)
+            })
+
+        # --- Process Final Turn Events ---
+        for event_str in context.get('events', []):
+            event_type = event_str.split(':')[0].replace('- ', '')
+            if "Object id_" in event_str:
+                obj_id_int = int(event_str.split('id_')[1].split(' ')[0])
+                obj_props = get_common_properties({obj_id_int})
+                patterns.append({
+                    'pattern_type': 'event',
+                    'sub_type': event_type,
+                    'object_ids': frozenset({obj_id_int}),
+                    'common_properties': obj_props
+                })
+
+        # Return a unique list of patterns
+        unique_patterns = {str(p) for p in patterns}
+        return [eval(s) for s in unique_patterns]
 
     def _analyze_relationships(self, object_summary: list[dict]) -> tuple[dict, dict, dict]:
         """Analyzes object relationships and returns a structured dictionary of groups."""
