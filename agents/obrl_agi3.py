@@ -1115,140 +1115,102 @@ class ObrlAgi3Agent(Agent):
 
     def _analyze_win_condition(self, level_history: list[dict], milestone_indices: list[int], id_map: dict = None):
         """
-        Analyzes the final winning state. Creates a multi-layered "Master Checklist"
-        and refines it by finding the best possible match (ID, Property, or Abstract)
-        between level wins.
+        Analyzes the winning state to create and refine "Role-Based" hypotheses.
+        A rule consists of an abstract pattern, roles for objects, and group properties.
         """
-        print("\n--- Win Condition Analysis (V4 - Multi-Layered) ---")
+        print("\n--- Win Condition Analysis (V5 - Role-Based) ---")
         if not level_history: return
         if id_map is None: id_map = {}
 
         winning_context = level_history[-1]
-        newly_observed_patterns = self._extract_patterns_from_context(winning_context)
-
+        
         if not self.win_condition_hypotheses:
-            # --- CREATION MODE (After Level 1) with Uniqueness Filter ---
-            print("No Master Checklist found. Analyzing winning state for unique patterns...")
+            # --- CREATION MODE (After Level 1) ---
+            print("No Master Recipe found. Creating initial Role-Based rules...")
             
-            # 1. Get all patterns from the final, winning state.
-            win_patterns = newly_observed_patterns # This was calculated at the top of the function.
-            win_patterns_set = {tuple(p.items()) for p in win_patterns}
-            
-            # 2. Get all patterns that have ever existed in any previous state.
+            # 1. Use the Uniqueness Filter to find the most significant patterns.
+            win_patterns = self._extract_patterns_from_context(winning_context)
             historical_contexts = level_history[:-1]
             seen_patterns_set = set()
             for context in historical_contexts:
                 historical_patterns = self._extract_patterns_from_context(context)
                 for p in historical_patterns:
-                    seen_patterns_set.add(tuple(p.items()))
+                    seen_patterns_set.add(str(p)) # Use string for hashable representation
             
-            # 3. The true win conditions are the patterns that are new to the winning frame.
-            unique_win_patterns_set = win_patterns_set - seen_patterns_set
-            
-            unique_win_patterns = [dict(t) for t in unique_win_patterns_set]
-            
-            print(f"Found {len(win_patterns)} patterns in winning state. After filtering, {len(unique_win_patterns)} are unique to the win.")
+            unique_win_patterns = [p for p in win_patterns if str(p) not in seen_patterns_set]
+            print(f"Found {len(win_patterns)} patterns in win state; {len(unique_win_patterns)} are unique.")
 
-            # 4. Create the Master Checklist from only these unique patterns.
-            master_checklist = {
-                'id': 'master_checklist',
-                'type': 'win_state_checklist',
-                'conditions': unique_win_patterns
-            }
-            self.win_condition_hypotheses = [master_checklist]
+            # 2. For each unique pattern, create a detailed "Role-Based" rule.
+            new_rules = []
+            summary_map = {int(obj['id'].replace('obj_', '')): obj for obj in winning_context.get('summary', [])}
+
+            for i, pattern in enumerate(unique_win_patterns):
+                obj_ids = pattern['object_ids']
+                
+                # 3. Create the roles based on the objects in this first instance.
+                roles = {}
+                all_props_in_pattern = []
+                for role_idx, obj_id in enumerate(sorted(list(obj_ids))):
+                    obj = summary_map.get(obj_id)
+                    if not obj: continue
+                    
+                    # The initial "learned properties" for a role are just the object's full properties.
+                    initial_props = frozenset({
+                        'color': obj['color'], 'shape': obj['fingerprint'], 'size': obj['size']
+                    }.items())
+                    
+                    roles[f'role_{role_idx}'] = {
+                        'learned_properties': initial_props,
+                        'history': [obj_id] # Start the history for this role
+                    }
+                    all_props_in_pattern.append(dict(initial_props))
+
+                # 4. Find the initial "group properties" - what's common to all roles.
+                group_common_props = {}
+                if all_props_in_pattern:
+                    first_props = all_props_in_pattern[0]
+                    for key in first_props:
+                        if all(p.get(key) == first_props[key] for p in all_props_in_pattern):
+                            group_common_props[key] = first_props[key]
+
+                new_rules.append({
+                    'id': f'rule_{i+1}',
+                    'abstract_pattern': {'pattern_type': pattern['pattern_type'], 'sub_type': pattern['sub_type']},
+                    'roles': roles,
+                    'group_properties': frozenset(group_common_props.items()),
+                    'confidence': 1.0
+                })
+            
+            self.win_condition_hypotheses = new_rules
+
         else:
             # --- REFINING MODE (After Level 2+) ---
-            old_checklist = self.win_condition_hypotheses[0]
-            old_patterns = old_checklist['conditions']
+            # TODO: Implement the logic to refine the Master Recipe.
+            # This will involve matching new patterns to existing rules, assigning objects to roles,
+            # and updating the 'learned_properties' for each role and the group.
+            print("\n--- Refining Master Recipe (Placeholder) ---")
+            print("Refining logic will be implemented in the next step.")
             
-            print(f"\n--- Refining Master Checklist: Comparing {len(old_patterns)} old patterns with {len(newly_observed_patterns)} new ones ---")
-            
-            refined_patterns = []
-            
-            # --- 3-Layer Fallback Matching ---
-            temp_new_patterns = list(newly_observed_patterns) # Create a copy to consume from
-
-            for old_p in old_patterns:
-                best_match_found = None
-                
-                # Layer 1: Try for a perfect Identity Match
-                old_ids = old_p['object_ids']
-                # Remap old IDs to their new IDs in the current level
-                remapped_ids = {int(id_map.get(f"obj_{i}", "obj_-1").replace("obj_","")) for i in old_ids}
-                if -1 in remapped_ids: # If any object wasn't found, ID match is impossible
-                    pass
-                else:
-                    for new_p in temp_new_patterns:
-                        if old_p['pattern_type'] == new_p['pattern_type'] and old_p['sub_type'] == new_p['sub_type'] and remapped_ids == new_p['object_ids']:
-                            best_match_found = ('ID', new_p)
-                            break
-                
-                # Layer 2: Fallback to Property Match
-                if not best_match_found:
-                    for new_p in temp_new_patterns:
-                        if (old_p['pattern_type'] == new_p['pattern_type'] and 
-                            old_p['sub_type'] == new_p['sub_type'] and 
-                            old_p['common_properties'] and # Ensure there are properties to match
-                            old_p['common_properties'] == new_p['common_properties']):
-                            best_match_found = ('Property', new_p)
-                            break
-                
-                # Layer 3: Fallback to Abstract Match
-                if not best_match_found:
-                    for new_p in temp_new_patterns:
-                        if old_p['pattern_type'] == new_p['pattern_type'] and old_p['sub_type'] == new_p['sub_type']:
-                            best_match_found = ('Abstract', new_p)
-                            break
-                
-                if best_match_found:
-                    match_level, matched_new_p = best_match_found
-                    # This pattern survived! Add it to the refined list.
-                    refined_patterns.append(old_p)
-                    # Remove the matched pattern from the new list so it can't be matched again
-                    temp_new_patterns.remove(matched_new_p)
-                    print(f"- Pattern Re-confirmed via {match_level} Match: {old_p['sub_type']} involving objects {old_p['object_ids']}")
-                else:
-                    print(f"- Pattern Pruned: {old_p['sub_type']} involving objects {old_p['object_ids']} did not reoccur.")
-            
-            pruned_count = len(old_patterns) - len(refined_patterns)
-            print(f"Pruned {pruned_count} inconsistent patterns.")
-            
-            old_checklist['conditions'] = refined_patterns
-            self.win_condition_hypotheses = [old_checklist]
-
         # --- Final Report ---
         if self.win_condition_hypotheses:
-            checklist = self.win_condition_hypotheses[0]
-            patterns = checklist['conditions']
-            print(f"\n--- Current Master Checklist ({len(patterns)} patterns) ---")
-            
-            # Sort for consistent, readable output
-            sorted_patterns = sorted(patterns, key=lambda p: (p['pattern_type'], p['sub_type']))
+            print(f"\n--- Current Master Recipe ({len(self.win_condition_hypotheses)} rules) ---")
+            sorted_rules = sorted(self.win_condition_hypotheses, key=lambda x: x['confidence'], reverse=True)
 
-            for pattern in sorted_patterns:
-                p_type = pattern['pattern_type']
-                sub_type = pattern['sub_type']
+            for rule in sorted_rules[:10]: # Log top 10 rules
+                pattern = rule['abstract_pattern']
+                desc = f"A '{pattern['sub_type']}' pattern"
                 
-                # Build a description based on the pattern's structure
-                desc = f"A '{sub_type}' pattern" # Default description
-                if p_type == 'rels':
-                    desc = f"A '{sub_type}' group exists"
-                elif p_type == 'aligns':
-                    desc = f"An '{sub_type}' alignment exists"
-                elif p_type == 'conjs':
-                    desc = f"A '{sub_type}' conjunction exists"
-                elif p_type == 'adjacency':
-                    desc = "An adjacency pattern exists"
-                elif p_type == 'event':
-                    desc = f"A '{sub_type}' event occurs"
+                group_props_str = ", ".join([f"{k}:{v}" for k, v in rule['group_properties']])
+                if not group_props_str: group_props_str = "None"
+
+                print(f"\n- {rule['id']} [Conf: {rule['confidence']:.0%}]: Requires {desc}")
+                print(f"  - Group Property Consistency: [{group_props_str}]")
+                print(f"  - Role Analysis:")
                 
-                # Add details about the objects involved
-                obj_ids = sorted(list(pattern['object_ids']))
-                props = pattern['common_properties']
-                
-                prop_str = ", ".join([f"{k}:{v}" for k, v in props]) if props else "any properties"
-                
-                print(f"- {desc} involving objects like {obj_ids} with common properties: [{prop_str}]")
+                for role_id, role_data in sorted(rule['roles'].items()):
+                    props_str = ", ".join([f"{k}:{v}" for k, v in role_data['learned_properties']])
+                    history_str = ", ".join(map(str, role_data['history']))
+                    print(f"    - {role_id}: Consistent properties [{props_str}]. Seen as objects [{history_str}]")
 
     def _get_context_delta(self, start_context: dict, end_context: dict) -> dict:
         """Finds significant changes (deltas) between a start and end context."""
