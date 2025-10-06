@@ -675,7 +675,7 @@ class ObrlAgi3Agent(Agent):
 
             score += failure_penalty
 
-            goal_bonus = self._calculate_goal_bonus(move)
+            goal_bonus = self._calculate_goal_bonus(move, current_summary)
             score += goal_bonus
 
             if score > best_score:
@@ -1319,62 +1319,64 @@ class ObrlAgi3Agent(Agent):
         unique_patterns = {tuple(p.items()) for p in patterns}
         return [dict(t) for t in unique_patterns]
 
-    def _calculate_goal_bonus(self, move: dict) -> float:
+    def _calculate_goal_bonus(self, move: dict, current_summary: list[dict]) -> float:
         """
-        Calculates a score bonus based on how well a potential move helps achieve
-        any of the current win condition hypotheses. This acts as the "Scoreboard" system.
+        Calculates a score bonus if a move is predicted to satisfy an unmet condition
+        from the agent's Master Checklist, by checking for abstract pattern matches.
         """
         if not self.win_condition_hypotheses or not self.rule_hypotheses:
             return 0.0
 
         total_bonus = 0.0
+        
+        # --- Step 1: Figure Out What's Left to Do ---
+        master_checklist = self.win_condition_hypotheses[0]
+        # We get the list of required patterns
+        required_patterns = master_checklist.get('conditions', [])
+        
+        current_context = {'summary': current_summary, 'rels': self._analyze_relationships(current_summary)[0], 'align': self._analyze_alignments(current_summary), 'conj': self._analyze_conjunctions(self._analyze_relationships(current_summary)[0], self._analyze_alignments(current_summary)), 'adj': self._analyze_relationships(current_summary)[1], 'events': []}
+        patterns_already_true = self._extract_patterns_from_context(current_context)
+        
+        # For comparison, we only need the abstract part of the patterns
+        true_abstract_patterns = {(p['pattern_type'], p['sub_type']) for p in patterns_already_true}
+        
+        unmet_conditions = []
+        for p in required_patterns:
+            abstract_tuple = (p['pattern_type'], p['sub_type'])
+            if abstract_tuple not in true_abstract_patterns:
+                unmet_conditions.append(p)
+
+        if not unmet_conditions:
+            return 0.0
+
+        # --- Step 2: Predict the Action's Outcome ---
         action_template = move['type']
         target_object = move['object']
-
-        # Determine the base action key for looking up rules.
         coords_for_key = {'x': target_object['position'][1], 'y': target_object['position'][0]} if target_object else None
         base_action_key = self._get_learning_key(action_template.name, coords_for_key)
         
-        # --- Step 1: Predict the Action's Outcome ---
-        # Find all known effects for this specific action from our rule hypotheses.
-        known_effects = set()
+        predicted_event_types = set()
         for rule_key, hypothesis in self.rule_hypotheses.items():
             rule_base_key = rule_key[0]
-            # We only consider rules with high confidence to make reliable predictions
             if rule_base_key == base_action_key and hypothesis.get('confidence', 0.0) > 0.75:
-                # The rule_key is a tuple: (base_action_key, object_id, object_state)
-                # We need to ensure the rule applies to the object we're targeting.
                 if target_object and rule_key[1] == target_object['id']:
                     for event in hypothesis.get('rules', []):
-                        # Generalize the effect into a searchable "creates_property_value" format
-                        if event.get('type') == 'RECOLORED': known_effects.add(f"creates_Color_{event.get('to_color')}")
-                        elif event.get('type') == 'SHAPE_CHANGED': known_effects.add(f"creates_Shape_{event.get('to_fingerprint')}")
-                        elif 'to_size' in event: known_effects.add(f"creates_Size_{event.get('to_size')}")
+                        if event.get('type'):
+                            predicted_event_types.add(event.get('type'))
 
-        if not known_effects:
+        if not predicted_event_types:
             return 0.0
 
-        # --- Step 2: Check Predictions Against Each Hypothesis ---
-        for hyp in self.win_condition_hypotheses:
-            required_patterns = []
-            if hyp['type'] == 'static_pattern':
-                required_patterns = hyp['conditions']
-            elif hyp['type'] == 'sequential_pattern' and hyp['conditions']:
-                # For a sequence, focus on achieving the first step.
-                required_patterns = hyp['conditions'][0].get('patterns', [])
+        # --- Step 3: Award a Bonus for Helpful Actions ---
+        for unmet in unmet_conditions:
+            # We can only predict 'event' type patterns for now
+            if unmet['pattern_type'] == 'event':
+                required_event_type = unmet['sub_type']
+                if required_event_type in predicted_event_types:
+                    bonus = 50.0
+                    total_bonus += bonus
+                    print(f"Goal-Seeking Bonus: Action on {target_object['id']} is predicted to cause a needed '{required_event_type}' event. Adding {bonus:.2f} bonus.")
 
-            for pattern in required_patterns:
-                if pattern.get('type') == 'group':
-                    prop = pattern.get('property')
-                    val = pattern.get('value')
-                    required_effect = f"creates_{prop}_{val}"
-                    
-                    if required_effect in known_effects:
-                        # --- Step 3: Calculate a Confidence-Weighted Bonus ---
-                        bonus = 25.0 * hyp['confidence']
-                        total_bonus += bonus
-                        print(f"Goal-Seeking Bonus: Action on {target_object['id']} helps '{hyp['description']}' (Confidence: {hyp['confidence']:.0%}). Adding {bonus:.2f} bonus.")
-        
         return total_bonus
     
     def _extract_patterns_from_context(self, context: dict) -> list[dict]:
@@ -1576,6 +1578,70 @@ class ObrlAgi3Agent(Agent):
         
         return final_rels, adjacency_map, match_groups
     
+    def _analyze_conjunctions(self, relationships: dict, alignments: dict) -> dict:
+        """
+        Finds all partial-profile matches between objects. This discovers conjunctions
+        of any complexity (2-part, 3-part, etc.) in a single, efficient pass.
+        """
+        # --- Step 1: Create a "Profile" for Each Object ---
+        # A profile is a set of all group signatures an object belongs to.
+        object_group_map = {}
+        
+        # Consolidate all group-based perception modules
+        all_modules = {
+            **relationships,
+            **alignments
+        }
+
+        for group_type, groups in all_modules.items():
+            for value, obj_ids in groups.items():
+                # The group signature is a tuple, e.g., ('Color', 3) or ('bottom_y', 42)
+                group_signature = (group_type, value)
+                for obj_id in obj_ids:
+                    object_group_map.setdefault(obj_id, set()).add(group_signature)
+        
+        if len(object_group_map) < 2:
+            return {}
+
+        # --- Step 2: Compare Every Pair to Find "Common Ground" ---
+        # This dictionary will store the results, mapping a common profile to a set of objects.
+        # e.g., {frozenset({('Color',3), ('bottom_y',42)}): {1, 5, 7}}
+        temp_conjunctions = {}
+        obj_ids = sorted(list(object_group_map.keys()))
+
+        for i in range(len(obj_ids)):
+            for j in range(i + 1, len(obj_ids)):
+                obj_A_id = obj_ids[i]
+                obj_B_id = obj_ids[j]
+
+                profile_A = object_group_map[obj_A_id]
+                profile_B = object_group_map[obj_B_id]
+                
+                # Find the intersection of their profiles
+                common_groups = profile_A & profile_B
+                
+                # We only care about conjunctions of 2 or more properties.
+                if len(common_groups) > 1:
+                    # The frozenset of common groups is our unique key for this conjunction.
+                    conjunction_key = frozenset(common_groups)
+                    temp_conjunctions.setdefault(conjunction_key, set()).update({obj_A_id, obj_B_id})
+
+        # --- Step 3: Format the Output for the Rest of the System ---
+        final_conjunctions = {}
+        for common_profile, obj_ids in temp_conjunctions.items():
+            if len(obj_ids) > 1:
+                # Create a human-readable name for the conjunction type, e.g., "Color_and_bottom_y"
+                type_names = sorted([item[0] for item in common_profile])
+                conj_type_name = "_and_".join(type_names)
+                
+                # Sort the profile by the type name first to ensure a consistent order
+                sorted_profile = sorted(list(common_profile))
+                value_tuple = tuple([item[1] for item in sorted_profile])
+
+                final_conjunctions.setdefault(conj_type_name, {})[value_tuple] = obj_ids
+        
+        return final_conjunctions
+
     def _analyze_alignments(self, object_summary: list[dict]) -> dict:
         """Analyzes and groups objects based on horizontal and vertical alignments."""
         if len(object_summary) < 2:
