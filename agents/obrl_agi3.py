@@ -1322,61 +1322,68 @@ class ObrlAgi3Agent(Agent):
     def _calculate_goal_bonus(self, move: dict, current_summary: list[dict]) -> float:
         """
         Calculates a score bonus if a move is predicted to satisfy an unmet condition
-        from the agent's Master Checklist, by checking for abstract pattern matches.
+        from the agent's Master Checklist.
         """
         if not self.win_condition_hypotheses or not self.rule_hypotheses:
             return 0.0
 
         total_bonus = 0.0
         
-        # --- Step 1: Figure Out What's Left to Do ---
+        # --- Step 1: Identify the "To-Do List" (Unmet Goals) ---
         master_checklist = self.win_condition_hypotheses[0]
-        # We get the list of required patterns
         required_patterns = master_checklist.get('conditions', [])
         
-        current_context = {'summary': current_summary, 'rels': self._analyze_relationships(current_summary)[0], 'align': self._analyze_alignments(current_summary), 'conj': self._analyze_conjunctions(self._analyze_relationships(current_summary)[0], self._analyze_alignments(current_summary)), 'adj': self._analyze_relationships(current_summary)[1], 'events': []}
+        # Get all abstract patterns that are already true in the current state
+        current_context = {'summary': current_summary} # We only need the summary for the extractor
         patterns_already_true = self._extract_patterns_from_context(current_context)
         
-        # For comparison, we only need the abstract part of the patterns
+        # For comparison, we only need the abstract part of the patterns, not the specific IDs/properties yet
+        # This creates a set of tuples like {('event', 'GROWTH'), ('alignment', 'bottom_y'), ...}
         true_abstract_patterns = {(p['pattern_type'], p['sub_type']) for p in patterns_already_true}
         
-        unmet_conditions = []
+        unmet_abstract_goals = set()
         for p in required_patterns:
             abstract_tuple = (p['pattern_type'], p['sub_type'])
             if abstract_tuple not in true_abstract_patterns:
-                unmet_conditions.append(p)
+                unmet_abstract_goals.add(abstract_tuple)
 
-        if not unmet_conditions:
-            return 0.0
+        if not unmet_abstract_goals:
+            return 0.0 # All goals are met, no specific action to incentivize.
 
-        # --- Step 2: Predict the Action's Outcome ---
+        # --- Step 2: Predict the Action's Abstract Outcome ---
         action_template = move['type']
         target_object = move['object']
         coords_for_key = {'x': target_object['position'][1], 'y': target_object['position'][0]} if target_object else None
         base_action_key = self._get_learning_key(action_template.name, coords_for_key)
         
-        predicted_event_types = set()
+        predicted_abstract_patterns = set()
         for rule_key, hypothesis in self.rule_hypotheses.items():
             rule_base_key = rule_key[0]
+            # Consider only high-confidence rules for reliable predictions
             if rule_base_key == base_action_key and hypothesis.get('confidence', 0.0) > 0.75:
+                # Ensure the rule applies to the object we're targeting
                 if target_object and rule_key[1] == target_object['id']:
                     for event in hypothesis.get('rules', []):
-                        if event.get('type'):
-                            predicted_event_types.add(event.get('type'))
+                        event_type = event.get('type')
+                        if event_type:
+                            # Predict the abstract pattern for this event
+                            predicted_abstract_patterns.add(('event', event_type))
 
-        if not predicted_event_types:
+        if not predicted_abstract_patterns:
             return 0.0
 
-        # --- Step 3: Award a Bonus for Helpful Actions ---
-        for unmet in unmet_conditions:
-            # We can only predict 'event' type patterns for now
-            if unmet['pattern_type'] == 'event':
-                required_event_type = unmet['sub_type']
-                if required_event_type in predicted_event_types:
-                    bonus = 50.0
-                    total_bonus += bonus
-                    print(f"Goal-Seeking Bonus: Action on {target_object['id']} is predicted to cause a needed '{required_event_type}' event. Adding {bonus:.2f} bonus.")
-
+        # --- Step 3: Reward Actions that Help Achieve Unmet Goals ---
+        helpful_predictions = predicted_abstract_patterns & unmet_abstract_goals
+        
+        if helpful_predictions:
+            # Add a significant bonus for each unmet goal this action helps satisfy.
+            bonus = 50.0 * len(helpful_predictions)
+            total_bonus += bonus
+            
+            summary = sorted([f"{p[0]}:{p[1]}" for p in helpful_predictions])
+            obj_id_str = target_object['id'].replace('obj_', 'id_') if target_object else 'N/A'
+            print(f"Goal-Seeking Bonus: Action on {obj_id_str} is predicted to help achieve unmet goals: {summary}. Adding {bonus:.2f} bonus.")
+        
         return total_bonus
     
     def _extract_patterns_from_context(self, context: dict) -> list[dict]:
