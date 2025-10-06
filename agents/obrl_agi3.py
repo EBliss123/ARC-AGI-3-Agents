@@ -1127,10 +1127,35 @@ class ObrlAgi3Agent(Agent):
         newly_observed_patterns = self._extract_patterns_from_context(winning_context)
 
         if not self.win_condition_hypotheses:
-            # --- CREATION MODE (After Level 1) ---
-            print(f"No Master Checklist found. Creating initial checklist from {len(newly_observed_patterns)} multi-layered patterns.")
-            self.win_condition_hypotheses = [{'id': 'master_checklist', 'type': 'win_state_checklist', 'conditions': newly_observed_patterns}]
+            # --- CREATION MODE (After Level 1) with Uniqueness Filter ---
+            print("No Master Checklist found. Analyzing winning state for unique patterns...")
+            
+            # 1. Get all patterns from the final, winning state.
+            win_patterns = newly_observed_patterns # This was calculated at the top of the function.
+            win_patterns_set = {tuple(p.items()) for p in win_patterns}
+            
+            # 2. Get all patterns that have ever existed in any previous state.
+            historical_contexts = level_history[:-1]
+            seen_patterns_set = set()
+            for context in historical_contexts:
+                historical_patterns = self._extract_patterns_from_context(context)
+                for p in historical_patterns:
+                    seen_patterns_set.add(tuple(p.items()))
+            
+            # 3. The true win conditions are the patterns that are new to the winning frame.
+            unique_win_patterns_set = win_patterns_set - seen_patterns_set
+            
+            unique_win_patterns = [dict(t) for t in unique_win_patterns_set]
+            
+            print(f"Found {len(win_patterns)} patterns in winning state. After filtering, {len(unique_win_patterns)} are unique to the win.")
 
+            # 4. Create the Master Checklist from only these unique patterns.
+            master_checklist = {
+                'id': 'master_checklist',
+                'type': 'win_state_checklist',
+                'conditions': unique_win_patterns
+            }
+            self.win_condition_hypotheses = [master_checklist]
         else:
             # --- REFINING MODE (After Level 2+) ---
             old_checklist = self.win_condition_hypotheses[0]
@@ -1221,7 +1246,7 @@ class ObrlAgi3Agent(Agent):
                 obj_ids = sorted(list(pattern['object_ids']))
                 props = pattern['common_properties']
                 
-                prop_str = ", ".join([f"{k}:{v}" for k,v in props.items()]) if props else "any properties"
+                prop_str = ", ".join([f"{k}:{v}" for k, v in props]) if props else "any properties"
                 
                 print(f"- {desc} involving objects like {obj_ids} with common properties: [{prop_str}]")
 
@@ -1434,7 +1459,7 @@ class ObrlAgi3Agent(Agent):
                         'pattern_type': module_name,
                         'sub_type': group_type,
                         'object_ids': frozenset(obj_ids_int),
-                        'common_properties': common_props
+                        'common_properties': frozenset(common_props.items())
                     })
         
         # --- Process Adjacencies ---
@@ -1447,7 +1472,7 @@ class ObrlAgi3Agent(Agent):
                 'pattern_type': 'adjacency',
                 'sub_type': 'contact',
                 'object_ids': frozenset(all_ids),
-                'common_properties': get_common_properties(all_ids)
+                'common_properties': frozenset(get_common_properties(all_ids).items())
             })
 
         # --- Process Final Turn Events ---
@@ -1460,7 +1485,7 @@ class ObrlAgi3Agent(Agent):
                     'pattern_type': 'event',
                     'sub_type': event_type,
                     'object_ids': frozenset({obj_id_int}),
-                    'common_properties': obj_props
+                    'common_properties': frozenset(obj_props.items())
                 })
 
         # Return a unique list of patterns
