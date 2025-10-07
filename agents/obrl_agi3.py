@@ -66,8 +66,6 @@ class ObrlAgi3Agent(Agent):
             return GameAction.RESET
         
         current_summary = self._perceive_objects(latest_frame)
-        current_relationships, current_adjacencies, current_match_groups = self._analyze_relationships(current_summary)
-        current_alignments = self._analyze_alignments(current_summary)
 
         # If this is the first scan (last summary is empty), print the full summary.
         if not self.last_object_summary or self.is_new_level:
@@ -232,6 +230,9 @@ class ObrlAgi3Agent(Agent):
             if id_map:
                 self._remap_memory(id_map)
 
+            current_relationships, current_adjacencies, current_match_groups = self._analyze_relationships(current_summary)
+            current_alignments = self._analyze_alignments(current_summary)
+
             print("--- Initial Frame Summary ---")
             if not current_summary:
                 print("No objects found.")
@@ -330,17 +331,28 @@ class ObrlAgi3Agent(Agent):
             prev_summary = self.last_object_summary
             changes, current_summary = self._log_changes(prev_summary, current_summary)
 
+            current_relationships, current_adjacencies, current_match_groups = self._analyze_relationships(current_summary)
+            current_alignments = self._analyze_alignments(current_summary)
+
             # --- LEVEL CHANGE DETECTION & HANDLING ---
             current_score = latest_frame.score
             if current_score > self.last_score:
                 print(f"\n--- LEVEL CHANGE DETECTED (Score increased from {self.last_score} to {current_score}) ---")
                 
-                # Analyze what was unique about the winning state compared to the rest of the level
-                if self.level_state_history:
-                    winning_context = self.level_state_history[-1] # The last state before the score change
-                    historical_contexts = self.level_state_history[:-1]
-                    self._analyze_win_condition(self.level_state_history, self.level_milestones, self.current_level_id_map)
+                # Construct the current (winning) context from the live variables
+                winning_context = {
+                    'summary': current_summary,
+                    'rels': current_relationships,
+                    'adj': current_adjacencies,
+                    'match': current_match_groups,
+                    'align': current_alignments,
+                    'events': changes
+                }
                 
+                # Create a temporary history list that includes the final winning state for analysis
+                history_for_analysis = self.level_state_history + [winning_context]
+                self._analyze_win_condition(history_for_analysis, self.level_milestones, self.current_level_id_map)
+
                 # Print the full summary of the final frame of the level that was just won.
                 print("\n--- Final Frame Summary (Old Level) ---")
                 self._print_full_summary(self.last_object_summary)
@@ -1450,13 +1462,22 @@ class ObrlAgi3Agent(Agent):
         
         # --- Process Adjacencies ---
         for obj_id_str, contacts in context.get('adj', {}).items():
-            obj_id_int = int(obj_id_str.replace('obj_',''))
-            contact_ids_int = {int(c.replace('obj_','')) for c in contacts if 'obj_' in c}
+            # Only generate a pattern if there is at least one contact to analyze
+            if not any('obj_' in c for c in contacts):
+                continue
+
+            obj_id_int = int(obj_id_str.replace('obj_', ''))
+            
+            # Create an abstract fingerprint of the neighborhood (e.g., ('na', 'contact', 'na', 'na')).
+            # This captures the arrangement without binding to specific object IDs in the subtype.
+            abstract_config = tuple(['contact' if 'obj_' in c else 'na' for c in contacts])
+            
+            contact_ids_int = {int(c.replace('obj_', '')) for c in contacts if 'obj_' in c}
             all_ids = {obj_id_int} | contact_ids_int
             
             patterns.append({
                 'pattern_type': 'adjacency',
-                'sub_type': 'contact',
+                'sub_type': abstract_config,
                 'object_ids': frozenset(all_ids),
                 'common_properties': frozenset(get_common_properties(all_ids).items())
             })
