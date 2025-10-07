@@ -1185,11 +1185,35 @@ class ObrlAgi3Agent(Agent):
 
         else:
             # --- REFINING MODE (After Level 2+) ---
-            # TODO: Implement the logic to refine the Master Recipe.
-            # This will involve matching new patterns to existing rules, assigning objects to roles,
-            # and updating the 'learned_properties' for each role and the group.
-            print("\n--- Refining Master Recipe (Placeholder) ---")
-            print("Refining logic will be implemented in the next step.")
+            master_recipe_rules = self.win_condition_hypotheses
+            print(f"\n--- Refining {len(master_recipe_rules)} Master Rules Based on New Evidence ---")
+
+            # Get the set of abstract patterns that were unique to this new win.
+            new_win_patterns = self._extract_patterns_from_context(winning_context)
+            historical_contexts = level_history[:-1]
+            seen_patterns_set = {str(p) for c in historical_contexts for p in self._extract_patterns_from_context(c)}
+            unique_new_patterns = [p for p in new_win_patterns if str(p) not in seen_patterns_set]
+            
+            # Create a simple set of abstract types for easy lookup, e.g., {('alignment', 'bottom_y'), ...}
+            unique_new_abstract_patterns = {
+                (p['pattern_type'], p['sub_type']) for p in unique_new_patterns
+            }
+
+            surviving_rules = []
+            for rule in master_recipe_rules:
+                # Check if the rule's abstract pattern was found in the new level's unique events
+                rule_abstract = (rule['abstract_pattern']['pattern_type'], rule['abstract_pattern']['sub_type'])
+                
+                if rule_abstract in unique_new_abstract_patterns:
+                    # The rule is consistent. Reinforce its confidence.
+                    rule['confidence'] = min(1.0, rule['confidence'] + 0.1)
+                    surviving_rules.append(rule)
+                    print(f"- Rule '{rule['id']}' ({rule['abstract_pattern']['sub_type']}) was REINFORCED. Confidence -> {rule['confidence']:.0%}")
+                else:
+                    # The rule is inconsistent with this win. Delete it immediately.
+                    print(f"- Rule '{rule['id']}' ({rule['abstract_pattern']['sub_type']}) was INCONSISTENT and has been DELETED.")
+            
+            self.win_condition_hypotheses = surviving_rules
             
         # --- Final Report ---
         if self.win_condition_hypotheses:
