@@ -371,9 +371,6 @@ class ObrlAgi3Agent(Agent):
             self._log_alignment_changes(self.last_alignments, current_alignments)
             self._log_match_type_changes(self.last_match_groups, current_match_groups)
 
-            # --- Prepare for Learning & Rule Analysis ---
-            current_state_key = self._get_state_key(current_summary)
-
             if self.last_action_context:
                 # --- Analyze the outcome of the previous action ---
                 prev_action_name, prev_target_id = self.last_action_context
@@ -597,8 +594,25 @@ class ObrlAgi3Agent(Agent):
             for prediction in sorted(list(set(boring_predictions))):
                 print(prediction)
 
-        # --- RL: Score and select the best action ---
+        # --- Prepare for Learning & Rule Analysis ---
         current_state_key = self._get_state_key(current_summary)
+
+        # --- Pre-calculate Unmet Goals for the current state ---
+        unmet_abstract_goals = set()
+        if self.win_condition_hypotheses:
+            required_abstract_patterns = {
+                (rule['abstract_pattern']['pattern_type'], rule['abstract_pattern']['sub_type'])
+                for rule in self.win_condition_hypotheses
+            }
+            current_context = {
+                'summary': current_summary, 'rels': current_relationships, 'adj': current_adjacencies,
+                'align': current_alignments, 'match': current_match_groups, 'events': changes
+            }
+            patterns_already_true = self._extract_patterns_from_context(current_context)
+            true_abstract_patterns = {(p['pattern_type'], p['sub_type']) for p in patterns_already_true}
+            unmet_abstract_goals = required_abstract_patterns - true_abstract_patterns
+
+        # --- RL: Score and select the best action ---
         best_move = None
         best_score = -float('inf')
 
@@ -687,7 +701,8 @@ class ObrlAgi3Agent(Agent):
 
             score += failure_penalty
 
-            goal_bonus = self._calculate_goal_bonus(move, current_summary)
+            # Pass the pre-calculated unmet goals to the bonus function
+            goal_bonus = self._calculate_goal_bonus(move, current_summary, unmet_abstract_goals)
             score += goal_bonus
 
             if score > best_score:
@@ -1342,72 +1357,92 @@ class ObrlAgi3Agent(Agent):
         unique_patterns = {tuple(p.items()) for p in patterns}
         return [dict(t) for t in unique_patterns]
 
-    def _calculate_goal_bonus(self, move: dict, current_summary: list[dict]) -> float:
+    def _calculate_goal_bonus(self, move: dict, current_summary: list[dict], unmet_goals: set) -> float:
         """
-        Calculates a score bonus if a move is predicted to satisfy an unmet condition
-        from the agent's Master Checklist.
+        Performs a "one-step lookahead" simulation. It predicts the next state based on
+        the given move, analyzes that hypothetical state, and awards a bonus if it
+        is predicted to satisfy an unmet goal from the Master Recipe.
         """
-        if not self.win_condition_hypotheses or not self.rule_hypotheses:
+        if not unmet_goals or not self.rule_hypotheses:
             return 0.0
 
-        total_bonus = 0.0
-        
-        # --- Step 1: Identify the "To-Do List" (Unmet Goals) ---
-        master_checklist = self.win_condition_hypotheses[0]
-        required_patterns = master_checklist.get('conditions', [])
-        
-        # Get all abstract patterns that are already true in the current state
-        current_context = {'summary': current_summary} # We only need the summary for the extractor
-        patterns_already_true = self._extract_patterns_from_context(current_context)
-        
-        # For comparison, we only need the abstract part of the patterns, not the specific IDs/properties yet
-        # This creates a set of tuples like {('event', 'GROWTH'), ('alignment', 'bottom_y'), ...}
-        true_abstract_patterns = {(p['pattern_type'], p['sub_type']) for p in patterns_already_true}
-        
-        unmet_abstract_goals = set()
-        for p in required_patterns:
-            abstract_tuple = (p['pattern_type'], p['sub_type'])
-            if abstract_tuple not in true_abstract_patterns:
-                unmet_abstract_goals.add(abstract_tuple)
-
-        if not unmet_abstract_goals:
-            return 0.0 # All goals are met, no specific action to incentivize.
-
-        # --- Step 2: Predict the Action's Abstract Outcome ---
         action_template = move['type']
         target_object = move['object']
-        coords_for_key = {'x': target_object['position'][1], 'y': target_object['position'][0]} if target_object else None
-        base_action_key = self._get_learning_key(action_template.name, coords_for_key)
         
-        predicted_abstract_patterns = set()
+        # --- Step 1: Find all high-confidence rules that apply to this specific action ---
+        applicable_rules = []
         for rule_key, hypothesis in self.rule_hypotheses.items():
-            rule_base_key = rule_key[0]
-            # Consider only high-confidence rules for reliable predictions
-            if rule_base_key == base_action_key and hypothesis.get('confidence', 0.0) > 0.75:
-                # Ensure the rule applies to the object we're targeting
-                if target_object and rule_key[1] == target_object['id']:
-                    for event in hypothesis.get('rules', []):
-                        event_type = event.get('type')
-                        if event_type:
-                            # Predict the abstract pattern for this event
-                            predicted_abstract_patterns.add(('event', event_type))
+            rule_base_key, rule_obj_id, rule_obj_state = rule_key
 
-        if not predicted_abstract_patterns:
-            return 0.0
+            if hypothesis.get('confidence', 0.0) < 0.9: # Use a high threshold for planning
+                continue
 
-        # --- Step 3: Reward Actions that Help Achieve Unmet Goals ---
-        helpful_predictions = predicted_abstract_patterns & unmet_abstract_goals
+            is_match = False
+            if target_object: # This is a targeted click action
+                # The rule must match the action, the specific object clicked, and that object's current state.
+                base_action_key = self._get_learning_key(action_template.name, target_object['id'])
+                current_object_state = (self._get_stable_id(target_object), target_object['position'])
+                if rule_base_key == base_action_key and rule_obj_id == target_object['id'] and rule_obj_state == current_object_state:
+                    is_match = True
+            else: # This is a global action
+                # The rule must match the action name. The `rule_obj_id` tells us which object will be affected.
+                base_action_key = self._get_learning_key(action_template.name, None)
+                if rule_base_key == base_action_key:
+                    is_match = True
+            
+            if is_match:
+                # Store the key along with the rule for easier access later
+                hypothesis['key'] = rule_key
+                applicable_rules.append(hypothesis)
+
+        if not applicable_rules:
+            return 0.0 # No reliable predictions for this action exist.
+
+        # --- Step 2: Build a Hypothetical Future State ---
+        future_summary = copy.deepcopy(current_summary)
+        future_summary_map = {obj['id']: obj for obj in future_summary}
+
+        for rule in applicable_rules:
+            # The rule_key contains the ID of the object that will be affected.
+            affected_obj_id = rule['key'][1] 
+            if affected_obj_id not in future_summary_map:
+                continue
+            
+            obj_to_change = future_summary_map[affected_obj_id]
+            
+            for event in rule.get('rules', []):
+                # Apply predictable state changes. For now, this handles MOVED and RECOLORED.
+                if event.get('type') == 'MOVED' and 'vector' in event:
+                    vy, vx = event['vector']
+                    old_pos = obj_to_change['position']
+                    obj_to_change['position'] = (old_pos[0] + vy, old_pos[1] + vx)
+                
+                elif event.get('type') == 'RECOLORED' and 'to_color' in event:
+                    obj_to_change['color'] = event['to_color']
+        
+        # --- Step 3: Analyze the Hypothetical Future State ---
+        future_rels, future_adj, _ = self._analyze_relationships(future_summary)
+        future_aligns = self._analyze_alignments(future_summary)
+        future_context = {
+            'summary': future_summary, 'rels': future_rels, 'adj': future_adj,
+            'align': future_aligns, 'match': {}, 'events': []
+        }
+        predicted_patterns = self._extract_patterns_from_context(future_context)
+        predicted_abstract_patterns = {(p['pattern_type'], p['sub_type']) for p in predicted_patterns}
+
+        # --- Step 4: Award Bonus if the Future State Achieves an Unmet Goal ---
+        helpful_predictions = predicted_abstract_patterns & unmet_goals
         
         if helpful_predictions:
-            # Add a significant bonus for each unmet goal this action helps satisfy.
-            bonus = 50.0 * len(helpful_predictions)
-            total_bonus += bonus
+            bonus = 75.0 * len(helpful_predictions) # Increased bonus for high-confidence planning
+            summary = sorted([f"{p[1]}" for p in helpful_predictions])
+            obj_id_str = target_object['id'].replace('obj_', 'id_') if target_object else 'GLOBAL'
+            action_name = self._get_learning_key(action_template.name, target_object['id'] if target_object else None)
             
-            summary = sorted([f"{p[0]}:{p[1]}" for p in helpful_predictions])
-            obj_id_str = target_object['id'].replace('obj_', 'id_') if target_object else 'N/A'
-            print(f"Goal-Seeking Bonus: Action on {obj_id_str} is predicted to help achieve unmet goals: {summary}. Adding {bonus:.2f} bonus.")
+            print(f"Goal-Seeking Bonus: Action {action_name} on {obj_id_str} is predicted to achieve unmet goals: {summary}. Adding {bonus:.2f} bonus.")
+            return bonus
         
-        return total_bonus
+        return 0.0
     
     def _extract_patterns_from_context(self, context: dict) -> list[dict]:
         """
@@ -2261,7 +2296,7 @@ class ObrlAgi3Agent(Agent):
         if not self.last_state_key or not self.last_action_context:
             return
 
-        # 1. Calculate reward (same as before)
+        # 1. Calculate reward
         reward = 0
         # --- Normalized reward for unique state discovery ---
         self.total_moves += 1
@@ -2289,68 +2324,18 @@ class ObrlAgi3Agent(Agent):
 
         if latest_frame.score > self.last_score:
             reward += 100
-        if changes:
-            # Reward is now proportional to the number of changes caused.
-            # An action that causes more things to happen is considered more valuable.
-            reward += len(changes)
-        else:
-            # Apply a small base penalty for doing nothing.
-            reward -= 5
-            # Check the action's lifetime history.
-            history = self.action_history.get(learning_key)
-            if history and history['successes'] == 0:
-                # This action has a history of ONLY ever failing. Punish it exponentially.
-                failed_attempts = history['attempts']
-                exponential_penalty = (10 ** failed_attempts) - 1
-                reward -= exponential_penalty
 
-        # --- Object-Level Novelty Reward ---
-        novel_object_count = 0
-        if new_summary:
-            for obj in new_summary:
-                # We use the stable ID to represent a unique object state
-                object_stable_id = self._get_stable_id(obj)
-                if object_stable_id not in self.seen_object_states:
-                    novel_object_count += 1
-                    # Add the new object state to our long-term memory
-                    self.seen_object_states.add(object_stable_id)
-        
-        if novel_object_count > 0:
-            # The reward is proportional to how many new object types were created.
-            # We can tune the multiplier (e.g., 3) as needed.
-            reward += novel_object_count * 3
-        elif not changes:
-             # If no new objects were created AND no changes happened, it was a wasted turn.
-             # This overlaps with the inaction penalty but reinforces it.
-             reward -= 2
-        
-        # Check if the action was a "discovery" (i.e., created new object states).
-        was_discovery = novel_object_count > 0
-        if not was_discovery:
-            # If it wasn't a discovery, penalize it based on how many times we've tried it.
-            # The count is for the PREVIOUS state-action pair, before the update.
-            repetition_count = self.action_counts.get((self.last_state_key, learning_key), 0)
-            # The penalty increases with each repetition of the unproductive action.
-            reward -= repetition_count
-
-        # --- Effect Pattern Novelty Reward ---
+        # --- Effect Pattern Novelty Reward (for discovering new game mechanics) ---
         if changes:
-            # Create a "fingerprint" of the outcome based on the types of changes.
             change_types = sorted([log.split(':')[0].replace('- ', '') for log in changes])
             effect_pattern_key = tuple(change_types)
-            
-            # Check how many times this exact pattern has occurred recently.
             pattern_count_in_history = self.recent_effect_patterns.count(effect_pattern_key)
             
             if pattern_count_in_history == 0:
-                # This is a brand new type of outcome we haven't seen recently.
-                reward += 20 # Large bonus for discovering a new mechanism.
+                reward += 20 # Bonus for a new type of outcome.
             else:
-                # We've seen this pattern before, so it's less interesting.
-                # Apply a penalty that increases the more we repeat the pattern.
-                reward -= pattern_count_in_history * 5 # Increased penalty for unoriginal outcomes
-
-            # Add the new pattern to our recent history.
+                reward -= pattern_count_in_history * 5 # Penalty for repeating old outcomes.
+            
             self.recent_effect_patterns.append(effect_pattern_key)
 
         # 2. Estimate the best possible Q-value from the new state
