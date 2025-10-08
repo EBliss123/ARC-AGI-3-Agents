@@ -263,7 +263,7 @@ class ObrlAgi3Agent(Agent):
                     print(line)
 
                 if current_adjacencies:
-                    print("\n--- Initial Adjacency Analysis (Top, Right, Bottom, Left) ---")
+                    print("\n--- Initial Adjacency Analysis (T, R, B, L, TL, TR, BL, BR) ---")
                     for obj_id, contacts in sorted(current_adjacencies.items(), key=lambda item: int(item[0].split('_')[1])):
                         # Format the contact list into the desired string
                         contact_ids = [c.replace('obj_', '') if 'obj_' in c else c for c in contacts]
@@ -684,9 +684,9 @@ class ObrlAgi3Agent(Agent):
                 # Check Adjacency Patterns
                 pattern_adj = known_failure_pattern.get('adj', {})
                 for obj_id, pattern_contacts in pattern_adj.items():
-                    current_contacts = tuple(current_adjacencies.get(obj_id, ['na']*4))
+                    current_contacts = tuple(current_adjacencies.get(obj_id, ['na']*8))
                     # Compare the current state against the pattern, ignoring wildcards ('x')
-                    for i in range(4):
+                    for i in range(8):
                         if pattern_contacts[i] != 'x' and pattern_contacts[i] != current_contacts[i]:
                             is_match = False
                             break
@@ -1028,7 +1028,7 @@ class ObrlAgi3Agent(Agent):
                     continue
                 
                 # Compare each direction (top, right, bottom, left)
-                for i in range(4):
+                for i in range(8):
                     # If a direction is already a wildcard, it stays a wildcard.
                     if master_pattern[i] == 'x':
                         continue
@@ -1096,15 +1096,15 @@ class ObrlAgi3Agent(Agent):
         all_adj_ids = set(adj_s.keys()) | set(adj_f.keys())
 
         for obj_id in sorted(list(all_adj_ids), key=lambda x: int(x.split('_')[1])):
-            contacts_s = tuple(adj_s.get(obj_id, ['na']*4))
-            contacts_f = tuple(adj_f.get(obj_id, ['na']*4))
+            contacts_s = tuple(adj_s.get(obj_id, ['na']*8))
+            contacts_f = tuple(adj_f.get(obj_id, ['na']*8))
 
             if contacts_s != contacts_f:
                 # VETO CHECK: Is this failure condition truly novel, or did it appear in at least one success?
                 if (obj_id, contacts_f) not in observed_in_any_success_adj:
                     diffs_found = True
                     failure_pattern = []
-                    for i in range(4):
+                    for i in range(8):
                         if contacts_s[i] == contacts_f[i]:
                             failure_pattern.append('x')
                         else:
@@ -1285,7 +1285,7 @@ class ObrlAgi3Agent(Agent):
         start_adj = start_context.get('adj', {})
         end_adj = end_context.get('adj', {})
         for obj_id, end_contacts in end_adj.items():
-            start_contacts = tuple(start_adj.get(obj_id, ('na', 'na', 'na', 'na')))
+            start_contacts = tuple(start_adj.get(obj_id, ('na', 'na', 'na', 'na', 'na', 'na', 'na', 'na')))
             if tuple(end_contacts) != start_contacts:
                 new_adjs.append({'obj_id': obj_id, 'contacts': tuple(end_contacts)})
         if new_adjs:
@@ -1573,12 +1573,16 @@ class ObrlAgi3Agent(Agent):
         for obj_a in object_summary:
             a_id = obj_a['id']
             for r, c in obj_a['pixel_coords']:
-                # Check neighbors (top, right, bottom, left)
+                # Check neighbors (8 directions)
                 neighbors = {
                     'top': (r - 1, c),
                     'bottom': (r + 1, c),
                     'left': (r, c - 1),
-                    'right': (r, c + 1)
+                    'right': (r, c + 1),
+                    'top_left': (r - 1, c - 1),
+                    'top_right': (r - 1, c + 1),
+                    'bottom_left': (r + 1, c - 1),
+                    'bottom_right': (r + 1, c + 1),
                 }
                 for direction, coord in neighbors.items():
                     if coord in pixel_map:
@@ -1588,22 +1592,30 @@ class ObrlAgi3Agent(Agent):
                             # If B is on top of A's pixel, then B is a 'top' contact for A.
                             temp_adj.setdefault(a_id, {}).setdefault(direction, set()).add(b_id)
 
-        # Pass 2: Simplify contacts into the final format (top, right, bottom, left)
+        # Pass 2: Simplify contacts into the final format (T, R, B, L, TL, TR, BL, BR)
         adjacency_map = {}
         for obj_id, contacts in temp_adj.items():
-            result = ['na'] * 4 # [top, right, bottom, left]
+            result = ['na'] * 8 # [top, right, bottom, left, tl, tr, bl, br]
             
+            # Direct contacts
             top_contacts = contacts.get('top', set())
             if len(top_contacts) == 1: result[0] = top_contacts.pop()
-
             right_contacts = contacts.get('right', set())
             if len(right_contacts) == 1: result[1] = right_contacts.pop()
-
             bottom_contacts = contacts.get('bottom', set())
             if len(bottom_contacts) == 1: result[2] = bottom_contacts.pop()
-            
             left_contacts = contacts.get('left', set())
             if len(left_contacts) == 1: result[3] = left_contacts.pop()
+
+            # Corner contacts
+            tl_contacts = contacts.get('top_left', set())
+            if len(tl_contacts) == 1: result[4] = tl_contacts.pop()
+            tr_contacts = contacts.get('top_right', set())
+            if len(tr_contacts) == 1: result[5] = tr_contacts.pop()
+            bl_contacts = contacts.get('bottom_left', set())
+            if len(bl_contacts) == 1: result[6] = bl_contacts.pop()
+            br_contacts = contacts.get('bottom_right', set())
+            if len(br_contacts) == 1: result[7] = br_contacts.pop()
 
             # Only add to the map if there's at least one unique contact
             if any(res != 'na' for res in result):
@@ -1807,8 +1819,8 @@ class ObrlAgi3Agent(Agent):
         all_ids = set(old_adj.keys()) | set(new_adj.keys())
 
         for obj_id in sorted(list(all_ids), key=lambda x: int(x.split('_')[1])):
-            old_contacts = old_adj.get(obj_id, ['na'] * 4)
-            new_contacts = new_adj.get(obj_id, ['na'] * 4)
+            old_contacts = old_adj.get(obj_id, ['na'] * 8)
+            new_contacts = new_adj.get(obj_id, ['na'] * 8)
 
             if old_contacts != new_contacts:
                 clean_id = obj_id.replace('obj_', 'id_')
