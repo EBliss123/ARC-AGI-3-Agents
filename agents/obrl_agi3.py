@@ -52,6 +52,7 @@ class ObrlAgi3Agent(Agent):
         self.seen_event_types_in_level = set()
         self.last_alignments = {}
         self.current_level_id_map = {}
+        self.last_diag_adjacencies = {}
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -230,7 +231,7 @@ class ObrlAgi3Agent(Agent):
             if id_map:
                 self._remap_memory(id_map)
 
-            current_relationships, current_adjacencies, current_match_groups = self._analyze_relationships(current_summary)
+            current_relationships, current_adjacencies, current_diag_adjacencies, current_match_groups = self._analyze_relationships(current_summary)
             current_alignments = self._analyze_alignments(current_summary)
             current_conjunctions = self._analyze_conjunctions(current_relationships, current_alignments)
 
@@ -267,6 +268,14 @@ class ObrlAgi3Agent(Agent):
                     print("\n--- Initial Adjacency Analysis (Top, Right, Bottom, Left) ---")
                     for obj_id, contacts in sorted(current_adjacencies.items(), key=lambda item: int(item[0].split('_')[1])):
                         # Format the contact list into the desired string
+                        contact_ids = [c.replace('obj_', '') if 'obj_' in c else c for c in contacts]
+                        contact_tuple_str = ", ".join(contact_ids)
+                        clean_obj_id = obj_id.replace('obj_', 'id_')
+                        print(f"- Object {clean_obj_id} ({contact_tuple_str})")
+
+                if current_diag_adjacencies:
+                    print("\n--- Initial Diagonal Adjacency (TR, BR, BL, TL) ---")
+                    for obj_id, contacts in sorted(current_diag_adjacencies.items(), key=lambda item: int(item[0].split('_')[1])):
                         contact_ids = [c.replace('obj_', '') if 'obj_' in c else c for c in contacts]
                         contact_tuple_str = ", ".join(contact_ids)
                         clean_obj_id = obj_id.replace('obj_', 'id_')
@@ -332,7 +341,7 @@ class ObrlAgi3Agent(Agent):
             prev_summary = self.last_object_summary
             changes, current_summary = self._log_changes(prev_summary, current_summary)
 
-            current_relationships, current_adjacencies, current_match_groups = self._analyze_relationships(current_summary)
+            current_relationships, current_adjacencies, current_diag_adjacencies, current_match_groups = self._analyze_relationships(current_summary)
             current_alignments = self._analyze_alignments(current_summary)
             current_conjunctions = self._analyze_conjunctions(current_relationships, current_alignments)
 
@@ -370,7 +379,7 @@ class ObrlAgi3Agent(Agent):
 
             self._log_relationship_changes(self.last_relationships, current_relationships)
             self._log_adjacency_changes(self.last_adjacencies, current_adjacencies)
-            self._log_alignment_changes(self.last_alignments, current_alignments)
+            self._log_diag_adjacency_changes(self.last_diag_adjacencies, current_diag_adjacencies)
             self._log_match_type_changes(self.last_match_groups, current_match_groups)
 
             if self.last_action_context:
@@ -482,7 +491,8 @@ class ObrlAgi3Agent(Agent):
                     success_context = {
                         'summary': prev_summary,
                         'rels': self.last_relationships,
-                        'adj': self.last_adjacencies
+                        'adj': self.last_adjacencies,
+                        'diag_adj': self.last_diag_adjacencies
                     }
                     self.success_contexts.setdefault(learning_key, []).append(success_context)
                 
@@ -513,7 +523,8 @@ class ObrlAgi3Agent(Agent):
                     failure_context = {
                         'summary': prev_summary,
                         'rels': self.last_relationships,
-                        'adj': self.last_adjacencies
+                        'adj': self.last_adjacencies,
+                        'diag_adj': self.last_diag_adjacencies
                     }
                     self.failure_contexts.setdefault(learning_key, []).append(failure_context)
 
@@ -547,6 +558,7 @@ class ObrlAgi3Agent(Agent):
         # Update the memory for the next turn.
         self.last_object_summary = current_summary
         self.last_adjacencies = current_adjacencies
+        self.last_diag_adjacencies = current_diag_adjacencies
         self.last_relationships = current_relationships
         self.last_alignments = current_alignments
         self.last_match_groups = current_match_groups
@@ -1424,7 +1436,7 @@ class ObrlAgi3Agent(Agent):
                     obj_to_change['color'] = event['to_color']
         
         # --- Step 3: Analyze the Hypothetical Future State ---
-        future_rels, future_adj, _ = self._analyze_relationships(future_summary)
+        future_rels, future_adj, _, __ = self._analyze_relationships(future_summary)
         future_aligns = self._analyze_alignments(future_summary)
         future_context = {
             'summary': future_summary, 'rels': future_rels, 'adj': future_adj,
@@ -1537,10 +1549,10 @@ class ObrlAgi3Agent(Agent):
         unique_patterns = {str(p) for p in patterns}
         return [eval(s) for s in unique_patterns]
 
-    def _analyze_relationships(self, object_summary: list[dict]) -> tuple[dict, dict, dict]:
+    def _analyze_relationships(self, object_summary: list[dict]) -> tuple[dict, dict, dict, dict]:
         """Analyzes object relationships and returns a structured dictionary of groups."""
         if not object_summary or len(object_summary) < 2:
-            return {}, {}, {}
+            return {}, {}, {}, {}
 
         # Use capitalized keys for cleaner log titles
         rel_data = {
@@ -1566,6 +1578,7 @@ class ObrlAgi3Agent(Agent):
 
         # --- Pixel-Perfect Adjacency Analysis ---
         temp_adj = {}
+        temp_diag_adj = {}
         # Create a quick lookup map of pixel coordinates to object IDs
         pixel_map = {}
         for obj in object_summary:
@@ -1591,6 +1604,18 @@ class ObrlAgi3Agent(Agent):
                             # If B is on top of A's pixel, then B is a 'top' contact for A.
                             temp_adj.setdefault(a_id, {}).setdefault(direction, set()).add(b_id)
 
+                diagonal_neighbors = {
+                    'top_right': (r - 1, c + 1),
+                    'bottom_right': (r + 1, c + 1),
+                    'bottom_left': (r + 1, c - 1),
+                    'top_left': (r - 1, c - 1),
+                }
+                for direction, coord in diagonal_neighbors.items():
+                    if coord in pixel_map:
+                        b_id = pixel_map[coord]
+                        if a_id != b_id:
+                            temp_diag_adj.setdefault(a_id, {}).setdefault(direction, set()).add(b_id)
+
         # Pass 2: Simplify contacts into the final format (top, right, bottom, left)
         adjacency_map = {}
         for obj_id, contacts in temp_adj.items():
@@ -1611,6 +1636,25 @@ class ObrlAgi3Agent(Agent):
             # Only add to the map if there's at least one unique contact
             if any(res != 'na' for res in result):
                 adjacency_map[obj_id] = result
+
+        # Pass 3: Simplify diagonal contacts into their own map
+        diag_adjacency_map = {}
+        for obj_id, contacts in temp_diag_adj.items():
+            # Order: TR, BR, BL, TL
+            result = ['na'] * 4 
+            
+            dir_map = {
+                'top_right': 0, 'bottom_right': 1, 'bottom_left': 2, 'top_left': 3
+            }
+            
+            for direction, index in dir_map.items():
+                contact_set = contacts.get(direction, set())
+                if len(contact_set) == 1:
+                    result[index] = contact_set.pop()
+
+            # Only add to the map if there's at least one unique contact
+            if any(res != 'na' for res in result):
+                diag_adjacency_map[obj_id] = result
         
         # Clean up empty relationship types
         final_rels = {k: v for k, v in final_rels.items() if v}
@@ -1653,7 +1697,7 @@ class ObrlAgi3Agent(Agent):
                 for group in partial_groups_dict.values():
                     processed_ids.update(group)
         
-        return final_rels, adjacency_map, match_groups
+        return final_rels, adjacency_map, diag_adjacency_map, match_groups
     
     def _analyze_conjunctions(self, relationships: dict, alignments: dict) -> dict:
         """
@@ -1826,6 +1870,35 @@ class ObrlAgi3Agent(Agent):
         
         if output_lines:
             print("\n--- Adjacency Change Log ---")
+            for line in output_lines:
+                print(line)
+            print()
+
+    def _log_diag_adjacency_changes(self, old_adj: dict, new_adj: dict):
+        """Compares two diagonal adjacency maps and logs the differences."""
+        if old_adj == new_adj:
+            return
+
+        output_lines = []
+        all_ids = set(old_adj.keys()) | set(new_adj.keys())
+
+        for obj_id in sorted(list(all_ids), key=lambda x: int(x.split('_')[1])):
+            old_contacts = old_adj.get(obj_id, ['na'] * 4)
+            new_contacts = new_adj.get(obj_id, ['na'] * 4)
+
+            if old_contacts != new_contacts:
+                clean_id = obj_id.replace('obj_', 'id_')
+                
+                old_ids = [c.replace('obj_', '') if 'obj_' in c else c for c in old_contacts]
+                new_ids = [c.replace('obj_', '') if 'obj_' in c else c for c in new_contacts]
+                
+                old_str = f"({', '.join(old_ids)})"
+                new_str = f"({', '.join(new_ids)})"
+                
+                output_lines.append(f"- Diagonal Adjacency for Object {clean_id}: contacts changed from {old_str} to {new_str}.")
+        
+        if output_lines:
+            print("\n--- Diagonal Adjacency Change Log ---")
             for line in output_lines:
                 print(line)
             print()
