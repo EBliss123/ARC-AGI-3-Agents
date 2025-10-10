@@ -232,6 +232,7 @@ class ObrlAgi3Agent(Agent):
 
             current_relationships, current_adjacencies, current_match_groups = self._analyze_relationships(current_summary)
             current_alignments = self._analyze_alignments(current_summary)
+            current_conjunctions = self._analyze_conjunctions(current_relationships, current_alignments)
 
             print("--- Initial Frame Summary ---")
             if not current_summary:
@@ -333,6 +334,7 @@ class ObrlAgi3Agent(Agent):
 
             current_relationships, current_adjacencies, current_match_groups = self._analyze_relationships(current_summary)
             current_alignments = self._analyze_alignments(current_summary)
+            current_conjunctions = self._analyze_conjunctions(current_relationships, current_alignments)
 
             # --- LEVEL CHANGE DETECTION & HANDLING ---
             current_score = latest_frame.score
@@ -754,6 +756,7 @@ class ObrlAgi3Agent(Agent):
             'adj': current_adjacencies,
             'match': current_match_groups,
             'align': current_alignments,
+            'conj': current_conjunctions,
             'events': changes 
         }
         if self.last_action_context:
