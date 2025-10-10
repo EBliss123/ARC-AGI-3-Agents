@@ -399,10 +399,31 @@ class ObrlAgi3Agent(Agent):
                                 prev_action_name, prev_target_id = self.last_action_context
                                 base_action_key = self._get_learning_key(prev_action_name, prev_target_id)
                                 
-                                # Create the object's complete state description (properties + position)
-                                object_state = (self._get_stable_id(target_in_prev_state), target_in_prev_state['position'])
+                                # --- START: New Relational Context Capture ---
+                                relational_props = []
+                                # Adjacency
+                                adj_tuple = tuple(self.last_adjacencies.get(obj_id, ('na', 'na', 'na', 'na')))
+                                relational_props.append(('adj', adj_tuple))
                                 
-                                # The new key is (ACTION, OBJECT_ID, OBJECT_STATE)
+                                # Relationships (Color, Shape, etc.)
+                                for rel_type, groups in self.last_relationships.items():
+                                    for value, ids in groups.items():
+                                        if int(obj_id.replace('obj_', '')) in ids:
+                                            relational_props.append((rel_type, value))
+                                
+                                # Alignments
+                                for align_type, groups in self.last_alignments.items():
+                                    for coord, ids in groups.items():
+                                        if int(obj_id.replace('obj_', '')) in ids:
+                                            relational_props.append((align_type, coord))
+                                # --- END: New Relational Context Capture ---
+                                
+                                object_state = (
+                                    self._get_stable_id(target_in_prev_state),
+                                    target_in_prev_state['position'],
+                                    frozenset(relational_props) # Add the relational context to the state key
+                                )
+                                
                                 contextual_key = (base_action_key, target_in_prev_state['id'], object_state)
                                 per_object_keys.append(contextual_key)
                     
@@ -580,7 +601,24 @@ class ObrlAgi3Agent(Agent):
                 # Create the specific 3-part key for this potential object/action pair
                 coords_for_key = {'x': obj['position'][1], 'y': obj['position'][0]} if 'CLICK' in action_template.name or action_template.name == 'ACTION6' else None
                 base_action_key = self._get_learning_key(action_template.name, coords_for_key)
-                object_state = (self._get_stable_id(obj), obj['position'])
+                
+                # --- START: New Relational Context Capture (for prediction) ---
+                relational_props = []
+                obj_id_int = int(obj['id'].replace('obj_', ''))
+                # Adjacency
+                adj_tuple = tuple(current_adjacencies.get(obj['id'], ('na', 'na', 'na', 'na')))
+                relational_props.append(('adj', adj_tuple))
+                # Relationships
+                for rel_type, groups in current_relationships.items():
+                    for value, ids in groups.items():
+                        if obj_id_int in ids: relational_props.append((rel_type, value))
+                # Alignments
+                for align_type, groups in current_alignments.items():
+                    for coord, ids in groups.items():
+                        if obj_id_int in ids: relational_props.append((align_type, coord))
+                # --- END: New Relational Context Capture ---
+
+                object_state = (self._get_stable_id(obj), obj['position'], frozenset(relational_props))
                 action_key = (base_action_key, obj['id'], object_state)
 
                 hypothesis = self.rule_hypotheses.get(action_key)
@@ -636,6 +674,23 @@ class ObrlAgi3Agent(Agent):
             # --- Check if the action is currently blacklisted ---
             if action_key in self.failed_action_blacklist:
                 continue # Skip this action
+
+            # --- START: New Relational Context Capture (for RL feature extraction) ---
+            if target_object:
+                relational_props = []
+                obj_id_int = int(target_object['id'].replace('obj_', ''))
+                adj_tuple = tuple(current_adjacencies.get(target_object['id'], ('na', 'na', 'na', 'na')))
+                relational_props.append(('adj', adj_tuple))
+                for rel_type, groups in current_relationships.items():
+                    for value, ids in groups.items():
+                        if obj_id_int in ids: relational_props.append((rel_type, value))
+                for align_type, groups in current_alignments.items():
+                    for coord, ids in groups.items():
+                        if obj_id_int in ids: relational_props.append((align_type, coord))
+                
+                # This richer state can be used by features later
+                target_object['relational_context'] = frozenset(relational_props)
+            # --- END: New Relational Context Capture ---
 
             features = self._extract_features(current_summary, move)
             
