@@ -48,6 +48,8 @@ class ObrlAgi3Agent(Agent):
         self.last_match_groups = {}
         self.level_state_history = []
         self.win_condition_hypotheses = []
+        self.physics_model = {}
+        self.unrefined_rules = {}
         self.level_milestones = []
         self.seen_event_types_in_level = set()
         self.last_alignments = {}
@@ -461,6 +463,30 @@ class ObrlAgi3Agent(Agent):
                 # --- Now, with all outcomes known, learn from the last action ---
                 self._learn_from_outcome(latest_frame, changes, current_summary, novel_state_count, is_failure_case, learning_key)
 
+                # --- Universal Physics Learning: Step 1 - Record Raw Experiment ---
+                if self.last_action_context and changes:
+                    last_action_name, _ = self.last_action_context
+                    outcome = self._get_abstract_outcome(changes)
+
+                    # Create a hashable, full context from the previous state
+                    full_context = frozenset(
+                        (obj['id'], self._get_stable_id(obj), obj['position'])
+                        for obj in self.last_object_summary
+                    )
+                    
+                    # Store the experiment data
+                    rule_key = (last_action_name, outcome)
+                    self.unrefined_rules.setdefault(rule_key, []).append(full_context)
+                    
+                    # --- DEBUG PRINT to see what rules are being learned ---
+                    print(f"\n--- Unrefined Rules Log ---")
+                    print(f"- Just observed outcome for action: {last_action_name}")
+                    print(f"- Total observations for this (action, outcome) pair: {len(self.unrefined_rules[rule_key])}")
+                    
+                    # Check if we have enough data to refine this rule
+                    if len(self.unrefined_rules[rule_key]) >= 2:
+                        self._refine_physics_rule(last_action_name, outcome)
+
                 # --- Handle all Logging and Rule Analysis *after* learning ---
                 if changes:
                     print("--- Change Log ---")
@@ -612,6 +638,18 @@ class ObrlAgi3Agent(Agent):
             true_abstract_patterns = {(p['pattern_type'], p['sub_type']) for p in patterns_already_true}
             unmet_abstract_goals = required_abstract_patterns - true_abstract_patterns
 
+        # --- Physics-Based Planning (Phase 3) ---
+        planned_move = self._plan_with_physics_model()
+        if planned_move:
+            # A confident plan was found, so we execute it directly and skip the RL scoring.
+            chosen_template = planned_move['type']
+            # This simplified section assumes the planned action is global.
+            # A full implementation would handle targeted clicks as well.
+            self.last_action_context = (chosen_template.name, None)
+            self.last_state_key = self._get_state_key(current_summary)
+            self.level_state_history.append(current_context)
+            return chosen_template
+        
         # --- RL: Score and select the best action ---
         best_move = None
         best_score = -float('inf')
@@ -2386,6 +2424,116 @@ class ObrlAgi3Agent(Agent):
         history['attempts'] += 1
         if changes:
             history['successes'] += 1
+
+    def _refine_physics_rule(self, action_name: str, outcome: tuple):
+        """
+        Compares multiple observations of the same outcome to find the minimal,
+        consistent context required, and saves it as a predictive rule.
+        """
+        rule_key = (action_name, outcome)
+        contexts = self.unrefined_rules.get(rule_key, [])
+        if len(contexts) < 2:
+            return
+
+        # Start with the full context of the first experiment as our baseline
+        minimal_context = set(contexts[0])
+
+        # Find the intersection with all other contexts for this outcome
+        for i in range(1, len(contexts)):
+            minimal_context.intersection_update(contexts[i])
+        
+        # The intersection is our refined, minimal context. Make it hashable.
+        refined_context = frozenset(minimal_context)
+
+        # Create the final key for our predictive model
+        physics_key = (action_name, refined_context)
+        
+        # Store the refined rule, overwriting if a previous version existed
+        if self.physics_model.get(physics_key) != outcome:
+            self.physics_model[physics_key] = outcome
+            print(f"\n--- Refined Physics Rule ---")
+            print(f"- Action '{action_name}' with a context of {len(refined_context)} objects")
+            print(f"- Reliably predicts outcome: {outcome[0] if len(outcome) == 1 else outcome}")
+
+    def _plan_with_physics_model(self) -> dict | None:
+        """
+        Uses the learned physics model to find a multi-step plan to achieve a goal.
+        Returns a 'move' dictionary if a plan is found, otherwise None.
+        """
+        if not self.win_condition_hypotheses or not self.physics_model:
+            return None
+
+        def _outcome_satisfies_goal(outcome: tuple, goal_hypotheses: list) -> bool:
+            """
+            Checks if a predicted abstract outcome satisfies any of the win condition goals.
+            """
+            goal_event_types = {
+                rule['abstract_pattern']['sub_type']
+                for rule in goal_hypotheses
+                if rule['abstract_pattern']['pattern_type'] == 'event'
+            }
+            if not goal_event_types:
+                return False # No event-based goals to satisfy.
+
+            # --- CORRECTED LOGIC ---
+            # The 'outcome' is a tuple of frozensets. We need to parse it correctly.
+            outcome_event_types = set()
+            for abstract_event in outcome:
+                # abstract_event is a frozenset, e.g., {('type', 'RECOLORED'), ('to_color', 8)}
+                event_dict = dict(abstract_event)
+                if 'type' in event_dict:
+                    outcome_event_types.add(event_dict['type'])
+            
+            return not goal_event_types.isdisjoint(outcome_event_types)
+
+        # Find a rule in our physics model that achieves the goal
+        for (action_name, context), outcome in self.physics_model.items():
+            if _outcome_satisfies_goal(outcome, self.win_condition_hypotheses):
+                # We found a plan! The goal is to recreate this context and perform this action.
+                target_context = context
+                
+                # Check if the current state already matches the required context
+                current_context = frozenset(
+                    (obj['id'], self._get_stable_id(obj), obj['position'])
+                    for obj in self.last_object_summary
+                )
+
+                if current_context == target_context:
+                    # The stage is set! Find the action object and return the move.
+                    print(f"\n--- Physics-Based Plan Found ---")
+                    print(f"- The world state matches the required context for a winning move.")
+                    print(f"- Executing winning action: {action_name}")
+                    
+                    action_template = next((a for a in GameAction if a.name == action_name), None)
+                    if action_template:
+                        # This logic handles global actions. Clicks would need to find the target obj.
+                         return {'type': action_template, 'object': None}
+        
+        # No plan found or context is not yet met
+        return None
+    
+    def _get_abstract_outcome(self, changes: list[str]) -> tuple:
+        """
+        Converts a detailed change log into an abstract, hashable representation
+        that captures the physical law, ignoring specific coordinates.
+        """
+        structured_events = self._parse_change_logs_to_events(changes)
+        abstract_events = []
+        for event in structured_events:
+            abstract_event = {'type': event['type']}
+            # Keep only the properties that define the physical law, not the instance
+            if event['type'] == 'MOVED' and 'vector' in event:
+                abstract_event['vector'] = event['vector']
+            elif event['type'] == 'RECOLORED' and 'to_color' in event:
+                abstract_event['to_color'] = event['to_color']
+            elif event['type'] in ['GROWTH', 'SHRINK'] and 'pixel_delta' in event:
+                abstract_event['pixel_delta'] = event['pixel_delta']
+            # Add more abstractions for other event types as needed
+            
+            abstract_events.append(frozenset(abstract_event.items()))
+        
+        # Sort the frozensets to ensure the final tuple is always in a consistent order
+        return tuple(sorted(abstract_events, key=str))
 
     def _find_object_by_coords(self, coords: dict | None) -> dict | None:
         """Helper to find an object in the last summary based on click coordinates."""
