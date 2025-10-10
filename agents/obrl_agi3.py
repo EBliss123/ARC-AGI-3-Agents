@@ -596,35 +596,31 @@ class ObrlAgi3Agent(Agent):
 
         # --- Proactive "Boring" Move Scan ---
         boring_predictions = []
-        for obj in current_summary:
-            for action_template in game_specific_actions:
-                # Create the specific 3-part key for this potential object/action pair
-                coords_for_key = {'x': obj['position'][1], 'y': obj['position'][0]} if 'CLICK' in action_template.name or action_template.name == 'ACTION6' else None
-                base_action_key = self._get_learning_key(action_template.name, coords_for_key)
-                
-                # --- START: New Relational Context Capture (for prediction) ---
-                relational_props = []
-                obj_id_int = int(obj['id'].replace('obj_', ''))
-                # Adjacency
-                adj_tuple = tuple(current_adjacencies.get(obj['id'], ('na', 'na', 'na', 'na')))
-                relational_props.append(('adj', adj_tuple))
-                # Relationships
-                for rel_type, groups in current_relationships.items():
-                    for value, ids in groups.items():
-                        if obj_id_int in ids: relational_props.append((rel_type, value))
-                # Alignments
-                for align_type, groups in current_alignments.items():
-                    for coord, ids in groups.items():
-                        if obj_id_int in ids: relational_props.append((align_type, coord))
-                # --- END: New Relational Context Capture ---
+        for move in possible_moves:
+            action_template = move['type']
+            target_object = move['object']
+            
+            base_action_key = self._get_learning_key(action_template.name, target_object['id'] if target_object else None)
+            
+            # Look through all case files related to this action
+            for (hypo_action, hypo_effect), hypotheses in self.rule_hypotheses.items():
+                if hypo_action == base_action_key:
+                    # Find the best-fitting, high-confidence rule
+                    current_preconditions = target_object.get('relational_context', frozenset()) if target_object else frozenset()
+                    
+                    best_rule = None
+                    min_preconditions = float('inf')
 
-                object_state = (self._get_stable_id(obj), obj['position'], frozenset(relational_props))
-                action_key = (base_action_key, obj['id'], object_state)
-
-                hypothesis = self.rule_hypotheses.get(action_key)
-                if hypothesis and hypothesis.get('is_boring', False):
-                    obj_id_str = obj['id'].replace('obj_', 'id_')
-                    boring_predictions.append(f"- Object {obj_id_str}: Action {base_action_key} is predicted to be boring.")
+                    for hypo in hypotheses:
+                        if hypo['confidence'] > 0.8 and hypo['preconditions'].issubset(current_preconditions):
+                            num_precons = len(hypo['preconditions'])
+                            if num_precons < min_preconditions:
+                                min_preconditions = num_precons
+                                best_rule = hypo
+                    
+                    if best_rule and best_rule.get('is_boring'):
+                         obj_id_str = target_object['id'].replace('obj_', 'id_') if target_object else "GLOBAL"
+                         boring_predictions.append(f"- Action {base_action_key} on {obj_id_str} is predicted to be boring (Rule {best_rule['id']}).")
 
         if boring_predictions:
             print("\n--- Boring Move Predictions ---")
@@ -953,108 +949,105 @@ class ObrlAgi3Agent(Agent):
                 continue
         return events
 
-    def _analyze_and_report(self, action_key: str, changes: list[str]):
-        """Compares new events with a stored hypothesis to find consistent, refined rules."""
+    def _generate_hypothesis_variants(self, full_preconditions: frozenset) -> list[frozenset]:
+        """
+        Takes a full set of preconditions and generates a list of simpler, more general
+        hypotheses by systematically dropping one condition at a time.
+        """
+        if not full_preconditions:
+            return [frozenset()]
         
-        def find_best_match(event_to_match, candidate_list):
-            """Finds the best matching event from a list based on event type."""
-            event_type = event_to_match['type']
-
-            # Special logic to track objects that transform and move between turns
-            if event_type in ['GROWTH', 'SHRINK', 'TRANSFORM']:
-                # Match the END position of the old event with the START position of a new one
-                if 'end_position' in event_to_match:
-                    for candidate in candidate_list:
-                        if event_to_match['end_position'] == candidate.get('start_position'):
-                            candidate_list.remove(candidate)
-                            return candidate
+        variants = [full_preconditions]
+        # Convert to list to allow removal
+        precondition_list = list(full_preconditions)
+        
+        # Create variants by removing one element at a time
+        for i in range(len(precondition_list)):
+            # Create a new frozenset with one less element
+            simplified_set = frozenset(precondition_list[:i] + precondition_list[i+1:])
+            if simplified_set not in variants:
+                variants.append(simplified_set)
+        
+        # Add the most general hypothesis (no preconditions)
+        if frozenset() not in variants:
+            variants.append(frozenset())
             
-            # --- Existing logic for matching events by stable properties ---
-            match_key_map = {
-                'MOVED': 'fingerprint',
-                'SHAPE_CHANGED': 'position',
-                'RECOLORED': 'position',
-                'NEW': 'position',
-                'REMOVED': 'position',
-            }
-            match_key = match_key_map.get(event_type)
+        return variants
 
-            if match_key and match_key in event_to_match:
-                for candidate in candidate_list:
-                    if event_to_match[match_key] == candidate.get(match_key):
-                        candidate_list.remove(candidate)
-                        return candidate
+    def _analyze_and_report(self, action_key: tuple, changes: list[str]):
+        """
+        Manages competing hypotheses about game rules. When new evidence arrives, it
+        generates general hypotheses and tests all existing ones, pruning those that
+        are contradicted by the evidence.
+        """
+        base_action_key, _, object_state = action_key
+        # The preconditions are the relational properties of the object when the action was taken.
+        full_preconditions = object_state[2] if len(object_state) > 2 else frozenset()
 
-            # Fallback: if no direct match and only one candidate of this type, it must be the one.
-            if len(candidate_list) == 1 and candidate_list[0]['type'] == event_type:
-                return candidate_list.pop(0)
+        # Each change (effect) gets its own "case file" to track hypotheses.
+        parsed_events = self._parse_change_logs_to_events(changes)
+        if not parsed_events: return
 
-            return None
-
-        def refine_rule(old_rule, new_event):
-            """Intersects the properties of a rule and a new event, keeping only commonalities."""
-            refined = {}
-            for key, value in old_rule.items():
-                if key in new_event and new_event[key] == value:
-                    refined[key] = value
-            refined['type'] = old_rule['type'] # Always preserve the event type
-            return refined
-
-        new_events = self._parse_change_logs_to_events(changes)
-        if not new_events: return
-
-        hypothesis = self.rule_hypotheses.get(action_key)
-
-        if not hypothesis:
-            # First observation: create the hypothesis with initial confidence.
-            self.rule_hypotheses[action_key] = {
-                'rules': new_events,
-                'attempts': 1,
-                'confirmations': 1,
-                'confidence': 1.0,
-                'is_boring': False,
-            }
-            print(f"\n--- Initial Case File for {action_key} (Confidence: 100%) ---")
-            for event in new_events:
-                details = {k:v for k,v in event.items() if k != 'type'}
-                print(f"- Observed {event['type']} with details: {details}")
-            return
-        
-        hypothesis['attempts'] += 1
-
-        # --- Stage 2 & 3: Match events and refine the hypothesis ---
-        refined_rules = []
-        # Group events by type to make matching manageable
-        new_events_by_type = {}
-        for event in new_events:
-            new_events_by_type.setdefault(event['type'], []).append(event)
-
-        # For each rule in our old hypothesis, try to find its twin in the new events
-        for old_rule in hypothesis['rules']:
-            rule_type = old_rule['type']
-            candidates = new_events_by_type.get(rule_type, [])
+        for event in parsed_events:
+            event_type = event['type']
+            case_file_key = (base_action_key, event_type)
             
-            match = find_best_match(old_rule, candidates)
-            
-            if match:
-                # If we found a match, refine the rule by finding the intersection of properties
-                refined_rule = refine_rule(old_rule, match)
-                refined_rules.append(refined_rule)
+            # --- The core of the "scientific method" for the agent ---
+            if case_file_key not in self.rule_hypotheses:
+                # 1. FIRST OBSERVATION: We've never seen this action cause this effect before.
+                # Create a set of hypotheses from most specific to most general.
+                
+                print(f"\n--- New Case File for {case_file_key} ---")
+                print(f"Initial observation context: {dict(full_preconditions)}")
+                
+                hypotheses = []
+                # The 'effect' is refined over time. Start with the first one observed.
+                consistent_effect = {k:v for k,v in event.items() if k != 'type'}
+                
+                for i, precon_variant in enumerate(self._generate_hypothesis_variants(full_preconditions)):
+                    hypotheses.append({
+                        'id': f'{case_file_key[0]}-{case_file_key[1]}-{i}',
+                        'preconditions': precon_variant,
+                        'effect': consistent_effect,
+                        'attempts': 1,
+                        'confirmations': 1,
+                        'confidence': 1.0
+                    })
+                    precon_str = "No specific conditions" if not precon_variant else dict(precon_variant)
+                    print(f"- Generated Hypothesis H{i}: Requires {precon_str}")
 
-        if refined_rules:
-            hypothesis['confirmations'] += 1
-        
-        hypothesis['rules'] = refined_rules
-        hypothesis['confidence'] = hypothesis['confirmations'] / hypothesis['attempts']
-        
-        confidence_percent = hypothesis['confidence'] * 100
-        print(f"\n--- Refined Hypothesis for {action_key} (Confidence: {confidence_percent:.0f}%) ---")
-        if not refined_rules:
-            print("No consistent rules could be confirmed from the new observation.")
-        else:
-            for rule in refined_rules:
-                details = {k:v for k,v in rule.items() if k != 'type'}
-                print(f"- Confirmed Rule: A {rule['type']} event occurs with consistent properties: {details}")
+                self.rule_hypotheses[case_file_key] = hypotheses
+
+            else:
+                # 2. SUBSEQUENT OBSERVATIONS: Test our existing theories with this new data.
+                print(f"\n--- Testing Hypotheses for {case_file_key} ---")
+                
+                for hypothesis in self.rule_hypotheses[case_file_key]:
+                    # A hypothesis is "relevant" to this event if its preconditions are a
+                    # subset of the conditions that were present when this event occurred.
+                    if hypothesis['preconditions'].issubset(full_preconditions):
+                        hypothesis['attempts'] += 1
+                        
+                        # Refine the effect: what parts of the outcome are consistent over time?
+                        old_effect = hypothesis['effect']
+                        new_effect = {k:v for k,v in event.items() if k != 'type'}
+                        
+                        refined_effect = {}
+                        for key, value in old_effect.items():
+                            if key in new_effect and new_effect[key] == value:
+                                refined_effect[key] = value
+
+                        # If the refined effect is not empty, the core of the rule holds.
+                        if refined_effect:
+                            hypothesis['confirmations'] += 1
+                            hypothesis['effect'] = refined_effect
+                            print(f"- Hypothesis {hypothesis['id']} CONFIRMED. Confidence -> {hypothesis['confirmations']/hypothesis['attempts']:.0%}")
+                        else:
+                            # CONTRADICTION: The hypothesis predicted an outcome that didn't happen.
+                            # This theory is flawed. We don't delete it, but its confidence will drop.
+                             print(f"- Hypothesis {hypothesis['id']} CONTRADICTED. Confidence -> {hypothesis['confirmations']/hypothesis['attempts']:.0%}")
+                        
+                        hypothesis['confidence'] = hypothesis['confirmations'] / hypothesis['attempts']
 
     def _find_common_context(self, contexts: list[dict]) -> dict:
         """
@@ -1414,9 +1407,8 @@ class ObrlAgi3Agent(Agent):
 
     def _calculate_goal_bonus(self, move: dict, current_summary: list[dict], unmet_goals: set) -> float:
         """
-        Performs a "one-step lookahead" simulation. It predicts the next state based on
-        the given move, analyzes that hypothetical state, and awards a bonus if it
-        is predicted to satisfy an unmet goal from the Master Recipe.
+        Performs a "one-step lookahead" using the best-fit generalized rule to predict
+        the next state and award a bonus if it achieves an unmet goal.
         """
         if not unmet_goals or not self.rule_hypotheses:
             return 0.0
@@ -1424,56 +1416,43 @@ class ObrlAgi3Agent(Agent):
         action_template = move['type']
         target_object = move['object']
         
-        # --- Step 1: Find all high-confidence rules that apply to this specific action ---
-        applicable_rules = []
-        for rule_key, hypothesis in self.rule_hypotheses.items():
-            rule_base_key, rule_obj_id, rule_obj_state = rule_key
+        base_action_key = self._get_learning_key(action_template.name, target_object['id'] if target_object else None)
+        current_preconditions = target_object.get('relational_context', frozenset()) if target_object else frozenset()
 
-            if hypothesis.get('confidence', 0.0) < 0.9: # Use a high threshold for planning
-                continue
+        # --- Step 1: Find the best, most general, high-confidence rule that applies ---
+        best_rule_for_prediction = None
+        min_preconditions = float('inf')
 
-            is_match = False
-            if target_object: # This is a targeted click action
-                # The rule must match the action, the specific object clicked, and that object's current state.
-                base_action_key = self._get_learning_key(action_template.name, target_object['id'])
-                current_object_state = (self._get_stable_id(target_object), target_object['position'])
-                if rule_base_key == base_action_key and rule_obj_id == target_object['id'] and rule_obj_state == current_object_state:
-                    is_match = True
-            else: # This is a global action
-                # The rule must match the action name. The `rule_obj_id` tells us which object will be affected.
-                base_action_key = self._get_learning_key(action_template.name, None)
-                if rule_base_key == base_action_key:
-                    is_match = True
-            
-            if is_match:
-                # Store the key along with the rule for easier access later
-                hypothesis['key'] = rule_key
-                applicable_rules.append(hypothesis)
+        # Find all outcomes this action might cause by checking all relevant case files.
+        for (hypo_action, _), hypotheses in self.rule_hypotheses.items():
+            if hypo_action == base_action_key:
+                for hypo in hypotheses:
+                    # Rule must be high-confidence and its preconditions must be met by the current situation.
+                    if hypo['confidence'] > 0.8 and hypo['preconditions'].issubset(current_preconditions):
+                        # We want the most general rule (fewest preconditions) that applies.
+                        num_precons = len(hypo['preconditions'])
+                        if num_precons < min_preconditions:
+                            min_preconditions = num_precons
+                            best_rule_for_prediction = hypo
 
-        if not applicable_rules:
+        if not best_rule_for_prediction:
             return 0.0 # No reliable predictions for this action exist.
 
-        # --- Step 2: Build a Hypothetical Future State ---
+        # --- Step 2: Build a Hypothetical Future State based on the best rule ---
         future_summary = copy.deepcopy(current_summary)
-        future_summary_map = {obj['id']: obj for obj in future_summary}
-
-        for rule in applicable_rules:
-            # The rule_key contains the ID of the object that will be affected.
-            affected_obj_id = rule['key'][1] 
-            if affected_obj_id not in future_summary_map:
-                continue
-            
-            obj_to_change = future_summary_map[affected_obj_id]
-            
-            for event in rule.get('rules', []):
-                # Apply predictable state changes. For now, this handles MOVED and RECOLORED.
-                if event.get('type') == 'MOVED' and 'vector' in event:
-                    vy, vx = event['vector']
-                    old_pos = obj_to_change['position']
-                    obj_to_change['position'] = (old_pos[0] + vy, old_pos[1] + vx)
-                
-                elif event.get('type') == 'RECOLORED' and 'to_color' in event:
-                    obj_to_change['color'] = event['to_color']
+        # Find the object that will be affected. For global actions, this is more complex,
+        # but for now we assume a simple 1:1 effect on the target if specified.
+        obj_to_change = target_object
+        
+        if obj_to_change:
+            event = best_rule_for_prediction.get('effect', {})
+            # Apply predictable state changes.
+            if 'vector' in event:
+                vy, vx = event['vector']
+                old_pos = obj_to_change['position']
+                obj_to_change['position'] = (old_pos[0] + vy, old_pos[1] + vx)
+            if 'to_color' in event:
+                obj_to_change['color'] = event['to_color']
         
         # --- Step 3: Analyze the Hypothetical Future State ---
         future_rels, future_adj, _ = self._analyze_relationships(future_summary)
@@ -1489,12 +1468,10 @@ class ObrlAgi3Agent(Agent):
         helpful_predictions = predicted_abstract_patterns & unmet_goals
         
         if helpful_predictions:
-            bonus = 75.0 * len(helpful_predictions) # Increased bonus for high-confidence planning
+            bonus = 75.0 * len(helpful_predictions)
             summary = sorted([f"{p[1]}" for p in helpful_predictions])
             obj_id_str = target_object['id'].replace('obj_', 'id_') if target_object else 'GLOBAL'
-            action_name = self._get_learning_key(action_template.name, target_object['id'] if target_object else None)
-            
-            print(f"Goal-Seeking Bonus: Action {action_name} on {obj_id_str} is predicted to achieve unmet goals: {summary}. Adding {bonus:.2f} bonus.")
+            print(f"Goal-Seeking Bonus: Action {base_action_key} on {obj_id_str} is predicted to achieve unmet goals: {summary} (via Rule {best_rule_for_prediction['id']}). Adding {bonus:.2f} bonus.")
             return bonus
         
         return 0.0
