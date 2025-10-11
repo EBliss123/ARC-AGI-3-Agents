@@ -53,6 +53,7 @@ class ObrlAgi3Agent(Agent):
         self.last_alignments = {}
         self.current_level_id_map = {}
         self.last_diag_adjacencies = {}
+        self.last_diag_alignments = {}
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -233,6 +234,7 @@ class ObrlAgi3Agent(Agent):
 
             current_relationships, current_adjacencies, current_diag_adjacencies, current_match_groups = self._analyze_relationships(current_summary)
             current_alignments = self._analyze_alignments(current_summary)
+            current_diag_alignments = self._analyze_diagonal_alignments(current_summary)
             current_conjunctions = self._analyze_conjunctions(current_relationships, current_alignments)
 
             print("--- Initial Frame Summary ---")
@@ -245,6 +247,13 @@ class ObrlAgi3Agent(Agent):
 
             if current_relationships:
                 print("\n--- Relationship Analysis ---")
+
+                def format_align_ids(id_set):
+                        id_list = sorted(list(id_set))
+                        if len(id_list) < 2: return f"Object {id_list[0]}"
+                        if len(id_list) == 2: return f"Objects {id_list[0]} and {id_list[1]}"
+                        return "Objects " + ", ".join(map(str, id_list[:-1])) + f", and {id_list[-1]}"
+                
                 output_lines = []
                 def format_id_list_str(id_set):
                     id_list = sorted(list(id_set))
@@ -273,6 +282,12 @@ class ObrlAgi3Agent(Agent):
                         clean_obj_id = obj_id.replace('obj_', 'id_')
                         print(f"- Object {clean_obj_id} ({contact_tuple_str})")
 
+                if current_diag_alignments:
+                    print("\n--- Initial Diagonal Alignment Analysis ---")
+                    for align_type, groups in sorted(current_diag_alignments.items()):
+                        for line_idx, ids in enumerate(groups):
+                            print(f"- '{align_type}' Alignment (Line {line_idx + 1}): {format_align_ids(ids)}")
+
                 if current_diag_adjacencies:
                     print("\n--- Initial Diagonal Adjacency (TR, BR, BL, TL) ---")
                     for obj_id, contacts in sorted(current_diag_adjacencies.items(), key=lambda item: int(item[0].split('_')[1])):
@@ -282,13 +297,7 @@ class ObrlAgi3Agent(Agent):
                         print(f"- Object {clean_obj_id} ({contact_tuple_str})")
 
                 if current_alignments:
-                    print("\n--- Initial Alignment Analysis ---")
-                    def format_align_ids(id_set):
-                        id_list = sorted(list(id_set))
-                        if len(id_list) < 2: return f"Object {id_list[0]}"
-                        if len(id_list) == 2: return f"Objects {id_list[0]} and {id_list[1]}"
-                        return "Objects " + ", ".join(map(str, id_list[:-1])) + f", and {id_list[-1]}"
-                    
+                    print("\n--- Initial Alignment Analysis ---")   
                     for align_type, groups in sorted(current_alignments.items()):
                         for coord, ids in sorted(groups.items()):
                             print(f"- '{align_type}' Alignment at {coord}: {format_align_ids(ids)}")
@@ -343,6 +352,7 @@ class ObrlAgi3Agent(Agent):
 
             current_relationships, current_adjacencies, current_diag_adjacencies, current_match_groups = self._analyze_relationships(current_summary)
             current_alignments = self._analyze_alignments(current_summary)
+            current_diag_alignments = self._analyze_diagonal_alignments(current_summary)
             current_conjunctions = self._analyze_conjunctions(current_relationships, current_alignments)
 
             # --- LEVEL CHANGE DETECTION & HANDLING ---
@@ -381,6 +391,7 @@ class ObrlAgi3Agent(Agent):
             self._log_adjacency_changes(self.last_adjacencies, current_adjacencies)
             self._log_diag_adjacency_changes(self.last_diag_adjacencies, current_diag_adjacencies)
             self._log_match_type_changes(self.last_match_groups, current_match_groups)
+            self._log_alignment_changes(self.last_diag_alignments, current_diag_alignments, is_diagonal=True)
 
             if self.last_action_context:
                 # --- Analyze the outcome of the previous action ---
@@ -492,7 +503,8 @@ class ObrlAgi3Agent(Agent):
                         'summary': prev_summary,
                         'rels': self.last_relationships,
                         'adj': self.last_adjacencies,
-                        'diag_adj': self.last_diag_adjacencies
+                        'diag_adj': self.last_diag_adjacencies,
+                        'diag_align': self.last_diag_alignments
                     }
                     self.success_contexts.setdefault(learning_key, []).append(success_context)
                 
@@ -524,7 +536,8 @@ class ObrlAgi3Agent(Agent):
                         'summary': prev_summary,
                         'rels': self.last_relationships,
                         'adj': self.last_adjacencies,
-                        'diag_adj': self.last_diag_adjacencies
+                        'diag_adj': self.last_diag_adjacencies,
+                        'diag_align': self.last_diag_alignments
                     }
                     self.failure_contexts.setdefault(learning_key, []).append(failure_context)
 
@@ -561,6 +574,7 @@ class ObrlAgi3Agent(Agent):
         self.last_diag_adjacencies = current_diag_adjacencies
         self.last_relationships = current_relationships
         self.last_alignments = current_alignments
+        self.last_diag_alignments = current_diag_alignments
         self.last_match_groups = current_match_groups
 
         # This is the REAL list of actions for this specific game on this turn.
@@ -1796,6 +1810,82 @@ class ObrlAgi3Agent(Agent):
                 final_alignments[align_type] = filtered_groups
         
         return final_alignments
+    
+    def _analyze_diagonal_alignments(self, object_summary: list[dict]) -> dict:
+        """Finds groups of objects aligned on a perfect diagonal (slope of 1 or -1)."""
+        if len(object_summary) < 2:
+            return {}
+
+        # Pre-calculate center points for all objects
+        for obj in object_summary:
+            y, x = obj['position']
+            h, w = obj['size']
+            obj['center_y'] = y + h // 2
+            obj['center_x'] = x + w // 2
+
+        coord_map = {(obj['center_y'], obj['center_x']): int(obj['id'].replace('obj_', '')) for obj in object_summary}
+        processed_ids = set()
+        final_alignments = {
+            'top_left_to_bottom_right': [],
+            'top_right_to_bottom_left': [],
+        }
+
+        # Iterate through every unique pair of objects
+        for i in range(len(object_summary)):
+            obj_a = object_summary[i]
+            id_a = int(obj_a['id'].replace('obj_', ''))
+            if id_a in processed_ids:
+                continue
+
+            for j in range(i + 1, len(object_summary)):
+                obj_b = object_summary[j]
+                id_b = int(obj_b['id'].replace('obj_', ''))
+                if id_b in processed_ids:
+                    continue
+
+                # Calculate slope between the two centers
+                y1, x1 = obj_a['center_y'], obj_a['center_x']
+                y2, x2 = obj_b['center_y'], obj_b['center_x']
+                
+                if x2 - x1 == 0: continue # Avoid division by zero for vertical lines
+                slope = (y2 - y1) / (x2 - x1)
+
+                if abs(slope) == 1.0:
+                    # Found a valid diagonal pair, now "walk" the line to find all members
+                    line_members = {id_a, id_b}
+                    
+                    # Determine the direction (step vector) of the line
+                    step_y = 1 if y2 > y1 else -1
+                    step_x = 1 if x2 > x1 else -1
+
+                    # Walk forward from the "second" object (obj_b)
+                    next_y, next_x = y2 + step_y, x2 + step_x
+                    while (next_y, next_x) in coord_map:
+                        found_id = coord_map[(next_y, next_x)]
+                        line_members.add(found_id)
+                        next_y, next_x = next_y + step_y, next_x + step_x
+
+                    # Walk backward from the "first" object (obj_a)
+                    prev_y, prev_x = y1 - step_y, x1 - step_x
+                    while (prev_y, prev_x) in coord_map:
+                        found_id = coord_map[(prev_y, prev_x)]
+                        line_members.add(found_id)
+                        prev_y, prev_x = prev_y - step_y, prev_x - step_x
+                    
+                    if len(line_members) > 1:
+                        align_type = 'top_left_to_bottom_right' if slope == 1.0 else 'top_right_to_bottom_left'
+                        final_alignments[align_type].append(frozenset(line_members))
+                        processed_ids.update(line_members)
+        
+        # Clean up empty alignment types and remove duplicate lines
+        final_results = {}
+        for align_type, groups in final_alignments.items():
+            if groups:
+                # Using a set of frozensets ensures all lines are unique
+                unique_groups = sorted([sorted(list(g)) for g in set(groups)])
+                final_results[align_type] = [set(g) for g in unique_groups]
+                
+        return final_results
 
     def _log_relationship_changes(self, old_rels: dict, new_rels: dict):
         """Compares two relationship dictionaries and logs which objects joined, left, or replaced others in groups."""
@@ -1903,7 +1993,7 @@ class ObrlAgi3Agent(Agent):
                 print(line)
             print()
 
-    def _log_alignment_changes(self, old_aligns: dict, new_aligns: dict):
+    def _log_alignment_changes(self, old_aligns: dict, new_aligns: dict, is_diagonal: bool = False):
         """Compares two alignment dictionaries and logs the differences."""
         if old_aligns == new_aligns:
             return
@@ -1917,29 +2007,46 @@ class ObrlAgi3Agent(Agent):
             return f"objects " + ", ".join(map(str, id_list))
 
         for align_type in all_align_types:
-            old_groups = old_aligns.get(align_type, {})
-            new_groups = new_aligns.get(align_type, {})
-            all_coords = set(old_groups.keys()) | set(new_groups.keys())
+            old_groups = old_aligns.get(align_type, [] if is_diagonal else {})
+            new_groups = new_aligns.get(align_type, [] if is_diagonal else {})
 
-            for coord in all_coords:
-                old_ids = old_groups.get(coord, set())
-                new_ids = new_groups.get(coord, set())
+            if is_diagonal:
+                # Handle list-based format for diagonal alignments
+                old_sets = {frozenset(g) for g in old_groups}
+                new_sets = {frozenset(g) for g in new_groups}
+                
+                joined_groups = new_sets - old_sets
+                left_groups = old_sets - new_sets
+                log_prefix = f"'{align_type}' Diagonal Alignment"
 
-                if old_ids == new_ids:
-                    continue
+                for group in joined_groups:
+                    output_lines.append(f"- {log_prefix}: {format_ids(group).capitalize()} appeared.")
+                for group in left_groups:
+                    output_lines.append(f"- {log_prefix}: {format_ids(group).capitalize()} disappeared.")
 
-                joined = new_ids - old_ids
-                left = old_ids - new_ids
+            else:
+                # Handle dictionary-based format for cardinal alignments
+                all_coords = set(old_groups.keys()) | set(new_groups.keys())
+                for coord in all_coords:
+                    old_ids = old_groups.get(coord, set())
+                    new_ids = new_groups.get(coord, set())
 
-                if joined and left:
-                    output_lines.append(f"- '{align_type}' Alignment at {coord}: {format_ids(joined).capitalize()} replaced {format_ids(left)}.")
-                elif joined:
-                    output_lines.append(f"- '{align_type}' Alignment at {coord}: {format_ids(joined).capitalize()} joined.")
-                elif left:
-                    output_lines.append(f"- '{align_type}' Alignment at {coord}: {format_ids(left).capitalize()} left.")
+                    if old_ids == new_ids: continue
+
+                    joined = new_ids - old_ids
+                    left = old_ids - new_ids
+                    log_prefix = f"'{align_type}' Alignment at {coord}"
+
+                    if joined and left:
+                        output_lines.append(f"- {log_prefix}: {format_ids(joined).capitalize()} replaced {format_ids(left)}.")
+                    elif joined:
+                        output_lines.append(f"- {log_prefix}: {format_ids(joined).capitalize()} joined.")
+                    elif left:
+                        output_lines.append(f"- {log_prefix}: {format_ids(left).capitalize()} left.")
 
         if output_lines:
-            print("\n--- Alignment Change Log ---")
+            title = "Diagonal Alignment Change Log" if is_diagonal else "Alignment Change Log"
+            print(f"\n--- {title} ---")
             for line in sorted(output_lines):
                 print(line)
             print()
