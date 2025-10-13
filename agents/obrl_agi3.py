@@ -54,6 +54,8 @@ class ObrlAgi3Agent(Agent):
         self.current_level_id_map = {}
         self.last_diag_adjacencies = {}
         self.last_diag_alignments = {}
+        self.transition_history = []
+        self.current_state_id = None
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -2490,6 +2492,7 @@ class ObrlAgi3Agent(Agent):
 
         # Reward actions that perform better than average, penalize those that do worse.
         performance_vs_average = novel_state_count - average_unique_change
+        print(f"Novelty Analysis: Found {novel_state_count} unique changes vs. average of {average_unique_change:.2f}. Performance score: {performance_vs_average:.2f}.")
         reward += performance_vs_average * 15 # Multiplier makes this a strong signal
 
         # --- Specific penalty for unexpected failures ---
