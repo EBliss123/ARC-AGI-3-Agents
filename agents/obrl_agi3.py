@@ -37,7 +37,7 @@ class ObrlAgi3Agent(Agent):
         self.recent_effect_patterns = deque(maxlen=20)
         self.seen_configurations = set()
         self.total_unique_changes = 0
-        self.total_moves = 0
+        self.total_successful_moves = 0
         self.failed_action_blacklist = set()
         self.turns_without_discovery = 0
         self.action_history = {}
@@ -56,6 +56,8 @@ class ObrlAgi3Agent(Agent):
         self.last_diag_alignments = {}
         self.transition_history = []
         self.current_state_id = None
+        self.click_failure_counts = {}
+        self.object_blacklist = set()
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -73,11 +75,15 @@ class ObrlAgi3Agent(Agent):
 
         # If this is the first scan (last summary is empty), print the full summary.
         if not self.last_object_summary or self.is_new_level:
+            self.click_failure_counts = {}
+            self.object_blacklist = set()
             self.level_state_history = []
             self.is_new_level = False
             self.level_milestones = []
             self.seen_event_types_in_level = set()
             self.last_alignments = {}
+            self.total_unique_changes = 0
+            self.total_successful_moves = 0
 
             id_map = {} # To store {old_id: new_id} mappings
             new_obj_to_old_id_map = {} # Initialize our map to handle the first frame case
@@ -409,6 +415,14 @@ class ObrlAgi3Agent(Agent):
                         print("A successful action was found, clearing the failure blacklist.")
                         self.failed_action_blacklist.clear()
                     
+                    # --- Handle successful click on a blacklisted object ---
+                    if prev_action_name == 'ACTION6' and prev_target_id:
+                        if prev_target_id in self.object_blacklist:
+                            print(f"Object {prev_target_id.replace('obj_', 'id_')} caused a change. Removing from blacklist.")
+                            self.object_blacklist.remove(prev_target_id)
+                            # Reset the failure count upon success
+                            self.click_failure_counts[prev_target_id] = 0
+
                     # --- Create a specific, per-object learning key for each change ---
                     per_object_keys = []
                     prev_summary_map = {obj['id']: obj for obj in prev_summary}
@@ -474,8 +488,16 @@ class ObrlAgi3Agent(Agent):
                         self.level_milestones.append(milestone_index)
                         print(f"Logging Milestone at state index {milestone_index}.")
 
-
                 else:
+                    # --- Handle click that caused no change ---
+                    if prev_action_name == 'ACTION6' and prev_target_id:
+                        failure_count = self.click_failure_counts.get(prev_target_id, 0) + 1
+                        self.click_failure_counts[prev_target_id] = failure_count
+                        self.object_blacklist.add(prev_target_id)
+                        
+                        failure_str = f"{failure_count} times" if failure_count > 1 else "for the first time"
+                        print(f"Clicking object {prev_target_id.replace('obj_', 'id_')} caused no change ({failure_str}). Blacklisting.")
+
                     # No changes occurred. Check if this is a failure, but NOT if we just finished waiting.
                     if not just_finished_waiting:
                         # We already have the correct learning_key from the top of the block.
@@ -728,6 +750,14 @@ class ObrlAgi3Agent(Agent):
                 if is_match:
                     failure_penalty = -50.0 # Apply a heavy penalty for a predicted failure
                     print(f"Heuristic: Current state matches a known failure pattern for {action_key}. Applying penalty.")
+            
+            # --- Object Blacklist Penalty ---
+            if target_object and target_object['id'] in self.object_blacklist:
+                failure_count = self.click_failure_counts.get(target_object['id'], 1)
+                object_blacklist_penalty = -5000 - (((failure_count - 1) * 100) ** 2)
+                failure_penalty += object_blacklist_penalty
+                obj_id_str = target_object['id'].replace('obj_', 'id_')
+                print(f"Heuristic: Object {obj_id_str} is blacklisted (failed {failure_count} time(s)). Applying penalty of {object_blacklist_penalty}.")
 
             score += failure_penalty
 
@@ -2484,16 +2514,18 @@ class ObrlAgi3Agent(Agent):
         # 1. Calculate reward
         reward = 0
         # --- Normalized reward for unique state discovery ---
-        self.total_moves += 1
-        self.total_unique_changes += novel_state_count
-
-        # Calculate the running average of unique changes per move.
-        average_unique_change = self.total_unique_changes / self.total_moves if self.total_moves > 0 else 0
+        # Calculate the running average based on past successful moves.
+        average_unique_change = self.total_unique_changes / self.total_successful_moves if self.total_successful_moves > 0 else 0
 
         # Reward actions that perform better than average, penalize those that do worse.
         performance_vs_average = novel_state_count - average_unique_change
         print(f"Novelty Analysis: Found {novel_state_count} unique changes vs. average of {average_unique_change:.2f}. Performance score: {performance_vs_average:.2f}.")
         reward += performance_vs_average * 15 # Multiplier makes this a strong signal
+
+        # Now, update the totals for the next turn's calculation.
+        self.total_unique_changes += novel_state_count
+        if novel_state_count > 0:
+            self.total_successful_moves += 1
 
         # --- Specific penalty for unexpected failures ---
         if is_failure:
