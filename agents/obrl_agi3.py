@@ -61,6 +61,7 @@ class ObrlAgi3Agent(Agent):
         self.action_to_state_map = {}
         self.novel_state_details = {}
         self.boring_state_details = []
+        self.actions_from_state = {}
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -85,9 +86,6 @@ class ObrlAgi3Agent(Agent):
             self.level_milestones = []
             self.seen_event_types_in_level = set()
             self.last_alignments = {}
-            self.state_counter = 0
-            self.action_to_state_map = {}
-            self.novel_state_details = {}
             self.boring_state_details = []
 
             id_map = {} # To store {old_id: new_id} mappings
@@ -388,6 +386,10 @@ class ObrlAgi3Agent(Agent):
                 self._analyze_win_condition(history_for_analysis, self.level_milestones, self.current_level_id_map)
 
                 self.novelty_ratio_history = []
+                self.state_counter = 0
+                self.action_to_state_map = {}
+                self.novel_state_details = {}
+                self.actions_from_state = {}
 
                 # Print the full summary of the final frame of the level that was just won.
                 print("\n--- Final Frame Summary (Old Level) ---")
@@ -826,6 +828,19 @@ class ObrlAgi3Agent(Agent):
         
         self.level_state_history.append(current_context)
 
+        # --- Record Action Taken From Current State ---
+        if self.current_state_id is not None and self.last_action_context:
+            action_name, target_id = self.last_action_context
+            action_key = self._get_learning_key(action_name, target_id)
+            
+            # Add the action to the set of actions taken from this state
+            known_actions = self.actions_from_state.setdefault(self.current_state_id, set())
+            known_actions.add(action_key)
+            
+            # Log the full set of known actions for this state
+            actions_list_str = ", ".join(sorted(list(known_actions)))
+            print(f"Memory Update: From State {self.current_state_id}, known actions are: [{actions_list_str}].")
+
         return action_to_return
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
@@ -1016,6 +1031,12 @@ class ObrlAgi3Agent(Agent):
                         end_color_str = details.split(' to ')[1].split(')')[0]
                         end_state['color'] = int(end_color_str)
                     outcome['end_state'] = end_state
+                    structured_outcomes.append(outcome)
+
+                elif 'GROWTH' in change_type_raw or 'SHRINK' in change_type_raw:
+                    outcome['type'] = 'growth' if 'GROWTH' in change_type_raw else 'shrink'
+                    end_pos_str = details.split('now at ')[1].replace('.', '')
+                    outcome['end_state'] = {'position': ast.literal_eval(end_pos_str)}
                     structured_outcomes.append(outcome)
 
             except (IndexError, ValueError, SyntaxError):
@@ -2597,7 +2618,8 @@ class ObrlAgi3Agent(Agent):
             self.state_counter += 1
             self.action_to_state_map[learning_key] = self.state_counter
             print(f"Outcome was novel. Assigning new state: State {self.state_counter}")
-
+            self.current_state_id = self.state_counter
+            
             # Record the structured details of this novel state
             self.novel_state_details[self.state_counter] = {
                 'transitions': structured_outcomes
@@ -2647,6 +2669,16 @@ class ObrlAgi3Agent(Agent):
                 
                 if best_match_state_id is not None:
                     print(f"  - Match Found: This outcome is most similar to novel State {best_match_state_id} (Score: {max_match_score}).")
+                    self.current_state_id = best_match_state_id
+                    print(f"  - Agent context is now considered to be State {self.current_state_id}.")
+                    
+                    # Announce the actions that have been tried from this state before
+                    known_actions = self.actions_from_state.get(self.current_state_id, set())
+                    if known_actions:
+                        actions_list_str = ", ".join(sorted(list(known_actions)))
+                        print(f"  - Previously tried actions from this state: [{actions_list_str}].")
+                    else:
+                        print("  - No actions have been taken from this state before.")
                 else:
                     print("  - No matching novel state found in memory.")
 
