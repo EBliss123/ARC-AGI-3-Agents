@@ -713,20 +713,34 @@ class ObrlAgi3Agent(Agent):
                     score -= 100.0 # Heavy penalty for repeating an action from a known state.
                     print(f"Heuristic: Action {action_key} has already been tried from State {self.current_state_id}. Applying penalty.")
 
-            # --- Open-Ended State Bonus ---
-            # Bonus for actions that are known to lead to states with more unexplored options.
+            # --- Open-Ended State Bonus (V2) ---
+            # Bonus for actions that lead to states with high exploration potential.
             open_ended_bonus = 0.0
             predicted_state_id = self.action_to_state_map.get(action_key)
-            if predicted_state_id:
-                # Check how many actions have been tried from the state this action leads to.
-                actions_tried_from_next_state = self.actions_from_state.get(predicted_state_id, set())
-                num_tried = len(actions_tried_from_next_state)
-                
-                # The bonus is higher for states with fewer tried actions (more room for discovery).
-                open_ended_bonus = 50.0 / (1.0 + num_tried)
-                
-                if open_ended_bonus > 1.0: # Only log significant bonuses
-                    print(f"Heuristic: Action {action_key} leads to State {predicted_state_id}, which has {num_tried} tried actions. Adding bonus of {open_ended_bonus:.2f}.")
+            if predicted_state_id and predicted_state_id != 'boring':
+                predicted_state_details = self.novel_state_details.get(predicted_state_id)
+                if predicted_state_details:
+                    # Calculate the total number of actions that were available in that state.
+                    state_summary = predicted_state_details.get('summary', [])
+                    state_actions = predicted_state_details.get('available_actions', [])
+                    
+                    num_objects = len(state_summary)
+                    num_non_clicks = len([a for a in state_actions if a.name != 'ACTION6'])
+                    click_available = any(a.name == 'ACTION6' for a in state_actions)
+                    num_clicks = num_objects if click_available else 0
+                    total_actions_in_next_state = num_clicks + num_non_clicks
+                    
+                    # Find how many actions have already been tried from that state.
+                    actions_tried_from_next_state = self.actions_from_state.get(predicted_state_id, set())
+                    num_tried = len(actions_tried_from_next_state)
+
+                    # The bonus is proportional to the number of UNTRIED actions.
+                    num_untried = total_actions_in_next_state - num_tried
+                    if num_untried > 0:
+                        open_ended_bonus = num_untried * 10.0
+                    
+                    if open_ended_bonus > 0:
+                        print(f"Heuristic: Action {action_key} leads to State {predicted_state_id}, which has {num_untried} untried actions. Adding bonus of {open_ended_bonus:.2f}.")
             
             score += open_ended_bonus
 
@@ -2602,11 +2616,13 @@ class ObrlAgi3Agent(Agent):
             print(f"Outcome was novel. Assigning new state: State {self.state_counter}")
             self.current_state_id = self.state_counter
             
-            # Record the structured details of this novel state
+            # Record the structured details and full context of this novel state
             self.novel_state_details[self.state_counter] = {
-                'transitions': structured_outcomes
+                'transitions': structured_outcomes,
+                'summary': new_summary,
+                'available_actions': latest_frame.available_actions
             }
-            print(f"  - Stored details for State {self.state_counter}: {len(structured_outcomes)} structured transitions.")
+            print(f"  - Stored snapshot for State {self.state_counter} (summary, actions, transitions).")
 
         else:
             self.action_to_state_map[learning_key] = 'boring'
@@ -2652,6 +2668,7 @@ class ObrlAgi3Agent(Agent):
                 if best_match_state_id is not None:
                     print(f"  - Match Found: This outcome is most similar to novel State {best_match_state_id} (Score: {max_match_score}).")
                     self.current_state_id = best_match_state_id
+                    self.action_to_state_map[learning_key] = best_match_state_id
                     print(f"  - Agent context is now considered to be State {self.current_state_id}.")
                     
                     # Announce the actions that have been tried from this state before
