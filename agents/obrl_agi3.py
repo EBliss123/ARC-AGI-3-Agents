@@ -540,23 +540,6 @@ class ObrlAgi3Agent(Agent):
                         'diag_align': self.last_diag_alignments
                     }
                     self.success_contexts.setdefault(learning_key, []).append(success_context)
-                
-                    # --- Tag rules that led to non-unique outcomes ---
-                    if changes and not is_failure_case:
-                        # First, get the set of IDs for objects that had a unique change
-                        unique_object_ids = set()
-                        for msg in unique_log_messages:
-                            if "Object id_" in msg:
-                                id_num_str = msg.split('id_')[1].split()[0]
-                                unique_object_ids.add(f"obj_{id_num_str}")
-
-                        # Now, tag the rules for any changed object that was NOT unique
-                        for key in per_object_keys:
-                            # key = (base_action_key, object_id, object_state)
-                            obj_id_from_key = key[1]
-                            if obj_id_from_key not in unique_object_ids:
-                                if key in self.rule_hypotheses:
-                                    self.rule_hypotheses[key]['is_boring'] = True
 
                 elif is_failure_case:
                     # Blacklist the action, regardless of its history.
@@ -634,27 +617,6 @@ class ObrlAgi3Agent(Agent):
             for obj in current_summary:
                 possible_moves.append({'type': click_action_template, 'object': obj})
 
-        # --- Proactive "Boring" Move Scan ---
-        boring_predictions = []
-        for obj in current_summary:
-            for action_template in game_specific_actions:
-                # Create the specific 3-part key for this potential object/action pair
-                coords_for_key = {'x': obj['position'][1], 'y': obj['position'][0]} if 'CLICK' in action_template.name or action_template.name == 'ACTION6' else None
-                base_action_key = self._get_learning_key(action_template.name, coords_for_key)
-                object_state = (self._get_stable_id(obj), obj['position'])
-                action_key = (base_action_key, obj['id'], object_state)
-
-                hypothesis = self.rule_hypotheses.get(action_key)
-                if hypothesis and hypothesis.get('is_boring', False):
-                    obj_id_str = obj['id'].replace('obj_', 'id_')
-                    boring_predictions.append(f"- Object {obj_id_str}: Action {base_action_key} is predicted to be boring.")
-
-        if boring_predictions:
-            print("\n--- Boring Move Predictions ---")
-            # Use set() to remove any duplicate predictions before printing
-            for prediction in sorted(list(set(boring_predictions))):
-                print(prediction)
-
         # --- Prepare for Learning & Rule Analysis ---
         current_state_key = self._get_state_key(current_summary)
 
@@ -706,30 +668,7 @@ class ObrlAgi3Agent(Agent):
             else:
                 exploration_bonus = 1.0 / (1.0 + action_count) # Smaller bonus for less-used actions
 
-            # --- Boring Penalty ---
-            # Penalize actions that are known to lead to non-unique states.
-            boring_penalty = 0.0
-            if target_object:
-                # Case 1: This is a CLICK action on a specific object.
-                hypothesis = self.rule_hypotheses.get(action_key)
-                if hypothesis and hypothesis.get('is_boring', False):
-                    boring_penalty = -20.0
-                    obj_id = target_object['id'].replace('obj_', 'id_')
-                    print(f"Heuristic: Predicting a 'boring' outcome for {action_key[0]} on object {obj_id}. Applying penalty.")
-            else:
-                # Case 2: This is a GLOBAL action. Scan all objects for potential boring outcomes.
-                action_name = action_template.name
-                for obj in current_summary:
-                    # Construct the specific key for this global action + this object
-                    obj_action_key = (action_name, obj['id'], (self._get_stable_id(obj), obj['position']))
-                    hypothesis = self.rule_hypotheses.get(obj_action_key)
-                    if hypothesis and hypothesis.get('is_boring', False):
-                        # Add a penalty for each predicted boring outcome
-                        boring_penalty -= 20.0
-                        obj_id = obj['id'].replace('obj_', 'id_')
-                        print(f"Heuristic: Predicting a 'boring' outcome for {action_name} on object {obj_id}. Applying penalty.")
-
-            score = q_value + exploration_bonus + boring_penalty
+            score = q_value + exploration_bonus
 
             # --- Failure Prediction Penalty ---
             failure_penalty = 0.0
@@ -764,6 +703,30 @@ class ObrlAgi3Agent(Agent):
                 print(f"Heuristic: Object {obj_id_str} is blacklisted (failed {failure_count} time(s)). Applying penalty of {object_blacklist_penalty}.")
 
             score += failure_penalty
+
+            # --- Penalty for Repeating Actions in a Known State ---
+            if self.current_state_id is not None:
+                previously_tried_actions = self.actions_from_state.get(self.current_state_id, set())
+                if action_key in previously_tried_actions:
+                    score -= 100.0 # Heavy penalty for repeating an action from a known state.
+                    print(f"Heuristic: Action {action_key} has already been tried from State {self.current_state_id}. Applying penalty.")
+
+            # --- Open-Ended State Bonus ---
+            # Bonus for actions that are known to lead to states with more unexplored options.
+            open_ended_bonus = 0.0
+            predicted_state_id = self.action_to_state_map.get(action_key)
+            if predicted_state_id:
+                # Check how many actions have been tried from the state this action leads to.
+                actions_tried_from_next_state = self.actions_from_state.get(predicted_state_id, set())
+                num_tried = len(actions_tried_from_next_state)
+                
+                # The bonus is higher for states with fewer tried actions (more room for discovery).
+                open_ended_bonus = 50.0 / (1.0 + num_tried)
+                
+                if open_ended_bonus > 1.0: # Only log significant bonuses
+                    print(f"Heuristic: Action {action_key} leads to State {predicted_state_id}, which has {num_tried} tried actions. Adding bonus of {open_ended_bonus:.2f}.")
+            
+            score += open_ended_bonus
 
             # Pass the pre-calculated unmet goals to the bonus function
             goal_bonus = self._calculate_goal_bonus(move, current_summary, unmet_abstract_goals)
