@@ -57,6 +57,8 @@ class ObrlAgi3Agent(Agent):
         self.current_state_id = None
         self.click_failure_counts = {}
         self.object_blacklist = set()
+        self.state_counter = 0
+        self.action_to_state_map = {}
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -81,6 +83,8 @@ class ObrlAgi3Agent(Agent):
             self.level_milestones = []
             self.seen_event_types_in_level = set()
             self.last_alignments = {}
+            self.state_counter = 0
+            self.action_to_state_map = {}
 
             id_map = {} # To store {old_id: new_id} mappings
             new_obj_to_old_id_map = {} # Initialize our map to handle the first frame case
@@ -485,7 +489,7 @@ class ObrlAgi3Agent(Agent):
                         # Its index will be the current length of the history.
                         milestone_index = len(self.level_state_history)
                         self.level_milestones.append(milestone_index)
-                        print(f"Logging Milestone at state index {milestone_index}.")
+                        print(f"Logging Milestone:")
 
                 else:
                     # --- Handle click that caused no change ---
@@ -676,13 +680,8 @@ class ObrlAgi3Agent(Agent):
         for move in possible_moves:
             action_template = move['type']
             target_object = move['object']
-            coords_for_context = None
-
-            if target_object:
-                pos = target_object['position']
-                coords_for_context = {'x': pos[1], 'y': pos[0]}
-
-            action_key = self._get_learning_key(action_template.name, coords_for_context)
+            target_id = target_object['id'] if target_object else None
+            action_key = self._get_learning_key(action_template.name, target_id)
 
             # --- Check if the action is currently blacklisted ---
             if action_key in self.failed_action_blacklist:
@@ -2523,6 +2522,15 @@ class ObrlAgi3Agent(Agent):
         # This will be a value between -1.0 and 1.0.
         performance_score = current_novelty_ratio - average_novelty_ratio
         
+        # --- State Assignment based on Performance ---
+        if performance_score >= 0:
+            self.state_counter += 1
+            self.action_to_state_map[learning_key] = self.state_counter
+            print(f"Outcome was novel. Assigning new state: State {self.state_counter}")
+        else:
+            self.action_to_state_map[learning_key] = 'boring'
+            print("Outcome was boring. No new state assigned.")
+
         # Since the score is now a ratio, the reward multiplier needs to be larger to have an impact.
         reward += performance_score * 50
 
