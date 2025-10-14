@@ -62,6 +62,7 @@ class ObrlAgi3Agent(Agent):
         self.novel_state_details = {}
         self.boring_state_details = []
         self.actions_from_state = {}
+        self.state_transition_map = {}
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -87,6 +88,7 @@ class ObrlAgi3Agent(Agent):
             self.seen_event_types_in_level = set()
             self.last_alignments = {}
             self.boring_state_details = []
+            self.state_transition_map = {}
 
             id_map = {} # To store {old_id: new_id} mappings
             new_obj_to_old_id_map = {} # Initialize our map to handle the first frame case
@@ -2559,6 +2561,8 @@ class ObrlAgi3Agent(Agent):
         if not self.last_state_key or not self.last_action_context:
             return
 
+        from_state_id = self.current_state_id
+
         # 1. Calculate reward
         reward = 0
         # --- Normalized reward for unique state discovery ---
@@ -2645,6 +2649,24 @@ class ObrlAgi3Agent(Agent):
                 else:
                     print("  - No matching novel state found in memory.")
 
+        to_state_id = self.current_state_id # Capture state after the action.
+
+        # --- Record and report all state transitions ---
+        if from_state_id is not None and to_state_id is not None:
+            # Always update the map with the latest observation for this action
+            self.state_transition_map.setdefault(from_state_id, {})[learning_key] = to_state_id
+
+            # Get the full dictionary of transitions from the origin state
+            all_known_transitions = self.state_transition_map[from_state_id]
+            
+            # Format the list for printing
+            transitions_str_parts = []
+            for action, dest_state in sorted(all_known_transitions.items()):
+                 transitions_str_parts.append(f"{action} -> State {dest_state}")
+            
+            full_transitions_str = ", ".join(transitions_str_parts)
+            print(f"Memory Update: From State {from_state_id}, known transitions are: [{full_transitions_str}].")
+        
         # Since the score is now a ratio, the reward multiplier needs to be larger to have an impact.
         reward += performance_score * 50
 
