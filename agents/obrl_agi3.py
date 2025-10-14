@@ -59,6 +59,8 @@ class ObrlAgi3Agent(Agent):
         self.object_blacklist = set()
         self.state_counter = 0
         self.action_to_state_map = {}
+        self.novel_state_details = {}
+        self.boring_state_details = []
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -85,6 +87,8 @@ class ObrlAgi3Agent(Agent):
             self.last_alignments = {}
             self.state_counter = 0
             self.action_to_state_map = {}
+            self.novel_state_details = {}
+            self.boring_state_details = []
 
             id_map = {} # To store {old_id: new_id} mappings
             new_obj_to_old_id_map = {} # Initialize our map to handle the first frame case
@@ -956,6 +960,68 @@ class ObrlAgi3Agent(Agent):
             except (ValueError, IndexError, SyntaxError):
                 continue
         return events
+    
+    def _parse_changes_for_state_memory(self, changes: list[str]) -> list[dict]:
+        """Parses change logs into a structured list for state memory."""
+        structured_outcomes = []
+        for log in changes:
+            try:
+                # --- Common parsing for all change types ---
+                change_type_raw, details = log.replace('- ', '', 1).split(': ', 1)
+                
+                if 'id_' not in details:
+                    continue
+
+                id_details = details.split('id_')[1]
+                obj_id_num = id_details.split()[0].rstrip('):.')
+                obj_id = f"id_{obj_id_num}"
+                
+                outcome = {'object_id': obj_id}
+
+                # --- Type-specific parsing ---
+                if 'MOVED' in change_type_raw:
+                    outcome['type'] = 'move'
+                    end_pos_str = details.split(' to ')[1].replace('.', '')
+                    outcome['end_state'] = {'position': ast.literal_eval(end_pos_str)}
+                    structured_outcomes.append(outcome)
+                
+                elif 'RECOLORED' in change_type_raw:
+                    outcome['type'] = 'recolor'
+                    end_color_str = details.split(' to ')[1].replace('.', '')
+                    outcome['end_state'] = {'color': int(end_color_str)}
+                    structured_outcomes.append(outcome)
+
+                elif 'SHAPE_CHANGED' in change_type_raw:
+                    outcome['type'] = 'shape_change'
+                    if ' -> ' in details:
+                        end_fp_str = details.split(' -> ')[1].replace(').', '')
+                    else:
+                        end_fp_str = details.split('fingerprint: ')[1].replace(').','')
+                    outcome['end_state'] = {'fingerprint': int(end_fp_str)}
+                    structured_outcomes.append(outcome)
+
+                elif 'REAPPEARED' in change_type_raw:
+                    outcome['type'] = 'reappear'
+                    end_pos_str = details.split(' at ')[1].replace('.', '')
+                    outcome['end_state'] = {'position': ast.literal_eval(end_pos_str)}
+                    structured_outcomes.append(outcome)
+
+                elif 'TRANSFORM' in change_type_raw:
+                    outcome['type'] = 'transform'
+                    end_state = {}
+                    if 'fingerprint:' in details and ' -> ' in details:
+                        end_fp_str = details.split('fingerprint: ')[1].split(' -> ')[1].split(')')[0]
+                        end_state['fingerprint'] = int(end_fp_str)
+                    if 'color (from ' in details and ' to ' in details:
+                        end_color_str = details.split(' to ')[1].split(')')[0]
+                        end_state['color'] = int(end_color_str)
+                    outcome['end_state'] = end_state
+                    structured_outcomes.append(outcome)
+
+            except (IndexError, ValueError, SyntaxError):
+                continue
+                
+        return structured_outcomes
 
     def _analyze_and_report(self, action_key: str, changes: list[str]):
         """Compares new events with a stored hypothesis to find consistent, refined rules."""
@@ -2523,13 +2589,29 @@ class ObrlAgi3Agent(Agent):
         performance_score = current_novelty_ratio - average_novelty_ratio
         
         # --- State Assignment based on Performance ---
+        
+        # First, parse the raw change logs into a structured format for memory.
+        structured_outcomes = self._parse_changes_for_state_memory(changes)
+
         if performance_score >= 0:
             self.state_counter += 1
             self.action_to_state_map[learning_key] = self.state_counter
             print(f"Outcome was novel. Assigning new state: State {self.state_counter}")
+
+            # Record the structured details of this novel state
+            self.novel_state_details[self.state_counter] = {
+                'transitions': structured_outcomes
+            }
+            print(f"  - Stored details for State {self.state_counter}: {len(structured_outcomes)} structured transitions.")
+
         else:
             self.action_to_state_map[learning_key] = 'boring'
             print("Outcome was boring. No new state assigned.")
+
+            # Record the structured details of this boring outcome
+            if structured_outcomes:
+                self.boring_state_details.append({'transitions': structured_outcomes})
+                print(f"  - Stored boring outcome with {len(structured_outcomes)} structured transitions.")
 
         # Since the score is now a ratio, the reward multiplier needs to be larger to have an impact.
         reward += performance_score * 50
