@@ -2608,10 +2608,47 @@ class ObrlAgi3Agent(Agent):
             self.action_to_state_map[learning_key] = 'boring'
             print("Outcome was boring. No new state assigned.")
 
-            # Record the structured details of this boring outcome
+            # Step 1: Record the structured details of this boring outcome to the log.
             if structured_outcomes:
                 self.boring_state_details.append({'transitions': structured_outcomes})
-                print(f"  - Stored boring outcome with {len(structured_outcomes)} structured transitions.")
+                print(f"  - Logged boring outcome with {len(structured_outcomes)} structured transitions.")
+
+            # Step 2: Now, use this outcome to find the most similar novel state in memory.
+            if not structured_outcomes or not self.novel_state_details:
+                if structured_outcomes: # Only print if there was something to compare
+                    print("  - No novel state history exists to compare against.")
+            else:
+                # Helper function to make nested dictionaries and lists hashable for comparison.
+                def make_hashable(obj):
+                    if isinstance(obj, dict):
+                        return frozenset((k, make_hashable(v)) for k, v in sorted(obj.items()))
+                    if isinstance(obj, list):
+                        return tuple(make_hashable(v) for v in obj)
+                    return obj
+
+                boring_transitions_set = {make_hashable(t) for t in structured_outcomes}
+                
+                best_match_state_id = None
+                max_match_score = 0 # Start at 0, as we only care about positive matches
+
+                for state_id, details in self.novel_state_details.items():
+                    novel_transitions = details.get('transitions', [])
+                    if not novel_transitions:
+                        continue
+
+                    novel_transitions_set = {make_hashable(t) for t in novel_transitions}
+                    
+                    # The score is the number of common transitions (set intersection).
+                    match_score = len(boring_transitions_set.intersection(novel_transitions_set))
+
+                    if match_score > max_match_score:
+                        max_match_score = match_score
+                        best_match_state_id = state_id
+                
+                if best_match_state_id is not None:
+                    print(f"  - Match Found: This outcome is most similar to novel State {best_match_state_id} (Score: {max_match_score}).")
+                else:
+                    print("  - No matching novel state found in memory.")
 
         # Since the score is now a ratio, the reward multiplier needs to be larger to have an impact.
         reward += performance_score * 50
