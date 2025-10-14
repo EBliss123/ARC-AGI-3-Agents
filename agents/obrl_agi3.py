@@ -806,6 +806,21 @@ class ObrlAgi3Agent(Agent):
             actions_list_str = ", ".join(sorted(list(known_actions)))
             print(f"Memory Update: From State {self.current_state_id}, known actions are: [{actions_list_str}].")
 
+            # --- Calculate and Log State Exploration Percentage ---
+            num_objects = len(current_summary)
+            num_non_clicks = len([a for a in game_specific_actions if a.name != 'ACTION6'])
+
+            # Only count objects as potential actions if a CLICK action is actually available.
+            click_action_is_available = any(a.name == 'ACTION6' for a in game_specific_actions)
+            num_clickable_actions = num_objects if click_action_is_available else 0
+            
+            total_available_actions = num_clickable_actions + num_non_clicks
+
+            if total_available_actions > 0:
+                num_actions_taken = len(known_actions)
+                exploration_percentage = (num_actions_taken / total_available_actions) * 100
+                print(f"Memory Update: State {self.current_state_id} is {exploration_percentage:.1f}% explored ({num_actions_taken}/{total_available_actions} actions taken).")
+
         return action_to_return
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
