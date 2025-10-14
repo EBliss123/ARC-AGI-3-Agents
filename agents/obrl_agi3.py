@@ -36,8 +36,6 @@ class ObrlAgi3Agent(Agent):
         self.seen_object_states = set()
         self.recent_effect_patterns = deque(maxlen=20)
         self.seen_configurations = set()
-        self.total_unique_changes = 0
-        self.total_successful_moves = 0
         self.failed_action_blacklist = set()
         self.turns_without_discovery = 0
         self.action_history = {}
@@ -55,6 +53,7 @@ class ObrlAgi3Agent(Agent):
         self.last_diag_adjacencies = {}
         self.last_diag_alignments = {}
         self.transition_history = []
+        self.novelty_ratio_history = []
         self.current_state_id = None
         self.click_failure_counts = {}
         self.object_blacklist = set()
@@ -82,8 +81,6 @@ class ObrlAgi3Agent(Agent):
             self.level_milestones = []
             self.seen_event_types_in_level = set()
             self.last_alignments = {}
-            self.total_unique_changes = 0
-            self.total_successful_moves = 0
 
             id_map = {} # To store {old_id: new_id} mappings
             new_obj_to_old_id_map = {} # Initialize our map to handle the first frame case
@@ -381,6 +378,8 @@ class ObrlAgi3Agent(Agent):
                 # Create a temporary history list that includes the final winning state for analysis
                 history_for_analysis = self.level_state_history + [winning_context]
                 self._analyze_win_condition(history_for_analysis, self.level_milestones, self.current_level_id_map)
+
+                self.novelty_ratio_history = []
 
                 # Print the full summary of the final frame of the level that was just won.
                 print("\n--- Final Frame Summary (Old Level) ---")
@@ -2514,18 +2513,24 @@ class ObrlAgi3Agent(Agent):
         # 1. Calculate reward
         reward = 0
         # --- Normalized reward for unique state discovery ---
-        # Calculate the running average based on past successful moves.
-        average_unique_change = self.total_unique_changes / self.total_successful_moves if self.total_successful_moves > 0 else 0
+        total_changes = len(changes)
+        current_novelty_ratio = (novel_state_count / total_changes) if total_changes > 0 else 0.0
 
-        # Reward actions that perform better than average, penalize those that do worse.
-        performance_vs_average = novel_state_count - average_unique_change
-        print(f"Novelty Analysis: Found {novel_state_count} unique changes vs. average of {average_unique_change:.2f}. Performance score: {performance_vs_average:.2f}.")
-        reward += performance_vs_average * 15 # Multiplier makes this a strong signal
+        # Calculate the running average novelty ratio from history.
+        average_novelty_ratio = sum(self.novelty_ratio_history) / len(self.novelty_ratio_history) if self.novelty_ratio_history else 0.0
+        
+        # The performance score is how much better (or worse) this turn's ratio is than the average.
+        # This will be a value between -1.0 and 1.0.
+        performance_score = current_novelty_ratio - average_novelty_ratio
+        
+        # Since the score is now a ratio, the reward multiplier needs to be larger to have an impact.
+        reward += performance_score * 50
 
-        # Now, update the totals for the next turn's calculation.
-        self.total_unique_changes += novel_state_count
-        if novel_state_count > 0:
-            self.total_successful_moves += 1
+        print(f"Novelty Analysis: Current ratio is {current_novelty_ratio:.2%} ({novel_state_count}/{total_changes} unique). Average is {average_novelty_ratio:.2%}. Performance score: {performance_score:.2f}.")
+
+        # Now, update the history for the next turn's calculation.
+        if total_changes > 0:
+            self.novelty_ratio_history.append(current_novelty_ratio)
 
         # --- Specific penalty for unexpected failures ---
         if is_failure:
