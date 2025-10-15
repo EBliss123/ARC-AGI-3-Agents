@@ -512,6 +512,64 @@ class ObrlAgi3Agent(Agent):
                     print("--- Change Log ---")
                     for change in changes:
                         print(change)
+
+                    # --- Record Transition State ---
+                    if self.current_state_id is None:
+                        self.current_state_id = 1
+                    else:
+                        self.current_state_id += 1
+                    
+                    current_summary_map = {obj['id']: obj for obj in current_summary}
+                    current_state_transitions = []
+                    
+                    for change in changes:
+                        try:
+                            parts = change.split(': Object ')
+                            transition_type = parts[0].replace('- ', '')
+                            details = parts[1]
+                            
+                            obj_id_str = details.split(' ')[0].replace('id_', '')
+                            obj_id = f'obj_{obj_id_str}'
+                            
+                            final_state = 'parsing_failed' # Sentinel value
+                            
+                            if 'RECOLORED' in transition_type:
+                                final_state = int(details.split(' to ')[-1].replace('.', ''))
+                            elif 'SHAPE_CHANGED' in transition_type:
+                                final_state = int(details.split(' -> ')[-1].replace(').', ''))
+                            elif 'MOVED' in transition_type:
+                                pos_str = details.split(' to ')[-1].replace('.', '')
+                                final_state = ast.literal_eval(pos_str)
+                            elif 'SHRINK' in transition_type or 'GROWTH' in transition_type:
+                                size_str = details.split(' to ')[1].split(')')[0]
+                                tuple_str = f"({size_str.replace('x', ',')})"
+                                final_state = ast.literal_eval(tuple_str)
+                            elif 'REMOVED' in transition_type:
+                                final_state = None
+                            elif ('NEW' in transition_type or 
+                                  'TRANSFORM' in transition_type or
+                                  'REAPPEARED' in transition_type):
+                                if obj_id in current_summary_map:
+                                    final_state = self._get_stable_id(current_summary_map[obj_id])
+                            
+                            if final_state != 'parsing_failed':
+                                current_state_transitions.append({
+                                    'type': transition_type,
+                                    'object_id': obj_id,
+                                    'final_state': final_state
+                                })
+                        except (IndexError, ValueError, KeyError, SyntaxError):
+                            continue # Skip lines that don't fit the pattern
+
+                    if current_state_transitions:
+                        self.transition_history.append({
+                            'state_id': self.current_state_id,
+                            'transitions': current_state_transitions
+                        })
+                        log_output = [f"\n--- Recorded State Transition #{self.current_state_id} ---"]
+                        for t in current_state_transitions:
+                            log_output.append(f"- Type: {t['type']}, Object: {t['object_id'].replace('obj_', 'id_')}, Final State: {t['final_state']}")
+                        print("\n".join(log_output))
                     
                     if unique_log_messages:
                         print("\n--- Unique Change Log ---")
