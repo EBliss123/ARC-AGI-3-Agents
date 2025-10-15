@@ -1,9 +1,9 @@
+import random
 from .agent import Agent, FrameData
 from .structs import GameAction, GameState
 from collections import deque
 import copy
 import ast
-import hashlib
 
 class ObrlAgi3Agent(Agent):
     """
@@ -36,6 +36,8 @@ class ObrlAgi3Agent(Agent):
         self.seen_object_states = set()
         self.recent_effect_patterns = deque(maxlen=20)
         self.seen_configurations = set()
+        self.total_unique_changes = 0
+        self.total_successful_moves = 0
         self.failed_action_blacklist = set()
         self.turns_without_discovery = 0
         self.action_history = {}
@@ -53,16 +55,9 @@ class ObrlAgi3Agent(Agent):
         self.last_diag_adjacencies = {}
         self.last_diag_alignments = {}
         self.transition_history = []
-        self.novelty_ratio_history = []
         self.current_state_id = None
         self.click_failure_counts = {}
         self.object_blacklist = set()
-        self.state_counter = 0
-        self.action_to_state_map = {}
-        self.novel_state_details = {}
-        self.boring_state_details = []
-        self.actions_from_state = {}
-        self.state_transition_map = {}
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -87,8 +82,8 @@ class ObrlAgi3Agent(Agent):
             self.level_milestones = []
             self.seen_event_types_in_level = set()
             self.last_alignments = {}
-            self.boring_state_details = []
-            self.state_transition_map = {}
+            self.total_unique_changes = 0
+            self.total_successful_moves = 0
 
             id_map = {} # To store {old_id: new_id} mappings
             new_obj_to_old_id_map = {} # Initialize our map to handle the first frame case
@@ -387,12 +382,6 @@ class ObrlAgi3Agent(Agent):
                 history_for_analysis = self.level_state_history + [winning_context]
                 self._analyze_win_condition(history_for_analysis, self.level_milestones, self.current_level_id_map)
 
-                self.novelty_ratio_history = []
-                self.state_counter = 0
-                self.action_to_state_map = {}
-                self.novel_state_details = {}
-                self.actions_from_state = {}
-
                 # Print the full summary of the final frame of the level that was just won.
                 print("\n--- Final Frame Summary (Old Level) ---")
                 self._print_full_summary(self.last_object_summary)
@@ -497,7 +486,7 @@ class ObrlAgi3Agent(Agent):
                         # Its index will be the current length of the history.
                         milestone_index = len(self.level_state_history)
                         self.level_milestones.append(milestone_index)
-                        print(f"Logging Milestone:")
+                        print(f"Logging Milestone at state index {milestone_index}.")
 
                 else:
                     # --- Handle click that caused no change ---
@@ -542,6 +531,23 @@ class ObrlAgi3Agent(Agent):
                         'diag_align': self.last_diag_alignments
                     }
                     self.success_contexts.setdefault(learning_key, []).append(success_context)
+                
+                    # --- Tag rules that led to non-unique outcomes ---
+                    if changes and not is_failure_case:
+                        # First, get the set of IDs for objects that had a unique change
+                        unique_object_ids = set()
+                        for msg in unique_log_messages:
+                            if "Object id_" in msg:
+                                id_num_str = msg.split('id_')[1].split()[0]
+                                unique_object_ids.add(f"obj_{id_num_str}")
+
+                        # Now, tag the rules for any changed object that was NOT unique
+                        for key in per_object_keys:
+                            # key = (base_action_key, object_id, object_state)
+                            obj_id_from_key = key[1]
+                            if obj_id_from_key not in unique_object_ids:
+                                if key in self.rule_hypotheses:
+                                    self.rule_hypotheses[key]['is_boring'] = True
 
                 elif is_failure_case:
                     # Blacklist the action, regardless of its history.
@@ -596,7 +602,7 @@ class ObrlAgi3Agent(Agent):
         self.last_match_groups = current_match_groups
 
         # This is the REAL list of actions for this specific game on this turn.
-        game_specific_actions = sorted(latest_frame.available_actions, key=lambda a: a.name)
+        game_specific_actions = latest_frame.available_actions
 
         # If we just discovered the game-specific actions, print them once.
         if game_specific_actions and not self.actions_printed:
@@ -619,6 +625,27 @@ class ObrlAgi3Agent(Agent):
             for obj in current_summary:
                 possible_moves.append({'type': click_action_template, 'object': obj})
 
+        # --- Proactive "Boring" Move Scan ---
+        boring_predictions = []
+        for obj in current_summary:
+            for action_template in game_specific_actions:
+                # Create the specific 3-part key for this potential object/action pair
+                coords_for_key = {'x': obj['position'][1], 'y': obj['position'][0]} if 'CLICK' in action_template.name or action_template.name == 'ACTION6' else None
+                base_action_key = self._get_learning_key(action_template.name, coords_for_key)
+                object_state = (self._get_stable_id(obj), obj['position'])
+                action_key = (base_action_key, obj['id'], object_state)
+
+                hypothesis = self.rule_hypotheses.get(action_key)
+                if hypothesis and hypothesis.get('is_boring', False):
+                    obj_id_str = obj['id'].replace('obj_', 'id_')
+                    boring_predictions.append(f"- Object {obj_id_str}: Action {base_action_key} is predicted to be boring.")
+
+        if boring_predictions:
+            print("\n--- Boring Move Predictions ---")
+            # Use set() to remove any duplicate predictions before printing
+            for prediction in sorted(list(set(boring_predictions))):
+                print(prediction)
+
         # --- Prepare for Learning & Rule Analysis ---
         current_state_key = self._get_state_key(current_summary)
 
@@ -638,24 +665,25 @@ class ObrlAgi3Agent(Agent):
             unmet_abstract_goals = required_abstract_patterns - true_abstract_patterns
 
         # --- RL: Score and select the best action ---
-        best_moves = []
+        best_move = None
         best_score = -float('inf')
 
         if not possible_moves:
-            print("Warning: No moves were generated. Falling back to the first available game action.")
-            # The game_specific_actions list is already sorted, so this is deterministic.
-            if game_specific_actions:
-                possible_moves.append({'type': game_specific_actions[0], 'object': None})
-            else:
-                # Absolute last resort if the environment provides no actions
-                possible_moves.append({'type': GameAction.ACTION1, 'object': None})
+             # If there are no possible moves, we might need a fallback.
+             # For now, let's try to use a generic click or another default.
+             possible_moves.append({'type': random.choice([a for a in GameAction if a is not GameAction.RESET]), 'object': None})
 
         all_scores_debug = []
         for move in possible_moves:
             action_template = move['type']
             target_object = move['object']
-            target_id = target_object['id'] if target_object else None
-            action_key = self._get_learning_key(action_template.name, target_id)
+            coords_for_context = None
+
+            if target_object:
+                pos = target_object['position']
+                coords_for_context = {'x': pos[1], 'y': pos[0]}
+
+            action_key = self._get_learning_key(action_template.name, coords_for_context)
 
             # --- Check if the action is currently blacklisted ---
             if action_key in self.failed_action_blacklist:
@@ -674,7 +702,30 @@ class ObrlAgi3Agent(Agent):
             else:
                 exploration_bonus = 1.0 / (1.0 + action_count) # Smaller bonus for less-used actions
 
-            score = q_value + exploration_bonus
+            # --- Boring Penalty ---
+            # Penalize actions that are known to lead to non-unique states.
+            boring_penalty = 0.0
+            if target_object:
+                # Case 1: This is a CLICK action on a specific object.
+                hypothesis = self.rule_hypotheses.get(action_key)
+                if hypothesis and hypothesis.get('is_boring', False):
+                    boring_penalty = -20.0
+                    obj_id = target_object['id'].replace('obj_', 'id_')
+                    print(f"Heuristic: Predicting a 'boring' outcome for {action_key[0]} on object {obj_id}. Applying penalty.")
+            else:
+                # Case 2: This is a GLOBAL action. Scan all objects for potential boring outcomes.
+                action_name = action_template.name
+                for obj in current_summary:
+                    # Construct the specific key for this global action + this object
+                    obj_action_key = (action_name, obj['id'], (self._get_stable_id(obj), obj['position']))
+                    hypothesis = self.rule_hypotheses.get(obj_action_key)
+                    if hypothesis and hypothesis.get('is_boring', False):
+                        # Add a penalty for each predicted boring outcome
+                        boring_penalty -= 20.0
+                        obj_id = obj['id'].replace('obj_', 'id_')
+                        print(f"Heuristic: Predicting a 'boring' outcome for {action_name} on object {obj_id}. Applying penalty.")
+
+            score = q_value + exploration_bonus + boring_penalty
 
             # --- Failure Prediction Penalty ---
             failure_penalty = 0.0
@@ -710,53 +761,13 @@ class ObrlAgi3Agent(Agent):
 
             score += failure_penalty
 
-            # --- Penalty for Repeating Actions in a Known State ---
-            if self.current_state_id is not None:
-                previously_tried_actions = self.actions_from_state.get(self.current_state_id, set())
-                if action_key in previously_tried_actions:
-                    score -= 100.0 # Heavy penalty for repeating an action from a known state.
-                    print(f"Heuristic: Action {action_key} has already been tried from State {self.current_state_id}. Applying penalty.")
-
-            # --- Open-Ended State Bonus (V2) ---
-            # Bonus for actions that lead to states with high exploration potential.
-            open_ended_bonus = 0.0
-            predicted_state_id = self.action_to_state_map.get(action_key)
-            if predicted_state_id and predicted_state_id != 'boring':
-                predicted_state_details = self.novel_state_details.get(predicted_state_id)
-                if predicted_state_details:
-                    # Calculate the total number of actions that were available in that state.
-                    state_summary = predicted_state_details.get('summary', [])
-                    state_actions = predicted_state_details.get('available_actions', [])
-                    
-                    num_objects = len(state_summary)
-                    num_non_clicks = len([a for a in state_actions if a.name != 'ACTION6'])
-                    click_available = any(a.name == 'ACTION6' for a in state_actions)
-                    num_clicks = num_objects if click_available else 0
-                    total_actions_in_next_state = num_clicks + num_non_clicks
-                    
-                    # Find how many actions have already been tried from that state.
-                    actions_tried_from_next_state = self.actions_from_state.get(predicted_state_id, set())
-                    num_tried = len(actions_tried_from_next_state)
-
-                    # The bonus is proportional to the number of UNTRIED actions.
-                    num_untried = total_actions_in_next_state - num_tried
-                    if num_untried > 0:
-                        open_ended_bonus = num_untried * 10.0
-                    
-                    if open_ended_bonus > 0:
-                        print(f"Heuristic: Action {action_key} leads to State {predicted_state_id}, which has {num_untried} untried actions. Adding bonus of {open_ended_bonus:.2f}.")
-            
-            score += open_ended_bonus
-
             # Pass the pre-calculated unmet goals to the bonus function
             goal_bonus = self._calculate_goal_bonus(move, current_summary, unmet_abstract_goals)
             score += goal_bonus
 
             if score > best_score:
                 best_score = score
-                best_moves = [move]
-            elif score == best_score:
-                best_moves.append(move)
+                best_move = move
 
             # Create a user-friendly name for the debug log
             if target_object:
@@ -767,25 +778,6 @@ class ObrlAgi3Agent(Agent):
             all_scores_debug.append(f"{debug_name} (Score: {score:.2f})")
         
         # --- Fallback if all available actions were blacklisted ---
-        best_move = None
-        if best_moves:
-            if len(best_moves) > 1:
-                # Deterministic Tie-Breaking: Sort by object ID (numerically) and action name.
-                def get_sort_key(m):
-                    obj_id_num = -1  # Default for non-click actions
-                    if m['object']:
-                        try:
-                            # Extract the number from 'obj_10' -> 10
-                            obj_id_num = int(m['object']['id'].split('_')[1])
-                        except (ValueError, IndexError):
-                            pass # Keep -1 if ID format is unexpected
-                    return (obj_id_num, m['type'].name)
-                
-                print(f"Tie detected between {len(best_moves)} actions. Applying deterministic sort.")
-                best_moves.sort(key=get_sort_key)
-            
-            best_move = best_moves[0]
-        
         if best_move is None and possible_moves:
             print("Warning: All available actions were blacklisted. Clearing blacklist to break deadlock.")
             self.failed_action_blacklist.clear()
@@ -832,34 +824,6 @@ class ObrlAgi3Agent(Agent):
         
         self.level_state_history.append(current_context)
 
-        # --- Record Action Taken From Current State ---
-        if self.current_state_id is not None and self.last_action_context:
-            action_name, target_id = self.last_action_context
-            action_key = self._get_learning_key(action_name, target_id)
-            
-            # Add the action to the set of actions taken from this state
-            known_actions = self.actions_from_state.setdefault(self.current_state_id, set())
-            known_actions.add(action_key)
-            
-            # Log the full set of known actions for this state
-            actions_list_str = ", ".join(sorted(list(known_actions)))
-            print(f"Memory Update: From State {self.current_state_id}, known actions are: [{actions_list_str}].")
-
-            # --- Calculate and Log State Exploration Percentage ---
-            num_objects = len(current_summary)
-            num_non_clicks = len([a for a in game_specific_actions if a.name != 'ACTION6'])
-
-            # Only count objects as potential actions if a CLICK action is actually available.
-            click_action_is_available = any(a.name == 'ACTION6' for a in game_specific_actions)
-            num_clickable_actions = num_objects if click_action_is_available else 0
-            
-            total_available_actions = num_clickable_actions + num_non_clicks
-
-            if total_available_actions > 0:
-                num_actions_taken = len(known_actions)
-                exploration_percentage = (num_actions_taken / total_available_actions) * 100
-                print(f"Memory Update: State {self.current_state_id} is {exploration_percentage:.1f}% explored ({num_actions_taken}/{total_available_actions} actions taken).")
-
         return action_to_return
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
@@ -872,7 +836,7 @@ class ObrlAgi3Agent(Agent):
         """Finds a removed object that matches the new object in all but one property."""
         new_stable_id = self._get_stable_id(new_obj)
         
-        for old_stable_id in sorted(list(self.removed_objects_memory.keys())):
+        for old_stable_id in self.removed_objects_memory.keys():
             diffs = {}
             # old_stable_id = (fingerprint, color, size, pixels)
             if new_stable_id[0] != old_stable_id[0]:
@@ -994,74 +958,6 @@ class ObrlAgi3Agent(Agent):
             except (ValueError, IndexError, SyntaxError):
                 continue
         return events
-    
-    def _parse_changes_for_state_memory(self, changes: list[str]) -> list[dict]:
-        """Parses change logs into a structured list for state memory."""
-        structured_outcomes = []
-        for log in changes:
-            try:
-                # --- Common parsing for all change types ---
-                change_type_raw, details = log.replace('- ', '', 1).split(': ', 1)
-                
-                if 'id_' not in details:
-                    continue
-
-                id_details = details.split('id_')[1]
-                obj_id_num = id_details.split()[0].rstrip('):.')
-                obj_id = f"id_{obj_id_num}"
-                
-                outcome = {'object_id': obj_id}
-
-                # --- Type-specific parsing ---
-                if 'MOVED' in change_type_raw:
-                    outcome['type'] = 'move'
-                    end_pos_str = details.split(' to ')[1].replace('.', '')
-                    outcome['end_state'] = {'position': ast.literal_eval(end_pos_str)}
-                    structured_outcomes.append(outcome)
-                
-                elif 'RECOLORED' in change_type_raw:
-                    outcome['type'] = 'recolor'
-                    end_color_str = details.split(' to ')[1].replace('.', '')
-                    outcome['end_state'] = {'color': int(end_color_str)}
-                    structured_outcomes.append(outcome)
-
-                elif 'SHAPE_CHANGED' in change_type_raw:
-                    outcome['type'] = 'shape_change'
-                    if ' -> ' in details:
-                        end_fp_str = details.split(' -> ')[1].replace(').', '')
-                    else:
-                        end_fp_str = details.split('fingerprint: ')[1].replace(').','')
-                    outcome['end_state'] = {'fingerprint': int(end_fp_str)}
-                    structured_outcomes.append(outcome)
-
-                elif 'REAPPEARED' in change_type_raw:
-                    outcome['type'] = 'reappear'
-                    end_pos_str = details.split(' at ')[1].replace('.', '')
-                    outcome['end_state'] = {'position': ast.literal_eval(end_pos_str)}
-                    structured_outcomes.append(outcome)
-
-                elif 'TRANSFORM' in change_type_raw:
-                    outcome['type'] = 'transform'
-                    end_state = {}
-                    if 'fingerprint:' in details and ' -> ' in details:
-                        end_fp_str = details.split('fingerprint: ')[1].split(' -> ')[1].split(')')[0]
-                        end_state['fingerprint'] = int(end_fp_str)
-                    if 'color (from ' in details and ' to ' in details:
-                        end_color_str = details.split(' to ')[1].split(')')[0]
-                        end_state['color'] = int(end_color_str)
-                    outcome['end_state'] = end_state
-                    structured_outcomes.append(outcome)
-
-                elif 'GROWTH' in change_type_raw or 'SHRINK' in change_type_raw:
-                    outcome['type'] = 'growth' if 'GROWTH' in change_type_raw else 'shrink'
-                    end_pos_str = details.split('now at ')[1].replace('.', '')
-                    outcome['end_state'] = {'position': ast.literal_eval(end_pos_str)}
-                    structured_outcomes.append(outcome)
-
-            except (IndexError, ValueError, SyntaxError):
-                continue
-                
-        return structured_outcomes
 
     def _analyze_and_report(self, action_key: str, changes: list[str]):
         """Compares new events with a stored hypothesis to find consistent, refined rules."""
@@ -1288,7 +1184,7 @@ class ObrlAgi3Agent(Agent):
         for rel_type in all_rel_types:
             groups_s, groups_f = rels_s.get(rel_type, {}), rels_f.get(rel_type, {})
             all_values = set(groups_s.keys()) | set(groups_f.keys())
-            for value in sorted(list(all_values)):
+            for value in all_values:
                 ids_s, ids_f = groups_s.get(value, set()), groups_f.get(value, set())
                 if ids_s != ids_f:
                     # VETO CHECK:
@@ -1697,7 +1593,7 @@ class ObrlAgi3Agent(Agent):
 
         # Return a unique list of patterns
         unique_patterns = {str(p) for p in patterns}
-        return [eval(s) for s in sorted(list(unique_patterns))]
+        return [eval(s) for s in unique_patterns]
 
     def _analyze_relationships(self, object_summary: list[dict]) -> tuple[dict, dict, dict, dict]:
         """Analyzes object relationships and returns a structured dictionary of groups."""
@@ -1864,7 +1760,7 @@ class ObrlAgi3Agent(Agent):
             **alignments
         }
 
-        for group_type, groups in sorted(all_modules.items()):
+        for group_type, groups in all_modules.items():
             for value, obj_ids in groups.items():
                 # The group signature is a tuple, e.g., ('Color', 3) or ('bottom_y', 42)
                 group_signature = (group_type, value)
@@ -1899,7 +1795,7 @@ class ObrlAgi3Agent(Agent):
 
         # --- Step 3: Format the Output for the Rest of the System ---
         final_conjunctions = {}
-        for common_profile, obj_ids in sorted(temp_conjunctions.items(), key=lambda item: str(item[0])):
+        for common_profile, obj_ids in temp_conjunctions.items():
             if len(obj_ids) > 1:
                 # Create a human-readable name for the conjunction type, e.g., "Color_and_bottom_y"
                 type_names = sorted([item[0] for item in common_profile])
@@ -1960,72 +1856,66 @@ class ObrlAgi3Agent(Agent):
             obj['center_x'] = x + w // 2
 
         coord_map = {(obj['center_y'], obj['center_x']): int(obj['id'].replace('obj_', '')) for obj in object_summary}
-        all_lines = {
-            'top_left_to_bottom_right': set(),
-            'top_right_to_bottom_left': set(),
+        processed_ids = set()
+        final_alignments = {
+            'top_left_to_bottom_right': [],
+            'top_right_to_bottom_left': [],
         }
 
-        # Pass 1: Discover all possible lines without modifying a processed set
+        # Iterate through every unique pair of objects
         for i in range(len(object_summary)):
-            for j in range(i + 1, len(object_summary)):
-                obj_a = object_summary[i]
-                obj_b = object_summary[j]
-                id_a = int(obj_a['id'].replace('obj_', ''))
-                id_b = int(obj_b['id'].replace('obj_', ''))
+            obj_a = object_summary[i]
+            id_a = int(obj_a['id'].replace('obj_', ''))
+            if id_a in processed_ids:
+                continue
 
+            for j in range(i + 1, len(object_summary)):
+                obj_b = object_summary[j]
+                id_b = int(obj_b['id'].replace('obj_', ''))
+                if id_b in processed_ids:
+                    continue
+
+                # Calculate slope between the two centers
                 y1, x1 = obj_a['center_y'], obj_a['center_x']
                 y2, x2 = obj_b['center_y'], obj_b['center_x']
                 
-                if x2 - x1 == 0: continue
+                if x2 - x1 == 0: continue # Avoid division by zero for vertical lines
                 slope = (y2 - y1) / (x2 - x1)
 
                 if abs(slope) == 1.0:
+                    # Found a valid diagonal pair, now "walk" the line to find all members
                     line_members = {id_a, id_b}
+                    
+                    # Determine the direction (step vector) of the line
                     step_y = 1 if y2 > y1 else -1
                     step_x = 1 if x2 > x1 else -1
 
+                    # Walk forward from the "second" object (obj_b)
                     next_y, next_x = y2 + step_y, x2 + step_x
                     while (next_y, next_x) in coord_map:
-                        line_members.add(coord_map[(next_y, next_x)])
+                        found_id = coord_map[(next_y, next_x)]
+                        line_members.add(found_id)
                         next_y, next_x = next_y + step_y, next_x + step_x
 
+                    # Walk backward from the "first" object (obj_a)
                     prev_y, prev_x = y1 - step_y, x1 - step_x
                     while (prev_y, prev_x) in coord_map:
-                        line_members.add(coord_map[(prev_y, prev_x)])
+                        found_id = coord_map[(prev_y, prev_x)]
+                        line_members.add(found_id)
                         prev_y, prev_x = prev_y - step_y, prev_x - step_x
                     
                     if len(line_members) > 1:
                         align_type = 'top_left_to_bottom_right' if slope == 1.0 else 'top_right_to_bottom_left'
-                        all_lines[align_type].add(frozenset(line_members))
-
-        # Pass 2: Deterministically process the discovered lines
-        final_alignments = {}
-        processed_ids = set()
-        
-        # Sort the alignment types to ensure consistent processing order
-        for align_type in sorted(all_lines.keys()):
-            # Sort the lines themselves. Sorting a list of frozensets requires
-            # first converting them to sorted lists.
-            sorted_lines = sorted([sorted(list(line)) for line in all_lines[align_type]])
-            
-            for line_list in sorted_lines:
-                line_set = set(line_list)
-                # If this line contains only objects we've already processed, skip it.
-                if line_set.issubset(processed_ids):
-                    continue
-                
-                final_alignments.setdefault(align_type, []).append(line_set)
-                processed_ids.update(line_set)
+                        final_alignments[align_type].append(frozenset(line_members))
+                        processed_ids.update(line_members)
         
         # Clean up empty alignment types and remove duplicate lines
         final_results = {}
         for align_type, groups in final_alignments.items():
             if groups:
-                # To find unique groups, we convert each set to a hashable frozenset
-                unique_frozensets = {frozenset(g) for g in groups}
-                # Sort the unique lines to ensure the output is deterministic
-                sorted_unique_lines = sorted([sorted(list(fs)) for fs in unique_frozensets])
-                final_results[align_type] = [set(g) for g in sorted_unique_lines]
+                # Using a set of frozensets ensures all lines are unique
+                unique_groups = sorted([sorted(list(g)) for g in set(groups)])
+                final_results[align_type] = [set(g) for g in unique_groups]
                 
         return final_results
 
@@ -2048,7 +1938,7 @@ class ObrlAgi3Agent(Agent):
             new_groups = new_rels.get(rel_type, {})
             all_values = set(old_groups.keys()) | set(new_groups.keys())
 
-            for value in sorted(list(all_values)):
+            for value in all_values:
                 old_ids = old_groups.get(value, set())
                 new_ids = new_groups.get(value, set())
 
@@ -2169,7 +2059,7 @@ class ObrlAgi3Agent(Agent):
             else:
                 # Handle dictionary-based format for cardinal alignments
                 all_coords = set(old_groups.keys()) | set(new_groups.keys())
-                for coord in sorted(list(all_coords)):
+                for coord in all_coords:
                     old_ids = old_groups.get(coord, set())
                     new_ids = new_groups.get(coord, set())
 
@@ -2245,7 +2135,7 @@ class ObrlAgi3Agent(Agent):
             
             label = f"Exact Match" if match_type == "Exact" else f"Except {match_type} Match"
 
-            for props in sorted(list(all_props)):
+            for props in all_props:
                 old_ids = set(old_groups.get(props, []))
                 new_ids = set(new_groups.get(props, []))
 
@@ -2345,9 +2235,7 @@ class ObrlAgi3Agent(Agent):
                 # Normalize pixel coordinates to be relative to the top-left corner.
                 # We use a frozenset to make the shape hashable.
                 normalized_pixels = frozenset((r - min_r, c - min_c) for r, c in object_pixels)
-                sorted_pixels = sorted(list(normalized_pixels))
-                pixel_string = str(sorted_pixels).encode('utf-8')
-                shape_fingerprint = int(hashlib.md5(pixel_string).hexdigest(), 16)
+                shape_fingerprint = hash(normalized_pixels)
 
                 obj = {
                     'id': f'obj_{object_id_counter}',
@@ -2360,7 +2248,7 @@ class ObrlAgi3Agent(Agent):
                 }
                 objects.append(obj)
 
-        return sorted(objects, key=lambda o: (o['position'][0], o['position'][1]))
+        return objects
     
     def _get_stable_id(self, obj):
         """Creates a hashable, stable ID for an object based on its intrinsic properties."""
@@ -2438,7 +2326,7 @@ class ObrlAgi3Agent(Agent):
         movable_ids = set(old_map_by_id.keys()) & set(new_map_by_id.keys())
         
         moves_to_remove = []
-        for stable_id in sorted(list(movable_ids)):
+        for stable_id in movable_ids:
             old_instances = old_map_by_id[stable_id]
             new_instances = new_map_by_id[stable_id]
             
@@ -2623,123 +2511,21 @@ class ObrlAgi3Agent(Agent):
         if not self.last_state_key or not self.last_action_context:
             return
 
-        from_state_id = self.current_state_id
-
         # 1. Calculate reward
         reward = 0
         # --- Normalized reward for unique state discovery ---
-        total_changes = len(changes)
-        current_novelty_ratio = (novel_state_count / total_changes) if total_changes > 0 else 0.0
+        # Calculate the running average based on past successful moves.
+        average_unique_change = self.total_unique_changes / self.total_successful_moves if self.total_successful_moves > 0 else 0
 
-        # Calculate the running average novelty ratio from history.
-        average_novelty_ratio = sum(self.novelty_ratio_history) / len(self.novelty_ratio_history) if self.novelty_ratio_history else 0.0
-        
-        # The performance score is how much better (or worse) this turn's ratio is than the average.
-        # This will be a value between -1.0 and 1.0.
-        performance_score = current_novelty_ratio - average_novelty_ratio
-        
-        # --- State Assignment based on Performance ---
-        
-        # First, parse the raw change logs into a structured format for memory.
-        structured_outcomes = self._parse_changes_for_state_memory(changes)
+        # Reward actions that perform better than average, penalize those that do worse.
+        performance_vs_average = novel_state_count - average_unique_change
+        print(f"Novelty Analysis: Found {novel_state_count} unique changes vs. average of {average_unique_change:.2f}. Performance score: {performance_vs_average:.2f}.")
+        reward += performance_vs_average * 15 # Multiplier makes this a strong signal
 
-        if performance_score >= 0:
-            self.state_counter += 1
-            self.action_to_state_map[learning_key] = self.state_counter
-            print(f"Outcome was novel. Assigning new state: State {self.state_counter}")
-            self.current_state_id = self.state_counter
-            
-            # Record the structured details and full context of this novel state
-            self.novel_state_details[self.state_counter] = {
-                'transitions': structured_outcomes,
-                'summary': new_summary,
-                'available_actions': latest_frame.available_actions
-            }
-            print(f"  - Stored snapshot for State {self.state_counter} (summary, actions, transitions).")
-
-        else:
-            self.action_to_state_map[learning_key] = 'boring'
-            print("Outcome was boring. No new state assigned.")
-
-            # Step 1: Record the structured details of this boring outcome to the log.
-            if structured_outcomes:
-                self.boring_state_details.append({'transitions': structured_outcomes})
-                print(f"  - Logged boring outcome with {len(structured_outcomes)} structured transitions.")
-
-            # Step 2: Now, use this outcome to find the most similar novel state in memory.
-            if not structured_outcomes or not self.novel_state_details:
-                if structured_outcomes: # Only print if there was something to compare
-                    print("  - No novel state history exists to compare against.")
-            else:
-                # Helper function to make nested dictionaries and lists hashable for comparison.
-                def make_hashable(obj):
-                    if isinstance(obj, dict):
-                        return frozenset((k, make_hashable(v)) for k, v in sorted(obj.items()))
-                    if isinstance(obj, list):
-                        return tuple(make_hashable(v) for v in obj)
-                    return obj
-
-                boring_transitions_set = {make_hashable(t) for t in structured_outcomes}
-                
-                best_match_state_id = None
-                max_match_score = 0 # Start at 0, as we only care about positive matches
-
-                for state_id, details in self.novel_state_details.items():
-                    novel_transitions = details.get('transitions', [])
-                    if not novel_transitions:
-                        continue
-
-                    novel_transitions_set = {make_hashable(t) for t in novel_transitions}
-                    
-                    # The score is the number of common transitions (set intersection).
-                    match_score = len(boring_transitions_set.intersection(novel_transitions_set))
-
-                    if match_score > max_match_score:
-                        max_match_score = match_score
-                        best_match_state_id = state_id
-                
-                if best_match_state_id is not None:
-                    print(f"  - Match Found: This outcome is most similar to novel State {best_match_state_id} (Score: {max_match_score}).")
-                    self.current_state_id = best_match_state_id
-                    self.action_to_state_map[learning_key] = best_match_state_id
-                    print(f"  - Agent context is now considered to be State {self.current_state_id}.")
-                    
-                    # Announce the actions that have been tried from this state before
-                    known_actions = self.actions_from_state.get(self.current_state_id, set())
-                    if known_actions:
-                        actions_list_str = ", ".join(sorted(list(known_actions)))
-                        print(f"  - Previously tried actions from this state: [{actions_list_str}].")
-                    else:
-                        print("  - No actions have been taken from this state before.")
-                else:
-                    print("  - No matching novel state found in memory.")
-
-        to_state_id = self.current_state_id # Capture state after the action.
-
-        # --- Record and report all state transitions ---
-        if from_state_id is not None and to_state_id is not None:
-            # Always update the map with the latest observation for this action
-            self.state_transition_map.setdefault(from_state_id, {})[learning_key] = to_state_id
-
-            # Get the full dictionary of transitions from the origin state
-            all_known_transitions = self.state_transition_map[from_state_id]
-            
-            # Format the list for printing
-            transitions_str_parts = []
-            for action, dest_state in sorted(all_known_transitions.items()):
-                 transitions_str_parts.append(f"{action} -> State {dest_state}")
-            
-            full_transitions_str = ", ".join(transitions_str_parts)
-            print(f"Memory Update: From State {from_state_id}, known transitions are: [{full_transitions_str}].")
-        
-        # Since the score is now a ratio, the reward multiplier needs to be larger to have an impact.
-        reward += performance_score * 50
-
-        print(f"Novelty Analysis: Current ratio is {current_novelty_ratio:.2%} ({novel_state_count}/{total_changes} unique). Average is {average_novelty_ratio:.2%}. Performance score: {performance_score:.2f}.")
-
-        # Now, update the history for the next turn's calculation.
-        if total_changes > 0:
-            self.novelty_ratio_history.append(current_novelty_ratio)
+        # Now, update the totals for the next turn's calculation.
+        self.total_unique_changes += novel_state_count
+        if novel_state_count > 0:
+            self.total_successful_moves += 1
 
         # --- Specific penalty for unexpected failures ---
         if is_failure:
