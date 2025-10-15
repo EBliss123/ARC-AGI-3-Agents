@@ -1,4 +1,3 @@
-import random
 from .agent import Agent, FrameData
 from .structs import GameAction, GameState
 from collections import deque
@@ -596,7 +595,7 @@ class ObrlAgi3Agent(Agent):
         self.last_match_groups = current_match_groups
 
         # This is the REAL list of actions for this specific game on this turn.
-        game_specific_actions = latest_frame.available_actions
+        game_specific_actions = sorted(latest_frame.available_actions, key=lambda a: a.name)
 
         # If we just discovered the game-specific actions, print them once.
         if game_specific_actions and not self.actions_printed:
@@ -638,13 +637,17 @@ class ObrlAgi3Agent(Agent):
             unmet_abstract_goals = required_abstract_patterns - true_abstract_patterns
 
         # --- RL: Score and select the best action ---
-        best_move = None
+        best_moves = []
         best_score = -float('inf')
 
         if not possible_moves:
-             # If there are no possible moves, we might need a fallback.
-             # For now, let's try to use a generic click or another default.
-             possible_moves.append({'type': random.choice([a for a in GameAction if a is not GameAction.RESET]), 'object': None})
+            print("Warning: No moves were generated. Falling back to the first available game action.")
+            # The game_specific_actions list is already sorted, so this is deterministic.
+            if game_specific_actions:
+                possible_moves.append({'type': game_specific_actions[0], 'object': None})
+            else:
+                # Absolute last resort if the environment provides no actions
+                possible_moves.append({'type': GameAction.ACTION1, 'object': None})
 
         all_scores_debug = []
         for move in possible_moves:
@@ -750,7 +753,9 @@ class ObrlAgi3Agent(Agent):
 
             if score > best_score:
                 best_score = score
-                best_move = move
+                best_moves = [move]
+            elif score == best_score:
+                best_moves.append(move)
 
             # Create a user-friendly name for the debug log
             if target_object:
@@ -761,6 +766,16 @@ class ObrlAgi3Agent(Agent):
             all_scores_debug.append(f"{debug_name} (Score: {score:.2f})")
         
         # --- Fallback if all available actions were blacklisted ---
+        best_move = None
+        if best_moves:
+            if len(best_moves) > 1:
+                # Deterministic Tie-Breaking:
+                # Sort by a stable identifier. Clicks are sorted by their target object ID.
+                # Non-clicks are already in a deterministic order, but we can sort by name for safety.
+                print(f"Tie detected between {len(best_moves)} actions. Applying deterministic sort.")
+                best_moves.sort(key=lambda m: (m['object']['id'] if m['object'] else 'non_click', m['type'].name))
+            best_move = best_moves[0]
+        
         if best_move is None and possible_moves:
             print("Warning: All available actions were blacklisted. Clearing blacklist to break deadlock.")
             self.failed_action_blacklist.clear()
@@ -2327,7 +2342,7 @@ class ObrlAgi3Agent(Agent):
                 }
                 objects.append(obj)
 
-        return objects
+        return sorted(objects, key=lambda o: (o['position'][0], o['position'][1]))
     
     def _get_stable_id(self, obj):
         """Creates a hashable, stable ID for an object based on its intrinsic properties."""
@@ -2405,7 +2420,7 @@ class ObrlAgi3Agent(Agent):
         movable_ids = set(old_map_by_id.keys()) & set(new_map_by_id.keys())
         
         moves_to_remove = []
-        for stable_id in movable_ids:
+        for stable_id in sorted(list(movable_ids)):
             old_instances = old_map_by_id[stable_id]
             new_instances = new_map_by_id[stable_id]
             
