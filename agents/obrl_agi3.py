@@ -58,6 +58,7 @@ class ObrlAgi3Agent(Agent):
         self.current_state_id = None
         self.click_failure_counts = {}
         self.object_blacklist = set()
+        self.last_novelty_analysis = {}
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -513,63 +514,50 @@ class ObrlAgi3Agent(Agent):
                     for change in changes:
                         print(change)
 
-                    # --- Record Transition State ---
-                    if self.current_state_id is None:
-                        self.current_state_id = 1
-                    else:
-                        self.current_state_id += 1
-                    
-                    current_summary_map = {obj['id']: obj for obj in current_summary}
+                    # --- Parse Changes for State Transition Recording ---
                     current_state_transitions = []
-                    
-                    for change in changes:
-                        try:
-                            parts = change.split(': Object ')
-                            transition_type = parts[0].replace('- ', '')
-                            details = parts[1]
-                            
-                            obj_id_str = details.split(' ')[0].replace('id_', '')
-                            obj_id = f'obj_{obj_id_str}'
-                            
-                            final_state = 'parsing_failed' # Sentinel value
-                            
-                            if 'RECOLORED' in transition_type:
-                                final_state = int(details.split(' to ')[-1].replace('.', ''))
-                            elif 'SHAPE_CHANGED' in transition_type:
-                                final_state = int(details.split(' -> ')[-1].replace(').', ''))
-                            elif 'MOVED' in transition_type:
-                                pos_str = details.split(' to ')[-1].replace('.', '')
-                                final_state = ast.literal_eval(pos_str)
-                            elif 'SHRINK' in transition_type or 'GROWTH' in transition_type:
-                                size_str = details.split(' to ')[1].split(')')[0]
-                                tuple_str = f"({size_str.replace('x', ',')})"
-                                final_state = ast.literal_eval(tuple_str)
-                            elif 'REMOVED' in transition_type:
-                                final_state = None
-                            elif ('NEW' in transition_type or 
-                                  'TRANSFORM' in transition_type or
-                                  'REAPPEARED' in transition_type):
-                                if obj_id in current_summary_map:
-                                    final_state = self._get_stable_id(current_summary_map[obj_id])
-                            
-                            if final_state != 'parsing_failed':
-                                current_state_transitions.append({
-                                    'type': transition_type,
-                                    'object_id': obj_id,
-                                    'final_state': final_state
-                                })
-                        except (IndexError, ValueError, KeyError, SyntaxError):
-                            continue # Skip lines that don't fit the pattern
+                    if changes:
+                        current_summary_map = {obj['id']: obj for obj in current_summary}
+                        for change in changes:
+                            try:
+                                parts = change.split(': Object ')
+                                transition_type = parts[0].replace('- ', '')
+                                details = parts[1]
+                                
+                                obj_id_str = details.split(' ')[0].replace('id_', '')
+                                obj_id = f'obj_{obj_id_str}'
+                                
+                                final_state = 'parsing_failed' # Sentinel value
+                                
+                                if 'RECOLORED' in transition_type:
+                                    final_state = int(details.split(' to ')[-1].replace('.', ''))
+                                elif 'SHAPE_CHANGED' in transition_type:
+                                    final_state = int(details.split(' -> ')[-1].replace(').', ''))
+                                elif 'MOVED' in transition_type:
+                                    pos_str = details.split(' to ')[-1].replace('.', '')
+                                    final_state = ast.literal_eval(pos_str)
+                                elif 'SHRINK' in transition_type or 'GROWTH' in transition_type:
+                                    size_str = details.split(' to ')[1].split(')')[0]
+                                    tuple_str = f"({size_str.replace('x', ',')})"
+                                    final_state = ast.literal_eval(tuple_str)
+                                elif 'REMOVED' in transition_type:
+                                    final_state = None
+                                elif ('NEW' in transition_type or 
+                                      'TRANSFORM' in transition_type or
+                                      'REAPPEARED' in transition_type):
+                                    if obj_id in current_summary_map:
+                                        final_state = self._get_stable_id(current_summary_map[obj_id])
+                                
+                                if final_state != 'parsing_failed':
+                                    current_state_transitions.append({
+                                        'type': transition_type,
+                                        'object_id': obj_id,
+                                        'final_state': final_state
+                                    })
+                            except (IndexError, ValueError, KeyError, SyntaxError):
+                                continue # Skip lines that don't fit the pattern
 
-                    if current_state_transitions:
-                        self.transition_history.append({
-                            'state_id': self.current_state_id,
-                            'transitions': current_state_transitions
-                        })
-                        log_output = [f"\n--- Recorded State Transition #{self.current_state_id} ---"]
-                        for t in current_state_transitions:
-                            log_output.append(f"- Type: {t['type']}, Object: {t['object_id'].replace('obj_', 'id_')}, Final State: {t['final_state']}")
-                        print("\n".join(log_output))
+
                     
                     if unique_log_messages:
                         print("\n--- Unique Change Log ---")
@@ -577,10 +565,6 @@ class ObrlAgi3Agent(Agent):
                             print(msg)
 
                     
-                    # Report each change under its own per-object contextual key
-                    for i, key in enumerate(per_object_keys):
-                        # Pass only the single relevant change string
-                        self._analyze_and_report(key, [changes[i]])
                     success_context = {
                         'summary': prev_summary,
                         'rels': self.last_relationships,
@@ -590,22 +574,55 @@ class ObrlAgi3Agent(Agent):
                     }
                     self.success_contexts.setdefault(learning_key, []).append(success_context)
                 
-                    # --- Tag rules that led to non-unique outcomes ---
+                    # --- Tag rules as "boring" or analyze novel outcomes, and record state transitions ---
                     if changes and not is_failure_case:
-                        # First, get the set of IDs for objects that had a unique change
-                        unique_object_ids = set()
-                        for msg in unique_log_messages:
-                            if "Object id_" in msg:
-                                id_num_str = msg.split('id_')[1].split()[0]
-                                unique_object_ids.add(f"obj_{id_num_str}")
-
-                        # Now, tag the rules for any changed object that was NOT unique
-                        for key in per_object_keys:
-                            # key = (base_action_key, object_id, object_state)
-                            obj_id_from_key = key[1]
-                            if obj_id_from_key not in unique_object_ids:
+                        # Use the novelty analysis result that was calculated and stored in _learn_from_outcome
+                        is_boring_outcome = self.last_novelty_analysis.get('performance', 0) < 0
+                        
+                        # For logging purposes, get the values to display
+                        novel_count_log = self.last_novelty_analysis.get('novel_count', novel_state_count)
+                        avg_log = self.last_novelty_analysis.get('average', 0)
+                        is_novel_outcome = not is_boring_outcome
+                        
+                        if is_novel_outcome:
+                            # Increment state ID only for novel outcomes
+                            if self.current_state_id is None:
+                                self.current_state_id = 1
+                            else:
+                                self.current_state_id += 1
+                            print(f"Novelty: Outcome is 'novel' ({novel_count_log} unique changes >= avg of {avg_log:.2f}). Analyzing rules.")
+                            # Analyze the changes to refine rules for novel outcomes
+                            for i, key in enumerate(per_object_keys):
+                                self._analyze_and_report(key, [changes[i]])
+                        else: # is_boring_outcome
+                            print(f"Novelty: Outcome is 'boring' ({novel_count_log} unique changes < avg of {avg_log:.2f}). Tagging rules.")
+                            # Tag all rules associated with this underperforming action as boring.
+                            for key in per_object_keys:
                                 if key in self.rule_hypotheses:
                                     self.rule_hypotheses[key]['is_boring'] = True
+
+                        # Record the transition for ALL outcomes, but handle numbering conditionally
+                        if current_state_transitions:
+                            state_id_to_log = None
+                            log_header = "\n--- Recorded State Transition"
+
+                            if is_novel_outcome:
+                                state_id_to_log = self.current_state_id
+                                log_header += f" #{state_id_to_log}"
+                            else:
+                                log_header += " (Boring Outcome)"
+                            
+                            log_header += " ---"
+
+                            self.transition_history.append({
+                                'state_id': state_id_to_log, # This will be None for boring outcomes
+                                'transitions': current_state_transitions
+                            })
+                            
+                            log_output = [log_header]
+                            for t in current_state_transitions:
+                                log_output.append(f"- Type: {t['type']}, Object: {t['object_id'].replace('obj_', 'id_')}, Final State: {t['final_state']}")
+                            print("\n".join(log_output))
 
                 elif is_failure_case:
                     # Blacklist the action, regardless of its history.
@@ -2579,6 +2596,13 @@ class ObrlAgi3Agent(Agent):
         performance_vs_average = novel_state_count - average_unique_change
         print(f"Novelty Analysis: Found {novel_state_count} unique changes vs. average of {average_unique_change:.2f}. Performance score: {performance_vs_average:.2f}.")
         reward += performance_vs_average * 15 # Multiplier makes this a strong signal
+
+        # Store the results for later use in choose_action
+        self.last_novelty_analysis = {
+            'novel_count': novel_state_count,
+            'average': average_unique_change,
+            'performance': performance_vs_average
+        }
 
         # Now, update the totals for the next turn's calculation.
         self.total_unique_changes += novel_state_count
