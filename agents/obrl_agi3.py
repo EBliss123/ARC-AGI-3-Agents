@@ -3,6 +3,7 @@ from .structs import GameAction, GameState
 from collections import deque
 import copy
 import ast
+import hashlib
 
 class ObrlAgi3Agent(Agent):
     """
@@ -769,11 +770,20 @@ class ObrlAgi3Agent(Agent):
         best_move = None
         if best_moves:
             if len(best_moves) > 1:
-                # Deterministic Tie-Breaking:
-                # Sort by a stable identifier. Clicks are sorted by their target object ID.
-                # Non-clicks are already in a deterministic order, but we can sort by name for safety.
+                # Deterministic Tie-Breaking: Sort by object ID (numerically) and action name.
+                def get_sort_key(m):
+                    obj_id_num = -1  # Default for non-click actions
+                    if m['object']:
+                        try:
+                            # Extract the number from 'obj_10' -> 10
+                            obj_id_num = int(m['object']['id'].split('_')[1])
+                        except (ValueError, IndexError):
+                            pass # Keep -1 if ID format is unexpected
+                    return (obj_id_num, m['type'].name)
+                
                 print(f"Tie detected between {len(best_moves)} actions. Applying deterministic sort.")
-                best_moves.sort(key=lambda m: (m['object']['id'] if m['object'] else 'non_click', m['type'].name))
+                best_moves.sort(key=get_sort_key)
+            
             best_move = best_moves[0]
         
         if best_move is None and possible_moves:
@@ -862,7 +872,7 @@ class ObrlAgi3Agent(Agent):
         """Finds a removed object that matches the new object in all but one property."""
         new_stable_id = self._get_stable_id(new_obj)
         
-        for old_stable_id in self.removed_objects_memory.keys():
+        for old_stable_id in sorted(list(self.removed_objects_memory.keys())):
             diffs = {}
             # old_stable_id = (fingerprint, color, size, pixels)
             if new_stable_id[0] != old_stable_id[0]:
@@ -1278,7 +1288,7 @@ class ObrlAgi3Agent(Agent):
         for rel_type in all_rel_types:
             groups_s, groups_f = rels_s.get(rel_type, {}), rels_f.get(rel_type, {})
             all_values = set(groups_s.keys()) | set(groups_f.keys())
-            for value in all_values:
+            for value in sorted(list(all_values)):
                 ids_s, ids_f = groups_s.get(value, set()), groups_f.get(value, set())
                 if ids_s != ids_f:
                     # VETO CHECK:
@@ -1687,7 +1697,7 @@ class ObrlAgi3Agent(Agent):
 
         # Return a unique list of patterns
         unique_patterns = {str(p) for p in patterns}
-        return [eval(s) for s in unique_patterns]
+        return [eval(s) for s in sorted(list(unique_patterns))]
 
     def _analyze_relationships(self, object_summary: list[dict]) -> tuple[dict, dict, dict, dict]:
         """Analyzes object relationships and returns a structured dictionary of groups."""
@@ -1854,7 +1864,7 @@ class ObrlAgi3Agent(Agent):
             **alignments
         }
 
-        for group_type, groups in all_modules.items():
+        for group_type, groups in sorted(all_modules.items()):
             for value, obj_ids in groups.items():
                 # The group signature is a tuple, e.g., ('Color', 3) or ('bottom_y', 42)
                 group_signature = (group_type, value)
@@ -1889,7 +1899,7 @@ class ObrlAgi3Agent(Agent):
 
         # --- Step 3: Format the Output for the Rest of the System ---
         final_conjunctions = {}
-        for common_profile, obj_ids in temp_conjunctions.items():
+        for common_profile, obj_ids in sorted(temp_conjunctions.items(), key=lambda item: str(item[0])):
             if len(obj_ids) > 1:
                 # Create a human-readable name for the conjunction type, e.g., "Color_and_bottom_y"
                 type_names = sorted([item[0] for item in common_profile])
@@ -1950,66 +1960,72 @@ class ObrlAgi3Agent(Agent):
             obj['center_x'] = x + w // 2
 
         coord_map = {(obj['center_y'], obj['center_x']): int(obj['id'].replace('obj_', '')) for obj in object_summary}
-        processed_ids = set()
-        final_alignments = {
-            'top_left_to_bottom_right': [],
-            'top_right_to_bottom_left': [],
+        all_lines = {
+            'top_left_to_bottom_right': set(),
+            'top_right_to_bottom_left': set(),
         }
 
-        # Iterate through every unique pair of objects
+        # Pass 1: Discover all possible lines without modifying a processed set
         for i in range(len(object_summary)):
-            obj_a = object_summary[i]
-            id_a = int(obj_a['id'].replace('obj_', ''))
-            if id_a in processed_ids:
-                continue
-
             for j in range(i + 1, len(object_summary)):
+                obj_a = object_summary[i]
                 obj_b = object_summary[j]
+                id_a = int(obj_a['id'].replace('obj_', ''))
                 id_b = int(obj_b['id'].replace('obj_', ''))
-                if id_b in processed_ids:
-                    continue
 
-                # Calculate slope between the two centers
                 y1, x1 = obj_a['center_y'], obj_a['center_x']
                 y2, x2 = obj_b['center_y'], obj_b['center_x']
                 
-                if x2 - x1 == 0: continue # Avoid division by zero for vertical lines
+                if x2 - x1 == 0: continue
                 slope = (y2 - y1) / (x2 - x1)
 
                 if abs(slope) == 1.0:
-                    # Found a valid diagonal pair, now "walk" the line to find all members
                     line_members = {id_a, id_b}
-                    
-                    # Determine the direction (step vector) of the line
                     step_y = 1 if y2 > y1 else -1
                     step_x = 1 if x2 > x1 else -1
 
-                    # Walk forward from the "second" object (obj_b)
                     next_y, next_x = y2 + step_y, x2 + step_x
                     while (next_y, next_x) in coord_map:
-                        found_id = coord_map[(next_y, next_x)]
-                        line_members.add(found_id)
+                        line_members.add(coord_map[(next_y, next_x)])
                         next_y, next_x = next_y + step_y, next_x + step_x
 
-                    # Walk backward from the "first" object (obj_a)
                     prev_y, prev_x = y1 - step_y, x1 - step_x
                     while (prev_y, prev_x) in coord_map:
-                        found_id = coord_map[(prev_y, prev_x)]
-                        line_members.add(found_id)
+                        line_members.add(coord_map[(prev_y, prev_x)])
                         prev_y, prev_x = prev_y - step_y, prev_x - step_x
                     
                     if len(line_members) > 1:
                         align_type = 'top_left_to_bottom_right' if slope == 1.0 else 'top_right_to_bottom_left'
-                        final_alignments[align_type].append(frozenset(line_members))
-                        processed_ids.update(line_members)
+                        all_lines[align_type].add(frozenset(line_members))
+
+        # Pass 2: Deterministically process the discovered lines
+        final_alignments = {}
+        processed_ids = set()
+        
+        # Sort the alignment types to ensure consistent processing order
+        for align_type in sorted(all_lines.keys()):
+            # Sort the lines themselves. Sorting a list of frozensets requires
+            # first converting them to sorted lists.
+            sorted_lines = sorted([sorted(list(line)) for line in all_lines[align_type]])
+            
+            for line_list in sorted_lines:
+                line_set = set(line_list)
+                # If this line contains only objects we've already processed, skip it.
+                if line_set.issubset(processed_ids):
+                    continue
+                
+                final_alignments.setdefault(align_type, []).append(line_set)
+                processed_ids.update(line_set)
         
         # Clean up empty alignment types and remove duplicate lines
         final_results = {}
         for align_type, groups in final_alignments.items():
             if groups:
-                # Using a set of frozensets ensures all lines are unique
-                unique_groups = sorted([sorted(list(g)) for g in set(groups)])
-                final_results[align_type] = [set(g) for g in unique_groups]
+                # To find unique groups, we convert each set to a hashable frozenset
+                unique_frozensets = {frozenset(g) for g in groups}
+                # Sort the unique lines to ensure the output is deterministic
+                sorted_unique_lines = sorted([sorted(list(fs)) for fs in unique_frozensets])
+                final_results[align_type] = [set(g) for g in sorted_unique_lines]
                 
         return final_results
 
@@ -2032,7 +2048,7 @@ class ObrlAgi3Agent(Agent):
             new_groups = new_rels.get(rel_type, {})
             all_values = set(old_groups.keys()) | set(new_groups.keys())
 
-            for value in all_values:
+            for value in sorted(list(all_values)):
                 old_ids = old_groups.get(value, set())
                 new_ids = new_groups.get(value, set())
 
@@ -2153,7 +2169,7 @@ class ObrlAgi3Agent(Agent):
             else:
                 # Handle dictionary-based format for cardinal alignments
                 all_coords = set(old_groups.keys()) | set(new_groups.keys())
-                for coord in all_coords:
+                for coord in sorted(list(all_coords)):
                     old_ids = old_groups.get(coord, set())
                     new_ids = new_groups.get(coord, set())
 
@@ -2229,7 +2245,7 @@ class ObrlAgi3Agent(Agent):
             
             label = f"Exact Match" if match_type == "Exact" else f"Except {match_type} Match"
 
-            for props in all_props:
+            for props in sorted(list(all_props)):
                 old_ids = set(old_groups.get(props, []))
                 new_ids = set(new_groups.get(props, []))
 
@@ -2329,7 +2345,9 @@ class ObrlAgi3Agent(Agent):
                 # Normalize pixel coordinates to be relative to the top-left corner.
                 # We use a frozenset to make the shape hashable.
                 normalized_pixels = frozenset((r - min_r, c - min_c) for r, c in object_pixels)
-                shape_fingerprint = hash(normalized_pixels)
+                sorted_pixels = sorted(list(normalized_pixels))
+                pixel_string = str(sorted_pixels).encode('utf-8')
+                shape_fingerprint = int(hashlib.md5(pixel_string).hexdigest(), 16)
 
                 obj = {
                     'id': f'obj_{object_id_counter}',
