@@ -61,6 +61,7 @@ class ObrlAgi3Agent(Agent):
         self.last_novelty_analysis = {}
         self.actions_from_outcome_state = {}
         self.last_outcome_state_id = None
+        self.state_graph = set()
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -638,6 +639,25 @@ class ObrlAgi3Agent(Agent):
                                     log_header += " (Boring Outcome, no match found)"
                             
                             log_header += " ---"
+
+                            # --- Capture and log the state transition link ---
+                            if self.last_outcome_state_id is not None and state_id_to_log is not None and self.last_action_context:
+                                prev_state_id = self.last_outcome_state_id
+                                new_state_id = state_id_to_log
+                                
+                                # Reconstruct the action key for logging
+                                prev_action_name, prev_target_id = self.last_action_context
+                                action_key = self._get_learning_key(prev_action_name, prev_target_id)
+                                
+                                # Create the link string
+                                link_str = f"State #{prev_state_id} --({action_key})--> State #{new_state_id}"
+                                
+                                # Add to the graph and print if it's a new link
+                                if link_str not in self.state_graph:
+                                    self.state_graph.add(link_str)
+                                    print("\n--- State Transition Map ---")
+                                    for connection in sorted(list(self.state_graph)):
+                                        print(connection)
 
                             self.transition_history.append({
                                 'state_id': state_id_to_log, # This will be None for boring outcomes
