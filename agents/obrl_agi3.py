@@ -59,6 +59,8 @@ class ObrlAgi3Agent(Agent):
         self.click_failure_counts = {}
         self.object_blacklist = set()
         self.last_novelty_analysis = {}
+        self.actions_from_outcome_state = {}
+        self.last_outcome_state_id = None
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -643,9 +645,17 @@ class ObrlAgi3Agent(Agent):
                             })
                             
                             log_output = [log_header]
+                            # --- Report actions previously taken from this state pattern ---
+                            if state_id_to_log is not None:
+                                previous_actions = self.actions_from_outcome_state.get(state_id_to_log, set())
+                                if previous_actions:
+                                    sorted_actions = sorted(list(previous_actions))
+                                    log_output.append(f"Actions previously taken from this state pattern: {sorted_actions}")
+
                             for t in current_state_transitions:
                                 log_output.append(f"- Type: {t['type']}, Object: {t['object_id'].replace('obj_', 'id_')}, Final State: {t['final_state']}")
                             print("\n".join(log_output))
+                            self.last_outcome_state_id = state_id_to_log
 
                 elif is_failure_case:
                     # Blacklist the action, regardless of its history.
@@ -905,6 +915,11 @@ class ObrlAgi3Agent(Agent):
         target_id_for_context = chosen_object['id'] if chosen_object else None
         self.last_action_context = (action_to_return.name, target_id_for_context)
         
+        # --- Record the action taken from the last outcome state ---
+        if self.last_outcome_state_id is not None:
+            chosen_action_key = self._get_learning_key(action_to_return.name, target_id_for_context)
+            self.actions_from_outcome_state.setdefault(self.last_outcome_state_id, set()).add(chosen_action_key)
+
         # Store the current state for the level history before ending the turn
         current_context = {
             'summary': current_summary,
