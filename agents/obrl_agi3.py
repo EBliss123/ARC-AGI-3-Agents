@@ -583,6 +583,8 @@ class ObrlAgi3Agent(Agent):
                         novel_count_log = self.last_novelty_analysis.get('novel_count', novel_state_count)
                         avg_log = self.last_novelty_analysis.get('average', 0)
                         is_novel_outcome = not is_boring_outcome
+                        boring_state_match_id = None
+                        overlap_percentage = 0.0
                         
                         if is_novel_outcome:
                             # Increment state ID only for novel outcomes
@@ -595,7 +597,24 @@ class ObrlAgi3Agent(Agent):
                             for i, key in enumerate(per_object_keys):
                                 self._analyze_and_report(key, [changes[i]])
                         else: # is_boring_outcome
-                            print(f"Novelty: Outcome is 'boring' ({novel_count_log} unique changes < avg of {avg_log:.2f}). Tagging rules.")
+                            print(f"Novelty: Outcome is 'boring' ({novel_count_log} unique changes < avg of {avg_log:.2f}). Finding best match to overlap.")
+                            # --- Find the best matching previous novel state ---
+                            best_match_score = -1
+                            current_trans_set = {frozenset(t.items()) for t in current_state_transitions}
+                            novel_history = [h for h in self.transition_history if h.get('state_id') is not None]
+
+                            if novel_history:
+                                for past_state in novel_history:
+                                    past_trans_set = {frozenset(t.items()) for t in past_state['transitions']}
+                                    score = len(current_trans_set & past_trans_set)
+                                    
+                                    if score > best_match_score:
+                                        best_match_score = score
+                                        boring_state_match_id = past_state['state_id']
+                            
+                            if best_match_score > 0 and current_state_transitions:
+                                overlap_percentage = (best_match_score / len(current_state_transitions)) * 100
+
                             # Tag all rules associated with this underperforming action as boring.
                             for key in per_object_keys:
                                 if key in self.rule_hypotheses:
@@ -609,8 +628,12 @@ class ObrlAgi3Agent(Agent):
                             if is_novel_outcome:
                                 state_id_to_log = self.current_state_id
                                 log_header += f" #{state_id_to_log}"
-                            else:
-                                log_header += " (Boring Outcome)"
+                            else: # is_boring_outcome
+                                state_id_to_log = boring_state_match_id # Use the matched ID
+                                if state_id_to_log is not None:
+                                    log_header += f" (Overlapping with State #{state_id_to_log} by {overlap_percentage:.0f}%)"
+                                else:
+                                    log_header += " (Boring Outcome, no match found)"
                             
                             log_header += " ---"
 
