@@ -59,7 +59,6 @@ class ObrlAgi3Agent(Agent):
         self.click_failure_counts = {}
         self.object_blacklist = set()
         self.state_action_history = {}
-        self.effective_state_id = 0
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -74,6 +73,7 @@ class ObrlAgi3Agent(Agent):
             return GameAction.RESET
         
         current_summary = self._perceive_objects(latest_frame)
+        previous_effective_state_id = self.current_state_id if self.current_state_id is not None else 0
 
         # If this is the first scan (last summary is empty), print the full summary.
         if not self.last_object_summary or self.is_new_level:
@@ -575,7 +575,11 @@ class ObrlAgi3Agent(Agent):
                                         best_match_id = historical_entry['state_id']
 
                             if best_match_id is not None:
-                                self.effective_state_id = best_match_id
+                                destination_state_id = best_match_id
+                                history = self.state_action_history.get(destination_state_id, [])
+                                print(f"\n--- Arrived at aliased State #{destination_state_id} ---")
+                                print(f"Previously taken actions from this state: {history}")
+                                
                                 log_output = [f"\n--- State is an alias for Novel State #{best_match_id} (Similarity: {best_match_score:.0%}) ---"]
                             else:
                                 # Fallback if history is empty
@@ -583,10 +587,12 @@ class ObrlAgi3Agent(Agent):
                         else:
                             if self.current_state_id is None:
                                 self.current_state_id = 1
-                                self.effective_state_id = self.current_state_id
                             else:
                                 self.current_state_id += 1
-                                self.effective_state_id = self.current_state_id
+
+                            # By definition, the history for a new state is empty.
+                            print(f"\n--- Arrived at new Novel State #{self.current_state_id} ---")
+                            print("No previous actions taken from this state.")
 
                             self.transition_history.append({
                                 'state_id': self.current_state_id,
@@ -886,17 +892,15 @@ class ObrlAgi3Agent(Agent):
             print(f"RL Agent chose action: {chosen_template.name} (Score: {best_score:.2f}) {debug_scores_str}")
         
         action_to_return = chosen_template
-        # --- Record Action History for Current State ---
-        source_state_id = self.effective_state_id
+        
+        # --- Record Action History for Source State ---
+        source_state_id = previous_effective_state_id
         action_key_for_history = self._get_learning_key(chosen_template.name, chosen_object['id'] if chosen_object else None)
-
+        
         history_list = self.state_action_history.setdefault(source_state_id, [])
         if action_key_for_history not in history_list:
             history_list.append(action_key_for_history)
 
-        print(f"\n--- State Action History (State: {source_state_id}) ---")
-        print(f"Action taken: {action_key_for_history}")
-        print(f"Complete history for this state: {history_list}")
         self.last_state_key = current_state_key # Remember the state for the next learning cycle
 
         # Before returning, store the context of the chosen action for the next turn's analysis.
