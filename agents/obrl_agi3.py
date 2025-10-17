@@ -505,7 +505,7 @@ class ObrlAgi3Agent(Agent):
                             is_failure_case = True
 
                 # --- Now, with all outcomes known, learn from the last action ---
-                self._learn_from_outcome(latest_frame, changes, current_summary, novel_state_count, is_failure_case, learning_key)
+                performance_score = self._learn_from_outcome(latest_frame, changes, current_summary, novel_state_count, is_failure_case, learning_key)
 
                 # --- Handle all Logging and Rule Analysis *after* learning ---
                 if changes:
@@ -514,25 +514,22 @@ class ObrlAgi3Agent(Agent):
                         print(change)
 
                     # --- Record Transition State ---
-                    if self.current_state_id is None:
-                        self.current_state_id = 1
-                    else:
-                        self.current_state_id += 1
-                    
+                    is_boring_transition = performance_score < 0.0
+
                     current_summary_map = {obj['id']: obj for obj in current_summary}
                     current_state_transitions = []
-                    
+
                     for change in changes:
                         try:
                             parts = change.split(': Object ')
                             transition_type = parts[0].replace('- ', '')
                             details = parts[1]
-                            
+
                             obj_id_str = details.split(' ')[0].replace('id_', '')
                             obj_id = f'obj_{obj_id_str}'
-                            
+
                             final_state = 'parsing_failed' # Sentinel value
-                            
+
                             if 'RECOLORED' in transition_type:
                                 final_state = int(details.split(' to ')[-1].replace('.', ''))
                             elif 'SHAPE_CHANGED' in transition_type:
@@ -547,11 +544,11 @@ class ObrlAgi3Agent(Agent):
                             elif 'REMOVED' in transition_type:
                                 final_state = None
                             elif ('NEW' in transition_type or 
-                                  'TRANSFORM' in transition_type or
-                                  'REAPPEARED' in transition_type):
+                                'TRANSFORM' in transition_type or
+                                'REAPPEARED' in transition_type):
                                 if obj_id in current_summary_map:
                                     final_state = self._get_stable_id(current_summary_map[obj_id])
-                            
+
                             if final_state != 'parsing_failed':
                                 current_state_transitions.append({
                                     'type': transition_type,
@@ -562,15 +559,24 @@ class ObrlAgi3Agent(Agent):
                             continue # Skip lines that don't fit the pattern
 
                     if current_state_transitions:
-                        self.transition_history.append({
-                            'state_id': self.current_state_id,
-                            'transitions': current_state_transitions
-                        })
-                        log_output = [f"\n--- Recorded State Transition #{self.current_state_id} ---"]
+                        if is_boring_transition:
+                            log_output = ["\n--- Recorded State Transition (Boring) ---"]
+                        else:
+                            if self.current_state_id is None:
+                                self.current_state_id = 1
+                            else:
+                                self.current_state_id += 1
+
+                            self.transition_history.append({
+                                'state_id': self.current_state_id,
+                                'transitions': current_state_transitions
+                            })
+                            log_output = [f"\n--- Recorded State Transition #{self.current_state_id} ---"]
+
                         for t in current_state_transitions:
                             log_output.append(f"- Type: {t['type']}, Object: {t['object_id'].replace('obj_', 'id_')}, Final State: {t['final_state']}")
                         print("\n".join(log_output))
-                    
+
                     if unique_log_messages:
                         print("\n--- Unique Change Log ---")
                         for msg in sorted(unique_log_messages):
@@ -2662,6 +2668,8 @@ class ObrlAgi3Agent(Agent):
         history['attempts'] += 1
         if changes:
             history['successes'] += 1
+
+        return performance_vs_average
 
     def _find_object_by_coords(self, coords: dict | None) -> dict | None:
         """Helper to find an object in the last summary based on click coordinates."""
