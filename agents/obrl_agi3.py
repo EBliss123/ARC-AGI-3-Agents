@@ -59,6 +59,9 @@ class ObrlAgi3Agent(Agent):
         self.click_failure_counts = {}
         self.object_blacklist = set()
         self.state_action_history = {}
+        self.state_graph = []
+        self.logical_state_id = 0
+        self.last_taken_action_key = None
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -73,7 +76,6 @@ class ObrlAgi3Agent(Agent):
             return GameAction.RESET
         
         current_summary = self._perceive_objects(latest_frame)
-        previous_effective_state_id = self.current_state_id if self.current_state_id is not None else 0
 
         # If this is the first scan (last summary is empty), print the full summary.
         if not self.last_object_summary or self.is_new_level:
@@ -580,6 +582,19 @@ class ObrlAgi3Agent(Agent):
                                 print(f"\n--- Arrived at aliased State #{destination_state_id} ---")
                                 print(f"Previously taken actions from this state: {history}")
                                 
+                                # --- Record State Graph Connection ---
+                                if self.last_taken_action_key is not None:
+                                    connection = {
+                                        'source': self.logical_state_id,
+                                        'action': self.last_taken_action_key,
+                                        'destination': destination_state_id
+                                    }
+                                    # After a transition, the agent's logical location is now the destination.
+                                    self.logical_state_id = destination_state_id
+                                    if connection not in self.state_graph:
+                                        self.state_graph.append(connection)
+                                        print(f"--- State Graph Updated: State {connection['source']} -> {connection['action']} -> State {connection['destination']} ---")
+
                                 log_output = [f"\n--- State is an alias for Novel State #{best_match_id} (Similarity: {best_match_score:.0%}) ---"]
                             else:
                                 # Fallback if history is empty
@@ -593,6 +608,20 @@ class ObrlAgi3Agent(Agent):
                             # By definition, the history for a new state is empty.
                             print(f"\n--- Arrived at new Novel State #{self.current_state_id} ---")
                             print("No previous actions taken from this state.")
+
+                            # --- Record State Graph Connection ---
+                            if self.last_taken_action_key is not None:
+                                destination_state_id = self.current_state_id
+                                connection = {
+                                    'source': self.logical_state_id,
+                                    'action': self.last_taken_action_key,
+                                    'destination': destination_state_id
+                                }
+                                # The agent's new logical location is this new novel state.
+                                self.logical_state_id = destination_state_id
+                                if connection not in self.state_graph:
+                                    self.state_graph.append(connection)
+                                    print(f"--- State Graph Updated: State {connection['source']} -> {connection['action']} -> State {connection['destination']} ---")
 
                             self.transition_history.append({
                                 'state_id': self.current_state_id,
@@ -893,13 +922,17 @@ class ObrlAgi3Agent(Agent):
         
         action_to_return = chosen_template
         
-        # --- Record Action History for Source State ---
-        source_state_id = previous_effective_state_id
-        action_key_for_history = self._get_learning_key(chosen_template.name, chosen_object['id'] if chosen_object else None)
-        
+        # --- Record Action and Store for Next Turn's Graph ---
+        source_state_id = self.logical_state_id
+        action_key = self._get_learning_key(chosen_template.name, chosen_object['id'] if chosen_object else None)
+
+        # Record the action in the history for the state we are currently in.
         history_list = self.state_action_history.setdefault(source_state_id, [])
-        if action_key_for_history not in history_list:
-            history_list.append(action_key_for_history)
+        if action_key not in history_list:
+            history_list.append(action_key)
+
+        # Store the action key to build the graph connection on the next turn.
+        self.last_taken_action_key = action_key
 
         self.last_state_key = current_state_key # Remember the state for the next learning cycle
 
