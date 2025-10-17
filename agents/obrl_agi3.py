@@ -560,7 +560,23 @@ class ObrlAgi3Agent(Agent):
 
                     if current_state_transitions:
                         if is_boring_transition:
-                            log_output = ["\n--- Recorded State Transition (Boring) ---"]
+                            best_match_id = None
+                            best_match_score = -1.0
+
+                            if self.transition_history:
+                                for historical_entry in self.transition_history:
+                                    historical_transitions = historical_entry['transitions']
+                                    similarity = self._calculate_transition_similarity(current_state_transitions, historical_transitions)
+
+                                    if similarity > best_match_score:
+                                        best_match_score = similarity
+                                        best_match_id = historical_entry['state_id']
+
+                            if best_match_id is not None:
+                                log_output = [f"\n--- State is an alias for Novel State #{best_match_id} (Similarity: {best_match_score:.0%}) ---"]
+                            else:
+                                # Fallback if history is empty
+                                log_output = ["\n--- Recorded State Transition (Boring) ---"]
                         else:
                             if self.current_state_id is None:
                                 self.current_state_id = 1
@@ -2569,6 +2585,26 @@ class ObrlAgi3Agent(Agent):
         # Create a tuple of stable object IDs, sorted to ensure consistency
         state_tuple = tuple(sorted(self._get_stable_id(obj) for obj in object_summary))
         return str(hash(state_tuple))
+    
+    def _calculate_transition_similarity(self, trans1: list[dict], trans2: list[dict]) -> float:
+        """Calculates Jaccard similarity between two lists of state transition dicts."""
+        def to_tuple(t):
+            # Convert final_state to a string to ensure it's hashable, especially for tuples.
+            final_state_str = str(t['final_state'])
+            return (t['type'], t['object_id'], final_state_str)
+
+        set1 = {to_tuple(t) for t in trans1}
+        set2 = {to_tuple(t) for t in trans2}
+
+        if not set1 and not set2:
+            return 1.0  # Two empty sets are identical
+
+        try:
+            intersection = len(set1.intersection(set2))
+            union = len(set1.union(set2))
+            return intersection / union
+        except ZeroDivisionError:
+            return 0.0
     
     def _learn_from_outcome(self, latest_frame: FrameData, changes: list[str], new_summary: list[dict], novel_state_count: int, is_failure: bool, learning_key: str):
         """Calculates reward and updates model weights based on the last action's outcome."""
