@@ -525,7 +525,7 @@ class ObrlAgi3Agent(Agent):
                         print(change)
 
                     # --- Record Transition State ---
-                    is_boring_transition = performance_score < 0.0
+                    is_boring_transition = performance_score < 0.0 or novel_state_count == 0
 
                     current_summary_map = {obj['id']: obj for obj in current_summary}
                     current_state_transitions = []
@@ -2677,15 +2677,36 @@ class ObrlAgi3Agent(Agent):
         performance_vs_baseline = 0.0
         # Only successful moves (that cause change) are considered for the baseline.
         if changes:
-            # For now, the score is just the count. We'll make this a composite score in later steps.
-            current_turn_novelty_score = novel_state_count
+            # --- Calculate Novelty Ratio (% of unique changes per total change) ---
+            novelty_ratio = 0.0
+            if changes:
+                affected_object_ids = set()
+                for change_str in changes:
+                    if "Object id_" in change_str:
+                        try:
+                            # Extracts '34' from 'Object id_34 ...'
+                            id_num_str = change_str.split('id_')[1].split(' ')[0]
+                            affected_object_ids.add(f"obj_{id_num_str}")
+                        except IndexError:
+                            continue
+
+                total_changed_objects = len(affected_object_ids)
+                if total_changed_objects > 0:
+                    novelty_ratio = novel_state_count / total_changed_objects
+                elif novel_state_count > 0:
+                    # Handle cases like a new object appearing from nowhere. 100% novel efficiency.
+                    novelty_ratio = 1.0
+
+            # The composite score combines raw novelty with the novelty efficiency ratio.
+            # (The weight for novelty_ratio can be tuned).
+            current_turn_novelty_score = novel_state_count + (novelty_ratio * 5)
             self.successful_novelty_history.append(current_turn_novelty_score)
 
             # The baseline is the median of all successful moves this level.
             baseline_median = statistics.median(self.successful_novelty_history)
 
             performance_vs_baseline = current_turn_novelty_score - baseline_median
-            print(f"Novelty Analysis: Found {current_turn_novelty_score} unique changes vs. level median of {baseline_median:.2f}. Performance score: {performance_vs_baseline:.2f}.")
+            print(f"Novelty Analysis: Composite score of {current_turn_novelty_score:.2f} (Novelty: {novel_state_count}, Ratio: {novelty_ratio:.2f}) vs. level median of {baseline_median:.2f}. Performance score: {performance_vs_baseline:.2f}.")
         else:
             # No changes, so performance is negative based on the discovery drought.
             performance_vs_baseline = -self.turns_without_discovery
