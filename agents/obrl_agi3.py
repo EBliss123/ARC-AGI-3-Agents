@@ -30,12 +30,33 @@ class ObrlAgi3Agent(Agent):
         self.weights = {}
         self.action_counts = {}
         self.last_state_key = None
-        self.learning_rate = 0.1  # Alpha
-        self.discount_factor = 0.9 # Gamma
         self.is_waiting_for_stability = False
+
+        # --- Centralized Hyperparameters for Tuning ---
+        self.hyperparams = {
+            'learning_rate': 0.1,
+            'discount_factor': 0.9,
+            'reward_win': 100.0,
+            'reward_novelty_multiplier': 15.0,
+            'reward_new_effect_pattern': 20.0,
+            'penalty_unexpected_failure': 15.0,
+            'penalty_repeated_effect': 5.0,
+            'penalty_boring_move': 20.0,
+            'penalty_predicted_failure': 50.0,
+            'penalty_blacklist_base': 5000.0,
+            'penalty_blacklist_scaler': 100.0,
+            'drought_increment': 10.0,
+            'bonus_action_exp': 25.0,
+            'bonus_state_exp_unknown': 50.0,
+            'bonus_state_exp_known_scaler': 30.0,
+            'bonus_goal_seeking': 75.0,
+            'weight_novelty_ratio': 5.0,
+            'planning_confidence_threshold': 0.9,
+            'recent_effect_patterns_maxlen': 20,
+        }
         self.visited_states = set()
         self.seen_object_states = set()
-        self.recent_effect_patterns = deque(maxlen=20)
+        self.recent_effect_patterns = deque(maxlen=self.hyperparams['recent_effect_patterns_maxlen'])
         self.seen_configurations = set()
         self.total_unique_changes = 0
         self.total_successful_moves = 0
@@ -857,14 +878,14 @@ class ObrlAgi3Agent(Agent):
 
             if predicted_destination_id is None:
                 # This action has never been taken from this state. It's pure exploration.
-                state_exploration_bonus = 50.0
+                state_exploration_bonus = self.hyperparams['bonus_state_exp_unknown']
                 print(f"State Exploration: Action {action_key} is unknown from this state. Adding max bonus.")
             else:
                 # We've been to the destination before. Is it a well-explored state?
                 destination_history = self.state_action_history.get(predicted_destination_id, [])
                 num_actions_tried = len(destination_history)
                 # The bonus is higher for leading to states with fewer tried actions.
-                state_exploration_bonus = 30.0 / (1.0 + num_actions_tried)
+                state_exploration_bonus = self.hyperparams['bonus_state_exp_known_scaler'] / (1.0 + num_actions_tried)
                 obj_id_str = target_object['id'].replace('obj_', 'id_') if target_object else 'GLOBAL'
                 print(f"State Exploration: {action_key} on {obj_id_str} leads to state {predicted_destination_id} (history size: {num_actions_tried}). Bonus: {state_exploration_bonus:.2f}")
 
@@ -881,7 +902,7 @@ class ObrlAgi3Agent(Agent):
             
             action_count = self.action_counts.get((current_state_key, action_key), 0)
             if action_count == 0:
-                exploration_bonus = 25.0 # Large bonus to encourage trying a new action
+                exploration_bonus = self.hyperparams['bonus_action_exp'] # Large bonus to encourage trying a new action
             else:
                 exploration_bonus = 1.0 / (1.0 + action_count) # Smaller bonus for less-used actions
 
@@ -892,7 +913,7 @@ class ObrlAgi3Agent(Agent):
                 # Case 1: This is a CLICK action on a specific object.
                 hypothesis = self.rule_hypotheses.get(action_key)
                 if hypothesis and hypothesis.get('is_boring', False):
-                    boring_penalty = -20.0
+                    boring_penalty = -self.hyperparams['penalty_boring_move']
                     obj_id = target_object['id'].replace('obj_', 'id_')
                     print(f"Heuristic: Predicting a 'boring' outcome for {action_key[0]} on object {obj_id}. Applying penalty.")
             else:
@@ -904,7 +925,7 @@ class ObrlAgi3Agent(Agent):
                     hypothesis = self.rule_hypotheses.get(obj_action_key)
                     if hypothesis and hypothesis.get('is_boring', False):
                         # Add a penalty for each predicted boring outcome
-                        boring_penalty -= 20.0
+                        boring_penalty -= self.hyperparams['penalty_boring_move']
                         obj_id = obj['id'].replace('obj_', 'id_')
                         print(f"Heuristic: Predicting a 'boring' outcome for {action_name} on object {obj_id}. Applying penalty.")
 
@@ -931,13 +952,13 @@ class ObrlAgi3Agent(Agent):
                 # (Future enhancement: Could add checks for relationship patterns here as well)
 
                 if is_match:
-                    failure_penalty = -50.0 # Apply a heavy penalty for a predicted failure
+                    failure_penalty = -self.hyperparams['penalty_predicted_failure'] # Apply a heavy penalty for a predicted failure
                     print(f"Heuristic: Current state matches a known failure pattern for {action_key}. Applying penalty.")
             
             # --- Object Blacklist Penalty ---
             if target_object and target_object['id'] in self.object_blacklist:
                 failure_count = self.click_failure_counts.get(target_object['id'], 1)
-                object_blacklist_penalty = -5000 - (((failure_count - 1) * 100) ** 2)
+                object_blacklist_penalty = -self.hyperparams['penalty_blacklist_base'] - (((failure_count - 1) * self.hyperparams['penalty_blacklist_scaler']) ** 2)
                 failure_penalty += object_blacklist_penalty
                 obj_id_str = target_object['id'].replace('obj_', 'id_')
                 print(f"Heuristic: Object {obj_id_str} is blacklisted (failed {failure_count} time(s)). Applying penalty of {object_blacklist_penalty}.")
@@ -1631,7 +1652,7 @@ class ObrlAgi3Agent(Agent):
         for rule_key, hypothesis in self.rule_hypotheses.items():
             rule_base_key, rule_obj_id, rule_obj_state = rule_key
 
-            if hypothesis.get('confidence', 0.0) < 0.9: # Use a high threshold for planning
+            if hypothesis.get('confidence', 0.0) < self.hyperparams['planning_confidence_threshold']: # Use a high threshold for planning
                 continue
 
             is_match = False
@@ -1691,7 +1712,7 @@ class ObrlAgi3Agent(Agent):
         helpful_predictions = predicted_abstract_patterns & unmet_goals
         
         if helpful_predictions:
-            bonus = 75.0 * len(helpful_predictions) # Increased bonus for high-confidence planning
+            bonus = self.hyperparams['bonus_goal_seeking'] * len(helpful_predictions) # Increased bonus for high-confidence planning
             summary = sorted([f"{p[1]}" for p in helpful_predictions])
             obj_id_str = target_object['id'].replace('obj_', 'id_') if target_object else 'GLOBAL'
             action_name = self._get_learning_key(action_template.name, target_object['id'] if target_object else None)
@@ -2755,7 +2776,7 @@ class ObrlAgi3Agent(Agent):
 
             # The composite score combines raw novelty with the novelty efficiency ratio.
             # (The weight for novelty_ratio can be tuned).
-            current_turn_novelty_score = novel_state_count + (novelty_ratio * 5)
+            current_turn_novelty_score = novel_state_count + (novelty_ratio * self.hyperparams['weight_novelty_ratio'])
             self.successful_novelty_history.append(current_turn_novelty_score)
 
             # The baseline is the median of all successful moves this level.
@@ -2767,11 +2788,11 @@ class ObrlAgi3Agent(Agent):
             # No changes, so performance is negative based on the discovery drought.
             performance_vs_baseline = -self.turns_without_discovery
 
-        reward += performance_vs_baseline * 15 # Multiplier makes this a strong signal
+        reward += performance_vs_baseline * self.hyperparams['reward_novelty_multiplier'] # Multiplier makes this a strong signal
 
         # --- Specific penalty for unexpected failures ---
         if is_failure:
-            reward -= 15 # Heavy penalty for an action that should have worked but didn't.
+            reward -= self.hyperparams['penalty_unexpected_failure'] # Heavy penalty for an action that should have worked but didn't.
 
         # --- Escalating penalty for being in an unproductive loop ---
         if novel_state_count > 0:
@@ -2779,11 +2800,11 @@ class ObrlAgi3Agent(Agent):
             self.turns_without_discovery = 0
         else:
             # No discovery, the drought continues and the penalty increases.
-            self.turns_without_discovery += 10
+            self.turns_without_discovery += self.hyperparams['drought_increment']
             reward -= self.turns_without_discovery
 
         if latest_frame.score > self.last_score:
-            reward += 100
+            reward += self.hyperparams['reward_win']
 
         # --- Effect Pattern Novelty Reward (for discovering new game mechanics) ---
         if changes:
@@ -2792,9 +2813,9 @@ class ObrlAgi3Agent(Agent):
             pattern_count_in_history = self.recent_effect_patterns.count(effect_pattern_key)
             
             if pattern_count_in_history == 0:
-                reward += 20 # Bonus for a new type of outcome.
+                reward += self.hyperparams['reward_new_effect_pattern'] # Bonus for a new type of outcome.
             else:
-                reward -= pattern_count_in_history * 5 # Penalty for repeating old outcomes.
+                reward -= pattern_count_in_history * self.hyperparams['penalty_repeated_effect'] # Penalty for repeating old outcomes.
             
             self.recent_effect_patterns.append(effect_pattern_key)
 
@@ -2830,13 +2851,13 @@ class ObrlAgi3Agent(Agent):
         prev_features = self._extract_features(prev_summary, prev_move_mock)
         
         old_q_prediction = sum(self.weights.get(f, 0.0) * v for f, v in prev_features.items())
-        
-        temporal_difference = reward + (self.discount_factor * max_q_for_next_state) - old_q_prediction
+
+        temporal_difference = reward + (self.hyperparams['discount_factor'] * max_q_for_next_state) - old_q_prediction
 
         # 4. Update the weights
         for feature, value in prev_features.items():
             # The update rule: adjust weight in proportion to the error and the feature's value
-            self.weights[feature] = self.weights.get(feature, 0.0) + (self.learning_rate * temporal_difference * value)
+            self.weights[feature] = self.weights.get(feature, 0.0) + (self.hyperparams['learning_rate'] * temporal_difference * value)
         
         # Update action count for exploration bonus
         self.action_counts[(self.last_state_key, learning_key)] = self.action_counts.get((self.last_state_key, learning_key), 0) + 1
