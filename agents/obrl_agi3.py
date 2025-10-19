@@ -67,7 +67,6 @@ class ObrlAgi3Agent(Agent):
         # If the game is over or hasn't started, the correct action is to reset.
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
             self.actions_printed = False  # Reset the print flag for the new game.
-            self.is_new_level = True
             self.object_id_counter = 0
             return GameAction.RESET
         
