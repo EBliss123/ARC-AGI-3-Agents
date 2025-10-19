@@ -463,19 +463,52 @@ class ObrlAgi3Agent(Agent):
                             affected_object_ids.add(f"obj_{id_num_str}")
 
                     unique_log_messages = []
+                    change_log_map = {}
+                    for change_str in changes:
+                        if "Object id_" in change_str:
+                            try:
+                                id_num_str = change_str.split('id_')[1].split(' ')[0]
+                                obj_id = f"obj_{id_num_str}"
+                                change_log_map[obj_id] = change_str
+                            except IndexError:
+                                continue
+
+                    current_summary_map = {obj['id']: obj for obj in current_summary}
                     for obj in current_summary:
                         if obj['id'] in affected_object_ids:
                             state_fingerprint = (obj['id'], self._get_stable_id(obj), obj['position'])
                             if state_fingerprint not in self.seen_configurations:
                                 self.seen_configurations.add(state_fingerprint)
-                                obj_id_str = obj['id'].replace('obj_', 'id_')
-                                size_str = f"{obj['size'][0]}x{obj['size'][1]}"
-                                log_msg = (
-                                    f"- Unique State: Object {obj_id_str} recorded in new state "
-                                    f"(Color: {obj['color']}, Size: {size_str}, Pos: {obj['position']}, "
-                                    f"Fingerprint: {obj['fingerprint']})."
-                                )
-                                unique_log_messages.append(log_msg)
+
+                                change_str = change_log_map.get(obj['id'])
+                                if change_str:
+                                    try:
+                                        parts = change_str.split(': Object ')
+                                        transition_type = parts[0].replace('- ', '')
+                                        details = parts[1]
+                                        final_state = 'parsing_failed'
+
+                                        if 'RECOLORED' in transition_type:
+                                            final_state = int(details.split(' to ')[-1].replace('.', ''))
+                                        elif 'SHAPE_CHANGED' in transition_type:
+                                            final_state = int(details.split(' -> ')[-1].replace(').', ''))
+                                        elif 'MOVED' in transition_type:
+                                            pos_str = details.split(' to ')[-1].replace('.', '')
+                                            final_state = ast.literal_eval(pos_str)
+                                        elif 'GROWTH' in transition_type or 'SHRINK' in transition_type:
+                                            size_str = details.split(' to ')[1].split(')')[0]
+                                            tuple_str = f"({size_str.replace('x', ',')})"
+                                            final_state = ast.literal_eval(tuple_str)
+                                        elif ('TRANSFORM' in transition_type or 'NEW' in transition_type or 'REAPPEARED' in transition_type):
+                                            if obj['id'] in current_summary_map:
+                                                final_state = self._get_stable_id(current_summary_map[obj['id']])
+
+                                        if final_state != 'parsing_failed':
+                                            log_msg = f"- Type: {transition_type}, Object: {obj['id'].replace('obj_', 'id_')}, Final State: {final_state}"
+                                            unique_log_messages.append(log_msg)
+                                    except (IndexError, ValueError, KeyError, SyntaxError):
+                                        continue
+
                     novel_state_count = len(unique_log_messages)
 
                     # --- Milestone Detection ---
@@ -641,7 +674,7 @@ class ObrlAgi3Agent(Agent):
                         print("\n".join(log_output))
 
                     if unique_log_messages:
-                        print("\n--- Unique Change Log ---")
+                        print("\n--- Unique State Transition Log ---")
                         for msg in sorted(unique_log_messages):
                             print(msg)
 
@@ -810,7 +843,30 @@ class ObrlAgi3Agent(Agent):
                 pos = target_object['position']
                 coords_for_context = {'x': pos[1], 'y': pos[0]}
 
-            action_key = self._get_learning_key(action_template.name, coords_for_context)
+            action_key = self._get_learning_key(action_template.name, target_object['id'] if target_object else None)
+
+            # --- State Graph Exploration Bonus ---
+            state_exploration_bonus = 0.0
+            predicted_destination_id = None
+
+            # Look for a known connection in our state graph
+            for connection in self.state_graph:
+                if connection['source'] == self.logical_state_id and connection['action'] == action_key:
+                    predicted_destination_id = connection['destination']
+                    break
+
+            if predicted_destination_id is None:
+                # This action has never been taken from this state. It's pure exploration.
+                state_exploration_bonus = 50.0
+                print(f"State Exploration: Action {action_key} is unknown from this state. Adding max bonus.")
+            else:
+                # We've been to the destination before. Is it a well-explored state?
+                destination_history = self.state_action_history.get(predicted_destination_id, [])
+                num_actions_tried = len(destination_history)
+                # The bonus is higher for leading to states with fewer tried actions.
+                state_exploration_bonus = 30.0 / (1.0 + num_actions_tried)
+                obj_id_str = target_object['id'].replace('obj_', 'id_') if target_object else 'GLOBAL'
+                print(f"State Exploration: {action_key} on {obj_id_str} leads to state {predicted_destination_id} (history size: {num_actions_tried}). Bonus: {state_exploration_bonus:.2f}")
 
             # --- Check if the action is currently blacklisted ---
             if action_key in self.failed_action_blacklist:
@@ -886,7 +942,7 @@ class ObrlAgi3Agent(Agent):
                 obj_id_str = target_object['id'].replace('obj_', 'id_')
                 print(f"Heuristic: Object {obj_id_str} is blacklisted (failed {failure_count} time(s)). Applying penalty of {object_blacklist_penalty}.")
 
-            score += failure_penalty
+            score += failure_penalty + state_exploration_bonus
 
             # Pass the pre-calculated unmet goals to the bonus function
             goal_bonus = self._calculate_goal_bonus(move, current_summary, unmet_abstract_goals)
