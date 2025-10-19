@@ -4,6 +4,7 @@ from .structs import GameAction, GameState
 from collections import deque
 import copy
 import ast
+import statistics
 
 class ObrlAgi3Agent(Agent):
     """
@@ -58,6 +59,7 @@ class ObrlAgi3Agent(Agent):
         self.current_state_id = None
         self.click_failure_counts = {}
         self.object_blacklist = set()
+        self.successful_novelty_history = []
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -84,6 +86,7 @@ class ObrlAgi3Agent(Agent):
             self.last_taken_action_key = None
             self.transition_history = []
             self.current_state_id = None
+            self.successful_novelty_history = []
 
             self.level_state_history = []
             self.is_new_level = False
@@ -2670,19 +2673,24 @@ class ObrlAgi3Agent(Agent):
 
         # 1. Calculate reward
         reward = 0
-        # --- Normalized reward for unique state discovery ---
-        # Calculate the running average based on past successful moves.
-        average_unique_change = self.total_unique_changes / self.total_successful_moves if self.total_successful_moves > 0 else 0
+        # --- Sophisticated Novelty Analysis (Step 1: Median of Successes) ---
+        performance_vs_baseline = 0.0
+        # Only successful moves (that cause change) are considered for the baseline.
+        if changes:
+            # For now, the score is just the count. We'll make this a composite score in later steps.
+            current_turn_novelty_score = novel_state_count
+            self.successful_novelty_history.append(current_turn_novelty_score)
 
-        # Reward actions that perform better than average, penalize those that do worse.
-        performance_vs_average = novel_state_count - average_unique_change
-        print(f"Novelty Analysis: Found {novel_state_count} unique changes vs. average of {average_unique_change:.2f}. Performance score: {performance_vs_average:.2f}.")
-        reward += performance_vs_average * 15 # Multiplier makes this a strong signal
+            # The baseline is the median of all successful moves this level.
+            baseline_median = statistics.median(self.successful_novelty_history)
 
-        # Now, update the totals for the next turn's calculation.
-        self.total_unique_changes += novel_state_count
-        if novel_state_count > 0:
-            self.total_successful_moves += 1
+            performance_vs_baseline = current_turn_novelty_score - baseline_median
+            print(f"Novelty Analysis: Found {current_turn_novelty_score} unique changes vs. level median of {baseline_median:.2f}. Performance score: {performance_vs_baseline:.2f}.")
+        else:
+            # No changes, so performance is negative based on the discovery drought.
+            performance_vs_baseline = -self.turns_without_discovery
+
+        reward += performance_vs_baseline * 15 # Multiplier makes this a strong signal
 
         # --- Specific penalty for unexpected failures ---
         if is_failure:
@@ -2762,7 +2770,7 @@ class ObrlAgi3Agent(Agent):
         if changes:
             history['successes'] += 1
 
-        return performance_vs_average
+        return performance_vs_baseline
 
     def _find_object_by_coords(self, coords: dict | None) -> dict | None:
         """Helper to find an object in the last summary based on click coordinates."""
