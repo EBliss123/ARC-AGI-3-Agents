@@ -58,10 +58,6 @@ class ObrlAgi3Agent(Agent):
         self.current_state_id = None
         self.click_failure_counts = {}
         self.object_blacklist = set()
-        self.state_action_history = {}
-        self.state_graph = []
-        self.logical_state_id = 0
-        self.last_taken_action_key = None
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -81,6 +77,15 @@ class ObrlAgi3Agent(Agent):
         if not self.last_object_summary or self.is_new_level:
             self.click_failure_counts = {}
             self.object_blacklist = set()
+
+            print("\n--- New Level Detected: Resetting state graph and history. ---")
+            self.state_action_history = {}
+            self.state_graph = []
+            self.logical_state_id = 0
+            self.last_taken_action_key = None
+            self.transition_history = []
+            self.current_state_id = None
+
             self.level_state_history = []
             self.is_new_level = False
             self.level_milestones = []
