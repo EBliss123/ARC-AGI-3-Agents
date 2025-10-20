@@ -1,21 +1,14 @@
 import optuna
 import subprocess
+import json
 import argparse
 import sys
 
 def run_agent_and_get_score(params: dict) -> float:
     """
-    Launches the main agent script with a given set of hyperparameters,
-    captures its output, and parses the final score.
+    Launches the main agent script, captures its JSON scorecard output,
+    and returns a single objective score to maximize.
     """
-    # ---
-    # PREREQUISITE 1: Your main entrypoint script (e.g., main.py) must be modified
-    # to accept command-line arguments and pass them to the agent's constructor.
-    # An example of how to do this is provided in the comments at the bottom of this file.
-    # ---
-    
-    # This command assumes your main script is named 'main.py'.
-    # Change 'main.py' if your entrypoint script has a different name.
     command = ['python', 'main.py']
     for key, value in params.items():
         command.extend([f'--{key}', str(value)])
@@ -23,42 +16,48 @@ def run_agent_and_get_score(params: dict) -> float:
     print(f"\n--- Starting Trial with command: {' '.join(command)} ---")
     
     try:
-        # Run the agent script and wait for it to complete.
         result = subprocess.run(
             command, 
             capture_output=True, 
             text=True, 
-            check=True, # This will raise an error if the script fails
-            timeout=1800  # Set a timeout (e.g., 30 minutes) to kill trials that get stuck
+            check=True,
+            timeout=1800
         )
         
-        # ---
-        # PREREQUISITE 2: Your main script must print a machine-readable final line
-        # upon completion. For example: "FINAL_RESULT: WINS=4,STEPS=150"
-        # ---
+        # Find the final JSON scorecard in the agent's output
         for line in result.stdout.strip().split('\n'):
-            if line.startswith("FINAL_RESULT:"):
-                parts = line.replace("FINAL_RESULT: ", "").split(',')
-                wins = int(parts[0].split('=')[1])
-                steps = int(parts[1].split('=')[1])
-                
-                # This is our objective score: reward wins, penalize steps.
-                # A higher score is better.
-                score = (wins * 1000) - steps
-                print(f"--- Trial Complete. Wins: {wins}, Steps: {steps}. Objective Score: {score} ---")
-                return score
+            if line.strip().startswith("{") and '"played"' in line:
+                try:
+                    scorecard = json.loads(line)
+                    score = scorecard.get('score', 0)
+                    total_actions = scorecard.get('total_actions', 0)
+                    
+                    # --- NEW OBJECTIVE SCORE CALCULATION ---
+                    # Prioritize score, then efficiency (actions/score).
+                    objective_score = 0.0
+                    if score > 0:
+                        efficiency = total_actions / score
+                        objective_score = (score * 1000) - efficiency
+                    else:
+                        # If score is 0 or less, just penalize based on actions taken.
+                        objective_score = -total_actions
+                    
+                    print(f"--- Trial Complete. Score: {score}, Actions: {total_actions}. Objective Score: {objective_score:.2f} ---")
+                    return objective_score
 
-        print("--- Trial Warning: FINAL_RESULT line not found in agent output. ---")
-        return -float('inf') # Return a very bad score if the result line isn't found
+                except (json.JSONDecodeError, ZeroDivisionError):
+                    continue # Ignore lines that are not valid JSON or cause math errors
+
+        print("--- Trial Warning: Scorecard JSON not found in agent output. ---")
+        return -float('inf')
 
     except subprocess.CalledProcessError as e:
         print(f"--- Trial FAILED with an error. ---")
-        print(e.stderr) # Print the error for debugging
-        return -float('inf') # Return a very bad score for failed/crashed runs
+        print(e.stderr)
+        return -float('inf')
     except subprocess.TimeoutExpired:
         print(f"--- Trial FAILED: Timed out. ---")
         return -float('inf')
-
 
 def objective(trial: optuna.Trial) -> float:
     """
