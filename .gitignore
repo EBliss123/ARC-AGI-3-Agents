@@ -19,3 +19,5 @@ tests/recordings/not-a-recording.txt
 
 # Long-term memory
 memory.db
+tuning_study.db
+tuning_study.db
