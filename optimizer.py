@@ -20,7 +20,7 @@ def run_agent_and_get_score(params: dict) -> float:
     # NOTE: This assumes your environment is named 'base'.
     command = f'conda run -n arc_agent {python_command_string}'
 
-    print(f"\n--- Starting Trial with command: {' '.join(command)}")
+    print(f"\n--- Starting Trial with command: {''.join(command)}")
 
     try:
         result = subprocess.run(
@@ -110,15 +110,15 @@ if __name__ == "__main__":
     # and resume the tuning process at any time.
     study = optuna.create_study(
         direction='maximize',
-        study_name='obrl_agi3_tuning',
-        storage='sqlite:///tuning_study.db', # This file will be created
+        study_name='obrl_agi3_tuning_2', #change name for different studies
+        storage='sqlite:///tuning_study_2.db', #change name for different studies
         load_if_exists=True
     )
 
     # Start the optimization. Optuna will call the 'objective' function N times.
     # 'n_jobs=-1' tells Optuna to run trials in parallel using all available CPU cores.
     try:
-        study.optimize(objective, n_trials=1, n_jobs=1)
+        study.optimize(objective, n_trials=10, n_jobs=-1) #trials is total changes, jobs uses all cores
     except KeyboardInterrupt:
         print("--- Tuning interrupted by user. Study progress has been saved. ---")
 
