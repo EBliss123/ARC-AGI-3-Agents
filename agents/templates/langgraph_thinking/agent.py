@@ -14,7 +14,7 @@ from .schema import LLM, AgentState
 class LangGraphThinking(Agent):
     """A LangGraph agent, using a variety of tools to make decisions."""
 
-    MAX_ACTIONS = 20
+    MAX_ACTIONS = 2
 
     agent_state: AgentState
     workflow: Pregel[AgentState, Any, AgentState, AgentState]

@@ -9,11 +9,11 @@ def run_agent_and_get_score(params: dict) -> float:
     Launches the main agent script, captures its final output,
     and returns a single objective score to maximize.
     """
-    command = ['python', 'main.py']
+    command = [sys.executable, 'main.py', '-a', 'obrlagi3agent']
     for key, value in params.items():
         command.extend([f'--{key}', str(value)])
 
-    print(f"\n--- Starting Trial with command: {' '.join(command)} ---")
+    print(f"\n--- Starting Trial with command: {' '.join(command)}")
 
     try:
         result = subprocess.run(
@@ -41,10 +41,10 @@ def run_agent_and_get_score(params: dict) -> float:
                     # If score is 0 or less, just penalize the number of actions.
                     objective_score = -actions
 
-                print(f"--- Trial Complete. Score: {score}, Actions: {actions}. Objective Score: {objective_score:.2f} ---")
+                print(f"--- Trial Complete. Score: {score}, Actions: {actions}. Objective Score: {objective_score:.2f}")
                 return objective_score
 
-        print("--- Trial Warning: FINAL_RESULT line not found in agent output. ---")
+        print("--- Trial Warning: FINAL_RESULT line not found in agent output. ")
         return -float('inf')
 
     except subprocess.CalledProcessError as e:
@@ -109,7 +109,7 @@ if __name__ == "__main__":
     # Start the optimization. Optuna will call the 'objective' function N times.
     # 'n_jobs=-1' tells Optuna to run trials in parallel using all available CPU cores.
     try:
-        study.optimize(objective, n_trials=100, n_jobs=-1)
+        study.optimize(objective, n_trials=1, n_jobs=1)
     except KeyboardInterrupt:
         print("--- Tuning interrupted by user. Study progress has been saved. ---")
 
