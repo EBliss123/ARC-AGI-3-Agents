@@ -48,8 +48,6 @@ HEADERS = {
 
 def run_agent(swarm: Swarm) -> None:
     swarm.main()
-    os.kill(os.getpid(), signal.SIGINT)
-
 
 def cleanup(
     swarm: Swarm,
@@ -247,14 +245,13 @@ def main() -> None:
     signal.signal(signal.SIGINT, partial(cleanup, swarm))  # handler for Ctrl+C
 
     try:
-        # Wait for the agent thread to complete
-        while agent_thread.is_alive():
-            agent_thread.join(timeout=5)  # Check every 5 second
+        # Wait indefinitely for the agent thread to complete on its own.
+        agent_thread.join()
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt received in main thread")
-        cleanup(swarm, signal.SIGINT, None)
-    except Exception as e:
-        logger.error(f"Unexpected error in main thread: {e}")
+    finally:
+        # This block will run whether the agent finished normally or was interrupted.
+        logger.info("Agent thread finished. Cleaning up.")
         cleanup(swarm, None, None)
 if __name__ == "__main__":
     os.environ["TESTING"] = "False"

@@ -3,15 +3,22 @@ import subprocess
 import json
 import argparse
 import sys
+import os
 
 def run_agent_and_get_score(params: dict) -> float:
     """
     Launches the main agent script, captures its final output,
     and returns a single objective score to maximize.
     """
-    command = [sys.executable, 'main.py', '-a', 'obrlagi3agent']
+    # Build the python command as a single string
+    python_command_string = f"python main.py -a obrlagi3agent"
     for key, value in params.items():
-        command.extend([f'--{key}', str(value)])
+        python_command_string += f" --{key} {value}"
+
+    # On Windows, it's more robust to call conda through the shell.
+    # This command activates the 'base' environment and then executes our python string.
+    # NOTE: This assumes your environment is named 'base'.
+    command = f'conda run -n arc_agent {python_command_string}'
 
     print(f"\n--- Starting Trial with command: {' '.join(command)}")
 
@@ -21,7 +28,9 @@ def run_agent_and_get_score(params: dict) -> float:
             capture_output=True, 
             text=True, 
             check=True,
-            timeout=1800
+            timeout=1800,
+            env=os.environ,
+            shell=True
         )
 
         # Find the final result line in the agent's output
