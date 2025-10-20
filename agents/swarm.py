@@ -38,6 +38,7 @@ class Swarm:
         ROOT_URL: str,
         games: list[str],
         tags: list[str] = [],
+        params=None
     ) -> None:
         from . import AVAILABLE_AGENTS
 
@@ -55,6 +56,7 @@ class Swarm:
         self._session = requests.Session()
         self._session.headers.update(self.headers)
         self.tags = tags.copy() if tags else []
+        self.agent_params = params
 
         # Set up base tags for tracing
         if self.agent_name.endswith(".recording.jsonl"):
@@ -83,6 +85,7 @@ class Swarm:
                 record=True,
                 cookies=self._session.cookies,
                 tags=self.tags,
+                params=self.agent_params,
             )
             self.agents.append(a)
 
@@ -104,6 +107,18 @@ class Swarm:
         if scorecard:
             logger.info("--- FINAL SCORECARD REPORT ---")
             logger.info(json.dumps(scorecard.model_dump(), indent=2))
+
+        # --- Calculate and Print Final Results for Optimizer ---
+        total_wins = 0
+        total_steps = 0
+        if scorecard.games:
+            for game in scorecard.games:
+                if game.status == 'win':
+                    total_wins += 1
+                total_steps += game.steps
+
+        # This specific format is what optimizer.py will parse
+        print(f"FINAL_RESULT: WINS={total_wins},STEPS={total_steps}")
 
         # Provide web link to scorecard
         if card_id:

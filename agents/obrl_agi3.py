@@ -11,7 +11,7 @@ class ObrlAgi3Agent(Agent):
     An agent for the ARC-AGI-3 challenge using object-based reinforcement learning.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, params: dict = None, **kwargs):
         """
         The constructor for the agent.
         """
@@ -54,6 +54,11 @@ class ObrlAgi3Agent(Agent):
             'planning_confidence_threshold': 0.9, # Confidence threshold for a rule to be used in goal-seeking lookahead.
             'recent_effect_patterns_maxlen': 20, # How many recent action outcomes to remember for detecting repetition.
         }
+        
+        # If a dictionary of params was provided, update the defaults.
+        if params:
+            self.hyperparams.update(params)
+
         self.visited_states = set()
         self.seen_object_states = set()
         self.recent_effect_patterns = deque(maxlen=self.hyperparams['recent_effect_patterns_maxlen'])
