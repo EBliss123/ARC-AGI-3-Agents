@@ -14,13 +14,11 @@ import threading
 from functools import partial
 from types import FrameType
 from typing import Optional
-from agents.my_custom_agent import MyCustomAgent
-
+from agents.obrl_agi3 import ObrlAgi3Agent
 import requests
 
 from agents import AVAILABLE_AGENTS, Swarm
 from agents.tracing import initialize as init_agentops
-from agents.my_custom_agent import MyCustomAgent 
 
 logger = logging.getLogger()
 
