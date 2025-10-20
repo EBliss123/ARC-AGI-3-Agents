@@ -85,7 +85,7 @@ def objective(trial: optuna.Trial) -> float:
         'bonus_goal_seeking': trial.suggest_float('bonus_goal_seeking', 50.0, 300.0),
 
         # Heuristic Weights & Thresholds
-        'weight_novelty_ratio': trial.suggest_float('weight_novel_ratio', 2.0, 75.0),
+        'weight_novelty_ratio': trial.suggest_float('weight_novelty_ratio', 2.0, 75.0),
         'planning_confidence_threshold': trial.suggest_float('planning_confidence_threshold', 0.75, 0.99),
         'recent_effect_patterns_maxlen': trial.suggest_int('recent_effect_patterns_maxlen', 3, 50),
     }
