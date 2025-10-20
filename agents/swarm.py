@@ -109,16 +109,12 @@ class Swarm:
             logger.info(json.dumps(scorecard.model_dump(), indent=2))
 
         # --- Calculate and Print Final Results for Optimizer ---
-        total_wins = 0
-        total_steps = 0
-        if scorecard.games:
-            for game in scorecard.games:
-                if game.status == 'win':
-                    total_wins += 1
-                total_steps += game.steps
+        # Directly access the score and actions from the scorecard object.
+        final_score = scorecard.score
+        total_actions = scorecard.total_actions
 
         # This specific format is what optimizer.py will parse
-        print(f"FINAL_RESULT: WINS={total_wins},STEPS={total_steps}")
+        print(f"FINAL_RESULT: SCORE={final_score},ACTIONS={total_actions}")
 
         # Provide web link to scorecard
         if card_id:

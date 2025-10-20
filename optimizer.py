@@ -6,7 +6,7 @@ import sys
 
 def run_agent_and_get_score(params: dict) -> float:
     """
-    Launches the main agent script, captures its JSON scorecard output,
+    Launches the main agent script, captures its final output,
     and returns a single objective score to maximize.
     """
     command = ['python', 'main.py']
@@ -14,7 +14,7 @@ def run_agent_and_get_score(params: dict) -> float:
         command.extend([f'--{key}', str(value)])
 
     print(f"\n--- Starting Trial with command: {' '.join(command)} ---")
-    
+
     try:
         result = subprocess.run(
             command, 
@@ -23,32 +23,28 @@ def run_agent_and_get_score(params: dict) -> float:
             check=True,
             timeout=1800
         )
-        
-        # Find the final JSON scorecard in the agent's output
+
+        # Find the final result line in the agent's output
         for line in result.stdout.strip().split('\n'):
-            if line.strip().startswith("{") and '"played"' in line:
-                try:
-                    scorecard = json.loads(line)
-                    score = scorecard.get('score', 0)
-                    total_actions = scorecard.get('total_actions', 0)
-                    
-                    # --- NEW OBJECTIVE SCORE CALCULATION ---
-                    # Prioritize score, then efficiency (actions/score).
-                    objective_score = 0.0
-                    if score > 0:
-                        efficiency = total_actions / score
-                        objective_score = (score * 1000) - efficiency
-                    else:
-                        # If score is 0 or less, just penalize based on actions taken.
-                        objective_score = -total_actions
-                    
-                    print(f"--- Trial Complete. Score: {score}, Actions: {total_actions}. Objective Score: {objective_score:.2f} ---")
-                    return objective_score
+            if line.startswith("FINAL_RESULT:"):
+                parts = line.replace("FINAL_RESULT: ", "").split(',')
+                score = int(parts[0].split('=')[1])
+                actions = int(parts[1].split('=')[1])
 
-                except (json.JSONDecodeError, ZeroDivisionError):
-                    continue # Ignore lines that are not valid JSON or cause math errors
+                # --- NEW OBJECTIVE SCORE CALCULATION ---
+                # Prioritize score, then efficiency (actions/score).
+                objective_score = 0.0
+                if score > 0:
+                    efficiency_penalty = actions / score
+                    objective_score = (score * 1000) - efficiency_penalty
+                else:
+                    # If score is 0 or less, just penalize the number of actions.
+                    objective_score = -actions
 
-        print("--- Trial Warning: Scorecard JSON not found in agent output. ---")
+                print(f"--- Trial Complete. Score: {score}, Actions: {actions}. Objective Score: {objective_score:.2f} ---")
+                return objective_score
+
+        print("--- Trial Warning: FINAL_RESULT line not found in agent output. ---")
         return -float('inf')
 
     except subprocess.CalledProcessError as e:
