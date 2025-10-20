@@ -55,8 +55,10 @@ def cleanup(
     frame: Optional[FrameType],
 ) -> None:
     logger.info("Received SIGINT, exiting...")
-    card_id = swarm.card_id
-    if card_id:
+    # Check if the swarm object has a card_id before trying to access it.
+    # This prevents a crash if the agent failed before the scorecard was opened.
+    if hasattr(swarm, 'card_id') and swarm.card_id:
+        card_id = swarm.card_id
         scorecard = swarm.close_scorecard(card_id)
         if scorecard:
             logger.info("--- EXISTING SCORECARD REPORT ---")
