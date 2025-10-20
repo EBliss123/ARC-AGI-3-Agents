@@ -110,8 +110,8 @@ if __name__ == "__main__":
     # and resume the tuning process at any time.
     study = optuna.create_study(
         direction='maximize',
-        study_name='obrl_agi3_tuning_2', #change name for different studies
-        storage='sqlite:///tuning_study_2.db', #change name for different studies
+        study_name='obrl_agi3_tuning_3', #change name for different studies
+        storage='sqlite:///tuning_study_3.db', #change name for different studies
         load_if_exists=True
     )
 

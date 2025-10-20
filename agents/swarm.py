@@ -133,13 +133,14 @@ class Swarm:
         return scorecard
 
     def open_scorecard(self) -> str:
-        json_str = json.dumps({"tags": self.tags})
+        with self.api_lock:
+            json_str = json.dumps({"tags": self.tags})
 
-        r = self._session.post(
-            f"{self.ROOT_URL}/api/scorecard/open",
-            json=json.loads(json_str),
-            headers=self.headers,
-        )
+            r = self._session.post(
+                f"{self.ROOT_URL}/api/scorecard/open",
+                json=json.loads(json_str),
+                headers=self.headers,
+            )
 
         try:
             response_data = r.json()
@@ -154,9 +155,10 @@ class Swarm:
         return str(response_data["card_id"])
 
     def close_scorecard(self, card_id: str) -> Optional[Scorecard]:
-        self.card_id = None
-        json_str = json.dumps({"card_id": card_id})
-        r = self._session.post(
+        with self.api_lock:
+            self.card_id = None
+            json_str = json.dumps({"card_id": card_id})
+            r = self._session.post(
             f"{self.ROOT_URL}/api/scorecard/close",
             json=json.loads(json_str),
             headers=self.headers,
