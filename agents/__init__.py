@@ -7,7 +7,7 @@ from .recorder import Recorder
 from .swarm import Swarm
 from .templates.langgraph_functional_agent import LangGraphFunc, LangGraphTextOnly
 from .templates.langgraph_random_agent import LangGraphRandom
-from .templates.langgraph_thinking import LangGraphThinking
+from .templates.langgraph_thinking.agent import LangGraphThinking
 from .templates.llm_agents import LLM, FastLLM, GuidedLLM, ReasoningLLM
 from .templates.random_agent import Random
 from .templates.reasoning_agent import ReasoningAgent
