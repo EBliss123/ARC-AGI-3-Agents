@@ -110,6 +110,27 @@ def main() -> None:
         default=None,
     )
 
+    # --- Hyperparameters for the Optimizer ---
+    parser.add_argument('--learning_rate', type=float)
+    parser.add_argument('--discount_factor', type=float)
+    parser.add_argument('--reward_win', type=float)
+    parser.add_argument('--reward_novelty_multiplier', type=float)
+    parser.add_argument('--reward_new_effect_pattern', type=float)
+    parser.add_argument('--penalty_unexpected_failure', type=float)
+    parser.add_argument('--penalty_repeated_effect', type=float)
+    parser.add_argument('--penalty_boring_move', type=float)
+    parser.add_argument('--penalty_predicted_failure', type=float)
+    parser.add_argument('--penalty_blacklist_base', type=float)
+    parser.add_argument('--penalty_blacklist_scaler', type=float)
+    parser.add_argument('--drought_increment', type=float)
+    parser.add_argument('--bonus_action_exp', type=float)
+    parser.add_argument('--bonus_state_exp_unknown', type=float)
+    parser.add_argument('--bonus_state_exp_known_scaler', type=float)
+    parser.add_argument('--bonus_goal_seeking', type=float)
+    parser.add_argument('--weight_novelty_ratio', type=float)
+    parser.add_argument('--planning_confidence_threshold', type=float)
+    parser.add_argument('--recent_effect_patterns_maxlen', type=int)
+
     args = parser.parse_args()
 
     if not args.agent:
@@ -181,11 +202,38 @@ def main() -> None:
     # Initialize AgentOps client
     init_agentops(api_key=os.getenv("AGENTOPS_API_KEY"), log_level=log_level)
 
+    # --- Collect Hyperparameters for the Agent ---
+    # Create a dictionary of only the hyperparameters that were passed via command line
+    hyperparams_to_pass = {
+        'learning_rate': args.learning_rate,
+        'discount_factor': args.discount_factor,
+        'reward_win': args.reward_win,
+        'reward_novelty_multiplier': args.reward_novelty_multiplier,
+        'reward_new_effect_pattern': args.reward_new_effect_pattern,
+        'penalty_unexpected_failure': args.penalty_unexpected_failure,
+        'penalty_repeated_effect': args.penalty_repeated_effect,
+        'penalty_boring_move': args.penalty_boring_move,
+        'penalty_predicted_failure': args.penalty_predicted_failure,
+        'penalty_blacklist_base': args.penalty_blacklist_base,
+        'penalty_blacklist_scaler': args.penalty_blacklist_scaler,
+        'drought_increment': args.drought_increment,
+        'bonus_action_exp': args.bonus_action_exp,
+        'bonus_state_exp_unknown': args.bonus_state_exp_unknown,
+        'bonus_state_exp_known_scaler': args.bonus_state_exp_known_scaler,
+        'bonus_goal_seeking': args.bonus_goal_seeking,
+        'weight_novelty_ratio': args.weight_novelty_ratio,
+        'planning_confidence_threshold': args.planning_confidence_threshold,
+        'recent_effect_patterns_maxlen': args.recent_effect_patterns_maxlen,
+    }
+    # Filter out any that were not set, so we don't pass `None`
+    cli_params = {key: value for key, value in hyperparams_to_pass.items() if value is not None}
+
     swarm = Swarm(
         args.agent,
         ROOT_URL,
         games,
-        tags=tags,  # Pass tags as keyword argument
+        tags=tags,
+        params=cli_params,  # Pass the collected hyperparameters
     )
     agent_thread = threading.Thread(target=partial(run_agent, swarm))
     agent_thread.daemon = True  # die when the main thread dies
