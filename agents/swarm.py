@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import os
-from threading import Thread
+from threading import Thread, Lock
 from typing import TYPE_CHECKING, Optional, Type
+import time
+import random
 
 import requests
 
@@ -38,7 +40,7 @@ class Swarm:
         ROOT_URL: str,
         games: list[str],
         tags: list[str] = [],
-        params=None
+        params=None,
     ) -> None:
         from . import AVAILABLE_AGENTS
 
@@ -57,6 +59,7 @@ class Swarm:
         self._session.headers.update(self.headers)
         self.tags = tags.copy() if tags else []
         self.agent_params = params
+        self.api_lock = Lock()
 
         # Set up base tags for tracing
         if self.agent_name.endswith(".recording.jsonl"):
@@ -70,6 +73,9 @@ class Swarm:
 
     def main(self) -> Scorecard | None:
         """The main orchestration loop, continues until all agents are done."""
+
+        # Stagger startup to avoid overwhelming the API server when running in parallel.
+        time.sleep(random.uniform(0.5, 5.0))
 
         # submit start of scorecard
         self.card_id = self.open_scorecard()
@@ -86,6 +92,7 @@ class Swarm:
                 cookies=self._session.cookies,
                 tags=self.tags,
                 params=self.agent_params,
+                api_lock=self.api_lock,
             )
             self.agents.append(a)
 

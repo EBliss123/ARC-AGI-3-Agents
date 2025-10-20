@@ -4,6 +4,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from copy import deepcopy
+from threading import Lock
 from typing import Any, Optional
 
 import requests
@@ -51,6 +52,7 @@ class Agent(ABC):
         record: bool,
         tags: Optional[list[str]] = None,
         cookies: requests.cookies.RequestsCookieJar = RequestsCookieJar(),
+        api_lock: Optional[Lock] = None,
     ) -> None:
         self.ROOT_URL = ROOT_URL
         self.card_id = card_id
@@ -66,6 +68,7 @@ class Agent(ABC):
             "X-API-Key": os.getenv("ARC_API_KEY", ""),
             "Accept": "application/json",
         }
+        self.api_lock = api_lock
         # Reuse session
         self._session = requests.Session()
         self._session.cookies = deepcopy(cookies)
@@ -154,11 +157,22 @@ class Agent(ABC):
             data["game_id"] = self.game_id
 
         json_str = json.dumps(data)
-        r = self._session.post(
-            f"{self.ROOT_URL}/api/cmd/{action.name}",
-            json=json.loads(json_str),
-            headers=self.headers,
-        )
+
+        # Use the lock to ensure only one thread makes an API call at a time
+        if self.api_lock:
+            with self.api_lock:
+                r = self._session.post(
+                    f"{self.ROOT_URL}/api/cmd/{action.name}",
+                    json=json.loads(json_str),
+                    headers=self.headers,
+                )
+        else: # Fallback for running without a swarm/lock
+            r = self._session.post(
+                f"{self.ROOT_URL}/api/cmd/{action.name}",
+                json=json.loads(json_str),
+                headers=self.headers,
+            )
+
         if "error" in r.json():
             logger.warning(f"Exception during action request: {r.json()}")
         return r
