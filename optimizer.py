@@ -64,30 +64,30 @@ def objective(trial: optuna.Trial) -> float:
     params = {
         # Learning Algorithm Parameters
         'learning_rate': trial.suggest_float('learning_rate', 0.001, 0.2, log=True),
-        'discount_factor': trial.suggest_float('discount_factor', 0.85, 0.99),
+        'discount_factor': trial.suggest_float('discount_factor', 0.8, 0.99),
 
         # Reward & Penalty Magnitudes
-        'reward_win': trial.suggest_float('reward_win', 100.0, 500.0),
-        'reward_novelty_multiplier': trial.suggest_float('reward_novelty_multiplier', 5.0, 50.0),
-        'reward_new_effect_pattern': trial.suggest_float('reward_new_effect_pattern', 10.0, 50.0),
-        'penalty_unexpected_failure': trial.suggest_float('penalty_unexpected_failure', 10.0, 50.0),
-        'penalty_repeated_effect': trial.suggest_float('penalty_repeated_effect', 1.0, 20.0),
-        'penalty_boring_move': trial.suggest_float('penalty_boring_move', 20.0, 200.0),
+        'reward_win': trial.suggest_float('reward_win', 100.0, 1000.0),
+        'reward_novelty_multiplier': trial.suggest_float('reward_novelty_multiplier', 5.0, 250.0),
+        'reward_new_effect_pattern': trial.suggest_float('reward_new_effect_pattern', 1.0, 50.0),
+        'penalty_unexpected_failure': trial.suggest_float('penalty_unexpected_failure', 5.0, 150.0),
+        'penalty_repeated_effect': trial.suggest_float('penalty_repeated_effect', 5.0, 500.0),
+        'penalty_boring_move': trial.suggest_float('penalty_boring_move', 5.0, 500.0),
         'penalty_predicted_failure': trial.suggest_float('penalty_predicted_failure', 50.0, 1000.0),
         'penalty_blacklist_base': trial.suggest_float('penalty_blacklist_base', 1000.0, 10000.0),
         'penalty_blacklist_scaler': trial.suggest_float('penalty_blacklist_scaler', 50.0, 200.0),
-        'drought_increment': trial.suggest_float('drought_increment', 5.0, 25.0),
+        'drought_increment': trial.suggest_float('drought_increment', 5.0, 50.0),
 
         # Exploration & Goal Bonuses
-        'bonus_action_exp': trial.suggest_float('bonus_action_exp', 10.0, 50.0),
-        'bonus_state_exp_unknown': trial.suggest_float('bonus_state_exp_unknown', 25.0, 150.0),
-        'bonus_state_exp_known_scaler': trial.suggest_float('bonus_state_exp_known_scaler', 10.0, 100.0),
-        'bonus_goal_seeking': trial.suggest_float('bonus_goal_seeking', 50.0, 200.0),
+        'bonus_action_exp': trial.suggest_float('bonus_action_exp', 10.0, 500.0),
+        'bonus_state_exp_unknown': trial.suggest_float('bonus_state_exp_unknown', 25.0, 750.0),
+        'bonus_state_exp_known_scaler': trial.suggest_float('bonus_state_exp_known_scaler', 10.0, 500.0),
+        'bonus_goal_seeking': trial.suggest_float('bonus_goal_seeking', 50.0, 300.0),
 
         # Heuristic Weights & Thresholds
-        'weight_novelty_ratio': trial.suggest_float('weight_novel_ratio', 2.0, 20.0),
-        'planning_confidence_threshold': trial.suggest_float('planning_confidence_threshold', 0.7, 0.99),
-        'recent_effect_patterns_maxlen': trial.suggest_int('recent_effect_patterns_maxlen', 10, 50),
+        'weight_novelty_ratio': trial.suggest_float('weight_novel_ratio', 2.0, 75.0),
+        'planning_confidence_threshold': trial.suggest_float('planning_confidence_threshold', 0.75, 0.99),
+        'recent_effect_patterns_maxlen': trial.suggest_int('recent_effect_patterns_maxlen', 3, 50),
     }
 
     # 2. Run the agent with these parameters and get its performance score.
