@@ -108,6 +108,9 @@ class Swarm:
         for t in self.threads:
             t.join()
 
+        # Stagger the cleanup to avoid a final burst of API calls.
+        time.sleep(random.uniform(0.5, 5.0))
+
         # all agents are now done
         card_id = self.card_id
         scorecard = self.close_scorecard(card_id)
