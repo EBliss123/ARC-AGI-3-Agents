@@ -4,6 +4,7 @@ from typing import Any, cast
 from langgraph.graph import END, START, StateGraph
 from langgraph.pregel import Pregel
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.store.sqlite import SqliteStore
 
 from ...agent import Agent
 from ...structs import FrameData, GameAction, GameState
@@ -67,17 +68,16 @@ class LangGraphThinking(Agent):
 
         workflow.add_edge("act", END)
 
-        # Create a connection to the SQLite database.
-        conn = sqlite3.connect(
-            "memory.db",
-            check_same_thread=False,
-            isolation_level=None,  # autocommit mode
+        return workflow.compile(
+            store=SqliteStore(
+                sqlite3.connect(
+                    "memory.db",
+                    check_same_thread=False,
+                    isolation_level=None,  # autocommit mode
+                )
+            )
         )
 
-        # Use the new SqliteSaver as the checkpointer.
-        checkpointer = SqliteSaver.from_conn(conn)
-
-        return workflow.compile(checkpointer=checkpointer)
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         """Decide if the agent is done playing or not."""

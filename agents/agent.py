@@ -22,7 +22,7 @@ logger = logging.getLogger()
 class Agent(ABC):
     """Interface for an agent that plays one ARC-AGI-3 game."""
 
-    MAX_ACTIONS: int = 240  # to avoid looping forever if agent doesnt exit
+    MAX_ACTIONS: int = 2  # to avoid looping forever if agent doesnt exit
     ROOT_URL: str
 
     action_counter: int = 0
