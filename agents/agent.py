@@ -157,25 +157,43 @@ class Agent(ABC):
         if self.game_id:
             data["game_id"] = self.game_id
 
-        json_str = json.dumps(data)
+        json_payload = json.loads(json.dumps(data))
+        max_retries = 5
+        base_backoff = 0.5  # seconds
 
-        # Use the lock to ensure only one thread makes an API call at a time
-        if self.api_lock:
-            with self.api_lock:
+        for i in range(max_retries):
+            # Use the lock to ensure only one thread makes an API call at a time
+            if self.api_lock:
+                with self.api_lock:
+                    r = self._session.post(
+                        f"{self.ROOT_URL}/api/cmd/{action.name}",
+                        json=json_payload,
+                        headers=self.headers,
+                    )
+            else: # Fallback for running without a swarm/lock
                 r = self._session.post(
                     f"{self.ROOT_URL}/api/cmd/{action.name}",
-                    json=json.loads(json_str),
+                    json=json_payload,
                     headers=self.headers,
                 )
-        else: # Fallback for running without a swarm/lock
-            r = self._session.post(
-                f"{self.ROOT_URL}/api/cmd/{action.name}",
-                json=json.loads(json_str),
-                headers=self.headers,
-            )
 
-        if "error" in r.json():
-            logger.warning(f"Exception during action request: {r.json()}")
+            # A 429 status code means "Too Many Requests"
+            if r.status_code == 429:
+                # Exponentially increase wait time, with a little randomness
+                wait_time = base_backoff * (2 ** i) + random.uniform(0, 0.1)
+                logger.warning(
+                    f"Rate limit exceeded. Retrying in {wait_time:.2f} seconds... (Attempt {i + 1}/{max_retries})"
+                )
+                time.sleep(wait_time)
+                continue # Go to the next iteration of the loop to retry
+
+            # If the request was successful or had a different error, return the response
+            if "error" in r.json():
+                logger.warning(f"Exception during action request: {r.json()}")
+            return r
+
+        # This part is reached only if all retries have failed
+        logger.error(f"Action '{action.name}' failed after {max_retries} retries due to persistent rate limiting.")
         return r
 
     def take_action(self, action: GameAction) -> Optional[FrameData]:
