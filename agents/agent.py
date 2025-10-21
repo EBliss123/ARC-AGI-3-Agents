@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import random
 import time
 from abc import ABC, abstractmethod
 from copy import deepcopy
@@ -201,6 +202,7 @@ class Agent(ABC):
 
     def cleanup(self, scorecard: Optional[Scorecard] = None) -> None:
         """Called after main loop is finished."""
+        time.sleep(random.uniform(0, 4.0))
         if self._cleanup:
             self._cleanup = False  # only cleanup once per agent
             if hasattr(self, "recorder") and not self.is_playback:
