@@ -44,7 +44,7 @@ class Swarm:
     ) -> None:
         from . import AVAILABLE_AGENTS
 
-        self.GAMES = games
+        self.GAMES = games #if adding unique logic, change trial db
         self.ROOT_URL = ROOT_URL
         self.agent_name = agent
         self.agent_class = AVAILABLE_AGENTS[agent]
