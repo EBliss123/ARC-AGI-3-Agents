@@ -111,15 +111,15 @@ if __name__ == "__main__":
     # and resume the tuning process at any time.
     study = optuna.create_study(
         direction='maximize',
-        study_name='obrl_agi3_tuning_8', #change name for different studies
-        storage='sqlite:///tuning_study_8.db', #change name for different studies
+        study_name='obrl_agi3_tuning_9', #change name for different studies
+        storage='sqlite:///tuning_study_9.db', #change name for different studies
         load_if_exists=True
     )
 
     # Start the optimization. Optuna will call the 'objective' function N times.
     # 'n_jobs=-1' tells Optuna to run trials in parallel using all available CPU cores.
     try:
-        study.optimize(objective, n_trials=3, n_jobs=3) #trials is total changes, jobs uses all cores
+        study.optimize(objective, n_trials=12, n_jobs=2) #trials is total changes, jobs uses all cores
     except KeyboardInterrupt:
         print("--- Tuning interrupted by user. Study progress has been saved. ---")
 
