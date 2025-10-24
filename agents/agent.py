@@ -84,7 +84,10 @@ class Agent(ABC):
             and self.action_counter <= self.MAX_ACTIONS
         ):
             action = self.choose_action(self.frames, self.frames[-1])
-            if frame := self.take_action(action):
+            
+            frame = self.take_action(action)
+            
+            if frame:
                 # Store the score from before the latest action
                 previous_score = self.score
 
@@ -100,7 +103,8 @@ class Agent(ABC):
                     )
                     self.action_counter = 0
 
-            self.action_counter += 1
+                # --- This line is now moved inside the 'if' block ---
+                self.action_counter += 1
 
         self.cleanup()
 
@@ -198,11 +202,20 @@ class Agent(ABC):
 
     def take_action(self, action: GameAction) -> Optional[FrameData]:
         """Submits the specific action and gets the next frame."""
-        frame_data = self.do_action_request(action).json()
+        response = self.do_action_request(action)
+
+        # Check if the HTTP request was successful (e.g., status 200 OK)
+        if not response.ok:
+            logger.warning(
+                f"Action request failed with status {response.status_code}. Agent will continue."
+            )
+            return None # Gracefully skip this frame without crashing
+
         try:
+            frame_data = response.json()
             frame = FrameData.model_validate(frame_data)
-        except ValidationError as e:
-            logger.warning(f"Incoming frame data did not validate: {e}")
+        except (ValidationError, requests.exceptions.JSONDecodeError) as e:
+            logger.warning(f"Could not process frame data from a successful request: {e}")
             return None
         return frame
 
