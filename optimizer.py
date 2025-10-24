@@ -7,58 +7,62 @@ import os
 
 def run_agent_and_get_score(params: dict) -> float:
     """
-    Launches the main agent script directly using the correct Python executable.
+    Launches the main agent script, streams its output, and captures the final score.
     """
-    # Build the command as a LIST of arguments, starting with the exact Python executable.
-    # This is the most robust way to run a subprocess from an activated environment.
+    # Build the command as a LIST of arguments
     command = [sys.executable, 'main.py', '-a', 'obrlagi3agent']
     for key, value in params.items():
         command.extend([f'--{key}', str(value)])
 
     print(f"\n--- Starting Trial with command: {' '.join(command)} ---")
     
+    final_result_line = None
+    
     try:
-        # Pass the command as a list and set shell=False
-        result = subprocess.run(
-            command, 
-            capture_output=True, 
-            text=True, 
-            check=True,
-            timeout=1800,
-            env=os.environ,
-            shell=False # Important: shell=False when passing a list
+        # Use Popen to get real-time access to the output
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # Merge error output with standard output
+            text=True,
+            env=os.environ
         )
+
+        # Read the output line by line as it is generated
+        for line in process.stdout:
+            stripped_line = line.strip()
+
+            # --- Filtered Printing ---
+            # Only print the lines we care about for debugging
+            if "DEBUG" in stripped_line or "WARNING" in stripped_line or "ERROR" in stripped_line:
+                print(stripped_line)
+            
+            # Always check for the final result line to get the score
+            if stripped_line.startswith("FINAL_RESULT:"):
+                final_result_line = stripped_line
         
-        for line in result.stdout.strip().split('\n'):
-            if line.startswith("FINAL_RESULT:"):
-                parts = line.replace("FINAL_RESULT: ", "").split(',')
-                score = int(parts[0].split('=')[1])
-                actions = int(parts[1].split('=')[1])
-                
-                objective_score = 0.0
-                if score > 0:
-                    efficiency_penalty = actions / score
-                    objective_score = (score * 1000) - efficiency_penalty
-                else:
-                    objective_score = -actions
-                
-                print(f"--- Trial Complete. Score: {score}, Actions: {actions}. Objective Score: {objective_score:.2f} ---")
-                return objective_score
+        process.wait() # Wait for the subprocess to fully complete
 
-        print("--- Trial Warning: FINAL_RESULT line not found in agent output. ---")
-        print("--- Agent's Standard Output (stdout) ---")
-        print(result.stdout) # Print stdout to see what happened
+        if final_result_line:
+            parts = final_result_line.replace("FINAL_RESULT: ", "").split(',')
+            score = int(parts[0].split('=')[1])
+            actions = int(parts[1].split('=')[1])
+            
+            objective_score = 0.0
+            if score > 0:
+                efficiency_penalty = actions / score
+                objective_score = (score * 1000) - efficiency_penalty
+            else:
+                objective_score = -actions
+            
+            print(f"--- Trial Complete. Score: {score}, Actions: {actions}. Objective Score: {objective_score:.2f} ---")
+            return objective_score
+
+        print("--- Trial Warning: FINAL_RESULT line not found. Trial likely failed. ---")
         return -float('inf')
 
-    except subprocess.CalledProcessError as e:
-        print(f"--- Trial FAILED with a crash (non-zero exit code). ---")
-        print("--- Agent's Standard Output (stdout) ---")
-        print(e.stdout)
-        print("\n--- Agent's Standard Error (stderr) ---")
-        print(e.stderr)
-        return -float('inf')
-    except subprocess.TimeoutExpired:
-        print(f"--- Trial FAILED: Timed out. ---")
+    except Exception as e:
+        print(f"--- Trial FAILED with an unexpected error: {e} ---")
         return -float('inf')
 
 def objective(trial: optuna.Trial) -> float:
