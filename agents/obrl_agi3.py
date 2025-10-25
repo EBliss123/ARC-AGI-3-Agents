@@ -34,25 +34,25 @@ class ObrlAgi3Agent(Agent):
 
         # --- Centralized Hyperparameters for Tuning ---
         self.hyperparams = {
-            'learning_rate': 0.00180457014736847, # Alpha: How quickly the agent learns from new information.
-            'discount_factor': 0.85, # Gamma: How much the agent values future rewards over immediate ones.
-            'reward_win': 881.19, # The large reward for successfully completing a level.
-            'reward_novelty_multiplier': 82.77, # Multiplies the novelty score to scale its impact on the reward.
-            'reward_new_effect_pattern': 15.32, # Bonus for discovering a new type of game mechanic (e.g., a new event type).
-            'penalty_unexpected_failure': 108.09, # Penalty for when a previously successful action suddenly fails.
-            'penalty_repeated_effect': 392.94,  # Penalty for producing the same outcome (effect pattern) repeatedly.
-            'penalty_boring_move': 61.77, # Penalty for considering an action that is predicted to be 'boring'.
-            'penalty_predicted_failure': 731.11, # Penalty for considering an action that matches a known failure pattern.
-            'penalty_blacklist_base': 5535.36, # The base penalty for clicking on a blacklisted object that has failed before.
-            'penalty_blacklist_scaler': 139.64, # Scales the blacklist penalty quadratically with repeated failures.
-            'drought_increment': 8.83, # How much the 'no discovery' penalty increases each turn.
-            'bonus_action_exp': 392.62,  # The base exploration bonus for trying any action for the first time.
-            'bonus_state_exp_unknown': 647.85, # Bonus for exploring a new path in the state graph (action from this state is unknown).
-            'bonus_state_exp_known_scaler': 283.68, # Bonus for choosing paths leading to less-explored states.
-            'bonus_goal_seeking': 60.81, # The bonus for taking an action predicted to advance towards a win condition.
-            'weight_novelty_ratio': 62.14, # How much to weigh novelty efficiency (unique changes / total changes) in the composite score.
-            'planning_confidence_threshold': 0.82, # Confidence threshold for a rule to be used in goal-seeking lookahead.
-            'recent_effect_patterns_maxlen': 39, # How many recent action outcomes to remember for detecting repetition.
+            'learning_rate': 0.005806070187145874, # Alpha: How quickly the agent learns from new information.
+            'discount_factor': 0.95, # Gamma: How much the agent values future rewards over immediate ones.
+            'reward_win': 353.3, # The large reward for successfully completing a level.
+            'reward_novelty_multiplier': 105.93, # Multiplies the novelty score to scale its impact on the reward.
+            'reward_new_effect_pattern': 49.44, # Bonus for discovering a new type of game mechanic (e.g., a new event type).
+            'penalty_unexpected_failure': 38.52, # Penalty for when a previously successful action suddenly fails.
+            'penalty_repeated_effect': 128.72,  # Penalty for producing the same outcome (effect pattern) repeatedly.
+            'penalty_boring_move': 19.64, # Penalty for considering an action that is predicted to be 'boring'.
+            'penalty_predicted_failure': 76.55, # Penalty for considering an action that matches a known failure pattern.
+            'penalty_blacklist_base': 5625.51, # The base penalty for clicking on a blacklisted object that has failed before.
+            'penalty_blacklist_scaler': 159.5, # Scales the blacklist penalty quadratically with repeated failures.
+            'drought_increment': 20.14, # How much the 'no discovery' penalty increases each turn.
+            'bonus_action_exp': 353.58,  # The base exploration bonus for trying any action for the first time.
+            'bonus_state_exp_unknown': 324.08, # Bonus for exploring a new path in the state graph (action from this state is unknown).
+            'bonus_state_exp_known_scaler': 258.68, # Bonus for choosing paths leading to less-explored states.
+            'bonus_goal_seeking': 166.49, # The bonus for taking an action predicted to advance towards a win condition.
+            'weight_novelty_ratio': 50.56, # How much to weigh novelty efficiency (unique changes / total changes) in the composite score.
+            'planning_confidence_threshold': 0.75, # Confidence threshold for a rule to be used in goal-seeking lookahead.
+            'recent_effect_patterns_maxlen': 49, # How many recent action outcomes to remember for detecting repetition.
         }
         
         # If a dictionary of params was provided, update the defaults.
