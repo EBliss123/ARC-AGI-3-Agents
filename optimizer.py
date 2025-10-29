@@ -119,7 +119,7 @@ if __name__ == "__main__":
     # Start the optimization. Optuna will call the 'objective' function N times.
     # 'n_jobs=-1' tells Optuna to run trials in parallel using all available CPU cores.
     try:
-        study.optimize(objective, n_trials=12, n_jobs=2) #trials is total changes, jobs uses all cores
+        study.optimize(objective, n_trials=2, n_jobs=2) #trials is total changes, jobs uses all cores
     except KeyboardInterrupt:
         print("--- Tuning interrupted by user. Study progress has been saved. ---")
 

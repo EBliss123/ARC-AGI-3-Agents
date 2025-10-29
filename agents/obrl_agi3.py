@@ -87,6 +87,18 @@ class ObrlAgi3Agent(Agent):
         self.object_blacklist = set()
         self.successful_novelty_history = []
 
+        # --- Debug Channels ---
+        # Set these to True or False to control the debug output.
+        self.debug_channels = {
+            'PERCEPTION': False,      # Object finding, relationships, new level setup
+            'CHANGES': False,         # All "Change Log" and "Milestone" prints
+            'STATE_GRAPH': False,     # "Arrived at new Novel State", "State Graph Updated"
+            'HYPOTHESIS': False,      # "Initial Case File", "Refined Hypothesis"
+            'FAILURE': False,         # "Failure Analysis", "Failure Detected", no-op clicks
+            'WIN_CONDITION': False,   # "LEVEL CHANGE DETECTED", "Win Condition Analysis"
+            'ACTION_SCORE': False,    # All scoring, heuristics, and final choice prints
+        }
+
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
         This method is called by the game to get the next action.
@@ -105,7 +117,7 @@ class ObrlAgi3Agent(Agent):
             self.click_failure_counts = {}
             self.object_blacklist = set()
 
-            print("\n--- New Level Detected: Resetting state graph and history. ---")
+            if self.debug_channels['PERCEPTION']: print("\n--- New Level Detected: Resetting state graph and history. ---")
             self.state_action_history = {}
             self.state_graph = []
             self.logical_state_id = 0
@@ -127,7 +139,7 @@ class ObrlAgi3Agent(Agent):
             
             # If we have a saved frame, perform correlation before final ID assignment.
             if self.final_summary_before_level_change is not None:
-                print("--- Correlating Objects Across Levels ---")
+                if self.debug_channels['PERCEPTION']: print("--- Correlating Objects Across Levels ---")
                 
                 # This temporary map will link a new object to its old ID.
                 new_obj_to_old_id_map = {}
@@ -255,7 +267,7 @@ class ObrlAgi3Agent(Agent):
 
             # --- Final Re-Numbering and Memory Migration ---
             self.current_level_id_map = id_map
-            print("--- Finalizing Frame with Sequential IDs ---")
+            if self.debug_channels['PERCEPTION']: print("--- Finalizing Frame with Sequential IDs ---")
             self.object_id_counter = 0
             
             # Sort by position for a clean, predictable order.
@@ -282,16 +294,17 @@ class ObrlAgi3Agent(Agent):
             current_diag_alignments = self._analyze_diagonal_alignments(current_summary)
             current_conjunctions = self._analyze_conjunctions(current_relationships, current_alignments)
 
-            print("--- Initial Frame Summary ---")
+            if self.debug_channels['PERCEPTION']: print("--- Initial Frame Summary ---")
             if not current_summary:
-                print("No objects found.")
+                if self.debug_channels['PERCEPTION']: print("No objects found.")
             
             # Create an inverse map for logging purposes.
             new_to_old_id_map = {v: k for k, v in id_map.items()}
-            self._print_full_summary(current_summary, new_to_old_id_map)
+            if self.debug_channels['PERCEPTION']:
+                self._print_full_summary(current_summary, new_to_old_id_map)
 
             if current_relationships:
-                print("\n--- Relationship Analysis ---")
+                if self.debug_channels['PERCEPTION']: print("\n--- Relationship Analysis ---")
 
                 def format_align_ids(id_set):
                         id_list = sorted(list(id_set))
@@ -315,47 +328,48 @@ class ObrlAgi3Agent(Agent):
                             value_str = f"{value[0]}x{value[1]}"
                         output_lines.append(f"- {rel_type} Group ({value_str}): {format_id_list_str(ids)}")
                 
-                for line in output_lines:
-                    print(line)
+                if self.debug_channels['PERCEPTION']:
+                    for line in output_lines:
+                        print(line)
 
                 if current_adjacencies:
-                    print("\n--- Initial Adjacency Analysis (Top, Right, Bottom, Left) ---")
+                    if self.debug_channels['PERCEPTION']: print("\n--- Initial Adjacency Analysis (Top, Right, Bottom, Left) ---")
                     for obj_id, contacts in sorted(current_adjacencies.items(), key=lambda item: int(item[0].split('_')[1])):
                         # Format the contact list into the desired string
                         contact_ids = [c.replace('obj_', '') if 'obj_' in c else c for c in contacts]
                         contact_tuple_str = ", ".join(contact_ids)
                         clean_obj_id = obj_id.replace('obj_', 'id_')
-                        print(f"- Object {clean_obj_id} ({contact_tuple_str})")
+                        if self.debug_channels['PERCEPTION']: print(f"- Object {clean_obj_id} ({contact_tuple_str})")
 
                 if current_diag_alignments:
-                    print("\n--- Initial Diagonal Alignment Analysis ---")
+                    if self.debug_channels['PERCEPTION']: print("\n--- Initial Diagonal Alignment Analysis ---")
                     for align_type, groups in sorted(current_diag_alignments.items()):
                         for line_idx, ids in enumerate(groups):
-                            print(f"- '{align_type}' Alignment (Line {line_idx + 1}): {format_align_ids(ids)}")
+                            if self.debug_channels['PERCEPTION']: print(f"- '{align_type}' Alignment (Line {line_idx + 1}): {format_align_ids(ids)}")
 
                 if current_diag_adjacencies:
-                    print("\n--- Initial Diagonal Adjacency (TR, BR, BL, TL) ---")
+                    if self.debug_channels['PERCEPTION']: print("\n--- Initial Diagonal Adjacency (TR, BR, BL, TL) ---")
                     for obj_id, contacts in sorted(current_diag_adjacencies.items(), key=lambda item: int(item[0].split('_')[1])):
                         contact_ids = [c.replace('obj_', '') if 'obj_' in c else c for c in contacts]
                         contact_tuple_str = ", ".join(contact_ids)
                         clean_obj_id = obj_id.replace('obj_', 'id_')
-                        print(f"- Object {clean_obj_id} ({contact_tuple_str})")
+                        if self.debug_channels['PERCEPTION']: print(f"- Object {clean_obj_id} ({contact_tuple_str})")
 
                 if current_alignments:
-                    print("\n--- Initial Alignment Analysis ---")   
+                    if self.debug_channels['PERCEPTION']: print("\n--- Initial Alignment Analysis ---")   
                     for align_type, groups in sorted(current_alignments.items()):
                         for coord, ids in sorted(groups.items()):
-                            print(f"- '{align_type}' Alignment at {coord}: {format_align_ids(ids)}")
+                            if self.debug_channels['PERCEPTION']: print(f"- '{align_type}' Alignment at {coord}: {format_align_ids(ids)}")
 
                 if current_match_groups:
-                    print("\n--- Object Match Type Analysis ---")
+                    if self.debug_channels['PERCEPTION']: print("\n--- Object Match Type Analysis ---")
                     print_order = ['Exact', 'Color', 'Fingerprint', 'Size', 'Pixels']
                     group_counter = 1
                     for match_type in print_order:
                         if match_type in current_match_groups:
                             groups_dict = current_match_groups[match_type]
                             label = f"Exact Matches" if match_type == "Exact" else f"Matches (Except {match_type})"
-                            print(f"- {label}:")
+                            if self.debug_channels['PERCEPTION']: print(f"- {label}:")
                             
                             for props, group in groups_dict.items():
                                 sorted_ids = sorted(group, key=int)
@@ -386,7 +400,7 @@ class ObrlAgi3Agent(Agent):
                                     props_str_parts.append(f"Size:{props[2][0]}x{props[2][1]}")
                                 
                                 props_str = f" ({', '.join(props_str_parts)})" if props_str_parts else ""
-                                print(f"  - Group {group_counter}{props_str}: {id_list_str}")
+                                if self.debug_channels['PERCEPTION']: print(f"  - Group {group_counter}{props_str}: {id_list_str}")
                                 group_counter += 1
 
         # On subsequent turns, analyze the outcome of the previous action.
@@ -403,7 +417,7 @@ class ObrlAgi3Agent(Agent):
             # --- LEVEL CHANGE DETECTION & HANDLING ---
             current_score = latest_frame.score
             if current_score > self.last_score:
-                print(f"\n--- LEVEL CHANGE DETECTED (Score increased from {self.last_score} to {current_score}) ---")
+                if self.debug_channels['WIN_CONDITION']: print(f"\n--- LEVEL CHANGE DETECTED (Score increased from {self.last_score} to {current_score}) ---")
                 
                 # Construct the current (winning) context from the live variables
                 winning_context = {
@@ -419,11 +433,13 @@ class ObrlAgi3Agent(Agent):
                 history_for_analysis = self.level_state_history + [winning_context]
                 self._analyze_win_condition(history_for_analysis, self.level_milestones, self.current_level_id_map)
 
-                # Print the full summary of the final frame of the level that was just won.
-                print("\n--- Final Frame Summary (Old Level) ---")
-                self._print_full_summary(self.last_object_summary)
+                if self.debug_channels['WIN_CONDITION']:
+                    # Print the full summary of the final frame of the level that was just won.
+                    print("\n--- Final Frame Summary (Old Level) ---")
+                    self._print_full_summary(self.last_object_summary)
 
-                print("\nSaving final frame for cross-level object matching.")
+                    print("\nSaving final frame for cross-level object matching.")
+
                 # Save the final summary of the completed level for comparison.
                 self.final_summary_before_level_change = self.last_object_summary
                 # Signal that the next frame is the start of a new level, but preserve all memory.
@@ -449,13 +465,13 @@ class ObrlAgi3Agent(Agent):
                 # Determine the outcomes first
                 if changes:
                     if self.failed_action_blacklist:
-                        print("A successful action was found, clearing the failure blacklist.")
+                        if self.debug_channels['FAILURE']: print("A successful action was found, clearing the failure blacklist.")
                         self.failed_action_blacklist.clear()
                     
                     # --- Handle successful click on a blacklisted object ---
                     if prev_action_name == 'ACTION6' and prev_target_id:
                         if prev_target_id in self.object_blacklist:
-                            print(f"Object {prev_target_id.replace('obj_', 'id_')} caused a change. Removing from blacklist.")
+                            if self.debug_channels['FAILURE']: print(f"Object {prev_target_id.replace('obj_', 'id_')} caused a change. Removing from blacklist.")
                             self.object_blacklist.remove(prev_target_id)
                             # Reset the failure count upon success
                             self.click_failure_counts[prev_target_id] = 0
@@ -549,14 +565,14 @@ class ObrlAgi3Agent(Agent):
                     if newly_discovered_types:
                         is_milestone = True
                         self.seen_event_types_in_level.update(newly_discovered_types)
-                        print(f"Milestone Discovery: New event types observed: {sorted(list(newly_discovered_types))}")
+                        if self.debug_channels['CHANGES']: print(f"Milestone Discovery: New event types observed: {sorted(list(newly_discovered_types))}")
                     
                     if is_milestone:
                         # The current state will be appended to the history at the end of this method.
                         # Its index will be the current length of the history.
                         milestone_index = len(self.level_state_history)
                         self.level_milestones.append(milestone_index)
-                        print(f"Logging Milestone at state index {milestone_index}.")
+                        if self.debug_channels['CHANGES']: print(f"Logging Milestone at state index {milestone_index}.")
 
                 else:
                     # --- Handle click that caused no change ---
@@ -566,7 +582,7 @@ class ObrlAgi3Agent(Agent):
                         self.object_blacklist.add(prev_target_id)
                         
                         failure_str = f"{failure_count} times" if failure_count > 1 else "for the first time"
-                        print(f"Clicking object {prev_target_id.replace('obj_', 'id_')} caused no change ({failure_str}). Blacklisting.")
+                        if self.debug_channels['FAILURE']: print(f"Clicking object {prev_target_id.replace('obj_', 'id_')} caused no change ({failure_str}). Blacklisting.")
 
                     # No changes occurred. Check if this is a failure, but NOT if we just finished waiting.
                     if not just_finished_waiting:
@@ -579,9 +595,10 @@ class ObrlAgi3Agent(Agent):
 
                 # --- Handle all Logging and Rule Analysis *after* learning ---
                 if changes:
-                    print("--- Change Log ---")
-                    for change in changes:
-                        print(change)
+                    if self.debug_channels['CHANGES']:
+                        print("--- Change Log ---")
+                        for change in changes:
+                            print(change)
 
                     # --- Record Transition State ---
                     is_boring_transition = performance_score < 0.0 or novel_state_count == 0
@@ -645,8 +662,8 @@ class ObrlAgi3Agent(Agent):
                             if best_match_id is not None:
                                 destination_state_id = best_match_id
                                 history = self.state_action_history.get(destination_state_id, [])
-                                print(f"\n--- Arrived at aliased State #{destination_state_id} ---")
-                                print(f"Previously taken actions from this state: {history}")
+                                if self.debug_channels['STATE_GRAPH']: print(f"\n--- Arrived at aliased State #{destination_state_id} ---")
+                                if self.debug_channels['STATE_GRAPH']: print(f"Previously taken actions from this state: {history}")
                                 
                                 # --- Record State Graph Connection ---
                                 if self.last_taken_action_key is not None:
@@ -659,7 +676,7 @@ class ObrlAgi3Agent(Agent):
                                     self.logical_state_id = destination_state_id
                                     if connection not in self.state_graph:
                                         self.state_graph.append(connection)
-                                        print(f"--- State Graph Updated: State {connection['source']} -> {connection['action']} -> State {connection['destination']} ---")
+                                        if self.debug_channels['STATE_GRAPH']: print(f"--- State Graph Updated: State {connection['source']} -> {connection['action']} -> State {connection['destination']} ---")
 
                                 log_output = [f"\n--- State is an alias for Novel State #{best_match_id} (Similarity: {best_match_score:.0%}) ---"]
                             else:
@@ -672,8 +689,9 @@ class ObrlAgi3Agent(Agent):
                                 self.current_state_id += 1
 
                             # By definition, the history for a new state is empty.
-                            print(f"\n--- Arrived at new Novel State #{self.current_state_id} ---")
-                            print("No previous actions taken from this state.")
+                            if self.debug_channels['STATE_GRAPH']:
+                                print(f"\n--- Arrived at new Novel State #{self.current_state_id} ---")
+                                print("No previous actions taken from this state.")
 
                             # --- Record State Graph Connection ---
                             if self.last_taken_action_key is not None:
@@ -687,7 +705,7 @@ class ObrlAgi3Agent(Agent):
                                 self.logical_state_id = destination_state_id
                                 if connection not in self.state_graph:
                                     self.state_graph.append(connection)
-                                    print(f"--- State Graph Updated: State {connection['source']} -> {connection['action']} -> State {connection['destination']} ---")
+                                    if self.debug_channels['STATE_GRAPH']: print(f"--- State Graph Updated: State {connection['source']} -> {connection['action']} -> State {connection['destination']} ---")
 
                             self.transition_history.append({
                                 'state_id': self.current_state_id,
@@ -697,12 +715,13 @@ class ObrlAgi3Agent(Agent):
 
                         for t in current_state_transitions:
                             log_output.append(f"- Type: {t['type']}, Object: {t['object_id'].replace('obj_', 'id_')}, Final State: {t['final_state']}")
-                        print("\n".join(log_output))
+                        if self.debug_channels['STATE_GRAPH']: print("\n".join(log_output))
 
                     if unique_log_messages:
-                        print("\n--- Unique State Transition Log ---")
-                        for msg in sorted(unique_log_messages):
-                            print(msg)
+                        if self.debug_channels['CHANGES']:
+                            print("\n--- Unique State Transition Log ---")
+                            for msg in sorted(unique_log_messages):
+                                print(msg)
 
                     
                     # Report each change under its own per-object contextual key
@@ -738,9 +757,10 @@ class ObrlAgi3Agent(Agent):
                 elif is_failure_case:
                     # Blacklist the action, regardless of its history.
                     self.failed_action_blacklist.add(learning_key)
-                    print(f"Action {learning_key} has been blacklisted until a success occurs.")
-                    
-                    print(f"\n--- Failure Detected for Action {learning_key} ---")
+                    if self.debug_channels['FAILURE']:
+                        print(f"Action {learning_key} has been blacklisted until a success occurs.")
+                        print(f"\n--- Failure Detected for Action {learning_key} ---")
+
                     # Store the context of this failure before analyzing
                     failure_context = {
                         'summary': prev_summary,
@@ -760,13 +780,14 @@ class ObrlAgi3Agent(Agent):
                         
             elif changes:
                 # Fallback for when changes happen without a known previous action
-                print("--- Change Log ---")
-                for change in changes:
-                    print(change)
+                if self.debug_channels['CHANGES']:
+                    print("--- Change Log ---")
+                    for change in changes:
+                        print(change)
 
             if self.is_waiting_for_stability:
                 if changes:
-                    print("Animation in progress, observing...")
+                    if self.debug_channels['CHANGES']: print("Animation in progress, observing...")
                     # Update our memory to check against the next frame
                     self.last_object_summary = current_summary
                     self.last_relationships = current_relationships
@@ -774,7 +795,7 @@ class ObrlAgi3Agent(Agent):
                     return latest_frame.available_actions[0] if latest_frame.available_actions else GameAction.RESET
                 else:
                     # The world is now stable, so we can proceed with a new action.
-                    print("Stability reached. Resuming control.")
+                    if self.debug_channels['CHANGES']: print("Stability reached. Resuming control.")
                     self.is_waiting_for_stability = False
                     just_finished_waiting = True
 
@@ -792,7 +813,7 @@ class ObrlAgi3Agent(Agent):
 
         # If we just discovered the game-specific actions, print them once.
         if game_specific_actions and not self.actions_printed:
-            print(f"Discovered game-specific actions: {[action.name for action in game_specific_actions]}")
+            if self.debug_channels['PERCEPTION']: print(f"Discovered game-specific actions: {[action.name for action in game_specific_actions]}")
             self.actions_printed = True
 
         # --- Build a list of possible move DESCRIPTIONS ---
@@ -827,10 +848,11 @@ class ObrlAgi3Agent(Agent):
                     boring_predictions.append(f"- Object {obj_id_str}: Action {base_action_key} is predicted to be boring.")
 
         if boring_predictions:
-            print("\n--- Boring Move Predictions ---")
-            # Use set() to remove any duplicate predictions before printing
-            for prediction in sorted(list(set(boring_predictions))):
-                print(prediction)
+            if self.debug_channels['ACTION_SCORE']:
+                print("\n--- Boring Move Predictions ---")
+                # Use set() to remove any duplicate predictions before printing
+                for prediction in sorted(list(set(boring_predictions))):
+                    print(prediction)
 
         # --- Prepare for Learning & Rule Analysis ---
         current_state_key = self._get_state_key(current_summary)
@@ -884,7 +906,7 @@ class ObrlAgi3Agent(Agent):
             if predicted_destination_id is None:
                 # This action has never been taken from this state. It's pure exploration.
                 state_exploration_bonus = self.hyperparams['bonus_state_exp_unknown']
-                print(f"State Exploration: Action {action_key} is unknown from this state. Adding max bonus.")
+                if self.debug_channels['ACTION_SCORE']: print(f"State Exploration: Action {action_key} is unknown from this state. Adding max bonus.")
             else:
                 # We've been to the destination before. Is it a well-explored state?
                 destination_history = self.state_action_history.get(predicted_destination_id, [])
@@ -892,7 +914,7 @@ class ObrlAgi3Agent(Agent):
                 # The bonus is higher for leading to states with fewer tried actions.
                 state_exploration_bonus = self.hyperparams['bonus_state_exp_known_scaler'] / (1.0 + num_actions_tried)
                 obj_id_str = target_object['id'].replace('obj_', 'id_') if target_object else 'GLOBAL'
-                print(f"State Exploration: {action_key} on {obj_id_str} leads to state {predicted_destination_id} (history size: {num_actions_tried}). Bonus: {state_exploration_bonus:.2f}")
+                if self.debug_channels['ACTION_SCORE']: print(f"State Exploration: {action_key} on {obj_id_str} leads to state {predicted_destination_id} (history size: {num_actions_tried}). Bonus: {state_exploration_bonus:.2f}")
 
             # --- Check if the action is currently blacklisted ---
             if action_key in self.failed_action_blacklist:
@@ -920,7 +942,7 @@ class ObrlAgi3Agent(Agent):
                 if hypothesis and hypothesis.get('is_boring', False):
                     boring_penalty = -self.hyperparams['penalty_boring_move']
                     obj_id = target_object['id'].replace('obj_', 'id_')
-                    print(f"Heuristic: Predicting a 'boring' outcome for {action_key[0]} on object {obj_id}. Applying penalty.")
+                    if self.debug_channels['ACTION_SCORE']: print(f"Heuristic: Predicting a 'boring' outcome for {action_key[0]} on object {obj_id}. Applying penalty.")
             else:
                 # Case 2: This is a GLOBAL action. Scan all objects for potential boring outcomes.
                 action_name = action_template.name
@@ -932,7 +954,7 @@ class ObrlAgi3Agent(Agent):
                         # Add a penalty for each predicted boring outcome
                         boring_penalty -= self.hyperparams['penalty_boring_move']
                         obj_id = obj['id'].replace('obj_', 'id_')
-                        print(f"Heuristic: Predicting a 'boring' outcome for {action_name} on object {obj_id}. Applying penalty.")
+                        if self.debug_channels['ACTION_SCORE']: print(f"Heuristic: Predicting a 'boring' outcome for {action_name} on object {obj_id}. Applying penalty.")
 
             score = q_value + exploration_bonus + boring_penalty
 
@@ -958,7 +980,7 @@ class ObrlAgi3Agent(Agent):
 
                 if is_match:
                     failure_penalty = -self.hyperparams['penalty_predicted_failure'] # Apply a heavy penalty for a predicted failure
-                    print(f"Heuristic: Current state matches a known failure pattern for {action_key}. Applying penalty.")
+                    if self.debug_channels['ACTION_SCORE']: print(f"Heuristic: Current state matches a known failure pattern for {action_key}. Applying penalty.")
             
             # --- Object Blacklist Penalty ---
             if target_object and target_object['id'] in self.object_blacklist:
@@ -966,7 +988,7 @@ class ObrlAgi3Agent(Agent):
                 object_blacklist_penalty = -self.hyperparams['penalty_blacklist_base'] - (((failure_count - 1) * self.hyperparams['penalty_blacklist_scaler']) ** 2)
                 failure_penalty += object_blacklist_penalty
                 obj_id_str = target_object['id'].replace('obj_', 'id_')
-                print(f"Heuristic: Object {obj_id_str} is blacklisted (failed {failure_count} time(s)). Applying penalty of {object_blacklist_penalty}.")
+                if self.debug_channels['ACTION_SCORE']: print(f"Heuristic: Object {obj_id_str} is blacklisted (failed {failure_count} time(s)). Applying penalty of {object_blacklist_penalty}.")
 
             score += failure_penalty + state_exploration_bonus
 
@@ -988,7 +1010,7 @@ class ObrlAgi3Agent(Agent):
         
         # --- Fallback if all available actions were blacklisted ---
         if best_move is None and possible_moves:
-            print("Warning: All available actions were blacklisted. Clearing blacklist to break deadlock.")
+            if self.debug_channels['ACTION_SCORE']: print("Warning: All available actions were blacklisted. Clearing blacklist to break deadlock.")
             self.failed_action_blacklist.clear()
             best_move = possible_moves[0] # Force select the first available action
 
@@ -1004,10 +1026,10 @@ class ObrlAgi3Agent(Agent):
             click_y, click_x = pos[0], pos[1]
             coords_for_context = {'x': click_x, 'y': click_y}
             obj_id = chosen_object['id'].replace('obj_', 'id_')
-            print(f"RL Agent chose CLICK on object {obj_id} (Score: {best_score:.2f}) {debug_scores_str}")
+            if self.debug_channels['ACTION_SCORE']: print(f"RL Agent chose CLICK on object {obj_id} (Score: {best_score:.2f}) {debug_scores_str}")
             chosen_template.set_data(coords_for_context)
         else:
-            print(f"RL Agent chose action: {chosen_template.name} (Score: {best_score:.2f}) {debug_scores_str}")
+            if self.debug_channels['ACTION_SCORE']: print(f"RL Agent chose action: {chosen_template.name} (Score: {best_score:.2f}) {debug_scores_str}")
         
         action_to_return = chosen_template
         
@@ -1078,7 +1100,7 @@ class ObrlAgi3Agent(Agent):
     
     def _remap_memory(self, id_map: dict[str, str]):
         """Updates all learning structures to use new IDs after a re-numbering."""
-        print(f"Remapping memory for {len(id_map)} objects...")
+        if self.debug_channels['PERCEPTION']: print(f"Remapping memory for {len(id_map)} objects...")
 
         def remap_key(key):
             if isinstance(key, str) and '_' in key:
@@ -1242,10 +1264,11 @@ class ObrlAgi3Agent(Agent):
                 'confidence': 1.0,
                 'is_boring': False,
             }
-            print(f"\n--- Initial Case File for {action_key} (Confidence: 100%) ---")
-            for event in new_events:
-                details = {k:v for k,v in event.items() if k != 'type'}
-                print(f"- Observed {event['type']} with details: {details}")
+            if self.debug_channels['HYPOTHESIS']:
+                print(f"\n--- Initial Case File for {action_key} (Confidence: 100%) ---")
+                for event in new_events:
+                    details = {k:v for k,v in event.items() if k != 'type'}
+                    print(f"- Observed {event['type']} with details: {details}")
             return
         
         hypothesis['attempts'] += 1
@@ -1276,13 +1299,14 @@ class ObrlAgi3Agent(Agent):
         hypothesis['confidence'] = hypothesis['confirmations'] / hypothesis['attempts']
         
         confidence_percent = hypothesis['confidence'] * 100
-        print(f"\n--- Refined Hypothesis for {action_key} (Confidence: {confidence_percent:.0f}%) ---")
-        if not refined_rules:
-            print("No consistent rules could be confirmed from the new observation.")
-        else:
-            for rule in refined_rules:
-                details = {k:v for k,v in rule.items() if k != 'type'}
-                print(f"- Confirmed Rule: A {rule['type']} event occurs with consistent properties: {details}")
+        if self.debug_channels['HYPOTHESIS']:
+            print(f"\n--- Refined Hypothesis for {action_key} (Confidence: {confidence_percent:.0f}%) ---")
+            if not refined_rules:
+                print("No consistent rules could be confirmed from the new observation.")
+            else:
+                for rule in refined_rules:
+                    details = {k:v for k,v in rule.items() if k != 'type'}
+                    print(f"- Confirmed Rule: A {rule['type']} event occurs with consistent properties: {details}")
 
     def _find_common_context(self, contexts: list[dict]) -> dict:
         """
@@ -1349,11 +1373,12 @@ class ObrlAgi3Agent(Agent):
         """
         
         if not all_success_contexts or not all_failure_contexts:
-            print("\n--- Failure Analysis ---")
-            print("Cannot perform differential analysis: insufficient history of successes or failures.")
+            if self.debug_channels['FAILURE']:
+                print("\n--- Failure Analysis ---")
+                print("Cannot perform differential analysis: insufficient history of successes or failures.")
             return
 
-        print("\n--- Failure Analysis: Consistent Differentiating Conditions ---")
+        if self.debug_channels['FAILURE']: print("\n--- Failure Analysis: Consistent Differentiating Conditions ---")
         
         # 1. Find the common context for all successes and all failures.
         common_success_context = self._find_common_context(all_success_contexts)
@@ -1396,7 +1421,7 @@ class ObrlAgi3Agent(Agent):
                     
                     pattern_str = f"({', '.join(failure_pattern)})"
                     clean_id = obj_id.replace('obj_', 'id_')
-                    print(f"- Adjacency Difference for {clean_id}: Failures consistently exhibit pattern {pattern_str}, which has never occurred in a success.")
+                    if self.debug_channels['FAILURE']: print(f"- Adjacency Difference for {clean_id}: Failures consistently exhibit pattern {pattern_str}, which has never occurred in a success.")
 
         # Relationship Differences
         rels_s = common_success_context['rels']
@@ -1413,7 +1438,7 @@ class ObrlAgi3Agent(Agent):
                     if (rel_type, value, frozenset(ids_f)) not in observed_in_any_success_rels:
                         diffs_found = True
                         value_str = f"{value[0]}x{value[1]}" if rel_type == 'Size' else value
-                        print(f"- {rel_type} Group ({value_str}) Difference: Failures consistently have members {sorted(list(ids_f))}, which has never occurred in a success.")
+                        if self.debug_channels['FAILURE']: print(f"- {rel_type} Group ({value_str}) Difference: Failures consistently have members {sorted(list(ids_f))}, which has never occurred in a success.")
         
         if diffs_found:
             # This is a key insight. Store the common failure context that was successfully
@@ -1421,14 +1446,14 @@ class ObrlAgi3Agent(Agent):
             self.failure_patterns[action_key] = common_failure_context
 
         if not diffs_found:
-            print("No conditions found that are both consistent across all failures and unique to them.")
+            if self.debug_channels['FAILURE']: print("No conditions found that are both consistent across all failures and unique to them.")
 
     def _analyze_win_condition(self, level_history: list[dict], milestone_indices: list[int], id_map: dict = None):
         """
         Analyzes the winning state to create and refine "Role-Based" hypotheses.
         A rule consists of an abstract pattern, roles for objects, and group properties.
         """
-        print("\n--- Win Condition Analysis (V5 - Role-Based) ---")
+        if self.debug_channels['WIN_CONDITION']: print("\n--- Win Condition Analysis (V5 - Role-Based) ---")
         if not level_history: return
         if id_map is None: id_map = {}
 
@@ -1436,7 +1461,7 @@ class ObrlAgi3Agent(Agent):
         
         if not self.win_condition_hypotheses:
             # --- CREATION MODE (After Level 1) ---
-            print("No Master Recipe found. Creating initial Role-Based rules...")
+            if self.debug_channels['WIN_CONDITION']: print("No Master Recipe found. Creating initial Role-Based rules...")
             
             # 1. Use the Uniqueness Filter to find the most significant patterns.
             win_patterns = self._extract_patterns_from_context(winning_context)
@@ -1448,7 +1473,7 @@ class ObrlAgi3Agent(Agent):
                     seen_patterns_set.add(str(p)) # Use string for hashable representation
             
             unique_win_patterns = [p for p in win_patterns if str(p) not in seen_patterns_set]
-            print(f"Found {len(win_patterns)} patterns in win state; {len(unique_win_patterns)} are unique.")
+            if self.debug_channels['WIN_CONDITION']: print(f"Found {len(win_patterns)} patterns in win state; {len(unique_win_patterns)} are unique.")
 
             # 2. For each unique pattern, create a detailed "Role-Based" rule.
             new_rules = []
@@ -1496,7 +1521,7 @@ class ObrlAgi3Agent(Agent):
         else:
             # --- REFINING MODE (After Level 2+) ---
             master_recipe_rules = self.win_condition_hypotheses
-            print(f"\n--- Refining {len(master_recipe_rules)} Master Rules Based on New Evidence ---")
+            if self.debug_channels['WIN_CONDITION']: print(f"\n--- Refining {len(master_recipe_rules)} Master Rules Based on New Evidence ---")
 
             # Get the set of abstract patterns that were unique to this new win.
             new_win_patterns = self._extract_patterns_from_context(winning_context)
@@ -1518,33 +1543,34 @@ class ObrlAgi3Agent(Agent):
                     # The rule is consistent. Reinforce its confidence.
                     rule['confidence'] = min(1.0, rule['confidence'] + 0.1)
                     surviving_rules.append(rule)
-                    print(f"- Rule '{rule['id']}' ({rule['abstract_pattern']['sub_type']}) was REINFORCED. Confidence -> {rule['confidence']:.0%}")
+                    if self.debug_channels['WIN_CONDITION']: print(f"- Rule '{rule['id']}' ({rule['abstract_pattern']['sub_type']}) was REINFORCED. Confidence -> {rule['confidence']:.0%}")
                 else:
                     # The rule is inconsistent with this win. Delete it immediately.
-                    print(f"- Rule '{rule['id']}' ({rule['abstract_pattern']['sub_type']}) was INCONSISTENT and has been DELETED.")
+                    if self.debug_channels['WIN_CONDITION']: print(f"- Rule '{rule['id']}' ({rule['abstract_pattern']['sub_type']}) was INCONSISTENT and has been DELETED.")
             
             self.win_condition_hypotheses = surviving_rules
             
         # --- Final Report ---
         if self.win_condition_hypotheses:
-            print(f"\n--- Current Master Recipe ({len(self.win_condition_hypotheses)} rules) ---")
-            sorted_rules = sorted(self.win_condition_hypotheses, key=lambda x: x['confidence'], reverse=True)
+            if self.debug_channels['WIN_CONDITION']:
+                print(f"\n--- Current Master Recipe ({len(self.win_condition_hypotheses)} rules) ---")
+                sorted_rules = sorted(self.win_condition_hypotheses, key=lambda x: x['confidence'], reverse=True)
 
-            for rule in sorted_rules[:10]: # Log top 10 rules
-                pattern = rule['abstract_pattern']
-                desc = f"A '{pattern['sub_type']}' pattern"
-                
-                group_props_str = ", ".join([f"{k}:{v}" for k, v in rule['group_properties']])
-                if not group_props_str: group_props_str = "None"
+                for rule in sorted_rules[:10]: # Log top 10 rules
+                    pattern = rule['abstract_pattern']
+                    desc = f"A '{pattern['sub_type']}' pattern"
+                    
+                    group_props_str = ", ".join([f"{k}:{v}" for k, v in rule['group_properties']])
+                    if not group_props_str: group_props_str = "None"
 
-                print(f"\n- {rule['id']} [Conf: {rule['confidence']:.0%}]: Requires {desc}")
-                print(f"  - Group Property Consistency: [{group_props_str}]")
-                print(f"  - Role Analysis:")
-                
-                for role_id, role_data in sorted(rule['roles'].items()):
-                    props_str = ", ".join([f"{k}:{v}" for k, v in role_data['learned_properties']])
-                    history_str = ", ".join(map(str, role_data['history']))
-                    print(f"    - {role_id}: Consistent properties [{props_str}]. Seen as objects [{history_str}]")
+                    print(f"\n- {rule['id']} [Conf: {rule['confidence']:.0%}]: Requires {desc}")
+                    print(f"  - Group Property Consistency: [{group_props_str}]")
+                    print(f"  - Role Analysis:")
+                    
+                    for role_id, role_data in sorted(rule['roles'].items()):
+                        props_str = ", ".join([f"{k}:{v}" for k, v in role_data['learned_properties']])
+                        history_str = ", ".join(map(str, role_data['history']))
+                        print(f"    - {role_id}: Consistent properties [{props_str}]. Seen as objects [{history_str}]")
 
     def _get_context_delta(self, start_context: dict, end_context: dict) -> dict:
         """Finds significant changes (deltas) between a start and end context."""
@@ -1722,7 +1748,7 @@ class ObrlAgi3Agent(Agent):
             obj_id_str = target_object['id'].replace('obj_', 'id_') if target_object else 'GLOBAL'
             action_name = self._get_learning_key(action_template.name, target_object['id'] if target_object else None)
             
-            print(f"Goal-Seeking Bonus: Action {action_name} on {obj_id_str} is predicted to achieve unmet goals: {summary}. Adding {bonus:.2f} bonus.")
+            if self.debug_channels['ACTION_SCORE']: print(f"Goal-Seeking Bonus: Action {action_name} on {obj_id_str} is predicted to achieve unmet goals: {summary}. Adding {bonus:.2f} bonus.")
             return bonus
         
         return 0.0
@@ -2184,10 +2210,11 @@ class ObrlAgi3Agent(Agent):
                         output_lines.append(f"- {rel_type} Group ({value_str}): {format_ids(left_ids).capitalize()} left.")
 
         if output_lines:
-            print("\n--- Relationship Change Log ---")
-            for line in sorted(output_lines):
-                print(line)
-            print()
+            if self.debug_channels['CHANGES']:
+                print("\n--- Relationship Change Log ---")
+                for line in sorted(output_lines):
+                    print(line)
+                print()
 
     def _log_adjacency_changes(self, old_adj: dict, new_adj: dict):
         """Compares two simplified adjacency maps and logs the differences."""
@@ -2213,10 +2240,11 @@ class ObrlAgi3Agent(Agent):
                 output_lines.append(f"- Adjacency Change for Object {clean_id}: contacts changed from {old_str} to {new_str}.")
         
         if output_lines:
-            print("\n--- Adjacency Change Log ---")
-            for line in output_lines:
-                print(line)
-            print()
+            if self.debug_channels['CHANGES']:
+                print("\n--- Adjacency Change Log ---")
+                for line in output_lines:
+                    print(line)
+                print()
 
     def _log_diag_adjacency_changes(self, old_adj: dict, new_adj: dict):
         """Compares two diagonal adjacency maps and logs the differences."""
@@ -2242,10 +2270,11 @@ class ObrlAgi3Agent(Agent):
                 output_lines.append(f"- Diagonal Adjacency for Object {clean_id}: contacts changed from {old_str} to {new_str}.")
         
         if output_lines:
-            print("\n--- Diagonal Adjacency Change Log ---")
-            for line in output_lines:
-                print(line)
-            print()
+            if self.debug_channels['CHANGES']:
+                print("\n--- Diagonal Adjacency Change Log ---")
+                for line in output_lines:
+                    print(line)
+                print()
 
     def _log_alignment_changes(self, old_aligns: dict, new_aligns: dict, is_diagonal: bool = False):
         """Compares two alignment dictionaries and logs the differences."""
@@ -2299,11 +2328,12 @@ class ObrlAgi3Agent(Agent):
                         output_lines.append(f"- {log_prefix}: {format_ids(left).capitalize()} left.")
 
         if output_lines:
-            title = "Diagonal Alignment Change Log" if is_diagonal else "Alignment Change Log"
-            print(f"\n--- {title} ---")
-            for line in sorted(output_lines):
-                print(line)
-            print()
+            if self.debug_channels['CHANGES']:
+                title = "Diagonal Alignment Change Log" if is_diagonal else "Alignment Change Log"
+                print(f"\n--- {title} ---")
+                for line in sorted(output_lines):
+                    print(line)
+                print()
 
     def _log_match_type_changes(self, old_matches: dict, new_matches: dict):
         """Compares two match group dictionaries and logs group-level changes."""
@@ -2375,15 +2405,16 @@ class ObrlAgi3Agent(Agent):
                     output_lines.append(f"- {label} Group {props_str}: {format_ids(left).capitalize()} left.")
 
         if output_lines:
-            print("\n--- Match Type Change Log ---")
-            for line in sorted(output_lines):
-                print(line)
-            print()
+            if self.debug_channels['CHANGES']:
+                print("\n--- Match Type Change Log ---")
+                for line in sorted(output_lines):
+                    print(line)
+                print()
 
     def _print_full_summary(self, summary: list[dict], new_to_old_map: dict = None):
         """Prints a formatted summary of all objects, noting previous IDs if available."""
         if not summary:
-            print("No objects found.")
+            if self.debug_channels['PERCEPTION']: print("No objects found.")
             return
 
         for obj in summary:
@@ -2403,7 +2434,7 @@ class ObrlAgi3Agent(Agent):
             if formerly_parts:
                 formerly_str = f" ({', '.join(formerly_parts)})"
 
-            print(
+            if self.debug_channels['PERCEPTION']: print(
                 f"- Object {obj_id}{formerly_str}: Found a {size_str} object of color {obj['color']} "
                 f"at position {obj['position']} with {obj['pixels']} pixels "
                 f"and shape fingerprint {obj['fingerprint']}."
@@ -2788,7 +2819,7 @@ class ObrlAgi3Agent(Agent):
             baseline_median = statistics.median(self.successful_novelty_history)
 
             performance_vs_baseline = current_turn_novelty_score - baseline_median
-            print(f"Novelty Analysis: Composite score of {current_turn_novelty_score:.2f} (Novelty: {novel_state_count}, Ratio: {novelty_ratio:.2f}) vs. level median of {baseline_median:.2f}. Performance score: {performance_vs_baseline:.2f}.")
+            if self.debug_channels['ACTION_SCORE']: print(f"Novelty Analysis: Composite score of {current_turn_novelty_score:.2f} (Novelty: {novel_state_count}, Ratio: {novelty_ratio:.2f}) vs. level median of {baseline_median:.2f}. Performance score: {performance_vs_baseline:.2f}.")
         else:
             # No changes, so performance is negative based on the discovery drought.
             performance_vs_baseline = -self.turns_without_discovery
