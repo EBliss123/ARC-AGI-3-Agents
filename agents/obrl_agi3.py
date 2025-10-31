@@ -476,26 +476,45 @@ class ObrlAgi3Agent(Agent):
                             # Reset the failure count upon success
                             self.click_failure_counts[prev_target_id] = 0
 
-                    # --- Create a specific, per-object learning key for each change ---
-                    per_object_keys = []
+                    # --- Create a map of {key: (conditions, change_list)} for analysis ---
+                    analysis_map = {}
                     prev_summary_map = {obj['id']: obj for obj in prev_summary}
+                    
+                    prev_action_name, prev_target_id = self.last_action_context
+                    base_action_key = self._get_learning_key(prev_action_name, prev_target_id)
 
                     for change_str in changes:
                         if "Object id_" in change_str:
-                            id_num_str = change_str.split('id_')[1].split()[0]
-                            obj_id = f"obj_{id_num_str}"
-                            
+                            try:
+                                id_num_str = change_str.split('id_')[1].split()[0]
+                                obj_id = f"obj_{id_num_str}"
+                            except IndexError:
+                                continue
+
                             if obj_id in prev_summary_map:
                                 target_in_prev_state = prev_summary_map[obj_id]
-                                prev_action_name, prev_target_id = self.last_action_context
-                                base_action_key = self._get_learning_key(prev_action_name, prev_target_id)
                                 
-                                # Create the object's complete state description (properties + position)
-                                object_state = (self._get_stable_id(target_in_prev_state), target_in_prev_state['position'])
+                                # NEW KEY: (ACTION_NAME, OBJECT_ID)
+                                # This key is now stable, regardless of the object's state.
+                                contextual_key = (base_action_key, target_in_prev_state['id'])
                                 
-                                # The new key is (ACTION, OBJECT_ID, OBJECT_STATE)
-                                contextual_key = (base_action_key, target_in_prev_state['id'], object_state)
-                                per_object_keys.append(contextual_key)
+                                # We need the object's properties *at the time of the action*
+                                current_conditions = {
+                                    'color': target_in_prev_state['color'],
+                                    'pos': target_in_prev_state['position'],
+                                    'size': target_in_prev_state['size'],
+                                    'shape': target_in_prev_state['fingerprint'],
+                                    'pixels': target_in_prev_state['pixels']
+                                }
+                                
+                                # Get or create the entry for this key
+                                entry = analysis_map.setdefault(contextual_key, ({}, []))
+                                
+                                # Store the conditions (we only need one set)
+                                entry[0].update(current_conditions)
+                                
+                                # Append the change string to this key's list of outcomes
+                                entry[1].append(change_str)
                     
                     # Success Path: Calculate how many unique states were created
                     affected_object_ids = set()
@@ -724,10 +743,10 @@ class ObrlAgi3Agent(Agent):
                                 print(msg)
 
                     
-                    # Report each change under its own per-object contextual key
-                    for i, key in enumerate(per_object_keys):
-                        # Pass only the single relevant change string
-                        self._analyze_and_report(key, [changes[i]])
+                    # Report each change under its new key
+                    for key, (conditions, change_list) in analysis_map.items():
+                        # Pass the stable key, the conditions of this event, and all changes caused.
+                        self._analyze_and_report(key, conditions, change_list)
                     success_context = {
                         'summary': prev_summary,
                         'rels': self.last_relationships,
@@ -747,7 +766,7 @@ class ObrlAgi3Agent(Agent):
                                 unique_object_ids.add(f"obj_{id_num_str}")
 
                         # Now, tag the rules for any changed object that was NOT unique
-                        for key in per_object_keys:
+                        for key in analysis_map.keys():
                             # key = (base_action_key, object_id, object_state)
                             obj_id_from_key = key[1]
                             if obj_id_from_key not in unique_object_ids:
@@ -836,13 +855,23 @@ class ObrlAgi3Agent(Agent):
         boring_predictions = []
         for obj in current_summary:
             for action_template in game_specific_actions:
-                # Create the specific 3-part key for this potential object/action pair
-                coords_for_key = {'x': obj['position'][1], 'y': obj['position'][0]} if 'CLICK' in action_template.name or action_template.name == 'ACTION6' else None
-                base_action_key = self._get_learning_key(action_template.name, coords_for_key)
-                object_state = (self._get_stable_id(obj), obj['position'])
-                action_key = (base_action_key, obj['id'], object_state)
-
-                hypothesis = self.rule_hypotheses.get(action_key)
+                # Determine if this action is targeted at the current object
+                if action_template.name == 'ACTION6':
+                    target_object = obj
+                else:
+                    target_object = None
+                # NEW KEY: (ACTION_NAME, OBJECT_ID)
+                base_action_key = self._get_learning_key(action_template.name, target_object['id'] if target_object else None)
+                
+                # For global actions, we check every object
+                if target_object:
+                    obj_ids_to_check = [target_object['id']]
+                else:
+                    obj_ids_to_check = [o['id'] for o in current_summary]
+                
+                for obj_id in obj_ids_to_check:
+                    action_key = (base_action_key, obj_id)
+                    hypothesis = self.rule_hypotheses.get(action_key)
                 if hypothesis and hypothesis.get('is_boring', False):
                     obj_id_str = obj['id'].replace('obj_', 'id_')
                     boring_predictions.append(f"- Object {obj_id_str}: Action {base_action_key} is predicted to be boring.")
@@ -948,7 +977,7 @@ class ObrlAgi3Agent(Agent):
                 action_name = action_template.name
                 for obj in current_summary:
                     # Construct the specific key for this global action + this object
-                    obj_action_key = (action_name, obj['id'], (self._get_stable_id(obj), obj['position']))
+                    obj_action_key = (action_name, obj['id'])
                     hypothesis = self.rule_hypotheses.get(obj_action_key)
                     if hypothesis and hypothesis.get('is_boring', False):
                         # Add a penalty for each predicted boring outcome
@@ -1119,14 +1148,14 @@ class ObrlAgi3Agent(Agent):
                 if new_key != old_key:
                     memory_dict[new_key] = memory_dict.pop(old_key)
 
-        # Remap rule_hypotheses, which have a more complex key structure
+        # Remap rule_hypotheses
         keys_to_remap = [k for k in self.rule_hypotheses.keys()]
         for old_key in keys_to_remap:
-            # old_key = (base_action_key, object_id, object_state)
-            base_action, old_id, obj_state = old_key
+            # new_key = (base_action_key, object_id)
+            base_action, old_id = old_key
             if old_id in id_map:
                 new_id = id_map[old_id]
-                new_key = (base_action, new_id, obj_state)
+                new_key = (base_action, new_id)
                 self.rule_hypotheses[new_key] = self.rule_hypotheses.pop(old_key)
     
     def _get_learning_key(self, action_name: str, target_id: str | None) -> str:
@@ -1203,110 +1232,108 @@ class ObrlAgi3Agent(Agent):
                 continue
         return events
 
-    def _analyze_and_report(self, action_key: str, changes: list[str]):
-        """Compares new events with a stored hypothesis to find consistent, refined rules."""
+    def _analyze_and_report(self, action_key: tuple, current_conditions: dict, changes: list[str]):
+        """
+        Compares new events with a stored hypothesis.
+        It refines the *conditions* for a rule by finding the intersection
+        of properties that are consistent across all successful attempts.
+        """
         
-        def find_best_match(event_to_match, candidate_list):
-            """Finds the best matching event from a list based on event type."""
-            event_type = event_to_match['type']
-
-            # Special logic to track objects that transform and move between turns
-            if event_type in ['GROWTH', 'SHRINK', 'TRANSFORM']:
-                # Match the END position of the old event with the START position of a new one
-                if 'end_position' in event_to_match:
-                    for candidate in candidate_list:
-                        if event_to_match['end_position'] == candidate.get('start_position'):
-                            candidate_list.remove(candidate)
-                            return candidate
-            
-            # --- Existing logic for matching events by stable properties ---
-            match_key_map = {
-                'MOVED': 'fingerprint',
-                'SHAPE_CHANGED': 'position',
-                'RECOLORED': 'position',
-                'NEW': 'position',
-                'REMOVED': 'position',
-            }
-            match_key = match_key_map.get(event_type)
-
-            if match_key and match_key in event_to_match:
-                for candidate in candidate_list:
-                    if event_to_match[match_key] == candidate.get(match_key):
-                        candidate_list.remove(candidate)
-                        return candidate
-
-            # Fallback: if no direct match and only one candidate of this type, it must be the one.
-            if len(candidate_list) == 1 and candidate_list[0]['type'] == event_type:
-                return candidate_list.pop(0)
-
-            return None
-
-        def refine_rule(old_rule, new_event):
-            """Intersects the properties of a rule and a new event, keeping only commonalities."""
-            refined = {}
-            for key, value in old_rule.items():
-                if key in new_event and new_event[key] == value:
-                    refined[key] = value
-            refined['type'] = old_rule['type'] # Always preserve the event type
-            return refined
-
+        # 1. Parse the outcome of this specific event.
+        # We parse all changes and sort them to create a stable, hashable "outcome fingerprint".
         new_events = self._parse_change_logs_to_events(changes)
         if not new_events: return
 
+        # Create a stable, sorted tuple of all event *details* that occurred.
+        # This becomes the "fingerprint" of the *outcome*.
+        hashable_events = []
+        for event in new_events:
+            # Sort the event dict by key to make it stable, then convert to a tuple of tuples.
+            # e.g., {'type': 'MOVED', 'vector': (0,8)} -> (('type', 'MOVED'), ('vector', (0,8)))
+            stable_event_tuple = tuple(sorted(event.items()))
+            hashable_events.append(stable_event_tuple)
+        
+        # Sort the list of event tuples to ensure a stable order, then make it a hashable tuple.
+        # e.g., [ (('type', 'MOVED'), ...), (('type', 'RECOLORED'), ...) ]
+        outcome_fingerprint = tuple(sorted(hashable_events))
+
+        # 2. Get the existing hypothesis (if any).
         hypothesis = self.rule_hypotheses.get(action_key)
 
+        # 3. Handle First-Time Observation
         if not hypothesis:
-            # First observation: create the hypothesis with initial confidence.
+            # This is the first time we've seen this action on this object.
+            # The "learned conditions" are just the current conditions.
+            # The "learned outcomes" are just this outcome.
             self.rule_hypotheses[action_key] = {
-                'rules': new_events,
+                'learned_conditions': frozenset(current_conditions.items()),
+                'outcomes': {
+                    outcome_fingerprint: {
+                        'rules': new_events, # Store the rich details for prediction
+                        'confirmations': 1
+                    }
+                },
                 'attempts': 1,
-                'confirmations': 1,
-                'confidence': 1.0,
+                'total_confirmations': 1,
                 'is_boring': False,
             }
+            
             if self.debug_channels['HYPOTHESIS']:
+                cond_str = ", ".join([f"{k}:{v}" for k, v in current_conditions.items()])
                 print(f"\n--- Initial Case File for {action_key} (Confidence: 100%) ---")
-                for event in new_events:
-                    details = {k:v for k,v in event.items() if k != 'type'}
-                    print(f"- Observed {event['type']} with details: {details}")
+                print(f"  Conditions: {cond_str}")
+                print(f"  Outcome: {outcome_fingerprint}")
             return
         
+        # 4. Handle Subsequent Observations
         hypothesis['attempts'] += 1
-
-        # --- Stage 2 & 3: Match events and refine the hypothesis ---
-        refined_rules = []
-        # Group events by type to make matching manageable
-        new_events_by_type = {}
-        for event in new_events:
-            new_events_by_type.setdefault(event['type'], []).append(event)
-
-        # For each rule in our old hypothesis, try to find its twin in the new events
-        for old_rule in hypothesis['rules']:
-            rule_type = old_rule['type']
-            candidates = new_events_by_type.get(rule_type, [])
-            
-            match = find_best_match(old_rule, candidates)
-            
-            if match:
-                # If we found a match, refine the rule by finding the intersection of properties
-                refined_rule = refine_rule(old_rule, match)
-                refined_rules.append(refined_rule)
-
-        if refined_rules:
-            hypothesis['confirmations'] += 1
         
-        hypothesis['rules'] = refined_rules
-        hypothesis['confidence'] = hypothesis['confirmations'] / hypothesis['attempts']
-        
-        confidence_percent = hypothesis['confidence'] * 100
-        if self.debug_channels['HYPOTHESIS']:
-            print(f"\n--- Refined Hypothesis for {action_key} (Confidence: {confidence_percent:.0f}%) ---")
-            if not refined_rules:
-                print("No consistent rules could be confirmed from the new observation.")
-            else:
-                for rule in refined_rules:
-                    details = {k:v for k,v in rule.items() if k != 'type'}
-                    print(f"- Confirmed Rule: A {rule['type']} event occurs with consistent properties: {details}")
+        if outcome_fingerprint in hypothesis['outcomes']:
+            # --- SUCCESS CASE: The outcome was consistent with a known one ---
+            hypothesis['total_confirmations'] += 1
+            hypothesis['outcomes'][outcome_fingerprint]['confirmations'] += 1
+            
+            # --- REFINEMENT STEP ---
+            # This is the "parsing down" logic you wanted.
+            # We take the intersection of the *old* learned conditions and the *new* conditions.
+            old_conds = dict(hypothesis['learned_conditions'])
+            
+            # Find the intersection
+            refined_conditions = {}
+            for key, old_value in old_conds.items():
+                if key in current_conditions and current_conditions[key] == old_value:
+                    refined_conditions[key] = old_value # This property is still consistent
+            
+            hypothesis['learned_conditions'] = frozenset(refined_conditions.items())
+            
+            # (Future enhancement: Could also refine the `rules` here, but for now we'll
+            # just use the ones from the first observation.)
+            
+            if self.debug_channels['HYPOTHESIS']:
+                conf = hypothesis['total_confirmations'] / hypothesis['attempts']
+                print(f"\n--- Refined Hypothesis for {action_key} (Confidence: {conf:.0%}) ---")
+                if not refined_conditions:
+                    print(f"  Consistent Outcome: {outcome_fingerprint}")
+                    print(f"  Refined Conditions: None (Rule is unconditional)")
+                else:
+                    cond_str = ", ".join([f"{k}:{v}" for k, v in refined_conditions.items()])
+                    print(f"  Consistent Outcome: {outcome_fingerprint}")
+                    print(f"  Refined Conditions: {cond_str}")
+
+        else:
+            # --- FAILURE CASE: The outcome was INCONSISTENT ---
+            # This action on this object can produce *different* outcomes.
+            # This is a new branch of logic for this hypothesis.
+            # We don'To refine the main conditions, as they are now ambiguous.
+            # Instead, we just log this new, separate outcome.
+            hypothesis['outcomes'][outcome_fingerprint] = {
+                'rules': new_events,
+                'confirmations': 1
+            }
+            if self.debug_channels['HYPOTHESIS']:
+                print(f"\n--- New Outcome Discovered for {action_key} ---")
+                print(f"  New Outcome: {outcome_fingerprint}")
+                print(f"  This hypothesis is now considered ambiguous (has multiple outcomes).")
 
     def _find_common_context(self, contexts: list[dict]) -> dict:
         """
@@ -1680,29 +1707,61 @@ class ObrlAgi3Agent(Agent):
         
         # --- Step 1: Find all high-confidence rules that apply to this specific action ---
         applicable_rules = []
-        for rule_key, hypothesis in self.rule_hypotheses.items():
-            rule_base_key, rule_obj_id, rule_obj_state = rule_key
+        
+        # Get the object(s) this action might affect
+        if target_object: # This is a targeted click action
+            objects_to_check = [target_object]
+        else: # This is a global action
+            objects_to_check = current_summary
 
-            if hypothesis.get('confidence', 0.0) < self.hyperparams['planning_confidence_threshold']: # Use a high threshold for planning
+        for obj in objects_to_check:
+            base_action_key = self._get_learning_key(action_template.name, obj['id'] if target_object else None)
+            
+            # The new, simpler hypothesis key
+            rule_key = (base_action_key, obj['id'])
+            hypothesis = self.rule_hypotheses.get(rule_key)
+            
+            if not hypothesis:
                 continue
-
-            is_match = False
-            if target_object: # This is a targeted click action
-                # The rule must match the action, the specific object clicked, and that object's current state.
-                base_action_key = self._get_learning_key(action_template.name, target_object['id'])
-                current_object_state = (self._get_stable_id(target_object), target_object['position'])
-                if rule_base_key == base_action_key and rule_obj_id == target_object['id'] and rule_obj_state == current_object_state:
-                    is_match = True
-            else: # This is a global action
-                # The rule must match the action name. The `rule_obj_id` tells us which object will be affected.
-                base_action_key = self._get_learning_key(action_template.name, None)
-                if rule_base_key == base_action_key:
-                    is_match = True
+                
+            # Check confidence
+            confidence = hypothesis['total_confirmations'] / hypothesis['attempts']
+            if confidence < self.hyperparams['planning_confidence_threshold']:
+                continue
+                
+            # Check if the object's CURRENT state matches the rule's LEARNED conditions
+            learned_conds = dict(hypothesis['learned_conditions'])
+            if not learned_conds: # An empty condition set always matches
+                is_match = True
+            else:
+                is_match = True
+                current_obj_props = {
+                    'color': obj['color'], 'pos': obj['position'], 'size': obj['size'],
+                    'shape': obj['fingerprint'], 'pixels': obj['pixels']
+                }
+                for key, learned_value in learned_conds.items():
+                    if current_obj_props.get(key) != learned_value:
+                        is_match = False
+                        break
             
             if is_match:
-                # Store the key along with the rule for easier access later
-                hypothesis['key'] = rule_key
-                applicable_rules.append(hypothesis)
+                # This rule applies! Store it.
+                # We need to find the most likely outcome.
+                if len(hypothesis['outcomes']) == 1:
+                    # Easy case: only one known outcome
+                    most_likely_outcome_key = list(hypothesis['outcomes'].keys())[0]
+                else:
+                    # Ambiguous case: find the one with the most confirmations
+                    most_likely_outcome_key = max(hypothesis['outcomes'], 
+                                                key=lambda k: hypothesis['outcomes'][k]['confirmations'])
+                
+                # Get the detailed 'rules' (parsed events) for that outcome
+                outcome_details = hypothesis['outcomes'][most_likely_outcome_key]
+                
+                applicable_rules.append({
+                    'affected_obj_id': obj['id'],
+                    'rules': outcome_details.get('rules', [])
+                })
 
         if not applicable_rules:
             return 0.0 # No reliable predictions for this action exist.
@@ -1713,7 +1772,7 @@ class ObrlAgi3Agent(Agent):
 
         for rule in applicable_rules:
             # The rule_key contains the ID of the object that will be affected.
-            affected_obj_id = rule['key'][1] 
+            affected_obj_id = rule['affected_obj_id'] 
             if affected_obj_id not in future_summary_map:
                 continue
             
@@ -2951,18 +3010,17 @@ class ObrlAgi3Agent(Agent):
         # --- Curiosity & Knowledge Features ---
         target_id_for_key = target_object['id'] if target_object else None
         base_action_key = self._get_learning_key(action_template.name, target_id_for_key)
-        contextual_id_part = None
-        contextual_state_part = None
-        if target_object:
-            # The context includes both the specific ID and the object's current state.
-            contextual_id_part = target_object['id']
-            object_state = (self._get_stable_id(target_object), target_object['position'])
-            contextual_state_part = object_state
-        action_key = (base_action_key, contextual_id_part, contextual_state_part)
         
-        hypothesis = self.rule_hypotheses.get(action_key)
+        # The hypothesis key is just (action, object_id)
+        # For global actions, we can't really check a hypothesis this way,
+        # so we'll only do it for targeted clicks.
+        if target_object:
+            action_key = (base_action_key, target_object['id'])
+            hypothesis = self.rule_hypotheses.get(action_key)
+        else:
+            hypothesis = None # Too ambiguous to check for a global action here
         if hypothesis:
-            features[f'rule_confidence_for_{action_name}'] = hypothesis['confidence']
+            features[f'rule_confidence_for_{action_name}'] = hypothesis['total_confirmations'] / hypothesis['attempts']
             features[f'is_novel_action_for_{action_name}'] = 0.0
         else:
             features[f'rule_confidence_for_{action_name}'] = 0.0
