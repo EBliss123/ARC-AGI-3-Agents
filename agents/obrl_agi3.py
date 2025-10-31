@@ -1329,7 +1329,7 @@ class ObrlAgi3Agent(Agent):
             # (Future enhancement: Could also refine the `rules` here, but for now we'll
             # just use the ones from the first observation.)
             
-            if self.debug_channels['HYPOTHESIS']:
+            if self.debug_channels['HYPOTHESIS'] and len(hypothesis['outcomes']) == 1:
                 conf = hypothesis['total_confirmations'] / hypothesis['attempts']
                 print(f"\n--- Refined Hypothesis for {action_key} (Confidence: {conf:.0%}) ---")
                 if not refined_conditions:
