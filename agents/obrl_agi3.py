@@ -1361,69 +1361,61 @@ class ObrlAgi3Agent(Agent):
 
     def _find_common_context(self, contexts: list[dict]) -> dict:
         """
-        Finds the common context across a list of attempts, supporting wildcard
-        adjacency and strict intersection for all other relationship types.
+        Finds the common context across a list of attempts, using wildcard 'x' for
+        inconsistent adjacency properties.
         """
         if not contexts:
-            return {}
+            return {'adj': {}, 'rels': {}}
 
-        common_context = {}
+        # --- Adjacency Analysis with Wildcards ---
+        # Start with the first case as the baseline pattern. Convert to lists for mutability.
+        master_adj = {obj_id: list(contacts) for obj_id, contacts in contexts[0].get('adj', {}).items()}
         
-        # --- 1. Adjacency Analysis (supports wildcards) ---
-        def find_common_adj(key_name: str) -> dict:
-            master_adj = {obj_id: list(contacts) for obj_id, contacts in contexts[0].get(key_name, {}).items()}
+        # Iteratively refine the master pattern against all other contexts
+        for i in range(1, len(contexts)):
+            next_adj = contexts[i].get('adj', {})
             
-            for i in range(1, len(contexts)):
-                next_adj = contexts[i].get(key_name, {})
-                for obj_id in list(master_adj.keys()):
-                    master_pattern = master_adj[obj_id]
-                    next_contacts = next_adj.get(obj_id)
-                    
-                    if not next_contacts:
-                        del master_adj[obj_id]
-                        continue
-                    
-                    # Compare each direction
-                    for i in range(4):
-                        if master_pattern[i] == 'x': continue
-                        if master_pattern[i] != next_contacts[i]:
-                            master_pattern[i] = 'x'
-                    
-                    if all(d == 'x' for d in master_pattern):
-                        del master_adj[obj_id]
-
-            return {obj_id: tuple(pattern) for obj_id, pattern in master_adj.items()}
-
-        common_context['adj'] = find_common_adj('adj')
-        common_context['diag_adj'] = find_common_adj('diag_adj')
-
-        # --- 2. Relationship Analysis (Strict Intersection) ---
-        # This generic logic works for rels, align, diag_align, and match.
-        def find_common_rels(key_name: str) -> dict:
-            common_rels = copy.deepcopy(contexts[0].get(key_name, {}))
-            
-            for i in range(1, len(contexts)):
-                next_rels = contexts[i].get(key_name, {})
-                temp_common_rels = {}
-                common_rel_types = set(common_rels.keys()) & set(next_rels.keys())
+            # Use list(master_adj.keys()) to iterate safely while potentially deleting keys
+            for obj_id in list(master_adj.keys()):
+                master_pattern = master_adj[obj_id]
+                next_contacts = next_adj.get(obj_id)
                 
-                for rel_type in common_rel_types:
-                    groups1, groups2 = common_rels[rel_type], next_rels[rel_type]
-                    common_values = set(groups1.keys()) & set(groups2.keys())
-                    
-                    for value in common_values:
-                        if groups1[value] == groups2[value]:
-                            temp_common_rels.setdefault(rel_type, {})[value] = groups1[value]
-                common_rels = temp_common_rels
-            
-            return common_rels
+                # If the object doesn't exist in the next context, the pattern is broken.
+                if not next_contacts:
+                    del master_adj[obj_id]
+                    continue
+                
+                # Compare each direction (top, right, bottom, left)
+                for i in range(4):
+                    # If a direction is already a wildcard, it stays a wildcard.
+                    if master_pattern[i] == 'x':
+                        continue
+                    # If the contacts for this direction differ, it becomes a wildcard.
+                    if master_pattern[i] != next_contacts[i]:
+                        master_pattern[i] = 'x'
+                
+                # If the whole pattern has become wildcards, it's not useful information.
+                if all(d == 'x' for d in master_pattern):
+                    del master_adj[obj_id]
 
-        common_context['rels'] = find_common_rels('rels')
-        common_context['align'] = find_common_rels('align')
-        common_context['diag_align'] = find_common_rels('diag_align')
-        common_context['match'] = find_common_rels('match')
+        # Convert lists back to tuples for the final result
+        common_adj = {obj_id: tuple(pattern) for obj_id, pattern in master_adj.items()}
+
+        # --- Relationship Analysis (Strict Intersection - logic is unchanged) ---
+        common_rels = copy.deepcopy(contexts[0].get('rels', {}))
+        for i in range(1, len(contexts)):
+            next_rels = contexts[i].get('rels', {})
+            temp_common_rels = {}
+            common_rel_types = set(common_rels.keys()) & set(next_rels.keys())
+            for rel_type in common_rel_types:
+                groups1, groups2 = common_rels[rel_type], next_rels[rel_type]
+                common_values = set(groups1.keys()) & set(groups2.keys())
+                for value in common_values:
+                    if groups1[value] == groups2[value]:
+                        temp_common_rels.setdefault(rel_type, {})[value] = groups1[value]
+            common_rels = temp_common_rels
         
-        return {k: v for k, v in common_context.items() if v}
+        return {'adj': common_adj, 'rels': common_rels}
 
     def _analyze_failures(self, action_key: str, all_success_contexts: list[dict], all_failure_contexts: list[dict], current_failure_context: dict):
         """
