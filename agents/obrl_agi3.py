@@ -90,7 +90,7 @@ class ObrlAgi3Agent(Agent):
         # --- Debug Channels ---
         # Set these to True or False to control the debug output.
         self.debug_channels = {
-            'PERCEPTION': False,      # Object finding, relationships, new level setup
+            'PERCEPTION': True,      # Object finding, relationships, new level setup
             'CHANGES': False,         # All "Change Log" and "Milestone" prints
             'STATE_GRAPH': False,     # "Arrived at new Novel State", "State Graph Updated"
             'HYPOTHESIS': True,      # "Initial Case File", "Refined Hypothesis"
@@ -372,8 +372,8 @@ class ObrlAgi3Agent(Agent):
                             if self.debug_channels['PERCEPTION']: print(f"- {label}:")
                             
                             for props, group in groups_dict.items():
-                                sorted_ids = sorted(group, key=int)
-                                id_list_str = ", ".join([f"id_{id_num}" for id_num in sorted_ids])
+                                sorted_ids = sorted(group, key=lambda x: int(x.split('_')[1]))
+                                id_list_str = ", ".join([i.replace('obj_', 'id_') for i in sorted_ids])
                                 
                                 # Add property details to the group title
                                 props_str_parts = []
@@ -1142,6 +1142,50 @@ class ObrlAgi3Agent(Agent):
                 
         return None, None
     
+    def _remap_recursive(self, data: any, id_map: dict[str, str]) -> any:
+        """
+        Recursively traverses a data structure (dict, list, set, etc.) and
+        replaces all occurrences of old object IDs with new ones based on id_map.
+        """
+        # --- Case 1: Remap a dictionary ---
+        if isinstance(data, dict):
+            new_dict = {}
+            for k, v in data.items():
+                # Remap the key (if it's an obj_id) and the value (recursively)
+                new_key = id_map.get(k, k)
+                new_dict[new_key] = self._remap_recursive(v, id_map)
+            return new_dict
+        
+        # --- Case 2: Remap a list ---
+        elif isinstance(data, list):
+            # Return a new list with each item remapped
+            return [self._remap_recursive(item, id_map) for item in data]
+        
+        # --- Case 3: Remap a set ---
+        elif isinstance(data, set):
+            # Return a new set with each item remapped
+            return {self._remap_recursive(item, id_map) for item in data}
+        
+        # --- Case 4: Remap a frozenset ---
+        elif isinstance(data, frozenset):
+            # Return a new frozenset
+            return frozenset({self._remap_recursive(item, id_map) for item in data})
+
+        # --- Case 5: Remap a tuple ---
+        elif isinstance(data, tuple):
+            # Return a new tuple
+            return tuple([self._remap_recursive(item, id_map) for item in data])
+        
+        # --- Base Case: Remap a string (obj_id) ---
+        elif isinstance(data, str):
+            # If this string is an old ID, return the new one. Otherwise, return as-is.
+            return id_map.get(data, data)
+        
+        # --- Default Case: (int, float, bool, etc.) ---
+        else:
+            # This data is not remappable, return it directly.
+            return data
+
     def _remap_memory(self, id_map: dict[str, str]):
         """Updates all learning structures to use new IDs after a re-numbering."""
         if self.debug_channels['PERCEPTION']: print(f"Remapping memory for {len(id_map)} objects...")
@@ -1163,15 +1207,26 @@ class ObrlAgi3Agent(Agent):
                 if new_key != old_key:
                     memory_dict[new_key] = memory_dict.pop(old_key)
 
-        # Remap rule_hypotheses
+        # --- "Deep Remap" of Rule Hypotheses ---
         keys_to_remap = [k for k in self.rule_hypotheses.keys()]
         for old_key in keys_to_remap:
             # new_key = (base_action_key, object_id)
             base_action, old_id = old_key
-            if old_id in id_map:
-                new_id = id_map[old_id]
+            
+            # --- Remap the Key ---
+            new_id = id_map.get(old_id)
+            if new_id:
                 new_key = (base_action, new_id)
-                self.rule_hypotheses[new_key] = self.rule_hypotheses.pop(old_key)
+            else:
+                new_key = old_key # No change to this key
+            
+            # --- Remap the Value (the entire hypothesis) ---
+            # This is the new, powerful part. It crawls the hypothesis and
+            # remaps all contexts, adjacencies, and relationship IDs.
+            old_hypothesis = self.rule_hypotheses.pop(old_key)
+            new_hypothesis = self._remap_recursive(old_hypothesis, id_map)
+            
+            self.rule_hypotheses[new_key] = new_hypothesis
     
     def _get_learning_key(self, action_name: str, target_id: str | None) -> str:
         """Generates a unique key for learning, specific to an object ID for CLICK actions."""
@@ -1750,7 +1805,7 @@ class ObrlAgi3Agent(Agent):
 
             # 2. For each unique pattern, create a detailed "Role-Based" rule.
             new_rules = []
-            summary_map = {int(obj['id'].replace('obj_', '')): obj for obj in winning_context.get('summary', [])}
+            summary_map = {obj['id']: obj for obj in winning_context.get('summary', [])}
 
             for i, pattern in enumerate(unique_win_patterns):
                 obj_ids = pattern['object_ids']
@@ -2080,7 +2135,7 @@ class ObrlAgi3Agent(Agent):
         summary = context.get('summary', [])
         if not summary: return []
         
-        summary_map = {int(obj['id'].replace('obj_', '')): obj for obj in summary}
+        summary_map = {obj['id']: obj for obj in summary}
 
         def get_common_properties(obj_ids: set) -> dict:
             """Finds the shared properties among a set of object IDs."""
@@ -2128,13 +2183,13 @@ class ObrlAgi3Agent(Agent):
             if not any('obj_' in c for c in contacts):
                 continue
 
-            obj_id_int = int(obj_id_str.replace('obj_', ''))
+            obj_id_int = obj_id_str
             
             # Create an abstract fingerprint of the neighborhood (e.g., ('na', 'contact', 'na', 'na')).
             # This captures the arrangement without binding to specific object IDs in the subtype.
             abstract_config = tuple(['contact' if 'obj_' in c else 'na' for c in contacts])
             
-            contact_ids_int = {int(c.replace('obj_', '')) for c in contacts if 'obj_' in c}
+            contact_ids_int = {c for c in contacts if 'obj_' in c}
             all_ids = {obj_id_int} | contact_ids_int
             
             patterns.append({
@@ -2148,7 +2203,7 @@ class ObrlAgi3Agent(Agent):
         for event_str in context.get('events', []):
             event_type = event_str.split(':')[0].replace('- ', '')
             if "Object id_" in event_str:
-                obj_id_int = int(event_str.split('id_')[1].split(' ')[0])
+                obj_id_int = f"obj_{event_str.split('id_')[1].split(' ')[0]}"
                 obj_props = get_common_properties({obj_id_int})
                 patterns.append({
                     'pattern_type': 'event',
@@ -2174,7 +2229,7 @@ class ObrlAgi3Agent(Agent):
             'Pixel': {}
         }
         for obj in object_summary:
-            obj_id = int(obj['id'].replace('obj_', ''))
+            obj_id = obj['id']
             
             rel_data['Color'].setdefault(obj['color'], set()).add(obj_id)
             rel_data['Shape'].setdefault(obj['fingerprint'], set()).add(obj_id)
@@ -2279,7 +2334,7 @@ class ObrlAgi3Agent(Agent):
         exact_match_key = lambda o: (o['color'], o['fingerprint'], o['size'], o['pixels'])
         temp_groups = {}
         for obj in object_summary:
-            temp_groups.setdefault(exact_match_key(obj), []).append(int(obj['id'].replace('obj_', '')))
+            temp_groups.setdefault(exact_match_key(obj), []).append(obj['id'])
         
         exact_groups_dict = {key: group for key, group in temp_groups.items() if len(group) > 1}
         if exact_groups_dict:
@@ -2298,10 +2353,10 @@ class ObrlAgi3Agent(Agent):
         for match_type, key_func in partial_match_definitions.items():
             temp_groups = {}
             # Only consider objects not yet processed
-            unprocessed_objects = [o for o in object_summary if int(o['id'].replace('obj_', '')) not in processed_ids]
+            unprocessed_objects = [o for o in object_summary if o['id'] not in processed_ids]
             
             for obj in unprocessed_objects:
-                temp_groups.setdefault(key_func(obj), []).append(int(obj['id'].replace('obj_', '')))
+                temp_groups.setdefault(key_func(obj), []).append(obj['id'])
             
             partial_groups_dict = {key: group for key, group in temp_groups.items() if len(group) > 1}
             if partial_groups_dict:
@@ -2397,7 +2452,7 @@ class ObrlAgi3Agent(Agent):
         for align_type in alignment_types:
             for obj in object_summary:
                 coord = obj[align_type]
-                obj_id = int(obj['id'].replace('obj_', ''))
+                obj_id = obj['id']
                 alignment_groups[align_type].setdefault(coord, set()).add(obj_id)
 
         # Filter out groups with only one member
@@ -2421,7 +2476,7 @@ class ObrlAgi3Agent(Agent):
             obj['center_y'] = y + h // 2
             obj['center_x'] = x + w // 2
 
-        coord_map = {(obj['center_y'], obj['center_x']): int(obj['id'].replace('obj_', '')) for obj in object_summary}
+        coord_map = {(obj['center_y'], obj['center_x']): obj['id'] for obj in object_summary}
         processed_ids = set()
         final_alignments = {
             'top_left_to_bottom_right': [],
@@ -2431,13 +2486,13 @@ class ObrlAgi3Agent(Agent):
         # Iterate through every unique pair of objects
         for i in range(len(object_summary)):
             obj_a = object_summary[i]
-            id_a = int(obj_a['id'].replace('obj_', ''))
+            id_a = obj_a['id']
             if id_a in processed_ids:
                 continue
 
             for j in range(i + 1, len(object_summary)):
                 obj_b = object_summary[j]
-                id_b = int(obj_b['id'].replace('obj_', ''))
+                id_b = obj_b['id']
                 if id_b in processed_ids:
                     continue
 
@@ -2603,9 +2658,9 @@ class ObrlAgi3Agent(Agent):
         all_align_types = sorted(list(set(old_aligns.keys()) | set(new_aligns.keys())))
 
         def format_ids(id_set):
-            id_list = sorted(list(id_set))
-            if len(id_list) == 1: return f"object {id_list[0]}"
-            return f"objects " + ", ".join(map(str, id_list))
+            id_list = sorted(list(id_set), key=lambda x: int(x.split('_')[1]))
+            if len(id_list) == 1: return f"object {id_list[0].replace('obj_', 'id_')}"
+            return f"objects " + ", ".join([i.replace('obj_', 'id_') for i in id_list])
 
         for align_type in all_align_types:
             old_groups = old_aligns.get(align_type, [] if is_diagonal else {})
