@@ -94,7 +94,7 @@ class ObrlAgi3Agent(Agent):
             'CHANGES': False,         # All "Change Log" and "Milestone" prints
             'STATE_GRAPH': False,     # "Arrived at new Novel State", "State Graph Updated"
             'HYPOTHESIS': True,      # "Initial Case File", "Refined Hypothesis"
-            'FAILURE': False,         # "Failure Analysis", "Failure Detected", no-op clicks
+            'FAILURE': True,         # "Failure Analysis", "Failure Detected", no-op clicks
             'WIN_CONDITION': False,   # "LEVEL CHANGE DETECTED", "Win Condition Analysis"
             'ACTION_SCORE': False,    # All scoring, heuristics, and final choice prints
         }
@@ -743,10 +743,18 @@ class ObrlAgi3Agent(Agent):
                                 print(msg)
 
                     
+                    # This is the full context of the *previous* state, when the action was taken.
+                    full_prev_context = {
+                        'rels': self.last_relationships,
+                        'adj': self.last_adjacencies,
+                        'diag_adj': self.last_diag_adjacencies,
+                        'diag_align': self.last_diag_alignments
+                    }
+                    
                     # Report each change under its new key
                     for key, (conditions, change_list) in analysis_map.items():
-                        # Pass the stable key, the conditions of this event, and all changes caused.
-                        self._analyze_and_report(key, conditions, change_list)
+                        # Pass the stable key, the conditions of this event, AND the full context
+                        self._analyze_and_report(key, conditions, change_list, full_prev_context)
                     success_context = {
                         'summary': prev_summary,
                         'rels': self.last_relationships,
@@ -1022,7 +1030,14 @@ class ObrlAgi3Agent(Agent):
             score += failure_penalty + state_exploration_bonus
 
             # Pass the pre-calculated unmet goals to the bonus function
-            goal_bonus = self._calculate_goal_bonus(move, current_summary, unmet_abstract_goals)
+            # Get the full context of the *current* state for predictive matching
+            current_full_context = {
+                'rels': current_relationships,
+                'adj': current_adjacencies,
+                'diag_adj': current_diag_adjacencies,
+                'diag_align': current_diag_alignments
+            }
+            goal_bonus = self._calculate_goal_bonus(move, current_summary, unmet_abstract_goals, current_full_context)
             score += goal_bonus
 
             if score > best_score:
@@ -1232,7 +1247,7 @@ class ObrlAgi3Agent(Agent):
                 continue
         return events
 
-    def _analyze_and_report(self, action_key: tuple, current_conditions: dict, changes: list[str]):
+    def _analyze_and_report(self, action_key: tuple, current_conditions: dict, changes: list[str], full_context: dict):
         """
         Compares new events with a stored hypothesis.
         It refines the *conditions* for a rule by finding the intersection
@@ -1270,7 +1285,8 @@ class ObrlAgi3Agent(Agent):
                 'outcomes': {
                     outcome_fingerprint: {
                         'rules': new_events, # Store the rich details for prediction
-                        'confirmations': 1
+                        'confirmations': 1,
+                        'contexts': [full_context] # Store the full context of this event
                     }
                 },
                 'attempts': 1,
@@ -1291,7 +1307,11 @@ class ObrlAgi3Agent(Agent):
         if outcome_fingerprint in hypothesis['outcomes']:
             # --- SUCCESS CASE: The outcome was consistent with a known one ---
             hypothesis['total_confirmations'] += 1
-            hypothesis['outcomes'][outcome_fingerprint]['confirmations'] += 1
+            
+            outcome_data = hypothesis['outcomes'][outcome_fingerprint]
+            outcome_data['confirmations'] += 1
+            # Add the context of this new event to the list for this outcome
+            outcome_data.setdefault('contexts', []).append(full_context)
             
             # --- REFINEMENT STEP ---
             # This is the "parsing down" logic you wanted.
@@ -1321,77 +1341,89 @@ class ObrlAgi3Agent(Agent):
                     print(f"  Refined Conditions: {cond_str}")
 
         else:
-            # --- FAILURE CASE: The outcome was INCONSISTENT ---
+            # --- INCONSISTENT OUTCOME CASE ---
             # This action on this object can produce *different* outcomes.
             # This is a new branch of logic for this hypothesis.
-            # We don'To refine the main conditions, as they are now ambiguous.
-            # Instead, we just log this new, separate outcome.
+            # We log this new, separate outcome along with its context.
             hypothesis['outcomes'][outcome_fingerprint] = {
                 'rules': new_events,
-                'confirmations': 1
+                'confirmations': 1,
+                'contexts': [full_context] # Store the first context for this new outcome
             }
+            
             if self.debug_channels['HYPOTHESIS']:
                 print(f"\n--- New Outcome Discovered for {action_key} ---")
                 print(f"  New Outcome: {outcome_fingerprint}")
                 print(f"  This hypothesis is now considered ambiguous (has multiple outcomes).")
 
+            # Now that we have at least two different outcomes, analyze the ambiguity.
+            self._analyze_ambiguity(action_key, hypothesis)
+
     def _find_common_context(self, contexts: list[dict]) -> dict:
         """
-        Finds the common context across a list of attempts, using wildcard 'x' for
-        inconsistent adjacency properties.
+        Finds the common context across a list of attempts, supporting wildcard
+        adjacency and strict intersection for all other relationship types.
         """
         if not contexts:
-            return {'adj': {}, 'rels': {}}
+            return {}
 
-        # --- Adjacency Analysis with Wildcards ---
-        # Start with the first case as the baseline pattern. Convert to lists for mutability.
-        master_adj = {obj_id: list(contacts) for obj_id, contacts in contexts[0].get('adj', {}).items()}
+        common_context = {}
         
-        # Iteratively refine the master pattern against all other contexts
-        for i in range(1, len(contexts)):
-            next_adj = contexts[i].get('adj', {})
+        # --- 1. Adjacency Analysis (supports wildcards) ---
+        def find_common_adj(key_name: str) -> dict:
+            master_adj = {obj_id: list(contacts) for obj_id, contacts in contexts[0].get(key_name, {}).items()}
             
-            # Use list(master_adj.keys()) to iterate safely while potentially deleting keys
-            for obj_id in list(master_adj.keys()):
-                master_pattern = master_adj[obj_id]
-                next_contacts = next_adj.get(obj_id)
-                
-                # If the object doesn't exist in the next context, the pattern is broken.
-                if not next_contacts:
-                    del master_adj[obj_id]
-                    continue
-                
-                # Compare each direction (top, right, bottom, left)
-                for i in range(4):
-                    # If a direction is already a wildcard, it stays a wildcard.
-                    if master_pattern[i] == 'x':
+            for i in range(1, len(contexts)):
+                next_adj = contexts[i].get(key_name, {})
+                for obj_id in list(master_adj.keys()):
+                    master_pattern = master_adj[obj_id]
+                    next_contacts = next_adj.get(obj_id)
+                    
+                    if not next_contacts:
+                        del master_adj[obj_id]
                         continue
-                    # If the contacts for this direction differ, it becomes a wildcard.
-                    if master_pattern[i] != next_contacts[i]:
-                        master_pattern[i] = 'x'
+                    
+                    # Compare each direction
+                    for i in range(4):
+                        if master_pattern[i] == 'x': continue
+                        if master_pattern[i] != next_contacts[i]:
+                            master_pattern[i] = 'x'
+                    
+                    if all(d == 'x' for d in master_pattern):
+                        del master_adj[obj_id]
+
+            return {obj_id: tuple(pattern) for obj_id, pattern in master_adj.items()}
+
+        common_context['adj'] = find_common_adj('adj')
+        common_context['diag_adj'] = find_common_adj('diag_adj')
+
+        # --- 2. Relationship Analysis (Strict Intersection) ---
+        # This generic logic works for rels, align, diag_align, and match.
+        def find_common_rels(key_name: str) -> dict:
+            common_rels = copy.deepcopy(contexts[0].get(key_name, {}))
+            
+            for i in range(1, len(contexts)):
+                next_rels = contexts[i].get(key_name, {})
+                temp_common_rels = {}
+                common_rel_types = set(common_rels.keys()) & set(next_rels.keys())
                 
-                # If the whole pattern has become wildcards, it's not useful information.
-                if all(d == 'x' for d in master_pattern):
-                    del master_adj[obj_id]
+                for rel_type in common_rel_types:
+                    groups1, groups2 = common_rels[rel_type], next_rels[rel_type]
+                    common_values = set(groups1.keys()) & set(groups2.keys())
+                    
+                    for value in common_values:
+                        if groups1[value] == groups2[value]:
+                            temp_common_rels.setdefault(rel_type, {})[value] = groups1[value]
+                common_rels = temp_common_rels
+            
+            return common_rels
 
-        # Convert lists back to tuples for the final result
-        common_adj = {obj_id: tuple(pattern) for obj_id, pattern in master_adj.items()}
-
-        # --- Relationship Analysis (Strict Intersection - logic is unchanged) ---
-        common_rels = copy.deepcopy(contexts[0].get('rels', {}))
-        for i in range(1, len(contexts)):
-            next_rels = contexts[i].get('rels', {})
-            temp_common_rels = {}
-            common_rel_types = set(common_rels.keys()) & set(next_rels.keys())
-            for rel_type in common_rel_types:
-                groups1, groups2 = common_rels[rel_type], next_rels[rel_type]
-                common_values = set(groups1.keys()) & set(groups2.keys())
-                for value in common_values:
-                    if groups1[value] == groups2[value]:
-                        temp_common_rels.setdefault(rel_type, {})[value] = groups1[value]
-            common_rels = temp_common_rels
+        common_context['rels'] = find_common_rels('rels')
+        common_context['align'] = find_common_rels('align')
+        common_context['diag_align'] = find_common_rels('diag_align')
+        common_context['match'] = find_common_rels('match')
         
-        return {'adj': common_adj, 'rels': common_rels}
+        return {k: v for k, v in common_context.items() if v}
 
     def _analyze_failures(self, action_key: str, all_success_contexts: list[dict], all_failure_contexts: list[dict], current_failure_context: dict):
         """
@@ -1474,6 +1506,127 @@ class ObrlAgi3Agent(Agent):
 
         if not diffs_found:
             if self.debug_channels['FAILURE']: print("No conditions found that are both consistent across all failures and unique to them.")
+
+    def _analyze_ambiguity(self, action_key: tuple, hypothesis: dict):
+        """
+        Analyzes an ambiguous hypothesis (one with multiple outcomes) to find
+        a differentiating context between the outcomes.
+        """
+        if len(hypothesis['outcomes']) < 2:
+            return
+
+        # Use 'FAILURE' channel for this deep analysis, as it's a type of failure
+        if self.debug_channels['FAILURE']:
+            print(f"\n--- Ambiguity Analysis for {action_key} ---")
+            print(f"  Hypothesis has {len(hypothesis['outcomes'])} outcomes. Comparing first two.")
+
+        try:
+            # Get the keys and context lists for the first two outcomes
+            outcome_keys = list(hypothesis['outcomes'].keys())
+            outcome_A_key = outcome_keys[0]
+            outcome_B_key = outcome_keys[1]
+            
+            contexts_A = hypothesis['outcomes'][outcome_A_key].get('contexts', [])
+            contexts_B = hypothesis['outcomes'][outcome_B_key].get('contexts', [])
+
+            if not contexts_A or not contexts_B:
+                if self.debug_channels['FAILURE']: print("  Analysis failed: Contexts not stored for outcomes.")
+                return
+
+            # Find the common, consistent context for each outcome
+            common_A = self._find_common_context(contexts_A)
+            common_B = self._find_common_context(contexts_B)
+
+            # --- Now, find the *difference* ---
+            diffs_found = False
+            differentiating_conditions = {'A': {}, 'B': {}}
+
+            # 1. Adjacency Diffs
+            adj_A = common_A.get('adj', {})
+            adj_B = common_B.get('adj', {})
+            all_adj_ids = set(adj_A.keys()) | set(adj_B.keys())
+
+            for obj_id in sorted(list(all_adj_ids), key=lambda x: int(x.split('_')[1])):
+                contacts_A = tuple(adj_A.get(obj_id, ['na']*4))
+                contacts_B = tuple(adj_B.get(obj_id, ['na']*4))
+                if contacts_A != contacts_B:
+                    diffs_found = True
+                    differentiating_conditions['A'].setdefault('adj', {})[obj_id] = contacts_A
+                    differentiating_conditions['B'].setdefault('adj', {})[obj_id] = contacts_B
+            
+            # 2. Relationship Diffs
+            rels_A = common_A.get('rels', {})
+            rels_B = common_B.get('rels', {})
+            all_rel_types = set(rels_A.keys()) | set(rels_B.keys())
+
+            for rel_type in all_rel_types:
+                groups_A = rels_A.get(rel_type, {})
+                groups_B = rels_B.get(rel_type, {})
+                all_values = set(groups_A.keys()) | set(groups_B.keys())
+                
+                for value in all_values:
+                    ids_A = groups_A.get(value, set())
+                    ids_B = groups_B.get(value, set())
+                    if ids_A != ids_B:
+                        diffs_found = True
+                        differentiating_conditions['A'].setdefault('rels', {}).setdefault(rel_type, {})[value] = ids_A
+                        differentiating_conditions['B'].setdefault('rels', {}).setdefault(rel_type, {})[value] = ids_B
+            
+            # (Future enhancement: Add diag_adj and diag_align checks here)
+
+            if diffs_found:
+                # Store these new, specific rules on the hypothesis
+                hypothesis['differentiated_outcomes'] = {
+                    outcome_A_key: differentiating_conditions['A'],
+                    outcome_B_key: differentiating_conditions['B']
+                }
+                if self.debug_channels['FAILURE']:
+                    print(f"  Found differentiating context!")
+                    print(f"  - Rule for Outcome A: {differentiating_conditions['A']}")
+                    print(f"  - Rule for Outcome B: {differentiating_conditions['B']}")
+            else:
+                 if self.debug_channels['FAILURE']:
+                    print(f"  No differentiating external context found between outcomes.")
+
+        except Exception as e:
+            if self.debug_channels['FAILURE']:
+                print(f"  Ambiguity analysis failed with error: {e}")
+
+    def _context_matches_pattern(self, current_context: dict, pattern: dict) -> bool:
+        """
+        Checks if the current_context (live state) matches a stored pattern.
+        The pattern can be partial (e.g., only checking for one adjacency).
+        """
+        if not pattern:
+            return True # An empty pattern always matches
+
+        try:
+            # Check Adjacency Patterns
+            pattern_adj = pattern.get('adj', {})
+            current_adj = current_context.get('adj', {})
+            for obj_id, pattern_contacts in pattern_adj.items():
+                current_contacts = tuple(current_adj.get(obj_id, ['na']*4))
+                # Compare the current state against the pattern, ignoring wildcards ('x')
+                for i in range(4):
+                    if pattern_contacts[i] != 'x' and pattern_contacts[i] != current_contacts[i]:
+                        return False # Mismatch
+            
+            # Check Relationship Patterns
+            pattern_rels = pattern.get('rels', {})
+            current_rels = current_context.get('rels', {})
+            for rel_type, pattern_groups in pattern_rels.items():
+                current_groups = current_rels.get(rel_type, {})
+                for value, pattern_ids in pattern_groups.items():
+                    current_ids = current_groups.get(value, set())
+                    if pattern_ids != current_ids:
+                        return False # Mismatch
+            
+            # (Future enhancement: Add diag_adj and diag_align checks here)
+        
+        except Exception:
+            return False # Failed to parse, so it's not a match
+
+        return True # All pattern checks passed
 
     def _analyze_win_condition(self, level_history: list[dict], milestone_indices: list[int], id_map: dict = None):
         """
@@ -1693,7 +1846,7 @@ class ObrlAgi3Agent(Agent):
         unique_patterns = {tuple(p.items()) for p in patterns}
         return [dict(t) for t in unique_patterns]
 
-    def _calculate_goal_bonus(self, move: dict, current_summary: list[dict], unmet_goals: set) -> float:
+    def _calculate_goal_bonus(self, move: dict, current_summary: list[dict], unmet_goals: set, current_full_context: dict) -> float:
         """
         Performs a "one-step lookahead" simulation. It predicts the next state based on
         the given move, analyzes that hypothetical state, and awards a bonus if it
@@ -1745,23 +1898,36 @@ class ObrlAgi3Agent(Agent):
                         break
             
             if is_match:
-                # This rule applies! Store it.
-                # We need to find the most likely outcome.
-                if len(hypothesis['outcomes']) == 1:
-                    # Easy case: only one known outcome
-                    most_likely_outcome_key = list(hypothesis['outcomes'].keys())[0]
-                else:
-                    # Ambiguous case: find the one with the most confirmations
-                    most_likely_outcome_key = max(hypothesis['outcomes'], 
-                                                key=lambda k: hypothesis['outcomes'][k]['confirmations'])
-                
-                # Get the detailed 'rules' (parsed events) for that outcome
-                outcome_details = hypothesis['outcomes'][most_likely_outcome_key]
-                
-                applicable_rules.append({
-                    'affected_obj_id': obj['id'],
-                    'rules': outcome_details.get('rules', [])
-                })
+                    # --- AMBIGUITY-SOLVING PREDICITON ---
+                    predicted_outcome_key = None
+                    differentiated_outcomes = hypothesis.get('differentiated_outcomes')
+
+                    if differentiated_outcomes:
+                        # This hypothesis is ambiguous, but we have rules to solve it.
+                        # Check if the current context matches one of the differentiated patterns.
+                        for outcome_key, differentiating_context in differentiated_outcomes.items():
+                            if self._context_matches_pattern(current_full_context, differentiating_context):
+                                predicted_outcome_key = outcome_key
+                                break # We found the specific rule that applies
+                    
+                    if not predicted_outcome_key:
+                        # Fallback: No differentiator, or no match. Use the most confirmed outcome.
+                        if len(hypothesis['outcomes']) == 1:
+                            predicted_outcome_key = list(hypothesis['outcomes'].keys())[0]
+                        else:
+                            # Ambiguous case: find the one with the most confirmations
+                            predicted_outcome_key = max(hypothesis['outcomes'], 
+                                                        key=lambda k: hypothesis['outcomes'][k]['confirmations'])
+                    
+                    # Get the detailed 'rules' (parsed events) for that outcome
+                    # Use .get() as a safeguard in case the key is somehow missing
+                    outcome_details = hypothesis['outcomes'].get(predicted_outcome_key)
+                    
+                    if outcome_details:
+                        applicable_rules.append({
+                            'affected_obj_id': obj['id'],
+                            'rules': outcome_details.get('rules', [])
+                        })
 
         if not applicable_rules:
             return 0.0 # No reliable predictions for this action exist.
