@@ -1499,56 +1499,33 @@ class ObrlAgi3Agent(Agent):
         if not diffs_found:
             if self.debug_channels['FAILURE']: print("No conditions found that are both consistent across all failures and unique to them.")
 
-    def _analyze_ambiguity(self, action_key: tuple, hypothesis: dict):
+    def _find_context_difference(self, context_A: dict, context_B: dict) -> dict:
         """
-        Analyzes an ambiguous hypothesis (one with multiple outcomes) to find
-        a differentiating context between the outcomes.
+        Compares two common_contexts (A and B) and returns a new context pattern
+        containing all elements that are in A and are different in B.
         """
-        if len(hypothesis['outcomes']) < 2:
-            return
+        diff_pattern = {}
 
-        # Use 'FAILURE' channel for this deep analysis, as it's a type of failure
-        if self.debug_channels['FAILURE']:
-            print(f"\n--- Ambiguity Analysis for {action_key} ---")
-            print(f"  Hypothesis has {len(hypothesis['outcomes'])} outcomes. Comparing first two.")
-
-        try:
-            # Get the keys and context lists for the first two outcomes
-            outcome_keys = list(hypothesis['outcomes'].keys())
-            outcome_A_key = outcome_keys[0]
-            outcome_B_key = outcome_keys[1]
-            
-            contexts_A = hypothesis['outcomes'][outcome_A_key].get('contexts', [])
-            contexts_B = hypothesis['outcomes'][outcome_B_key].get('contexts', [])
-
-            if not contexts_A or not contexts_B:
-                if self.debug_channels['FAILURE']: print("  Analysis failed: Contexts not stored for outcomes.")
-                return
-
-            # Find the common, consistent context for each outcome
-            common_A = self._find_common_context(contexts_A)
-            common_B = self._find_common_context(contexts_B)
-
-            # --- Now, find the *difference* ---
-            diffs_found = False
-            differentiating_conditions = {'A': {}, 'B': {}}
-
-            # 1. Adjacency Diffs
-            adj_A = common_A.get('adj', {})
-            adj_B = common_B.get('adj', {})
+        # 1. Adjacency and Diagonal Adjacency Diffs
+        for key in ['adj', 'diag_adj']:
+            adj_A = context_A.get(key, {})
+            adj_B = context_B.get(key, {})
             all_adj_ids = set(adj_A.keys()) | set(adj_B.keys())
 
-            for obj_id in sorted(list(all_adj_ids), key=lambda x: int(x.split('_')[1])):
+            for obj_id in all_adj_ids:
                 contacts_A = tuple(adj_A.get(obj_id, ['na']*4))
                 contacts_B = tuple(adj_B.get(obj_id, ['na']*4))
+                
+                # We add the pattern from A *if* it's different from B
                 if contacts_A != contacts_B:
-                    diffs_found = True
-                    differentiating_conditions['A'].setdefault('adj', {})[obj_id] = contacts_A
-                    differentiating_conditions['B'].setdefault('adj', {})[obj_id] = contacts_B
-            
-            # 2. Relationship Diffs
-            rels_A = common_A.get('rels', {})
-            rels_B = common_B.get('rels', {})
+                    # We only care about what's in A
+                    if obj_id in adj_A:
+                        diff_pattern.setdefault(key, {})[obj_id] = contacts_A
+
+        # 2. Relationship, Alignment, and Match Diffs (dict-of-dicts)
+        for key in ['rels', 'align', 'match']:
+            rels_A = context_A.get(key, {})
+            rels_B = context_B.get(key, {})
             all_rel_types = set(rels_A.keys()) | set(rels_B.keys())
 
             for rel_type in all_rel_types:
@@ -1559,26 +1536,150 @@ class ObrlAgi3Agent(Agent):
                 for value in all_values:
                     ids_A = groups_A.get(value, set())
                     ids_B = groups_B.get(value, set())
+                    
                     if ids_A != ids_B:
-                        diffs_found = True
-                        differentiating_conditions['A'].setdefault('rels', {}).setdefault(rel_type, {})[value] = ids_A
-                        differentiating_conditions['B'].setdefault('rels', {}).setdefault(rel_type, {})[value] = ids_B
-            
-            # (Future enhancement: Add diag_adj and diag_align checks here)
+                        # We only care about the state in A
+                        if value in groups_A:
+                            diff_pattern.setdefault(key, {}).setdefault(rel_type, {})[value] = ids_A
 
-            if diffs_found:
-                # Store these new, specific rules on the hypothesis
-                hypothesis['differentiated_outcomes'] = {
-                    outcome_A_key: differentiating_conditions['A'],
-                    outcome_B_key: differentiating_conditions['B']
-                }
+        # 3. Diagonal Alignment Diffs (dict-of-lists)
+        key = 'diag_align'
+        rels_A = context_A.get(key, {})
+        rels_B = context_B.get(key, {})
+        all_rel_types = set(rels_A.keys()) | set(rels_B.keys())
+
+        for rel_type in all_rel_types:
+            groups_A = rels_A.get(rel_type, [])
+            groups_B = rels_B.get(rel_type, [])
+            
+            frozensets_A = {frozenset(s) for s in groups_A}
+            frozensets_B = {frozenset(s) for s in groups_B}
+
+            if frozensets_A != frozensets_B:
+                # We only care about the state in A
+                if rel_type in rels_A:
+                    diff_pattern.setdefault(key, {})[rel_type] = groups_A
+
+        return diff_pattern
+    
+    def _intersect_contexts(self, context_A: dict, context_B: dict) -> dict:
+        """
+        Finds the intersection of two context patterns (A and B).
+        A context pattern is a (potentially partial) context.
+        """
+        if not context_A: return context_B
+        if not context_B: return context_A
+        
+        intersection = {}
+
+        # 1. Adjacency and Diagonal Adjacency
+        for key in ['adj', 'diag_adj']:
+            adj_A = context_A.get(key, {})
+            adj_B = context_B.get(key, {})
+            
+            # We only keep obj_ids that are in *both* patterns
+            common_ids = set(adj_A.keys()) & set(adj_B.keys())
+            for obj_id in common_ids:
+                # We only keep it if the pattern is *identical*
+                if adj_A[obj_id] == adj_B[obj_id]:
+                    intersection.setdefault(key, {})[obj_id] = adj_A[obj_id]
+
+        # 2. Relationship, Alignment, and Match Diffs (dict-of-dicts)
+        for key in ['rels', 'align', 'match']:
+            rels_A = context_A.get(key, {})
+            rels_B = context_B.get(key, {})
+            
+            common_rel_types = set(rels_A.keys()) & set(rels_B.keys())
+            for rel_type in common_rel_types:
+                groups_A = rels_A[rel_type]
+                groups_B = rels_B[rel_type]
+                
+                common_values = set(groups_A.keys()) & set(groups_B.keys())
+                for value in common_values:
+                    if groups_A[value] == groups_B[value]:
+                        intersection.setdefault(key, {}).setdefault(rel_type, {})[value] = groups_A[value]
+
+        # 3. Diagonal Alignment Diffs (dict-of-lists)
+        key = 'diag_align'
+        rels_A = context_A.get(key, {})
+        rels_B = context_B.get(key, {})
+        common_rel_types = set(rels_A.keys()) & set(rels_B.keys())
+
+        for rel_type in common_rel_types:
+            groups_A = rels_A[rel_type]
+            groups_B = rels_B[rel_type]
+            
+            frozensets_A = {frozenset(s) for s in groups_A}
+            frozensets_B = {frozenset(s) for s in groups_B}
+            
+            # Find the intersection of the sets of frozensets
+            common_lines_frozensets = frozensets_A & frozensets_B
+            
+            if common_lines_frozensets:
+                # Convert back to list of sets
+                intersection.setdefault(key, {})[rel_type] = [set(fs) for fs in common_lines_frozensets]
+
+        return intersection
+
+    def _analyze_ambiguity(self, action_key: tuple, hypothesis: dict):
+        """
+        Analyzes an ambiguous hypothesis (one with multiple outcomes) by comparing
+        every outcome to every *other* outcome to find a unique, differentiating context.
+        """
+        outcome_keys = list(hypothesis['outcomes'].keys())
+        if len(outcome_keys) < 2:
+            return
+
+        # Use 'FAILURE' channel for this deep analysis
+        if self.debug_channels['FAILURE']:
+            print(f"\n--- Ambiguity Analysis for {action_key} ---")
+            print(f"  Hypothesis has {len(outcome_keys)} outcomes. Running full comparison.")
+
+        try:
+            # Step 1: Get the common context for every outcome
+            all_common_contexts = {}
+            for key in outcome_keys:
+                contexts = hypothesis['outcomes'][key].get('contexts', [])
+                if not contexts:
+                    if self.debug_channels['FAILURE']: print(f"  Analysis failed: Contexts not stored for outcome {key}.")
+                    return
+                all_common_contexts[key] = self._find_common_context(contexts)
+
+            # Step 2: For each outcome, find its unique context by intersecting
+            #         its differences with all other outcomes.
+            differentiated_outcomes = {}
+            
+            for i in range(len(outcome_keys)):
+                target_key = outcome_keys[i]
+                common_target = all_common_contexts[target_key]
+                
+                intersection_of_diffs = None
+                
+                for j in range(len(outcome_keys)):
+                    if i == j: continue
+                    
+                    compare_key = outcome_keys[j]
+                    common_compare = all_common_contexts[compare_key]
+                    
+                    # Find what's in Target that is different from Compare
+                    current_diff = self._find_context_difference(common_target, common_compare)
+                    
+                    if intersection_of_diffs is None:
+                        intersection_of_diffs = current_diff
+                    else:
+                        # Keep refining the rule by finding the intersection of all differences
+                        intersection_of_diffs = self._intersect_contexts(intersection_of_diffs, current_diff)
+                
+                # The final `intersection_of_diffs` is the unique rule for this outcome
+                differentiated_outcomes[target_key] = intersection_of_diffs
+                
                 if self.debug_channels['FAILURE']:
-                    print(f"  Found differentiating context!")
-                    print(f"  - Rule for Outcome A: {differentiating_conditions['A']}")
-                    print(f"  - Rule for Outcome B: {differentiating_conditions['B']}")
-            else:
-                 if self.debug_channels['FAILURE']:
-                    print(f"  No differentiating external context found between outcomes.")
+                    if intersection_of_diffs:
+                        print(f"  - Found Rule for Outcome {i+1}: {intersection_of_diffs}")
+                    else:
+                        print(f"  - No unique rule found for Outcome {i+1} (may be a subset of another outcome).")
+
+            hypothesis['differentiated_outcomes'] = differentiated_outcomes
 
         except Exception as e:
             if self.debug_channels['FAILURE']:
