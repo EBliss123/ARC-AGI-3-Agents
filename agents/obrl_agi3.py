@@ -90,12 +90,12 @@ class ObrlAgi3Agent(Agent):
         # --- Debug Channels ---
         # Set these to True or False to control the debug output.
         self.debug_channels = {
-            'PERCEPTION': True,      # Object finding, relationships, new level setup
+            'PERCEPTION': False,      # Object finding, relationships, new level setup
             'CHANGES': False,         # All "Change Log" and "Milestone" prints
             'STATE_GRAPH': False,     # "Arrived at new Novel State", "State Graph Updated"
-            'HYPOTHESIS': True,      # "Initial Case File", "Refined Hypothesis"
-            'FAILURE': True,         # "Failure Analysis", "Failure Detected", no-op clicks
-            'WIN_CONDITION': False,   # "LEVEL CHANGE DETECTED", "Win Condition Analysis"
+            'HYPOTHESIS': False,      # "Initial Case File", "Refined Hypothesis"
+            'FAILURE': False,         # "Failure Analysis", "Failure Detected", no-op clicks
+            'WIN_CONDITION': True,   # "LEVEL CHANGE DETECTED", "Win Condition Analysis"
             'ACTION_SCORE': False,    # All scoring, heuristics, and final choice prints
         }
 
@@ -1787,21 +1787,30 @@ class ObrlAgi3Agent(Agent):
 
         winning_context = level_history[-1]
         
+        # --- 1. Find all patterns unique to this new win ---
+        if self.debug_channels['WIN_CONDITION']: print("Analyzing unique patterns from new win state...")
+        win_patterns = self._extract_patterns_from_context(winning_context)
+        
+        # Create a map of {abstract_key: [list_of_patterns]} for easy lookup
+        # This is used by REFINING mode, but we calculate it here for both.
+        new_patterns_map = {}
+        for p in win_patterns:
+            abstract_key = (p['pattern_type'], p['sub_type'])
+            new_patterns_map.setdefault(abstract_key, []).append(p)
+
         if not self.win_condition_hypotheses:
             # --- CREATION MODE (After Level 1) ---
             if self.debug_channels['WIN_CONDITION']: print("No Master Recipe found. Creating initial Role-Based rules...")
+            if self.debug_channels['WIN_CONDITION']: print("Comparing final win state against the initial start state...")
             
-            # 1. Use the Uniqueness Filter to find the most significant patterns.
-            win_patterns = self._extract_patterns_from_context(winning_context)
-            historical_contexts = level_history[:-1]
-            seen_patterns_set = set()
-            for context in historical_contexts:
-                historical_patterns = self._extract_patterns_from_context(context)
-                for p in historical_patterns:
-                    seen_patterns_set.add(str(p)) # Use string for hashable representation
+            # Get the very first state as the baseline
+            start_context = level_history[0]
+            start_patterns = self._extract_patterns_from_context(start_context)
+            start_patterns_set = {str(p) for p in start_patterns} # Use string for hashable representation
             
-            unique_win_patterns = [p for p in win_patterns if str(p) not in seen_patterns_set]
-            if self.debug_channels['WIN_CONDITION']: print(f"Found {len(win_patterns)} patterns in win state; {len(unique_win_patterns)} are unique.")
+            # The "unique" patterns are anything in the win state that was NOT in the start state.
+            unique_win_patterns = [p for p in win_patterns if str(p) not in start_patterns_set]
+            if self.debug_channels['WIN_CONDITION']: print(f"Found {len(win_patterns)} patterns in win state; {len(unique_win_patterns)} were not present in the start state.")
 
             # 2. For each unique pattern, create a detailed "Role-Based" rule.
             new_rules = []
@@ -1884,7 +1893,7 @@ class ObrlAgi3Agent(Agent):
                 print(f"\n--- Current Master Recipe ({len(self.win_condition_hypotheses)} rules) ---")
                 sorted_rules = sorted(self.win_condition_hypotheses, key=lambda x: x['confidence'], reverse=True)
 
-                for rule in sorted_rules[:10]: # Log top 10 rules
+                for rule in sorted_rules[:20]: # Log top 10 rules
                     pattern = rule['abstract_pattern']
                     desc = f"A '{pattern['sub_type']}' pattern"
                     
