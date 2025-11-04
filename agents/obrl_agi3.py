@@ -1837,19 +1837,11 @@ class ObrlAgi3Agent(Agent):
                     }
                     all_props_in_pattern.append(dict(initial_props))
 
-                # 4. Find the initial "group properties" - what's common to all roles.
-                group_common_props = {}
-                if all_props_in_pattern:
-                    first_props = all_props_in_pattern[0]
-                    for key in first_props:
-                        if all(p.get(key) == first_props[key] for p in all_props_in_pattern):
-                            group_common_props[key] = first_props[key]
-
                 new_rules.append({
                     'id': f'rule_{i+1}',
                     'abstract_pattern': {'pattern_type': pattern['pattern_type'], 'sub_type': pattern['sub_type']},
                     'roles': roles,
-                    'group_properties': frozenset(group_common_props.items()),
+                    'group_properties': pattern['common_properties'], # Use the pre-computed common properties
                     'confidence': 1.0
                 })
             
@@ -1857,35 +1849,101 @@ class ObrlAgi3Agent(Agent):
 
         else:
             # --- REFINING MODE (After Level 2+) ---
-            master_recipe_rules = self.win_condition_hypotheses
-            if self.debug_channels['WIN_CONDITION']: print(f"\n--- Refining {len(master_recipe_rules)} Master Rules Based on New Evidence ---")
-
-            # Get the set of abstract patterns that were unique to this new win.
-            new_win_patterns = self._extract_patterns_from_context(winning_context)
-            historical_contexts = level_history[:-1]
-            seen_patterns_set = {str(p) for c in historical_contexts for p in self._extract_patterns_from_context(c)}
-            unique_new_patterns = [p for p in new_win_patterns if str(p) not in seen_patterns_set]
+            # This is the new "Confirm, Generalize, or Delete" logic.
+            if self.debug_channels['WIN_CONDITION']: print(f"\n--- Refining {len(self.win_condition_hypotheses)} Master Rules Based on New Evidence ---")
             
-            # Create a simple set of abstract types for easy lookup, e.g., {('alignment', 'bottom_y'), ...}
-            unique_new_abstract_patterns = {
-                (p['pattern_type'], p['sub_type']) for p in unique_new_patterns
-            }
+            # 1. Find New Evidence: Get patterns from the (Win State) vs. (Start State) delta
+            start_context = level_history[0]
+            start_patterns = self._extract_patterns_from_context(start_context)
+            start_patterns_set = {str(p) for p in start_patterns}
+            
+            new_win_patterns = [p for p in win_patterns if str(p) not in start_patterns_set]
+            
+            # Create a map of {abstract_key: [list_of_patterns]} for easy lookup
+            new_evidence_map = {}
+            for p in new_win_patterns:
+                abstract_key = (p['pattern_type'], p['sub_type'])
+                new_evidence_map.setdefault(abstract_key, []).append(p)
 
-            surviving_rules = []
-            for rule in master_recipe_rules:
-                # Check if the rule's abstract pattern was found in the new level's unique events
-                rule_abstract = (rule['abstract_pattern']['pattern_type'], rule['abstract_pattern']['sub_type'])
+            next_master_recipe = []
+            used_new_evidence = set() # Stores str(pattern) of new patterns that were used
+            
+            # 2. Iterate Through Old Rules
+            for rule in self.win_condition_hypotheses:
+                abstract_key = (rule['abstract_pattern']['pattern_type'], rule['abstract_pattern']['sub_type'])
+                rule_was_matched = False
+                potential_matches = new_evidence_map.get(abstract_key, [])
+
+                if potential_matches:
+                    for new_pattern in potential_matches:
+                        old_props = rule['group_properties']
+                        new_props = new_pattern['common_properties']
+                        
+                        if old_props == new_props:
+                            # --- Case 1: Perfect Match (CONFIRM) ---
+                            rule['confidence'] = 1.0 # Re-confirm
+                            next_master_recipe.append(rule)
+                            used_new_evidence.add(str(new_pattern))
+                            rule_was_matched = True
+                            if self.debug_channels['WIN_CONDITION']: print(f"- Rule '{rule['id']}' ({abstract_key[1]}) was CONFIRMED (Perfect Match).")
+                            break # This old rule is confirmed, move to the next one
+                    
+                    if not rule_was_matched:
+                        # --- Case 2: Abstract Match, Specific Mismatch (GENERALIZE) ---
+                        new_pattern_to_gen = potential_matches[0] # Use the first one to generalize
+                        old_props_dict = dict(rule['group_properties'])
+                        new_props_dict = dict(new_pattern_to_gen['common_properties'])
+                        generalized_props = {}
+                        
+                        all_keys = set(old_props_dict.keys()) | set(new_props_dict.keys())
+                        for key in all_keys:
+                            if old_props_dict.get(key) == new_props_dict.get(key):
+                                generalized_props[key] = old_props_dict.get(key) # Property is consistent
+                            else:
+                                generalized_props[key] = 'VARIES' # Property has changed, so it generalizes
+                        
+                        rule['group_properties'] = frozenset(generalized_props.items())
+                        rule['confidence'] = 1.0 # Generalized rule is confirmed
+                        next_master_recipe.append(rule)
+                        used_new_evidence.add(str(new_pattern_to_gen))
+                        rule_was_matched = True
+                        if self.debug_channels['WIN_CONDITION']: print(f"- Rule '{rule['id']}' ({abstract_key[1]}) was GENERALIZED to props: {dict(rule['group_properties'])}.")
                 
-                if rule_abstract in unique_new_abstract_patterns:
-                    # The rule is consistent. Reinforce its confidence.
-                    rule['confidence'] = min(1.0, rule['confidence'] + 0.1)
-                    surviving_rules.append(rule)
-                    if self.debug_channels['WIN_CONDITION']: print(f"- Rule '{rule['id']}' ({rule['abstract_pattern']['sub_type']}) was REINFORCED. Confidence -> {rule['confidence']:.0%}")
-                else:
-                    # The rule is inconsistent with this win. Delete it immediately.
-                    if self.debug_channels['WIN_CONDITION']: print(f"- Rule '{rule['id']}' ({rule['abstract_pattern']['sub_type']}) was INCONSISTENT and has been DELETED.")
+                if not rule_was_matched:
+                    # --- Case 3: No Match (DELETE RED HERRING) ---
+                    if self.debug_channels['WIN_CONDITION']: print(f"- Rule '{rule['id']}' ({abstract_key[1]}) was DELETED (Red Herring).")
             
-            self.win_condition_hypotheses = surviving_rules
+            # 3. APPEND New Rules
+            if self.debug_channels['WIN_CONDITION']: print("\n--- Appending New Rules ---")
+            current_rule_count = len(next_master_recipe) # Get count *before* adding
+            summary_map = {obj['id']: obj for obj in winning_context.get('summary', [])}
+
+            for new_pattern in new_win_patterns:
+                if str(new_pattern) not in used_new_evidence:
+                    # This is a brand new rule (per LS20 logic)
+                    if self.debug_channels['WIN_CONDITION']: print(f"- New Rule Appended: '{new_pattern['sub_type']}' pattern.")
+                    current_rule_count += 1
+                    new_rule_id = f'rule_{current_rule_count}'
+                    obj_ids = new_pattern['object_ids']
+                    
+                    # --- Build roles for the new rule ---
+                    roles = {}
+                    for role_idx, obj_id in enumerate(sorted(list(obj_ids))):
+                        obj = summary_map.get(obj_id)
+                        if not obj: continue
+                        initial_props = frozenset({'color': obj['color'], 'shape': obj['fingerprint'], 'size': obj['size']}.items())
+                        roles[f'role_{role_idx}'] = {'learned_properties': initial_props, 'history': [obj_id]}
+                    
+                    next_master_recipe.append({
+                        'id': new_rule_id,
+                        'abstract_pattern': {'pattern_type': new_pattern['pattern_type'], 'sub_type': new_pattern['sub_type']},
+                        'roles': roles,
+                        'group_properties': new_pattern['common_properties'],
+                        'confidence': 1.0
+                    })
+            
+            # 4. Finalize: Replace the old recipe
+            self.win_condition_hypotheses = next_master_recipe
             
         # --- Final Report ---
         if self.win_condition_hypotheses:
@@ -1904,7 +1962,7 @@ class ObrlAgi3Agent(Agent):
                     print(f"  - Group Property Consistency: [{group_props_str}]")
                     print(f"  - Role Analysis:")
                     
-                    for role_id, role_data in sorted(rule['roles'].items()):
+                    for role_id, role_data in sorted(rule['roles'].items(), key=lambda item: int(item[0].split('_')[1])):
                         props_str = ", ".join([f"{k}:{v}" for k, v in role_data['learned_properties']])
                         history_str = ", ".join(map(str, role_data['history']))
                         print(f"    - {role_id}: Consistent properties [{props_str}]. Seen as objects [{history_str}]")
