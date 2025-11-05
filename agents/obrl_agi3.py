@@ -53,6 +53,7 @@ class ObrlAgi3Agent(Agent):
             'weight_novelty_ratio': 36.67, # How much to weigh novelty efficiency (unique changes / total changes) in the composite score.
             'planning_confidence_threshold': 0.88, # Confidence threshold for a rule to be used in goal-seeking lookahead.
             'recent_effect_patterns_maxlen': 18, # How many recent action outcomes to remember for detecting repetition.
+            'reward_goal_proximity': 150.0, # (NEW) Multiplier for rewarding moves that get closer to satisfying the Master Recipe.
         }
         
         # If a dictionary of params was provided, update the defaults.
@@ -86,6 +87,7 @@ class ObrlAgi3Agent(Agent):
         self.click_failure_counts = {}
         self.object_blacklist = set()
         self.successful_novelty_history = []
+        self.last_proximity_score = 0.0
 
         # --- Debug Channels ---
         # Set these to True or False to control the debug output.
@@ -116,6 +118,7 @@ class ObrlAgi3Agent(Agent):
         if not self.last_object_summary or self.is_new_level:
             self.click_failure_counts = {}
             self.object_blacklist = set()
+            self.last_proximity_score = 0.0
 
             if self.debug_channels['PERCEPTION']: print("\n--- New Level Detected: Resetting state graph and history. ---")
             self.state_action_history = {}
@@ -610,7 +613,17 @@ class ObrlAgi3Agent(Agent):
                             is_failure_case = True
 
                 # --- Now, with all outcomes known, learn from the last action ---
-                performance_score = self._learn_from_outcome(latest_frame, changes, current_summary, novel_state_count, is_failure_case, learning_key)
+                # (MODIFIED CALL: Pass the full current context for proximity reward)
+                current_context = {
+                    'summary': current_summary,
+                    'rels': current_relationships,
+                    'adj': current_adjacencies,
+                    'match': current_match_groups,
+                    'align': current_alignments,
+                    'conj': current_conjunctions,
+                    'events': changes 
+                }
+                performance_score = self._learn_from_outcome(latest_frame, changes, current_context, novel_state_count, is_failure_case, learning_key)
 
                 # --- Handle all Logging and Rule Analysis *after* learning ---
                 if changes:
@@ -1119,6 +1132,70 @@ class ObrlAgi3Agent(Agent):
         This method is called by the game to see if the agent thinks it is done.
         """
         return False
+    
+    def _calculate_proximity_score(self, current_context: dict, win_hypotheses: list[dict]) -> float:
+        """
+        Calculates a 'completion percentage' (0.0 to 1.0) of how many
+        win hypotheses are currently satisfied by the state.
+        """
+        if not win_hypotheses:
+            return 0.0
+        
+        # We only care about non-event rules for proximity
+        goal_rules = [r for r in win_hypotheses if r['abstract_pattern']['pattern_type'] != 'event']
+        if not goal_rules:
+            return 0.0
+
+        current_patterns = self._extract_patterns_from_context(current_context)
+        
+        # Create a simplified set of current patterns for fast lookup
+        current_abstract_patterns = set()
+        for p in current_patterns:
+            current_abstract_patterns.add(
+                (p['pattern_type'], p['sub_type'], p['common_properties'])
+            )
+
+        satisfied_count = 0
+        total_rules = len(goal_rules)
+
+        for rule in goal_rules:
+            g_type = rule['abstract_pattern']['pattern_type']
+            g_subtype = rule['abstract_pattern']['sub_type']
+            g_props = rule['group_properties']
+
+            is_satisfied = False
+            for c_type, c_subtype, c_props in current_abstract_patterns:
+                if g_type == c_type and g_subtype == c_subtype:
+                    # Abstract type matches, now check properties
+                    if self._properties_match(g_props, c_props):
+                        is_satisfied = True
+                        break # This goal is met, move to the next one
+            
+            if is_satisfied:
+                satisfied_count += 1
+                
+        return satisfied_count / total_rules
+
+    def _properties_match(self, goal_props: frozenset, current_props: frozenset) -> bool:
+        """
+        Helper to check if a set of current properties satisfies a
+        goal, allowing for 'VARIES' wildcard in the goal.
+        """
+        goal_dict = dict(goal_props)
+        current_dict = dict(current_props)
+        
+        if not goal_dict:
+            return True # A goal with no properties is just an abstract check
+
+        for key, goal_value in goal_dict.items():
+            if goal_value == 'VARIES':
+                continue # This property is a wildcard, so it passes
+            
+            # The current state must have this key, and the value must match
+            if current_dict.get(key) != goal_value:
+                return False # Mismatch
+        
+        return True # All required properties matched
 
     def _find_single_property_change_match(self, new_obj):
         """Finds a removed object that matches the new object in all but one property."""
@@ -3219,13 +3296,27 @@ class ObrlAgi3Agent(Agent):
         except ZeroDivisionError:
             return 0.0
     
-    def _learn_from_outcome(self, latest_frame: FrameData, changes: list[str], new_summary: list[dict], novel_state_count: int, is_failure: bool, learning_key: str):
+    def _learn_from_outcome(self, latest_frame: FrameData, changes: list[str], current_context: dict, novel_state_count: int, is_failure: bool, learning_key: str):
         """Calculates reward and updates model weights based on the last action's outcome."""
         if not self.last_state_key or not self.last_action_context:
             return
 
         # 1. Calculate reward
         reward = 0
+
+        # --- (NEW) Goal Proximity Reward ---
+        if self.win_condition_hypotheses:
+            current_proximity_score = self._calculate_proximity_score(current_context, self.win_condition_hypotheses)
+            proximity_reward = (current_proximity_score - self.last_proximity_score) * self.hyperparams['reward_goal_proximity']
+            
+            if proximity_reward > 0.01:
+                if self.debug_channels['ACTION_SCORE']: print(f"Goal Proximity: +{proximity_reward:.2f} reward (progressed from {self.last_proximity_score:.1%} to {current_proximity_score:.1%}).")
+            elif proximity_reward < -0.01:
+                if self.debug_channels['ACTION_SCORE']: print(f"Goal Proximity: {proximity_reward:.2f} penalty (regressed from {self.last_proximity_score:.1%} to {current_proximity_score:.1%}).")
+
+            reward += proximity_reward
+            self.last_proximity_score = current_proximity_score # Save for next turn
+
         # --- Sophisticated Novelty Analysis (Step 1: Median of Successes) ---
         performance_vs_baseline = 0.0
         # Only successful moves (that cause change) are considered for the baseline.
@@ -3297,6 +3388,7 @@ class ObrlAgi3Agent(Agent):
 
         # 2. Estimate the best possible Q-value from the new state
         max_q_for_next_state = 0
+        new_summary = current_context.get('summary', [])
         
         # We need to construct the possible moves for the *new* state to evaluate them
         next_possible_moves = []
