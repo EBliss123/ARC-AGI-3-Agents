@@ -132,6 +132,7 @@ def main() -> None:
     parser.add_argument('--bonus_state_exp_unknown', type=float)
     parser.add_argument('--bonus_state_exp_known_scaler', type=float)
     parser.add_argument('--bonus_goal_seeking', type=float)
+    parser.add_argument('--reward_goal_proximity', type=float)
     parser.add_argument('--weight_novelty_ratio', type=float)
     parser.add_argument('--planning_confidence_threshold', type=float)
     parser.add_argument('--recent_effect_patterns_maxlen', type=int)
