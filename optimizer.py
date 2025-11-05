@@ -74,7 +74,7 @@ def objective(trial: optuna.Trial) -> float:
     params = {
         # Learning Algorithm Parameters
         'learning_rate': trial.suggest_float('learning_rate', 0.001, 0.2, step=0.001),
-        'discount_factor': trial.suggest_float('discount_factor', 0.8, 0.99, step=1),
+        'discount_factor': trial.suggest_float('discount_factor', 0.8, 0.99, step=0.01),
 
         # Reward & Penalty Magnitudes
         'reward_win': trial.suggest_float('reward_win', 100.0, 1000.0, step=1),
@@ -97,7 +97,7 @@ def objective(trial: optuna.Trial) -> float:
 
         # Heuristic Weights & Thresholds
         'weight_novelty_ratio': trial.suggest_float('weight_novelty_ratio', 2.0, 75.0, step=1),
-        'planning_confidence_threshold': trial.suggest_float('planning_confidence_threshold', 0.75, 0.99, step=1),
+        'planning_confidence_threshold': trial.suggest_float('planning_confidence_threshold', 0.75, 0.99, step=0.01),
         'recent_effect_patterns_maxlen': trial.suggest_int('recent_effect_patterns_maxlen', 3, 50),
     }
 
@@ -112,8 +112,8 @@ if __name__ == "__main__":
     # and resume the tuning process at any time.
     study = optuna.create_study(
         direction='maximize',
-        study_name='obrl_agi3_tuning_10', #change name for different studies
-        storage='sqlite:///tuning_study_10.db', #change name for different studies
+        study_name='obrl_agi3_tuning_11', #change name for different studies
+        storage='sqlite:///tuning_study_11.db', #change name for different studies
         load_if_exists=True
     )
 
