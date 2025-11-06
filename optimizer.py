@@ -73,30 +73,30 @@ def objective(trial: optuna.Trial) -> float:
     # Optuna will intelligently pick a value from this range for each trial.
     params = {
         # Learning Algorithm Parameters
-        'learning_rate': trial.suggest_float('learning_rate', 0.001, 0.2, step=0.001),
+        'learning_rate': trial.suggest_float('learning_rate', 0.001, 0.2, log=True),
         'discount_factor': trial.suggest_float('discount_factor', 0.8, 0.99, step=0.01),
 
         # Reward & Penalty Magnitudes
-        'reward_win': trial.suggest_float('reward_win', 100.0, 1000.0, step=1),
-        'reward_novelty_multiplier': trial.suggest_float('reward_novelty_multiplier', 5.0, 250.0, step=1),
-        'reward_new_effect_pattern': trial.suggest_float('reward_new_effect_pattern', 1.0, 50.0, step=1),
-        'penalty_unexpected_failure': trial.suggest_float('penalty_unexpected_failure', 5.0, 150.0, step=1),
-        'penalty_repeated_effect': trial.suggest_float('penalty_repeated_effect', 5.0, 500.0, step=1),
-        'penalty_boring_move': trial.suggest_float('penalty_boring_move', 5.0, 500.0, step=1),
-        'penalty_predicted_failure': trial.suggest_float('penalty_predicted_failure', 50.0, 1000.0, step=1),
-        'penalty_blacklist_base': trial.suggest_float('penalty_blacklist_base', 1000.0, 10000.0, step=1),
-        'penalty_blacklist_scaler': trial.suggest_float('penalty_blacklist_scaler', 50.0, 200.0, step=1),
-        'drought_increment': trial.suggest_float('drought_increment', 5.0, 50.0, step=1),
+        'reward_win': trial.suggest_float('reward_win', 100.0, 1000.0, log=True),
+        'reward_novelty_multiplier': trial.suggest_float('reward_novelty_multiplier', 5.0, 250.0, log=True),
+        'reward_new_effect_pattern': trial.suggest_float('reward_new_effect_pattern', 1.0, 50.0, log=True),
+        'penalty_unexpected_failure': trial.suggest_float('penalty_unexpected_failure', 5.0, 150.0, log=True),
+        'penalty_repeated_effect': trial.suggest_float('penalty_repeated_effect', 5.0, 500.0, log=True),
+        'penalty_boring_move': trial.suggest_float('penalty_boring_move', 5.0, 500.0, log=True),
+        'penalty_predicted_failure': trial.suggest_float('penalty_predicted_failure', 50.0, 1000.0, log=True),
+        'penalty_blacklist_base': trial.suggest_float('penalty_blacklist_base', 1000.0, 10000.0, log=True),
+        'penalty_blacklist_scaler': trial.suggest_float('penalty_blacklist_scaler', 50.0, 200.0, log=True),
+        'drought_increment': trial.suggest_float('drought_increment', 5.0, 50.0, log=True),
 
         # Exploration & Goal Bonuses
-        'bonus_action_exp': trial.suggest_float('bonus_action_exp', 10.0, 500.0, step=1),
-        'bonus_state_exp_unknown': trial.suggest_float('bonus_state_exp_unknown', 25.0, 750.0, step=1),
-        'bonus_state_exp_known_scaler': trial.suggest_float('bonus_state_exp_known_scaler', 10.0, 500.0, step=1),
-        'bonus_goal_seeking': trial.suggest_float('bonus_goal_seeking', 50.0, 500.0, step=1),
-        'reward_goal_proximity': trial.suggest_float('reward_goal_proximity', 50.0, 500.0, step=1),
+        'bonus_action_exp': trial.suggest_float('bonus_action_exp', 10.0, 500.0, log=True),
+        'bonus_state_exp_unknown': trial.suggest_float('bonus_state_exp_unknown', 25.0, 750.0, log=True),
+        'bonus_state_exp_known_scaler': trial.suggest_float('bonus_state_exp_known_scaler', 10.0, 500.0, log=True),
+        'bonus_goal_seeking': trial.suggest_float('bonus_goal_seeking', 50.0, 500.0, log=True),
+        'reward_goal_proximity': trial.suggest_float('reward_goal_proximity', 50.0, 500.0, log=True),
 
         # Heuristic Weights & Thresholds
-        'weight_novelty_ratio': trial.suggest_float('weight_novelty_ratio', 2.0, 75.0, step=1),
+        'weight_novelty_ratio': trial.suggest_float('weight_novelty_ratio', 2.0, 75.0, log=True),
         'planning_confidence_threshold': trial.suggest_float('planning_confidence_threshold', 0.75, 0.99, step=0.01),
         'recent_effect_patterns_maxlen': trial.suggest_int('recent_effect_patterns_maxlen', 3, 50),
     }
@@ -112,15 +112,15 @@ if __name__ == "__main__":
     # and resume the tuning process at any time.
     study = optuna.create_study(
         direction='maximize',
-        study_name='obrl_agi3_tuning_11', #change name for different studies
-        storage='sqlite:///tuning_study_11.db', #change name for different studies
+        study_name='obrl_agi3_tuning_12', #change name for different studies
+        storage='sqlite:///tuning_study_12.db', #change name for different studies
         load_if_exists=True
     )
 
     # Start the optimization. Optuna will call the 'objective' function N times.
     # 'n_jobs=-1' tells Optuna to run trials in parallel using all available CPU cores.
     try:
-        study.optimize(objective, n_trials=8, n_jobs=2) #trials is total changes, jobs is how many cores (should be 2)
+        study.optimize(objective, n_trials=2, n_jobs=2) #trials is total changes, jobs is how many cores (should be 2)
     except KeyboardInterrupt:
         print("--- Tuning interrupted by user. Study progress has been saved. ---")
 
