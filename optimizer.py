@@ -76,27 +76,27 @@ def objective(trial: optuna.Trial) -> float:
         'learning_rate': trial.suggest_float('learning_rate', 0.001, 0.2, log=True),
         'discount_factor': trial.suggest_float('discount_factor', 0.8, 0.99, step=0.01),
 
-        # Reward & Penalty Magnitudes
-        'reward_win': trial.suggest_float('reward_win', 100.0, 1000.0, log=True),
-        'reward_novelty_multiplier': trial.suggest_float('reward_novelty_multiplier', 5.0, 250.0, log=True),
-        'reward_new_effect_pattern': trial.suggest_float('reward_new_effect_pattern', 1.0, 50.0, log=True),
-        'penalty_unexpected_failure': trial.suggest_float('penalty_unexpected_failure', 5.0, 150.0, log=True),
-        'penalty_repeated_effect': trial.suggest_float('penalty_repeated_effect', 5.0, 500.0, log=True),
-        'penalty_boring_move': trial.suggest_float('penalty_boring_move', 5.0, 500.0, log=True),
-        'penalty_predicted_failure': trial.suggest_float('penalty_predicted_failure', 50.0, 1000.0, log=True),
-        'penalty_blacklist_base': trial.suggest_float('penalty_blacklist_base', 1000.0, 10000.0, log=True),
-        'penalty_blacklist_scaler': trial.suggest_float('penalty_blacklist_scaler', 50.0, 200.0, log=True),
-        'drought_increment': trial.suggest_float('drought_increment', 5.0, 50.0, log=True),
+        # Reward & Penalty Magnitudes (Integers, Log Scale)
+        'reward_win': trial.suggest_int('reward_win', 100, 1000, log=True),
+        'reward_novelty_multiplier': trial.suggest_int('reward_novelty_multiplier', 5, 250, log=True),
+        'reward_new_effect_pattern': trial.suggest_int('reward_new_effect_pattern', 1, 50, log=True),
+        'penalty_unexpected_failure': trial.suggest_int('penalty_unexpected_failure', 5, 150, log=True),
+        'penalty_repeated_effect': trial.suggest_int('penalty_repeated_effect', 5, 500, log=True),
+        'penalty_boring_move': trial.suggest_int('penalty_boring_move', 5, 500, log=True),
+        'penalty_predicted_failure': trial.suggest_int('penalty_predicted_failure', 50, 1000, log=True),
+        'penalty_blacklist_base': trial.suggest_int('penalty_blacklist_base', 1000, 10000, log=True),
+        'penalty_blacklist_scaler': trial.suggest_int('penalty_blacklist_scaler', 50, 200, log=True),
+        'drought_increment': trial.suggest_int('drought_increment', 5, 50, log=True),
 
-        # Exploration & Goal Bonuses
-        'bonus_action_exp': trial.suggest_float('bonus_action_exp', 10.0, 500.0, log=True),
-        'bonus_state_exp_unknown': trial.suggest_float('bonus_state_exp_unknown', 25.0, 750.0, log=True),
-        'bonus_state_exp_known_scaler': trial.suggest_float('bonus_state_exp_known_scaler', 10.0, 500.0, log=True),
-        'bonus_goal_seeking': trial.suggest_float('bonus_goal_seeking', 50.0, 500.0, log=True),
-        'reward_goal_proximity': trial.suggest_float('reward_goal_proximity', 50.0, 500.0, log=True),
+        # Exploration & Goal Bonuses (Integers, Log Scale)
+        'bonus_action_exp': trial.suggest_int('bonus_action_exp', 10, 500, log=True),
+        'bonus_state_exp_unknown': trial.suggest_int('bonus_state_exp_unknown', 25, 750, log=True),
+        'bonus_state_exp_known_scaler': trial.suggest_int('bonus_state_exp_known_scaler', 10, 500, log=True),
+        'bonus_goal_seeking': trial.suggest_int('bonus_goal_seeking', 50, 500, log=True),
+        'reward_goal_proximity': trial.suggest_int('reward_goal_proximity', 50, 500, log=True),
 
         # Heuristic Weights & Thresholds
-        'weight_novelty_ratio': trial.suggest_float('weight_novelty_ratio', 2.0, 75.0, log=True),
+        'weight_novelty_ratio': trial.suggest_int('weight_novelty_ratio', 2, 75, log=True),
         'planning_confidence_threshold': trial.suggest_float('planning_confidence_threshold', 0.75, 0.99, step=0.01),
         'recent_effect_patterns_maxlen': trial.suggest_int('recent_effect_patterns_maxlen', 3, 50),
     }
@@ -112,8 +112,8 @@ if __name__ == "__main__":
     # and resume the tuning process at any time.
     study = optuna.create_study(
         direction='maximize',
-        study_name='obrl_agi3_tuning_12', #change name for different studies
-        storage='sqlite:///tuning_study_12.db', #change name for different studies
+        study_name='obrl_agi3_tuning_13', #change name for different studies
+        storage='sqlite:///tuning_study_13.db', #change name for different studies
         load_if_exists=True
     )
 
