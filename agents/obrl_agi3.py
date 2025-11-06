@@ -53,7 +53,7 @@ class ObrlAgi3Agent(Agent):
             'weight_novelty_ratio': 36.67, # How much to weigh novelty efficiency (unique changes / total changes) in the composite score.
             'planning_confidence_threshold': 0.88, # Confidence threshold for a rule to be used in goal-seeking lookahead.
             'recent_effect_patterns_maxlen': 18, # How many recent action outcomes to remember for detecting repetition.
-            'reward_goal_proximity': 150.0, # (NEW) Multiplier for rewarding moves that get closer to satisfying the Master Recipe.
+            'reward_goal_proximity': 500.0, # (NEW) Multiplier for rewarding moves that get closer to satisfying the Master Recipe.
         }
         
         # If a dictionary of params was provided, update the defaults.
