@@ -31,29 +31,33 @@ class ObrlAgi3Agent(Agent):
         self.action_counts = {}
         self.last_state_key = None
         self.is_waiting_for_stability = False
+        self.last_proximity_score = 0.0
+        self.current_plan = []
+        self.last_plan_failed = False
+        self.last_action_was_plan_step = False
 
         # --- Centralized Hyperparameters for Tuning ---
         self.hyperparams = {
-            'learning_rate': 0.0010039855654991648, # Alpha: How quickly the agent learns from new information.
-            'discount_factor': 0.91, # Gamma: How much the agent values future rewards over immediate ones.
-            'reward_win': 364.31, # The large reward for successfully completing a level.
-            'reward_novelty_multiplier': 94.24, # Multiplies the novelty score to scale its impact on the reward.
-            'reward_new_effect_pattern': 47.730000000000004, # Bonus for discovering a new type of game mechanic (e.g., a new event type).
-            'penalty_unexpected_failure': 17.37, # Penalty for when a previously successful action suddenly fails.
-            'penalty_repeated_effect': 135.97,  # Penalty for producing the same outcome (effect pattern) repeatedly.
-            'penalty_boring_move': 42.62, # Penalty for considering an action that is predicted to be 'boring'.
-            'penalty_predicted_failure': 697.89, # Penalty for considering an action that matches a known failure pattern.
-            'penalty_blacklist_base': 3060.87, # The base penalty for clicking on a blacklisted object that has failed before.
-            'penalty_blacklist_scaler': 179.15, # Scales the blacklist penalty quadratically with repeated failures.
-            'drought_increment': 27.27, # How much the 'no discovery' penalty increases each turn.
-            'bonus_action_exp': 353.85,  # The base exploration bonus for trying any action for the first time.
-            'bonus_state_exp_unknown': 460.41, # Bonus for exploring a new path in the state graph (action from this state is unknown).
-            'bonus_state_exp_known_scaler': 143.53, # Bonus for choosing paths leading to less-explored states.
-            'bonus_goal_seeking': 289.02, # The bonus for taking an action predicted to advance towards a win condition.
-            'weight_novelty_ratio': 36.67, # How much to weigh novelty efficiency (unique changes / total changes) in the composite score.
-            'planning_confidence_threshold': 0.88, # Confidence threshold for a rule to be used in goal-seeking lookahead.
-            'recent_effect_patterns_maxlen': 18, # How many recent action outcomes to remember for detecting repetition.
-            'reward_goal_proximity': 500.0, # (NEW) Multiplier for rewarding moves that get closer to satisfying the Master Recipe.
+            'learning_rate': 0.112,  # Alpha: How quickly the agent learns from new information.
+            'discount_factor': 0.96,  # Gamma: How much the agent values future rewards over immediate ones.
+            'reward_win': 237,  # The large reward for successfully completing a level.
+            'reward_novelty_multiplier': 17,  # Multiplies the novelty score to scale its impact on the reward.
+            'reward_new_effect_pattern': 18,  # Bonus for discovering a new type of game mechanic (e.g., a new event type).
+            'penalty_unexpected_failure': 136,  # Penalty for when a previously successful action suddenly fails.
+            'penalty_repeated_effect': 19,  # Penalty for producing the same outcome (effect pattern) repeatedly.
+            'penalty_boring_move': 97,  # Penalty for considering an action that is predicted to be 'boring'.
+            'penalty_predicted_failure': 890,  # Penalty for considering an action that matches a known failure pattern.
+            'penalty_blacklist_base': 8730,  # The base penalty for clicking on a blacklisted object that has failed before.
+            'penalty_blacklist_scaler': 87,  # Scales the blacklist penalty quadratically with repeated failures.
+            'drought_increment': 7,  # How much the 'no discovery' penalty increases each turn.
+            'bonus_action_exp': 367,  # The base exploration bonus for trying any action for the first time.
+            'bonus_state_exp_unknown': 605,  # Bonus for exploring a new path in the state graph (action from this state is unknown).
+            'bonus_state_exp_known_scaler': 472,  # Bonus for choosing paths leading to less-explored states.
+            'bonus_goal_seeking': 463,  # The bonus for taking an action predicted to advance towards a win condition.
+            'reward_goal_proximity': 390,  # Multiplier for rewarding moves that get closer to satisfying the Master Recipe.
+            'weight_novelty_ratio': 8,  # How much to weigh novelty efficiency (unique changes / total changes) in the composite score.
+            'planning_confidence_threshold': 0.96,  # Confidence threshold for a rule to be used in goal-seeking lookahead.
+            'recent_effect_patterns_maxlen': 17,  # How many recent action outcomes to remember for detecting repetition.
         }
         
         # If a dictionary of params was provided, update the defaults.
@@ -106,6 +110,7 @@ class ObrlAgi3Agent(Agent):
         This method is called by the game to get the next action.
         """
         changes = []
+
         # If the game is over or hasn't started, the correct action is to reset.
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
             self.actions_printed = False  # Reset the print flag for the new game.
@@ -848,6 +853,59 @@ class ObrlAgi3Agent(Agent):
         self.last_diag_alignments = current_diag_alignments
         self.last_match_groups = current_match_groups
 
+        # --- 1. PLAN EXECUTION ---
+        # If we are currently executing a multi-step plan, just do the next step.
+        if self.current_plan:
+            action_key, target_id = self.current_plan.pop(0)
+            action_name = action_key.split('_')[0] if '_' in action_key else action_key
+            
+            chosen_template = next((a for a in latest_frame.available_actions if a.name == action_name), None)
+            
+            if chosen_template is None:
+                # This should not happen if the plan is valid, but as a safeguard:
+                if self.debug_channels['ACTION_SCORE']: print(f"PLAN FAILED: Action {action_name} not available. Clearing plan.")
+                self.current_plan = []
+                self.last_plan_failed = True
+            
+            else:
+                chosen_object = None
+                if target_id:
+                    chosen_object = next((obj for obj in current_summary if obj['id'] == target_id), None)
+                
+                if target_id and not chosen_object:
+                    if self.debug_channels['ACTION_SCORE']: print(f"PLAN FAILED: Target object {target_id} not found. Clearing plan.")
+                    self.current_plan = []
+                    self.last_plan_failed = True
+                
+                else:
+                    if self.debug_channels['ACTION_SCORE']: 
+                        target_str = f"on {target_id.replace('obj_', 'id_')}" if target_id else ""
+                        print(f"\n--- EXECUTING PLAN (Step {self.last_plan_step_count - len(self.current_plan)}/{self.last_plan_step_count}) ---")
+                        print(f"Action: {action_name} {target_str}")
+
+                    self.last_action_was_plan_step = True
+                    
+                    # --- Prepare and return the planned action ---
+                    if chosen_object:
+                        pos = chosen_object['position']
+                        coords_for_context = {'x': pos[1], 'y': pos[0]}
+                        chosen_template.set_data(coords_for_context)
+                    
+                    action_to_return = chosen_template
+                    self.last_state_key = self._get_state_key(current_summary)
+                    self.last_action_context = (action_to_return.name, chosen_object['id'] if chosen_object else None)
+                    
+                    # Store current state in history before returning
+                    current_context_for_history = {
+                        'summary': current_summary, 'rels': current_relationships, 'adj': current_adjacencies,
+                        'match': current_match_groups, 'align': current_alignments, 'conj': current_conjunctions,
+                        'events': [] # No changes *yet* for this state
+                    }
+                    self.level_state_history.append(current_context_for_history)
+                    return action_to_return
+
+        # --- END PLAN EXECUTION BLOCK ---
+
         # This is the REAL list of actions for this specific game on this turn.
         game_specific_actions = latest_frame.available_actions
 
@@ -921,6 +979,38 @@ class ObrlAgi3Agent(Agent):
             patterns_already_true = self._extract_patterns_from_context(current_context)
             true_abstract_patterns = {(p['pattern_type'], p['sub_type']) for p in patterns_already_true}
             unmet_abstract_goals = required_abstract_patterns - true_abstract_patterns
+
+            # --- 2. PLAN GENERATION ---
+            # If we have unmet goals and didn't just fail a plan, try to find one.
+            if unmet_abstract_goals and not self.last_plan_failed:
+                if self.debug_channels['ACTION_SCORE']: print(f"\nSearching for a plan to achieve unmet goals: {unmet_abstract_goals}...")
+                
+                # This is the full, real-world context the planner will start from
+                current_full_context = {
+                    'summary': current_summary, 'rels': current_relationships, 'adj': current_adjacencies,
+                    'diag_adj': current_diag_adjacencies, 'align': current_alignments, 'diag_align': current_diag_alignments,
+                    'match': current_match_groups, 'conj': current_conjunctions,
+                    'available_actions': latest_frame.available_actions
+                }
+                
+                new_plan = self._find_plan(current_full_context, unmet_abstract_goals)
+                
+                if new_plan:
+                    if self.debug_channels['ACTION_SCORE']: print(f"--- NEW PLAN FOUND ({len(new_plan)} steps) ---")
+                    self.current_plan = new_plan
+                    self.last_plan_step_count = len(new_plan) # For logging
+                    # Immediately execute the first step by re-running the logic from Part 1
+                    return self.choose_action(frames, latest_frame)
+
+                else:
+                    if self.debug_channels['ACTION_SCORE']: print("No multi-step plan found. Proceeding with RL.")
+            
+            # If we just failed a plan, reset the flag and proceed to RL.
+            elif self.last_plan_failed:
+                if self.debug_channels['ACTION_SCORE']: print("A plan failed. Falling back to RL for this turn.")
+                self.last_plan_failed = False
+            
+            # --- END PLAN GENERATION BLOCK ---
 
         # --- RL: Score and select the best action ---
         best_move = None
@@ -3298,6 +3388,16 @@ class ObrlAgi3Agent(Agent):
     
     def _learn_from_outcome(self, latest_frame: FrameData, changes: list[str], current_context: dict, novel_state_count: int, is_failure: bool, learning_key: str):
         """Calculates reward and updates model weights based on the last action's outcome."""
+        if self.last_action_was_plan_step:
+            self.last_action_was_plan_step = False # Reset the flag
+            
+            # Check if the plan step failed
+            if is_failure or not changes:
+                if self.debug_channels['ACTION_SCORE']: 
+                    print(f"PLAN DEVIATION: Step {learning_key} failed to produce expected changes. Clearing plan.")
+                self.current_plan = []
+                self.last_plan_failed = True # Prevent re-planning for one turn
+        
         if not self.last_state_key or not self.last_action_context:
             return
 
@@ -3499,3 +3599,193 @@ class ObrlAgi3Agent(Agent):
             features[f'rule_confidence_for_{action_name}'] = 0.0
             features[f'is_novel_action_for_{action_name}'] = 1.0
         return features
+
+    def _find_plan(self, start_context: dict, goal_patterns: set, max_depth: int = 4, max_states: int = 100) -> list | None:
+        """
+        Performs a Breadth-First Search (BFS) using rule hypotheses to find a
+        sequence of actions that satisfies an unmet goal.
+        """
+        
+        q = deque([(start_context, [])]) # Queue of (context, plan_so_far)
+        # Use a set of state keys to avoid re-exploring the same hypothetical state
+        visited_states = {self._get_state_key(start_context['summary'])}
+        
+        states_explored = 0
+
+        while q and states_explored < max_states:
+            current_context, current_plan = q.popleft()
+            states_explored += 1
+            
+            # --- Check if this state satisfies the goal ---
+            # We must use the specific property-based check here
+            current_proximity = self._calculate_proximity_score(current_context, self.win_condition_hypotheses)
+            if current_proximity > self.last_proximity_score: # Any progress is a "win" for the planner
+                 if self.debug_channels['ACTION_SCORE']: print(f"Plan found! Proximity: {current_proximity:.1%}")
+                 return current_plan # SUCCESS!
+            
+            # --- If plan is too long, stop exploring this branch ---
+            if len(current_plan) >= max_depth:
+                continue
+                
+            # --- If not a goal, expand this state's children ---
+            current_summary = current_context['summary']
+            available_actions = current_context['available_actions']
+            
+            # Generate all possible moves from this hypothetical state
+            possible_moves = []
+            click_action = next((a for a in available_actions if a.name == 'ACTION6'), None)
+            for action in available_actions:
+                if action.name != 'ACTION6':
+                    possible_moves.append({'action': action, 'object': None})
+            if click_action:
+                for obj in current_summary:
+                    possible_moves.append({'action': click_action, 'object': obj})
+            
+            for move in possible_moves:
+                action_template = move['action']
+                target_object = move['object']
+                target_id = target_object['id'] if target_object else None
+                action_key = self._get_learning_key(action_template.name, target_id)
+                
+                # --- Predict the *next* state ---
+                next_context = self._predict_next_state(current_context, action_key, target_id)
+                
+                if next_context is None:
+                    continue # No high-confidence rule for this action, can't simulate.
+                    
+                # --- Check if we've seen this state before in our plan ---
+                next_state_key = self._get_state_key(next_context['summary'])
+                if next_state_key not in visited_states:
+                    visited_states.add(next_state_key)
+                    
+                    # Add this new state and plan to the queue
+                    new_plan = current_plan + [(action_key, target_id)]
+                    q.append((next_context, new_plan))
+                    
+        return None # No plan found
+
+    def _predict_next_state(self, current_context: dict, action_key: str, target_id: str | None) -> dict | None:
+        """
+        The "physics engine" of the planner. Predicts the outcome of one action.
+        Returns a new hypothetical context, or None if no confident prediction exists.
+        """
+        current_summary = current_context['summary']
+        
+        # --- 1. Find the high-confidence rule for this action ---
+        applicable_rules = []
+        objects_to_check = [next((obj for obj in current_summary if obj['id'] == target_id), None)] if target_id else current_summary
+        
+        for obj in objects_to_check:
+            if obj is None: continue
+            
+            # The hypothesis key is (base_action_key, object_id)
+            # We must derive the base_action_key *from* the full action_key
+            if target_id:
+                base_action_key = action_key
+                rule_key = (base_action_key, obj['id'])
+            else:
+                # Global action
+                base_action_key = action_key
+                rule_key = (base_action_key, obj['id'])
+
+            hypothesis = self.rule_hypotheses.get(rule_key)
+            if not hypothesis:
+                continue
+                
+            confidence = hypothesis['total_confirmations'] / hypothesis['attempts']
+            if confidence < self.hyperparams['planning_confidence_threshold']:
+                continue
+                
+            # Check if the object's CURRENT state matches the rule's LEARNED conditions
+            learned_conds = dict(hypothesis['learned_conditions'])
+            if not learned_conds:
+                is_match = True
+            else:
+                is_match = True
+                current_obj_props = {
+                    'color': obj['color'], 'pos': obj['position'], 'size': obj['size'],
+                    'shape': obj['fingerprint'], 'pixels': obj['pixels']
+                }
+                for key, learned_value in learned_conds.items():
+                    if current_obj_props.get(key) != learned_value:
+                        is_match = False
+                        break
+            
+            if is_match:
+                # --- AMBIGUITY-SOLVING PREDICITON ---
+                predicted_outcome_key = None
+                differentiated_outcomes = hypothesis.get('differentiated_outcomes')
+                if differentiated_outcomes:
+                    for outcome_key, differentiating_context in differentiated_outcomes.items():
+                        if self._context_matches_pattern(current_context, differentiating_context):
+                            predicted_outcome_key = outcome_key
+                            break
+                
+                if not predicted_outcome_key:
+                    if len(hypothesis['outcomes']) == 1:
+                        predicted_outcome_key = list(hypothesis['outcomes'].keys())[0]
+                    else:
+                        predicted_outcome_key = max(hypothesis['outcomes'], 
+                                                    key=lambda k: hypothesis['outcomes'][k]['confirmations'])
+                
+                outcome_details = hypothesis['outcomes'].get(predicted_outcome_key)
+                if outcome_details:
+                    applicable_rules.append({
+                        'affected_obj_id': obj['id'],
+                        'rules': outcome_details.get('rules', [])
+                    })
+
+        if not applicable_rules:
+            return None # No reliable prediction found
+
+        # --- 2. Build the Hypothetical Future State ---
+        future_summary = copy.deepcopy(current_summary)
+        future_summary_map = {obj['id']: obj for obj in future_summary}
+
+        for rule in applicable_rules:
+            affected_obj_id = rule['affected_obj_id'] 
+            if affected_obj_id not in future_summary_map:
+                continue
+            
+            obj_to_change = future_summary_map[affected_obj_id]
+            
+            for event in rule.get('rules', []):
+                # Apply predictable state changes
+                if event.get('type') == 'MOVED' and 'vector' in event:
+                    vy, vx = event['vector']
+                    old_pos = obj_to_change['position']
+                    obj_to_change['position'] = (old_pos[0] + vy, old_pos[1] + vx)
+                
+                elif event.get('type') == 'RECOLORED' and 'to_color' in event:
+                    obj_to_change['color'] = event['to_color']
+                
+                elif event.get('type') == 'SHAPE_CHANGED' and 'to_fingerprint' in event:
+                    obj_to_change['fingerprint'] = event['to_fingerprint']
+                
+                elif event.get('type') in ['GROWTH', 'SHRINK'] and 'to_size' in event:
+                     obj_to_change['size'] = event['to_size']
+                     obj_to_change['pixels'] += event.get('pixel_delta', 0)
+                     # We can't perfectly predict new fingerprint/pixel_coords,
+                     # but this is often good enough for relationship/alignment checks.
+
+        # --- 3. Analyze the Hypothetical Future State ---
+        # Note: We must pass 'future_summary' to all analysis functions
+        future_rels, future_adj, future_diag_adj, future_match = self._analyze_relationships(future_summary)
+        future_aligns = self._analyze_alignments(future_summary)
+        future_diag_aligns = self._analyze_diagonal_alignments(future_summary)
+        future_conjs = self._analyze_conjunctions(future_rels, future_aligns)
+        
+        future_context = {
+            'summary': future_summary,
+            'rels': future_rels,
+            'adj': future_adj,
+            'diag_adj': future_diag_adj,
+            'align': future_aligns,
+            'diag_align': future_diag_aligns,
+            'match': future_match,
+            'conj': future_conjs,
+            'events': [], # This is a hypothetical state, no events led *to* it
+            'available_actions': current_context['available_actions'] # Assume actions don't change
+        }
+        
+        return future_context
