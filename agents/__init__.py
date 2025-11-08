@@ -16,6 +16,7 @@ from .obrl_agi3 import ObrlAgi3Agent
 from .my_custom_agent import MyCustomAgent
 from .agi_3 import AGI3
 from .obrl_agi3 import ObrlAgi3Agent
+from .obml_agi_3 import ObmlAgi3Agent
 
 load_dotenv()
 
