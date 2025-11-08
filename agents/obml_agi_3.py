@@ -25,6 +25,7 @@ class ObmlAgi3Agent(Agent):
         self.is_new_level = True
         self.final_summary_before_level_change = None
         self.current_level_id_map = {}
+        self.actions_printed = False
 
         # --- Debug Channels ---
         # Set these to True or False to control the debug output.
@@ -47,9 +48,17 @@ class ObmlAgi3Agent(Agent):
         if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
             self.object_id_counter = 0
             self.is_new_level = True # Reset for the next game
+            self.actions_printed = False # Reset the print flag
             return GameAction.RESET
         
         # --- 1. Perceive Raw Objects ---
+        # --- Print available actions once ---
+        if latest_frame.available_actions and not self.actions_printed:
+            action_names = [action.name for action in latest_frame.available_actions]
+            if self.debug_channels['PERCEPTION']:
+                print(f"\n--- Discovered game-specific actions: {action_names} ---")
+            self.actions_printed = True
+        
         # This just finds the blobs of pixels, without persistent IDs
         current_summary = self._perceive_objects(latest_frame)
         changes = []
