@@ -30,12 +30,12 @@ class ObmlAgi3Agent(Agent):
         # Set these to True or False to control the debug output.
         self.debug_channels = {
             'PERCEPTION': True,      # Object finding, relationships, new level setup
-            'CHANGES': True,         # All "Change Log" and "Milestone" prints
-            'STATE_GRAPH': True,     # "Arrived at new Novel State", "State Graph Updated"
-            'HYPOTHESIS': True,      # "Initial Case File", "Refined Hypothesis"
-            'FAILURE': True,         # "Failure Analysis", "Failure Detected", no-op clicks
+            'CHANGES': True,         # All "Change Log" prints
+            'STATE_GRAPH': True,     # State understanding
+            'HYPOTHESIS': True,      # "Initial Hypotheses", "Refined Hypothesis"
+            'FAILURE': True,         # "Failure Analysis", "Failure Detected"
             'WIN_CONDITION': True,   # "LEVEL CHANGE DETECTED", "Win Condition Analysis"
-            'ACTION_SCORE': True,    # All scoring, heuristics, and final choice prints
+            'ACTION_SCORE': True,    # All scoring prints
         }
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
