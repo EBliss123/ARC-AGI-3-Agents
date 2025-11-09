@@ -243,18 +243,34 @@ class ObmlAgi3Agent(Agent):
                                 self._analyze_and_report(hypothesis_key, [], prev_context)
                 
                 else:
-                    # --- FAILURE ---
-                    if self.debug_channels['FAILURE']:
-                        print(f"\n--- Failure Detected for Action {learning_key} ---")
+                    # --- FAILURE (No changes occurred) ---
                     
-                    self.failure_contexts.setdefault(learning_key, []).append(prev_context)
-                    
-                    # Get all history for this action
-                    successes = self.success_contexts.get(learning_key, [])
-                    failures = self.failure_contexts.get(learning_key, [])
+                    if prev_target_id:
+                        # --- Case 1: This was a TARGETED action (e.g., ACTION6) ---
+                        if self.debug_channels['FAILURE']:
+                            print(f"\n--- Failure Detected for Action {learning_key} ---")
+                        
+                        self.failure_contexts.setdefault(learning_key, []).append(prev_context)
+                        successes = self.success_contexts.get(learning_key, [])
+                        failures = self.failure_contexts.get(learning_key, [])
+                        self._analyze_failures(learning_key, successes, failures, prev_context)
 
-                    # Perform the differential analysis
-                    self._analyze_failures(learning_key, successes, failures, prev_context)
+                    else:
+                        # --- Case 2: This was a GLOBAL action (e.g., ACTION1) ---
+                        # We must log a "no change" failure for EVERY object on the screen.
+                        if self.debug_channels['FAILURE']:
+                            print(f"\n--- Global Failure Detected for Action {learning_key} (No Changes) ---")
+                        
+                        for obj in prev_summary:
+                            obj_id = obj['id']
+                            hypothesis_key = (prev_action_name, obj_id)
+                            
+                            self.failure_contexts.setdefault(hypothesis_key, []).append(prev_context)
+                            
+                            # Analyze this specific object's failure history
+                            successes = self.success_contexts.get(hypothesis_key, [])
+                            failures = self.failure_contexts.get(hypothesis_key, [])
+                            self._analyze_failures(hypothesis_key, successes, failures, prev_context)
 
         # --- 3. Update Memory For Next Turn ---
         # This runs every frame, saving the state we just analyzed
@@ -457,15 +473,16 @@ class ObmlAgi3Agent(Agent):
         Analyzes failures by finding conditions that are consistent across all failures
         AND have never been observed in any past success.
         
-        This new version checks ALL perception modules.
+        This new version is quieter and only prints if it has history to analyze.
         """
+        # --- MODIFIED: Only proceed if there is history to analyze ---
         if not all_success_contexts or not all_failure_contexts:
-            if self.debug_channels['FAILURE']:
-                print("\n--- Failure Analysis ---")
-                print("Cannot perform differential analysis: insufficient history of successes or failures.")
+            # Silently return. The "Global Failure" message from choose_action is enough.
             return
 
-        if self.debug_channels['FAILURE']: print("\n--- Failure Analysis: Consistent Differentiating Conditions ---")
+        # --- MODIFIED: Print header *after* we know there's work to do ---
+        if self.debug_channels['FAILURE']: 
+            print(f"\n--- Failure Analysis for {action_key}: Consistent Differentiating Conditions ---")
         
         # --- Step 1: Find common contexts ---
         common_success_context = self._find_common_context(all_success_contexts)
@@ -558,7 +575,8 @@ class ObmlAgi3Agent(Agent):
             self.failure_patterns[action_key] = common_failure_context
 
         if not diffs_found:
-            if self.debug_channels['FAILURE']: print("No conditions found that are both consistent across all failures and unique to them.")
+            # --- MODIFIED: Quieter message ---
+            if self.debug_channels['FAILURE']: print(f"  (No unique differentiating conditions found for this key)")
 
     def _parse_change_logs_to_events(self, changes: list[str]) -> list[dict]:
         """Parses a list of human-readable change logs into a list of structured event dictionaries."""
