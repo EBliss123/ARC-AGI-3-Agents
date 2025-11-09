@@ -487,11 +487,27 @@ class ObmlAgi3Agent(Agent):
             all_values = set(groups_s.keys()) | set(groups_f.keys())
             for value in all_values:
                 ids_s, ids_f = groups_s.get(value, set()), groups_f.get(value, set())
+                
                 if ids_s != ids_f:
+                    # Check if this specific failure state has ever been seen in a success
                     if (rel_type, value, frozenset(ids_f)) not in observed_in_any_success_rels:
                         diffs_found = True
                         value_str = f"{value[0]}x{value[1]}" if rel_type == 'Size' else value
-                        if self.debug_channels['FAILURE']: print(f"- {rel_type} Group ({value_str}) Difference: Failures consistently have members {sorted(list(ids_f))}, which has never occurred in a success.")
+                        
+                        # --- NEW, SMARTER LOGGING ---
+                        if ids_f == set() and ids_s != set():
+                            # The group disappeared in the failure case
+                            if self.debug_channels['FAILURE']:
+                                print(f"- {rel_type} Group ({value_str}) DISAPPEARED: This group (which existed in successes) is consistently EMPTY in failures.")
+                        elif ids_f != set() and ids_s == set():
+                            # A new group appeared only in the failure case
+                            if self.debug_channels['FAILURE']:
+                                print(f"- {rel_type} Group ({value_str}) APPEARED: This group {sorted(list(ids_f))} consistently APPEARS in failures (and was not present in successes).")
+                        else:
+                            # The group's membership changed
+                            if self.debug_channels['FAILURE']:
+                                print(f"- {rel_type} Group ({value_str}) CHANGED: Failures consistently have members {sorted(list(ids_f))} (was {sorted(list(ids_s))} in successes).")
+                        # --- END NEW LOGGING ---
         
         if diffs_found:
             self.failure_patterns[action_key] = common_failure_context
