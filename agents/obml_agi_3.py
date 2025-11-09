@@ -25,6 +25,10 @@ class ObmlAgi3Agent(Agent):
         self.is_new_level = True
         self.final_summary_before_level_change = None
         self.current_level_id_map = {}
+        self.last_action_context = None  # Stores the action we just took
+        self.success_contexts = {}
+        self.failure_contexts = {}
+        self.failure_patterns = {}
         self.actions_printed = False
 
         # --- Debug Channels ---
@@ -70,6 +74,10 @@ class ObmlAgi3Agent(Agent):
             self.is_new_level = False
             self.final_summary_before_level_change = None
             self.current_level_id_map = {}
+            self.last_action_context = None
+            self.success_contexts = {}
+            self.failure_contexts = {}
+            self.failure_patterns = {}
             id_map = {}
             new_obj_to_old_id_map = {}
             
@@ -169,6 +177,38 @@ class ObmlAgi3Agent(Agent):
             self._log_alignment_changes(self.last_alignments, current_alignments, is_diagonal=False)
             self._log_alignment_changes(self.last_diag_alignments, current_diag_alignments, is_diagonal=True)
 
+            # --- Analyze the outcome of the previous action ---
+            if self.last_action_context:
+                prev_action_name, prev_target_id = self.last_action_context
+                learning_key = self._get_learning_key(prev_action_name, prev_target_id)
+                
+                # This is the full context of the *previous* state, when the action was taken.
+                prev_context = {
+                    'summary': prev_summary,
+                    'rels': self.last_relationships,
+                    'adj': self.last_adjacencies,
+                    'diag_adj': self.last_diag_adjacencies,
+                    'diag_align': self.last_diag_alignments
+                }
+
+                if changes:
+                    # --- SUCCESS ---
+                    self.success_contexts.setdefault(learning_key, []).append(prev_context)
+                
+                else:
+                    # --- FAILURE ---
+                    if self.debug_channels['FAILURE']:
+                        print(f"\n--- Failure Detected for Action {learning_key} ---")
+                    
+                    self.failure_contexts.setdefault(learning_key, []).append(prev_context)
+                    
+                    # Get all history for this action
+                    successes = self.success_contexts.get(learning_key, [])
+                    failures = self.failure_contexts.get(learning_key, [])
+
+                    # Perform the differential analysis
+                    self._analyze_failures(learning_key, successes, failures, prev_context)
+
         # --- 3. Update Memory For Next Turn ---
         # This runs every frame, saving the state we just analyzed
         self.last_object_summary = current_summary
@@ -179,13 +219,53 @@ class ObmlAgi3Agent(Agent):
         self.last_diag_alignments = current_diag_alignments
         self.last_match_groups = current_match_groups
 
-        # --- 4. Choose an Action (Placeholder) ---
-        # ( logic will go here)
-        if latest_frame.available_actions:
-            return latest_frame.available_actions[0]
+# --- 4. Choose an Action (Temporary Random Logic) ---
+        action_to_return = None
+        chosen_object = None
+        chosen_object_id = None
         
-        # Fallback
-        return GameAction.RESET
+        # Build a list of all possible moves (global actions + one click per object)
+        all_possible_moves = []
+        click_action_template = None
+
+        for action in latest_frame.available_actions:
+            if action.name == 'ACTION6':
+                click_action_template = action
+            else:
+                all_possible_moves.append({'template': action, 'object': None})
+        
+        if click_action_template and current_summary:
+            for obj in current_summary:
+                all_possible_moves.append({'template': click_action_template, 'object': obj})
+
+        if all_possible_moves:
+            # --- THIS IS THE TEMPORARY RANDOM CHOICE ---
+            chosen_move = random.choice(all_possible_moves)
+            action_to_return = chosen_move['template']
+            chosen_object = chosen_move['object']
+            
+            action_name = action_to_return.name
+            target_name = ""
+            
+            if chosen_object:
+                chosen_object_id = chosen_object['id']
+                pos = chosen_object['position']
+                action_to_return.set_data({'x': pos[1], 'y': pos[0]})
+                target_name = f" on {chosen_object_id.replace('obj_', 'id_')}"
+
+            if self.debug_channels['ACTION_SCORE']:
+                print(f"\n####### TEMPORARY RANDOM AGENT #######")
+                print(f"Chose random action: {action_name}{target_name}")
+                print(f"########################################")
+
+        else:
+            # Fallback if no actions are possible
+            action_to_return = GameAction.RESET
+
+        # --- Store action for next turn's analysis ---
+        self.last_action_context = (action_to_return.name, chosen_object_id)
+        
+        return action_to_return
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         return False
@@ -257,6 +337,126 @@ class ObmlAgi3Agent(Agent):
         """Creates a hashable, stable ID for an object based on its intrinsic properties."""
         return (obj['fingerprint'], obj['color'], obj['size'], obj['pixels'])
     
+    def _get_learning_key(self, action_name: str, target_id: str | None) -> str:
+        """Generates a unique key for learning, specific to an object ID for CLICK actions."""
+        if action_name == 'ACTION6' and target_id:
+            return f"{action_name}_{target_id}"
+        return action_name
+
+    def _find_common_context(self, contexts: list[dict]) -> dict:
+        """
+        Finds the common context across a list of attempts, using wildcard 'x' for
+        inconsistent adjacency properties.
+        """
+        if not contexts:
+            return {'adj': {}, 'rels': {}}
+
+        # --- Adjacency Analysis with Wildcards ---
+        master_adj = {obj_id: list(contacts) for obj_id, contacts in contexts[0].get('adj', {}).items()}
+        for i in range(1, len(contexts)):
+            next_adj = contexts[i].get('adj', {})
+            for obj_id in list(master_adj.keys()):
+                master_pattern = master_adj[obj_id]
+                next_contacts = next_adj.get(obj_id)
+                if not next_contacts:
+                    del master_adj[obj_id]
+                    continue
+                for i in range(4):
+                    if master_pattern[i] == 'x':
+                        continue
+                    if master_pattern[i] != next_contacts[i]:
+                        master_pattern[i] = 'x'
+                if all(d == 'x' for d in master_pattern):
+                    del master_adj[obj_id]
+        common_adj = {obj_id: tuple(pattern) for obj_id, pattern in master_adj.items()}
+
+        # --- Relationship Analysis (Strict Intersection) ---
+        common_rels = copy.deepcopy(contexts[0].get('rels', {}))
+        for i in range(1, len(contexts)):
+            next_rels = contexts[i].get('rels', {})
+            temp_common_rels = {}
+            common_rel_types = set(common_rels.keys()) & set(next_rels.keys())
+            for rel_type in common_rel_types:
+                groups1, groups2 = common_rels[rel_type], next_rels[rel_type]
+                common_values = set(groups1.keys()) & set(groups2.keys())
+                for value in common_values:
+                    if groups1[value] == groups2[value]:
+                        temp_common_rels.setdefault(rel_type, {})[value] = groups1[value]
+            common_rels = temp_common_rels
+        
+        return {'adj': common_adj, 'rels': common_rels}
+
+    def _analyze_failures(self, action_key: str, all_success_contexts: list[dict], all_failure_contexts: list[dict], current_failure_context: dict):
+        """
+        Analyzes failures by finding conditions that are consistent across all failures
+        AND have never been observed in any past success.
+        """
+        if not all_success_contexts or not all_failure_contexts:
+            if self.debug_channels['FAILURE']:
+                print("\n--- Failure Analysis ---")
+                print("Cannot perform differential analysis: insufficient history of successes or failures.")
+            return
+
+        if self.debug_channels['FAILURE']: print("\n--- Failure Analysis: Consistent Differentiating Conditions ---")
+        
+        common_success_context = self._find_common_context(all_success_contexts)
+        common_failure_context = self._find_common_context(all_failure_contexts)
+        
+        observed_in_any_success_adj = set()
+        observed_in_any_success_rels = set()
+        for context in all_success_contexts:
+            for obj_id, contacts in context.get('adj', {}).items():
+                observed_in_any_success_adj.add((obj_id, tuple(contacts)))
+            for rel_type, groups in context.get('rels', {}).items():
+                for value, ids in groups.items():
+                    observed_in_any_success_rels.add((rel_type, value, frozenset(ids)))
+
+        diffs_found = False
+
+        adj_s = common_success_context['adj']
+        adj_f = common_failure_context['adj']
+        all_adj_ids = set(adj_s.keys()) | set(adj_f.keys())
+
+        for obj_id in sorted(list(all_adj_ids), key=lambda x: int(x.split('_')[1])):
+            contacts_s = tuple(adj_s.get(obj_id, ['na']*4))
+            contacts_f = tuple(adj_f.get(obj_id, ['na']*4))
+
+            if contacts_s != contacts_f:
+                if (obj_id, contacts_f) not in observed_in_any_success_adj:
+                    diffs_found = True
+                    failure_pattern = []
+                    for i in range(4):
+                        if contacts_s[i] == contacts_f[i]:
+                            failure_pattern.append('x')
+                        else:
+                            contact = contacts_f[i]
+                            failure_pattern.append(contact.replace('obj_', '') if 'obj_' in contact else contact)
+                    
+                    pattern_str = f"({', '.join(failure_pattern)})"
+                    clean_id = obj_id.replace('obj_', 'id_')
+                    if self.debug_channels['FAILURE']: print(f"- Adjacency Difference for {clean_id}: Failures consistently exhibit pattern {pattern_str}, which has never occurred in a success.")
+
+        rels_s = common_success_context['rels']
+        rels_f = common_failure_context['rels']
+        all_rel_types = set(rels_s.keys()) | set(rels_f.keys())
+
+        for rel_type in all_rel_types:
+            groups_s, groups_f = rels_s.get(rel_type, {}), rels_f.get(rel_type, {})
+            all_values = set(groups_s.keys()) | set(groups_f.keys())
+            for value in all_values:
+                ids_s, ids_f = groups_s.get(value, set()), groups_f.get(value, set())
+                if ids_s != ids_f:
+                    if (rel_type, value, frozenset(ids_f)) not in observed_in_any_success_rels:
+                        diffs_found = True
+                        value_str = f"{value[0]}x{value[1]}" if rel_type == 'Size' else value
+                        if self.debug_channels['FAILURE']: print(f"- {rel_type} Group ({value_str}) Difference: Failures consistently have members {sorted(list(ids_f))}, which has never occurred in a success.")
+        
+        if diffs_found:
+            self.failure_patterns[action_key] = common_failure_context
+
+        if not diffs_found:
+            if self.debug_channels['FAILURE']: print("No conditions found that are both consistent across all failures and unique to them.")
+
     def _analyze_relationships(self, object_summary: list[dict]) -> tuple:
         """
         Analyzes all object relationships, adjacencies, alignments, and
