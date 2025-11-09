@@ -727,7 +727,7 @@ class ObmlAgi3Agent(Agent):
             print(f"  Hypothesis has {len(outcome_keys)} outcomes. Running full comparison.")
 
         try:
-            # Step 1: Get the common context for every outcome
+            # --- Step 1: Get the common context for every outcome ---
             all_common_contexts = {}
             for key in outcome_keys:
                 contexts = hypothesis['outcomes'][key].get('contexts', [])
@@ -736,19 +736,20 @@ class ObmlAgi3Agent(Agent):
                     return
                 all_common_contexts[key] = self._find_common_context(contexts)
 
-            # Step 2: For each outcome, find its unique rule
+            # --- Step 2: Find all differentiated rules (no printing yet) ---
             differentiated_rules = {}
+            all_outcome_keys = list(hypothesis['outcomes'].keys())
             
-            for i in range(len(outcome_keys)):
-                target_key = outcome_keys[i]
+            for i in range(len(all_outcome_keys)):
+                target_key = all_outcome_keys[i]
                 common_target = all_common_contexts[target_key]
                 
                 intersection_of_diffs = None
                 
-                for j in range(len(outcome_keys)):
+                for j in range(len(all_outcome_keys)):
                     if i == j: continue
                     
-                    compare_key = outcome_keys[j]
+                    compare_key = all_outcome_keys[j]
                     common_compare = all_common_contexts[compare_key]
                     
                     # Find what's in Target that is different from Compare
@@ -762,15 +763,28 @@ class ObmlAgi3Agent(Agent):
                 
                 # The final `intersection_of_diffs` is the unique rule for this outcome
                 differentiated_rules[target_key] = intersection_of_diffs
-                
-                if self.debug_channels['HYPOTHESIS']:
-                    if intersection_of_diffs:
-                        # This print statement is now more descriptive
-                        print(f"  - Found Rule for Outcome {i+1} (Result: {target_key}): {intersection_of_diffs}")
-                    else:
-                        # This print statement is now more descriptive
-                        print(f"  - No unique rule found for Outcome {i+1} (Result: {target_key}).")
 
+            # --- NEW Step 3: Analyze and Print the rules ---
+            if self.debug_channels['HYPOTHESIS']:
+                # Find all the *other* positive rules
+                all_positive_rules = [rule for rule in differentiated_rules.values() if rule]
+                
+                for i in range(len(all_outcome_keys)):
+                    target_key = all_outcome_keys[i]
+                    rule = differentiated_rules[target_key]
+                    
+                    if rule:
+                        # This is a POSITIVE rule
+                        print(f"  - Found POSITIVE Rule for Outcome {i+1} (Result: {target_key}): {rule}")
+                    else:
+                        # This is a NEGATIVE (default) rule
+                        if not all_positive_rules:
+                            print(f"  - Learned DEFAULT Rule for Outcome {i+1} (Result: {target_key}). (No positive rules found for any outcome yet)")
+                        else:
+                            # Build the "NOT" string from all other positive rules
+                            not_rules_str = " AND NOT ".join([str(r) for r in all_positive_rules])
+                            print(f"  - Learned NEGATIVE Rule for Outcome {i+1} (Result: {target_key}): (Occurs when NOT ({not_rules_str}))")
+            
             hypothesis['differentiated_rules'] = differentiated_rules
 
         except Exception as e:
