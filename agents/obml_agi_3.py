@@ -1,6 +1,5 @@
 from .agent import Agent, FrameData
 from .structs import GameAction, GameState
-import random
 from collections import deque
 import copy
 import ast
@@ -337,34 +336,61 @@ class ObmlAgi3Agent(Agent):
             profile = {'unknowns': 0, 'discoveries': 0, 'boring': 0, 'failures': 0}
             predicted_outcomes_for_this_move = set()
 
-            # --- Profile the action's effect on ALL objects ---
-            for obj in current_summary:
-                obj_id = obj['id']
+            if target_id:
+                # --- Case 1: This is a TARGETED action (e.g., ACTION6_obj_1) ---
+                # We only need to check this one specific hypothesis.
                 
-                # The hypothesis key is always (base_action_name, affected_object_id)
-                hypothesis_key = (base_action_key_str.split('_')[0], obj_id)
-
-                # --- *** THE FIX IS HERE *** ---
-                # 1. Check for a predicted per-object FAILURE
-                if hypothesis_key in self.failure_patterns:
-                    failure_rule = self.failure_patterns[hypothesis_key]
+                # 1. Check for a predicted FAILURE for this specific action
+                if base_action_key_str in self.failure_patterns:
+                    failure_rule = self.failure_patterns[base_action_key_str]
                     if self._context_matches_pattern(current_full_context, failure_rule):
-                        profile['failures'] += 1
-                        continue # This object will fail, check the next object
-
-                # 2. If no failure, predict the per-object SUCCESS outcome
-                predicted_outcome = self._predict_outcome(hypothesis_key, current_full_context)
-                
-                # 3. Tally the results
-                if predicted_outcome is None:
-                    profile['unknowns'] += 1
-                elif predicted_outcome == ():
-                    profile['boring'] += 1 # Predicted "no change"
-                elif predicted_outcome in self.seen_outcomes:
-                    profile['boring'] += 1 # Predicted "repetitive change"
+                        profile['failures'] = 1
+                    
                 else:
-                    profile['discoveries'] += 1 # Predicted "new, novel change"
-                    predicted_outcomes_for_this_move.add(predicted_outcome)
+                    # 2. If no failure, predict the SUCCESS outcome
+                    hypothesis_key = (base_action_key_str.split('_')[0], target_id)
+                    predicted_outcome = self._predict_outcome(hypothesis_key, current_full_context)
+                    
+                    # 3. Tally the result
+                    if predicted_outcome is None:
+                        profile['unknowns'] = 1
+                    elif predicted_outcome == ():
+                        profile['boring'] = 1 # Predicted "no change"
+                    elif predicted_outcome in self.seen_outcomes:
+                        profile['boring'] = 1 # Predicted "repetitive change"
+                    else:
+                        profile['discoveries'] = 1 # Predicted "new, novel change"
+                        predicted_outcomes_for_this_move.add(predicted_outcome)
+
+            else:
+                # --- Case 2: This is a GLOBAL action (e.g., ACTION4) ---
+                # We profile its effect on ALL objects on the screen.
+                for obj in current_summary:
+                    obj_id = obj['id']
+                    
+                    # The hypothesis key is always (base_action_name, affected_object_id)
+                    hypothesis_key = (base_action_key_str.split('_')[0], obj_id)
+
+                    # 1. Check for a predicted per-object FAILURE
+                    if hypothesis_key in self.failure_patterns:
+                        failure_rule = self.failure_patterns[hypothesis_key]
+                        if self._context_matches_pattern(current_full_context, failure_rule):
+                            profile['failures'] += 1
+                            continue # This object will fail, check the next object
+
+                    # 2. If no failure, predict the per-object SUCCESS outcome
+                    predicted_outcome = self._predict_outcome(hypothesis_key, current_full_context)
+                    
+                    # 3. Tally the results
+                    if predicted_outcome is None:
+                        profile['unknowns'] += 1
+                    elif predicted_outcome == ():
+                        profile['boring'] += 1 # Predicted "no change"
+                    elif predicted_outcome in self.seen_outcomes:
+                        profile['boring'] += 1 # Predicted "repetitive change"
+                    else:
+                        profile['discoveries'] += 1 # Predicted "new, novel change"
+                        predicted_outcomes_for_this_move.add(predicted_outcome)
 
             move_profiles.append((move, profile, predicted_outcomes_for_this_move))
 
