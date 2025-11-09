@@ -30,19 +30,23 @@ class ObmlAgi3Agent(Agent):
         self.failure_contexts = {}
         self.failure_patterns = {}
         self.rule_hypotheses = {}
+        self.seen_outcomes = set()
+        self.level_state_history = []
+        self.win_condition_hypotheses = []
         self.actions_printed = False
         self.last_score = 0
 
         # --- Debug Channels ---
         # Set these to True or False to control the debug output.
         self.debug_channels = {
-            'PERCEPTION': True,      # Object finding, relationships, new level setup
+            'PERCEPTION': False,      # Object finding, relationships, new level setup
             'CHANGES': True,         # All "Change Log" prints
             'STATE_GRAPH': True,     # State understanding
             'HYPOTHESIS': True,      # "Initial Hypotheses", "Refined Hypothesis"
             'FAILURE': True,         # "Failure Analysis", "Failure Detected"
             'WIN_CONDITION': True,   # "LEVEL CHANGE DETECTED", "Win Condition Analysis"
             'ACTION_SCORE': True,    # All scoring prints
+            'CONTEXT_DETAILS': False # Keep or remove large prints
         }
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
@@ -82,6 +86,8 @@ class ObmlAgi3Agent(Agent):
             self.success_contexts = {}
             self.failure_contexts = {}
             self.last_score = current_score
+            self.seen_outcomes = set()
+            self.level_state_history = []
             id_map = {}
             new_obj_to_old_id_map = {}
             
@@ -166,7 +172,14 @@ class ObmlAgi3Agent(Agent):
              current_match_groups, current_alignments, current_diag_alignments, 
              current_conjunctions) = self._analyze_relationships(current_summary)
 
-            # (Future: Add level change detection here)
+            # --- Check for score changes (win detection) ---
+            current_score = latest_frame.score
+            if current_score > self.last_score:
+                if self.debug_channels['WIN_CONDITION']:
+                    print(f"\n--- LEVEL CHANGE DETECTED (Score increased from {self.last_score} to {current_score}) ---")
+                # (Win analysis logic will go here)
+                self.is_new_level = True # Signal for the *next* frame
+            self.last_score = current_score
 
             # --- Log all changes found ---
             if changes and self.debug_channels['CHANGES']:
@@ -282,52 +295,135 @@ class ObmlAgi3Agent(Agent):
         self.last_diag_alignments = current_diag_alignments
         self.last_match_groups = current_match_groups
 
-# --- 4. Choose an Action (Temporary Random Logic) ---
+# --- 4. Choose an Action (Discovery Profiler Logic) ---
         action_to_return = None
         chosen_object = None
         chosen_object_id = None
         
-        # Build a list of all possible moves (global actions + one click per object)
+        # Get the full context of the *current* state for prediction
+        current_full_context = {
+            'summary': current_summary,
+            'rels': current_relationships,
+            'adj': current_adjacencies,
+            'diag_adj': current_diag_adjacencies,
+            'align': current_alignments,
+            'diag_align': current_diag_alignments,
+            'match': current_match_groups
+        }
+
+        # Build a list of all possible moves
         all_possible_moves = []
         click_action_template = None
-
         for action in latest_frame.available_actions:
             if action.name == 'ACTION6':
                 click_action_template = action
             else:
                 all_possible_moves.append({'template': action, 'object': None})
-        
         if click_action_template and current_summary:
             for obj in current_summary:
                 all_possible_moves.append({'template': click_action_template, 'object': obj})
+        
+        # --- Deterministic Profiling ---
+        move_profiles = []
+        
+        for move in all_possible_moves:
+            action_template = move['template']
+            target_obj = move['object']
+            target_id = target_obj['id'] if target_obj else None
+            
+            # This is the "base" key for this action, e.g. "ACTION4" or "ACTION6_obj_5"
+            base_action_key_str = self._get_learning_key(action_template.name, target_id)
+            
+            profile = {'unknowns': 0, 'discoveries': 0, 'boring': 0, 'failures': 0}
+            predicted_outcomes_for_this_move = set()
 
-        if all_possible_moves:
-            # --- THIS IS THE TEMPORARY RANDOM CHOICE ---
-            chosen_move = random.choice(all_possible_moves)
+            # --- Profile the action's effect on ALL objects ---
+            for obj in current_summary:
+                obj_id = obj['id']
+                
+                # The hypothesis key is always (base_action_name, affected_object_id)
+                hypothesis_key = (base_action_key_str.split('_')[0], obj_id)
+
+                # --- *** THE FIX IS HERE *** ---
+                # 1. Check for a predicted per-object FAILURE
+                if hypothesis_key in self.failure_patterns:
+                    failure_rule = self.failure_patterns[hypothesis_key]
+                    if self._context_matches_pattern(current_full_context, failure_rule):
+                        profile['failures'] += 1
+                        continue # This object will fail, check the next object
+
+                # 2. If no failure, predict the per-object SUCCESS outcome
+                predicted_outcome = self._predict_outcome(hypothesis_key, current_full_context)
+                
+                # 3. Tally the results
+                if predicted_outcome is None:
+                    profile['unknowns'] += 1
+                elif predicted_outcome == ():
+                    profile['boring'] += 1 # Predicted "no change"
+                elif predicted_outcome in self.seen_outcomes:
+                    profile['boring'] += 1 # Predicted "repetitive change"
+                else:
+                    profile['discoveries'] += 1 # Predicted "new, novel change"
+                    predicted_outcomes_for_this_move.add(predicted_outcome)
+
+            move_profiles.append((move, profile, predicted_outcomes_for_this_move))
+
+        # --- Deterministic Priority-Based Sorting ---
+        if move_profiles:
+            # Sort by:
+            # 1. Most Unknowns (desc)
+            # 2. Most Discoveries (desc)
+            # 3. Fewest Failures (asc)
+            # 4. Most Boring (desc) - (to break ties, prefer action over inaction)
+            move_profiles.sort(key=lambda x: (
+                x[1]['unknowns'], 
+                x[1]['discoveries'], 
+                -x[1]['failures'], 
+                x[1]['boring']
+            ), reverse=True)
+            
+            # Choose the best move (the first one after sorting)
+            chosen_move, best_profile, new_outcomes_to_add = move_profiles[0]
+            
             action_to_return = chosen_move['template']
             chosen_object = chosen_move['object']
             
+            # Add any new discoveries to our "seen" list
+            self.seen_outcomes.update(new_outcomes_to_add)
+
+            # --- Logging ---
             action_name = action_to_return.name
             target_name = ""
-            
             if chosen_object:
                 chosen_object_id = chosen_object['id']
                 pos = chosen_object['position']
                 action_to_return.set_data({'x': pos[1], 'y': pos[0]})
                 target_name = f" on {chosen_object_id.replace('obj_', 'id_')}"
-
+            
             if self.debug_channels['ACTION_SCORE']:
-                print(f"\n####### TEMPORARY RANDOM AGENT #######")
-                print(f"Chose random action: {action_name}{target_name}")
-                print(f"########################################")
-
+                print(f"\n--- Discovery Profiler ---")
+                print(f"Chose: {action_name}{target_name}")
+                print(f"Profile: U:{best_profile['unknowns']} D:{best_profile['discoveries']} B:{best_profile['boring']} F:{best_profile['failures']}")
+        
         else:
-            # Fallback if no actions are possible
-            action_to_return = GameAction.RESET
+            action_to_return = GameAction.RESET # Fallback
 
         # --- Store action for next turn's analysis ---
-        self.last_action_context = (action_to_return.name, chosen_object_id)
+        self.last_action_context = (action_to_return.name, chosen_object_id if chosen_object else None)
         
+        # --- Store state for level history ---
+        current_context = {
+            'summary': current_summary,
+            'rels': current_relationships,
+            'adj': current_adjacencies,
+            'diag_adj': current_diag_adjacencies,
+            'align': current_alignments,
+            'diag_align': current_diag_alignments,
+            'match': current_match_groups,
+            'events': changes 
+        }
+        self.level_state_history.append(current_context)
+
         return action_to_return
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
@@ -473,14 +569,30 @@ class ObmlAgi3Agent(Agent):
         Analyzes failures by finding conditions that are consistent across all failures
         AND have never been observed in any past success.
         
-        This new version is quieter and only prints if it has history to analyze.
+        This new version can learn from failures even if no successes have been seen.
         """
-        # --- MODIFIED: Only proceed if there is history to analyze ---
-        if not all_success_contexts or not all_failure_contexts:
-            # Silently return. The "Global Failure" message from choose_action is enough.
+        # --- NEW: Check for failure-only history ---
+        if not all_failure_contexts:
+            # Can't analyze failures if none have happened.
             return
 
-        # --- MODIFIED: Print header *after* we know there's work to do ---
+        if not all_success_contexts:
+            # This action has ONLY ever failed. The common context *is* the failure rule.
+            common_failure_context = self._find_common_context(all_failure_contexts)
+            if common_failure_context:
+                if self.debug_channels['FAILURE']: 
+                    print(f"\n--- Failure Analysis for {action_key}: (No successes on record) ---")
+                    # --- MODIFIED PRINT ---
+                    if self.debug_channels['CONTEXT_DETAILS']:
+                        print(f"  Learning rule: Action fails in this common context: {common_failure_context}")
+                    else:
+                        print(f"  Learning rule: Action fails in this common context. (Rule stored)")
+                self.failure_patterns[action_key] = common_failure_context
+            return
+        
+        # --- End of new logic ---
+
+        # (The rest of the function is the same, but we must print the header here)
         if self.debug_channels['FAILURE']: 
             print(f"\n--- Failure Analysis for {action_key}: Consistent Differentiating Conditions ---")
         
@@ -520,9 +632,12 @@ class ObmlAgi3Agent(Agent):
             nonlocal diffs_found
             diffs_found = True
             if self.debug_channels['FAILURE']:
-                print(f"- {module_name} Difference for {identifier}:")
-                print(f"  - In Successes: {success_val}")
-                print(f"  - In Failures:  {failure_val} (This state was never seen in a success)")
+                if self.debug_channels['CONTEXT_DETAILS']:
+                    print(f"- {module_name} Difference for {identifier}:")
+                    print(f"  - In Successes: {success_val}")
+                    print(f"  - In FailFures:  {failure_val} (This state was never seen in a success)")
+                else:
+                    print(f"- {module_name} Difference for {identifier}: Found a differentiating rule.")
 
         # Check Adj and Diag_Adj
         for key in ['adj', 'diag_adj']:
@@ -575,7 +690,6 @@ class ObmlAgi3Agent(Agent):
             self.failure_patterns[action_key] = common_failure_context
 
         if not diffs_found:
-            # --- MODIFIED: Quieter message ---
             if self.debug_channels['FAILURE']: print(f"  (No unique differentiating conditions found for this key)")
 
     def _parse_change_logs_to_events(self, changes: list[str]) -> list[dict]:
@@ -638,13 +752,14 @@ class ObmlAgi3Agent(Agent):
         and re-analyzing rule ambiguities.
         """
         new_events = self._parse_change_logs_to_events(changes)
-        if not new_events: return
 
         hashable_events = []
-        for event in new_events:
-            stable_event_tuple = tuple(sorted(event.items()))
-            hashable_events.append(stable_event_tuple)
+        if new_events: # Only loop if there are events
+            for event in new_events:
+                stable_event_tuple = tuple(sorted(event.items()))
+                hashable_events.append(stable_event_tuple)
         
+        # An empty tuple () is the fingerprint for "no change"
         outcome_fingerprint = tuple(sorted(hashable_events))
 
         # 1. Get or create the hypothesis
@@ -672,8 +787,12 @@ class ObmlAgi3Agent(Agent):
             
             if self.debug_channels['HYPOTHESIS']:
                 print(f"\n--- Refined Rule for {action_key} (Outcome 1) ---")
-                print(f"  Confirmations: {outcome_data['confirmations']}")
-                print(f"  Rule (Common Context): {common_context}")
+                print(f"  Confirmations: {outcome_data['confirmations']}.")
+                # --- MODIFIED PRINT ---
+                if self.debug_channels['CONTEXT_DETAILS']:
+                    print(f"  Rule (Common Context): {common_context}")
+                else:
+                    print(f"  Rule (Common Context) refined.")
         
         else:
             # --- Case 2: Ambiguity Detected ---
@@ -854,21 +973,117 @@ class ObmlAgi3Agent(Agent):
                     
                     if rule:
                         # This is a POSITIVE rule
-                        print(f"  - Found POSITIVE Rule for Outcome {i+1} (Result: {target_key}): {rule}")
+                        print(f"  - Found POSITIVE Rule for Outcome {i+1} (Result: {target_key}).")
+                        if self.debug_channels['CONTEXT_DETAILS']:
+                            print(f"    Rule: {rule}")
                     else:
                         # This is a NEGATIVE (default) rule
-                        if not all_positive_rules:
-                            print(f"  - Learned DEFAULT Rule for Outcome {i+1} (Result: {target_key}). (No positive rules found for any outcome yet)")
-                        else:
-                            # Build the "NOT" string from all other positive rules
-                            not_rules_str = " AND NOT ".join([str(r) for r in all_positive_rules])
-                            print(f"  - Learned NEGATIVE Rule for Outcome {i+1} (Result: {target_key}): (Occurs when NOT ({not_rules_str}))")
+                        print(f"  - Learned NEGATIVE Rule for Outcome {i+1} (Result: {target_key}).")
+                        if self.debug_channels['CONTEXT_DETAILS']:
+                            if not all_positive_rules:
+                                print(f"    (This is the 'default' outcome; no other positive rules exist yet)")
+                            else:
+                                # Build the "NOT" string from all other positive rules
+                                not_rules_str = " AND NOT ".join([str(r) for r in all_positive_rules])
+                                print(f"    (Occurs when NOT ({not_rules_str}))")
             
             hypothesis['differentiated_rules'] = differentiated_rules
 
         except Exception as e:
             if self.debug_channels['FAILURE']:
                 print(f"  Ambiguity analysis failed with error: {e}")
+
+    def _context_matches_pattern(self, current_context: dict, pattern: dict) -> bool:
+        """
+        Checks if the current_context (live state) matches a stored pattern.
+        The pattern can be partial (e.g., only checking for one adjacency).
+        """
+        if not pattern:
+            # An empty pattern is a "default" rule and should only match
+            # if no other specific patterns do. We'll handle this in the
+            # prediction function, not here. For a direct check, empty is True.
+            return True 
+
+        try:
+            # Check Adjacency Patterns
+            for key in ['adj', 'diag_adj']:
+                pattern_adj = pattern.get(key, {})
+                current_adj = current_context.get(key, {})
+                for obj_id, pattern_contacts in pattern_adj.items():
+                    current_contacts = tuple(current_adj.get(obj_id, ['na']*4))
+                    for i in range(4):
+                        if pattern_contacts[i] != 'x' and pattern_contacts[i] != current_contacts[i]:
+                            return False # Mismatch
+            
+            # Check Relationship, Alignment, and Match Patterns
+            for key in ['rels', 'align', 'match']:
+                pattern_rels = pattern.get(key, {})
+                current_rels = current_context.get(key, {})
+                for rel_type, pattern_groups in pattern_rels.items():
+                    current_groups = current_rels.get(rel_type, {})
+                    for value, pattern_ids in pattern_groups.items():
+                        current_ids = current_groups.get(value, set())
+                        if pattern_ids != current_ids:
+                            return False # Mismatch
+            
+            # Check Diagonal Alignment Patterns
+            key = 'diag_align'
+            pattern_rels = pattern.get(key, {})
+            current_rels = current_context.get(key, {})
+            for rel_type, pattern_groups in pattern_rels.items():
+                current_lines_frozensets = {frozenset(s) for s in current_rels.get(rel_type, [])}
+                pattern_lines_frozensets = {frozenset(s) for s in pattern_groups}
+                if not pattern_lines_frozensets.issubset(current_lines_frozensets):
+                    return False # Mismatch
+        
+        except Exception:
+            return False # Failed to parse, so it's not a match
+
+        return True # All pattern checks passed
+
+    def _predict_outcome(self, hypothesis_key: tuple, current_context: dict) -> tuple | None:
+        """
+        Predicts the outcome_fingerprint of an action given the current context.
+        Returns:
+        - The outcome_fingerprint (a tuple of events) if a rule matches.
+        - An empty tuple () if the rule predicts "no change".
+        - None if the action is completely unknown.
+        """
+        hypothesis = self.rule_hypotheses.get(hypothesis_key)
+        
+        if not hypothesis:
+            return None # This action is an "Unknown"
+
+        differentiated_rules = hypothesis.get('differentiated_rules', {})
+        if not differentiated_rules:
+            # This can happen if ambiguity was detected but analysis failed
+            # or hasn't completed. Treat as unknown.
+            return None
+
+        # We must check specific rules first
+        matching_rule_outcome = None
+        default_rule_outcome = None
+
+        for outcome_fingerprint, rule_pattern in differentiated_rules.items():
+            if rule_pattern: # This is a specific, POSITIVE rule
+                if self._context_matches_pattern(current_context, rule_pattern):
+                    # Found a specific rule that matches. This is our prediction.
+                    matching_rule_outcome = outcome_fingerprint
+                    break
+            else:
+                # This is a NEGATIVE (default) rule
+                default_rule_outcome = outcome_fingerprint
+        
+        if matching_rule_outcome is not None:
+            return matching_rule_outcome
+        
+        if default_rule_outcome is not None:
+            # No specific rule matched, so the default rule applies
+            return default_rule_outcome
+
+        # If we are here, rules exist but none matched the context.
+        # This implies our rules are incomplete. Treat as unknown.
+        return None
 
     def _analyze_relationships(self, object_summary: list[dict]) -> tuple:
         """
