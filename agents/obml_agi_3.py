@@ -31,6 +31,7 @@ class ObmlAgi3Agent(Agent):
         self.failure_patterns = {}
         self.rule_hypotheses = {}
         self.actions_printed = False
+        self.last_score = 0
 
         # --- Debug Channels ---
         # Set these to True or False to control the debug output.
@@ -71,14 +72,16 @@ class ObmlAgi3Agent(Agent):
         # --- 2. Compare Current State to Previous State ---
         if not self.last_object_summary or self.is_new_level:
             # --- FIRST FRAME LOGIC ---
-            if self.debug_channels['PERCEPTION']: print("\n--- New Level Detected: Resetting history. ---")
+            current_score = latest_frame.score
+            if self.debug_channels['PERCEPTION'] and current_score > self.last_score:
+                print(f"\n--- Level Cleared (Score: {current_score}): Resetting history. ---")
             self.is_new_level = False
             self.final_summary_before_level_change = None
             self.current_level_id_map = {}
             self.last_action_context = None
             self.success_contexts = {}
             self.failure_contexts = {}
-            self.failure_patterns = {}
+            self.last_score = current_score
             id_map = {}
             new_obj_to_old_id_map = {}
             
