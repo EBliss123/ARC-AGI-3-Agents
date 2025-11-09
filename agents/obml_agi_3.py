@@ -192,7 +192,9 @@ class ObmlAgi3Agent(Agent):
                     'rels': self.last_relationships,
                     'adj': self.last_adjacencies,
                     'diag_adj': self.last_diag_adjacencies,
-                    'diag_align': self.last_diag_alignments
+                    'align': self.last_alignments,
+                    'diag_align': self.last_diag_alignments,
+                    'match': self.last_match_groups
                 }
 
                 if changes:
@@ -390,51 +392,72 @@ class ObmlAgi3Agent(Agent):
 
     def _find_common_context(self, contexts: list[dict]) -> dict:
         """
-        Finds the common context across a list of attempts, using wildcard 'x' for
-        inconsistent adjacency properties.
+        Finds the common context across a list of attempts.
+        This new version checks all perception modules.
         """
         if not contexts:
-            return {'adj': {}, 'rels': {}}
+            return {}
 
-        # --- Adjacency Analysis with Wildcards ---
-        master_adj = {obj_id: list(contacts) for obj_id, contacts in contexts[0].get('adj', {}).items()}
-        for i in range(1, len(contexts)):
-            next_adj = contexts[i].get('adj', {})
-            for obj_id in list(master_adj.keys()):
-                master_pattern = master_adj[obj_id]
-                next_contacts = next_adj.get(obj_id)
-                if not next_contacts:
-                    del master_adj[obj_id]
-                    continue
-                for i in range(4):
-                    if master_pattern[i] == 'x':
-                        continue
-                    if master_pattern[i] != next_contacts[i]:
-                        master_pattern[i] = 'x'
-                if all(d == 'x' for d in master_pattern):
-                    del master_adj[obj_id]
-        common_adj = {obj_id: tuple(pattern) for obj_id, pattern in master_adj.items()}
-
-        # --- Relationship Analysis (Strict Intersection) ---
-        common_rels = copy.deepcopy(contexts[0].get('rels', {}))
-        for i in range(1, len(contexts)):
-            next_rels = contexts[i].get('rels', {})
-            temp_common_rels = {}
-            common_rel_types = set(common_rels.keys()) & set(next_rels.keys())
-            for rel_type in common_rel_types:
-                groups1, groups2 = common_rels[rel_type], next_rels[rel_type]
-                common_values = set(groups1.keys()) & set(groups2.keys())
-                for value in common_values:
-                    if groups1[value] == groups2[value]:
-                        temp_common_rels.setdefault(rel_type, {})[value] = groups1[value]
-            common_rels = temp_common_rels
+        # Start with the first context as the baseline
+        common_context = copy.deepcopy(contexts[0])
         
-        return {'adj': common_adj, 'rels': common_rels}
+        # Remove summary, we only care about the analysis
+        common_context.pop('summary', None) 
+
+        # Iteratively find the intersection
+        for i in range(1, len(contexts)):
+            next_context = contexts[i]
+            intersection = {} # The intersection of common_context and next_context
+            
+            # 1. Adjacency and Diagonal Adjacency
+            for key in ['adj', 'diag_adj']:
+                adj_A = common_context.get(key, {})
+                adj_B = next_context.get(key, {})
+                common_ids = set(adj_A.keys()) & set(adj_B.keys())
+                for obj_id in common_ids:
+                    if adj_A[obj_id] == adj_B[obj_id]:
+                        intersection.setdefault(key, {})[obj_id] = adj_A[obj_id]
+
+            # 2. Relationship, Alignment, and Match Diffs (dict-of-dicts)
+            for key in ['rels', 'align', 'match']:
+                rels_A = common_context.get(key, {})
+                rels_B = next_context.get(key, {})
+                common_rel_types = set(rels_A.keys()) & set(rels_B.keys())
+                for rel_type in common_rel_types:
+                    groups_A = rels_A[rel_type]
+                    groups_B = rels_B[rel_type]
+                    common_values = set(groups_A.keys()) & set(groups_B.keys())
+                    for value in common_values:
+                        if groups_A[value] == groups_B[value]:
+                            intersection.setdefault(key, {}).setdefault(rel_type, {})[value] = groups_A[value]
+
+            # 3. Diagonal Alignment Diffs (dict-of-lists)
+            key = 'diag_align'
+            rels_A = common_context.get(key, {})
+            rels_B = next_context.get(key, {})
+            common_rel_types = set(rels_A.keys()) & set(rels_B.keys())
+            for rel_type in common_rel_types:
+                groups_A = rels_A[rel_type]
+                groups_B = rels_B[rel_type]
+                frozensets_A = {frozenset(s) for s in groups_A}
+                frozensets_B = {frozenset(s) for s in groups_B}
+                common_lines_frozensets = frozensets_A & frozensets_B
+                if common_lines_frozensets:
+                    intersection.setdefault(key, {})[rel_type] = [set(fs) for fs in common_lines_frozensets]
+            
+            # The new common_context is this intersection
+            common_context = intersection
+
+        # We don't need wildcards ('x') for this method,
+        # because we're intersecting full contexts, not patterns.
+        return common_context
 
     def _analyze_failures(self, action_key: str, all_success_contexts: list[dict], all_failure_contexts: list[dict], current_failure_context: dict):
         """
         Analyzes failures by finding conditions that are consistent across all failures
         AND have never been observed in any past success.
+        
+        This new version checks ALL perception modules.
         """
         if not all_success_contexts or not all_failure_contexts:
             if self.debug_channels['FAILURE']:
@@ -444,73 +467,92 @@ class ObmlAgi3Agent(Agent):
 
         if self.debug_channels['FAILURE']: print("\n--- Failure Analysis: Consistent Differentiating Conditions ---")
         
+        # --- Step 1: Find common contexts ---
         common_success_context = self._find_common_context(all_success_contexts)
         common_failure_context = self._find_common_context(all_failure_contexts)
         
-        observed_in_any_success_adj = set()
-        observed_in_any_success_rels = set()
+        # --- Step 2: Build a veto list of all states ever seen in *any* success ---
+        observed_in_any_success = {
+            'adj': set(), 'diag_adj': set(), 'rels': set(),
+            'align': set(), 'diag_align': set(), 'match': set()
+        }
         for context in all_success_contexts:
             for obj_id, contacts in context.get('adj', {}).items():
-                observed_in_any_success_adj.add((obj_id, tuple(contacts)))
+                observed_in_any_success['adj'].add((obj_id, tuple(contacts)))
+            for obj_id, contacts in context.get('diag_adj', {}).items():
+                observed_in_any_success['diag_adj'].add((obj_id, tuple(contacts)))
             for rel_type, groups in context.get('rels', {}).items():
                 for value, ids in groups.items():
-                    observed_in_any_success_rels.add((rel_type, value, frozenset(ids)))
+                    observed_in_any_success['rels'].add((rel_type, value, frozenset(ids)))
+            for rel_type, groups in context.get('align', {}).items():
+                for value, ids in groups.items():
+                    observed_in_any_success['align'].add((rel_type, value, frozenset(ids)))
+            for rel_type, groups in context.get('match', {}).items():
+                for value, ids in groups.items():
+                    observed_in_any_success['match'].add((rel_type, value, frozenset(ids)))
+            for rel_type, groups in context.get('diag_align', {}).items():
+                for line_set in groups:
+                    observed_in_any_success['diag_align'].add((rel_type, frozenset(line_set)))
 
         diffs_found = False
+        
+        # --- Step 3: Compare all perception modules ---
+        
+        # Helper for logging
+        def log_diff(module_name, identifier, success_val, failure_val):
+            nonlocal diffs_found
+            diffs_found = True
+            if self.debug_channels['FAILURE']:
+                print(f"- {module_name} Difference for {identifier}:")
+                print(f"  - In Successes: {success_val}")
+                print(f"  - In Failures:  {failure_val} (This state was never seen in a success)")
 
-        adj_s = common_success_context['adj']
-        adj_f = common_failure_context['adj']
-        all_adj_ids = set(adj_s.keys()) | set(adj_f.keys())
+        # Check Adj and Diag_Adj
+        for key in ['adj', 'diag_adj']:
+            adj_s = common_success_context.get(key, {})
+            adj_f = common_failure_context.get(key, {})
+            all_ids = set(adj_s.keys()) | set(adj_f.keys())
+            for obj_id in all_ids:
+                contacts_s = tuple(adj_s.get(obj_id, ['na']*4))
+                contacts_f = tuple(adj_f.get(obj_id, ['na']*4))
+                if contacts_s != contacts_f:
+                    if (obj_id, contacts_f) not in observed_in_any_success[key]:
+                        log_diff(key.upper(), obj_id, contacts_s, contacts_f)
 
-        for obj_id in sorted(list(all_adj_ids), key=lambda x: int(x.split('_')[1])):
-            contacts_s = tuple(adj_s.get(obj_id, ['na']*4))
-            contacts_f = tuple(adj_f.get(obj_id, ['na']*4))
+        # Check Rels, Align, and Match
+        for key in ['rels', 'align', 'match']:
+            rels_s = common_success_context.get(key, {})
+            rels_f = common_failure_context.get(key, {})
+            all_types = set(rels_s.keys()) | set(rels_f.keys())
+            for rel_type in all_types:
+                groups_s = rels_s.get(rel_type, {})
+                groups_f = rels_f.get(rel_type, {})
+                all_values = set(groups_s.keys()) | set(groups_f.keys())
+                for value in all_values:
+                    ids_s = groups_s.get(value, set())
+                    ids_f = groups_f.get(value, set())
+                    if ids_s != ids_f:
+                        if (rel_type, value, frozenset(ids_f)) not in observed_in_any_success[key]:
+                            log_diff(f"{key.upper()} Group", f"({rel_type}, {value})", ids_s, ids_f)
+                            
+        # Check Diag_Align
+        key = 'diag_align'
+        rels_s = common_success_context.get(key, {})
+        rels_f = common_failure_context.get(key, {})
+        all_types = set(rels_s.keys()) | set(rels_f.keys())
+        for rel_type in all_types:
+            lines_s = {frozenset(s) for s in rels_s.get(rel_type, [])}
+            lines_f = {frozenset(s) for s in rels_f.get(rel_type, [])}
+            if lines_s != lines_f:
+                # Check each individual line that is unique to the failure
+                for line_f in lines_f - lines_s:
+                    if (rel_type, line_f) not in observed_in_any_success[key]:
+                        log_diff(f"{key.upper()} Line", f"({rel_type})", "Not present", line_f)
+                # Check for lines that disappeared
+                for line_s in lines_s - lines_f:
+                    if (rel_type, frozenset()) not in observed_in_any_success[key]: # A bit of a guess
+                        log_diff(f"{key.upper()} Line", f"({rel_type})", line_s, "Not present")
 
-            if contacts_s != contacts_f:
-                if (obj_id, contacts_f) not in observed_in_any_success_adj:
-                    diffs_found = True
-                    failure_pattern = []
-                    for i in range(4):
-                        if contacts_s[i] == contacts_f[i]:
-                            failure_pattern.append('x')
-                        else:
-                            contact = contacts_f[i]
-                            failure_pattern.append(contact.replace('obj_', '') if 'obj_' in contact else contact)
-                    
-                    pattern_str = f"({', '.join(failure_pattern)})"
-                    clean_id = obj_id.replace('obj_', 'id_')
-                    if self.debug_channels['FAILURE']: print(f"- Adjacency Difference for {clean_id}: Failures consistently exhibit pattern {pattern_str}, which has never occurred in a success.")
-
-        rels_s = common_success_context['rels']
-        rels_f = common_failure_context['rels']
-        all_rel_types = set(rels_s.keys()) | set(rels_f.keys())
-
-        for rel_type in all_rel_types:
-            groups_s, groups_f = rels_s.get(rel_type, {}), rels_f.get(rel_type, {})
-            all_values = set(groups_s.keys()) | set(groups_f.keys())
-            for value in all_values:
-                ids_s, ids_f = groups_s.get(value, set()), groups_f.get(value, set())
-                
-                if ids_s != ids_f:
-                    # Check if this specific failure state has ever been seen in a success
-                    if (rel_type, value, frozenset(ids_f)) not in observed_in_any_success_rels:
-                        diffs_found = True
-                        value_str = f"{value[0]}x{value[1]}" if rel_type == 'Size' else value
-                        
-                        # --- NEW, SMARTER LOGGING ---
-                        if ids_f == set() and ids_s != set():
-                            # The group disappeared in the failure case
-                            if self.debug_channels['FAILURE']:
-                                print(f"- {rel_type} Group ({value_str}) DISAPPEARED: This group (which existed in successes) is consistently EMPTY in failures.")
-                        elif ids_f != set() and ids_s == set():
-                            # A new group appeared only in the failure case
-                            if self.debug_channels['FAILURE']:
-                                print(f"- {rel_type} Group ({value_str}) APPEARED: This group {sorted(list(ids_f))} consistently APPEARS in failures (and was not present in successes).")
-                        else:
-                            # The group's membership changed
-                            if self.debug_channels['FAILURE']:
-                                print(f"- {rel_type} Group ({value_str}) CHANGED: Failures consistently have members {sorted(list(ids_f))} (was {sorted(list(ids_s))} in successes).")
-                        # --- END NEW LOGGING ---
         
         if diffs_found:
             self.failure_patterns[action_key] = common_failure_context
