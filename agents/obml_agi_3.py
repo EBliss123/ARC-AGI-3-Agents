@@ -29,6 +29,7 @@ class ObmlAgi3Agent(Agent):
         self.success_contexts = {}
         self.failure_contexts = {}
         self.failure_patterns = {}
+        self.rule_hypotheses = {}
         self.actions_printed = False
 
         # --- Debug Channels ---
@@ -192,8 +193,49 @@ class ObmlAgi3Agent(Agent):
                 }
 
                 if changes:
-                    # --- SUCCESS ---
+                    # --- SUCCESS: Log for failure analysis ---
                     self.success_contexts.setdefault(learning_key, []).append(prev_context)
+                    
+                    # --- SUCCESS: Learn rules from the outcome ---
+                    prev_summary_map = {obj['id']: obj for obj in prev_summary}
+                    
+                    if prev_target_id:
+                        # --- Case 1: This was a TARGETED action (e.g., ACTION6 on obj_14) ---
+                        # The "outcome" includes ALL changes (including side effects).
+                        hypothesis_key = (prev_action_name, prev_target_id)
+                        self._analyze_and_report(hypothesis_key, changes, prev_context)
+                        
+                    else:
+                        # --- Case 2: This was a GLOBAL action (e.g., ACTION4) ---
+                        # Find all objects that *changed*
+                        affected_ids = set()
+                        for change_str in changes:
+                             if "Object id_" in change_str:
+                                try:
+                                    id_num_str = change_str.split('id_')[1].split()[0]
+                                    affected_ids.add(f"obj_{id_num_str}")
+                                except IndexError:
+                                    continue
+                        
+                        # 1. Learn rules for all AFFECTED objects
+                        for obj_id in affected_ids:
+                            if obj_id in prev_summary_map:
+                                hypothesis_key = (prev_action_name, obj_id)
+                                obj_id_str = obj_id.replace('obj_', 'id_')
+                                object_specific_changes = [c for c in changes if f"Object {obj_id_str}" in c]
+
+                                if object_specific_changes:
+                                    self._analyze_and_report(hypothesis_key, object_specific_changes, prev_context)
+                        
+                        # 2. Learn "no change" rules for all UNAFFECTED objects
+                        all_prev_ids = set(prev_summary_map.keys())
+                        unaffected_ids = all_prev_ids - affected_ids
+                        
+                        for obj_id in unaffected_ids:
+                            if obj_id in prev_summary_map: # Check if object still exists
+                                hypothesis_key = (prev_action_name, obj_id)
+                                # Pass an EMPTY list of changes to learn "no change"
+                                self._analyze_and_report(hypothesis_key, [], prev_context)
                 
                 else:
                     # --- FAILURE ---
@@ -456,6 +498,284 @@ class ObmlAgi3Agent(Agent):
 
         if not diffs_found:
             if self.debug_channels['FAILURE']: print("No conditions found that are both consistent across all failures and unique to them.")
+
+    def _parse_change_logs_to_events(self, changes: list[str]) -> list[dict]:
+        """Parses a list of human-readable change logs into a list of structured event dictionaries."""
+        events = []
+        for log_str in changes:
+            try:
+                change_type, details = log_str.replace('- ', '', 1).split(': ', 1)
+                event = {'type': change_type}
+
+                if change_type == 'MOVED':
+                    parts = details.split(' moved from ')
+                    pos_parts = parts[1].replace('.', '').split(' to ')
+                    start_pos, end_pos = ast.literal_eval(pos_parts[0]), ast.literal_eval(pos_parts[1])
+                    event.update({'vector': (end_pos[0] - start_pos[0], end_pos[1] - start_pos[1])})
+                    events.append(event)
+                elif change_type == 'RECOLORED':
+                    from_color_str = details.split(' from ')[1].split(' to ')[0]
+                    to_color_str = details.split(' to ')[1].replace('.', '')
+                    event.update({'from_color': int(from_color_str), 'to_color': int(to_color_str)})
+                    events.append(event)
+                elif change_type == 'SHAPE_CHANGED':
+                    fp_part = details.split('fingerprint: ')[1]
+                    from_fp_str, to_fp_str = fp_part.replace(').','').split(' -> ')
+                    event.update({'from_fingerprint': int(from_fp_str), 'to_fingerprint': int(to_fp_str)})
+                    events.append(event)
+                elif change_type in ['GROWTH', 'SHRINK', 'TRANSFORM']:
+                    start_pos_str = details.split(') ')[0] + ')'
+                    start_pos = ast.literal_eval(start_pos_str.split(' at ')[1])
+                    end_pos_str = details.split('now at ')[1].replace('.', '')
+                    end_pos = ast.literal_eval(end_pos_str)
+                    event.update({'start_position': start_pos, 'end_position': end_pos})
+                    if '(from ' in details:
+                        from_size_str = details.split('(from ')[1].split(' to ')[0]
+                        to_size_str = details.split(' to ')[1].split(')')[0]
+                        pixel_diff = int(details.split(' by ')[1].split(' pixels')[0])
+                        event.update({
+                            'from_size': ast.literal_eval(from_size_str.replace('x', ',')),
+                            'to_size': ast.literal_eval(to_size_str.replace('x', ',')),
+                            'pixel_delta': pixel_diff if change_type == 'GROWTH' else -pixel_diff
+                        })
+                    events.append(event)
+                elif change_type in ['NEW', 'REMOVED']:
+                    id_str = details.split(') ')[0] + ')'
+                    id_tuple = ast.literal_eval(id_str.split('ID ')[1])
+                    pos_str = '(' + details.split('(')[-1].replace('.', '')
+                    position = ast.literal_eval(pos_str)
+                    event.update({
+                        'position': position, 'fingerprint': id_tuple[0],
+                        'color': id_tuple[1], 'size': id_tuple[2], 'pixels': id_tuple[3]
+                    })
+                    events.append(event)
+            except (ValueError, IndexError, SyntaxError):
+                continue
+        return events
+
+    def _analyze_and_report(self, action_key: tuple, changes: list[str], full_context: dict):
+        """
+        Learns from a successful action by storing the full context
+        and re-analyzing rule ambiguities.
+        """
+        new_events = self._parse_change_logs_to_events(changes)
+        if not new_events: return
+
+        hashable_events = []
+        for event in new_events:
+            stable_event_tuple = tuple(sorted(event.items()))
+            hashable_events.append(stable_event_tuple)
+        
+        outcome_fingerprint = tuple(sorted(hashable_events))
+
+        # 1. Get or create the hypothesis
+        hypothesis = self.rule_hypotheses.setdefault(action_key, {
+            'outcomes': {},          # Stores the raw contexts for each outcome
+            'differentiated_rules': {} # Stores the *learned rule* (common context) for each outcome
+        })
+
+        # 2. Add this event's context to the history for this outcome
+        outcome_data = hypothesis['outcomes'].setdefault(outcome_fingerprint, {
+            'contexts': [],
+            'confirmations': 0,
+            'rules': new_events # Store the parsed outcome for prediction
+        })
+        outcome_data['contexts'].append(full_context)
+        outcome_data['confirmations'] += 1
+        
+        # 3. Check for ambiguity
+        if len(hypothesis['outcomes']) == 1:
+            # --- Case 1: No Ambiguity ---
+            # This is the first outcome, or a confirmation of the only outcome.
+            # The "rule" is just the common context of all observations.
+            common_context = self._find_common_context(outcome_data['contexts'])
+            hypothesis['differentiated_rules'][outcome_fingerprint] = common_context
+            
+            if self.debug_channels['HYPOTHESIS']:
+                print(f"\n--- Refined Rule for {action_key} (Outcome 1) ---")
+                print(f"  Confirmations: {outcome_data['confirmations']}")
+                print(f"  Rule (Common Context): {common_context}")
+        
+        else:
+            # --- Case 2: Ambiguity Detected ---
+            # We have multiple possible outcomes for this action.
+            # We must re-calculate all rules by finding the *differences*
+            # between all outcomes.
+            if self.debug_channels['HYPOTHESIS']:
+                print(f"\n--- Ambiguity Detected for {action_key}. Re-analyzing all outcomes. ---")
+            self._analyze_ambiguity(action_key, hypothesis)
+
+    def _find_context_difference(self, context_A: dict, context_B: dict) -> dict:
+        """
+        Compares two common_contexts (A and B) and returns a new context pattern
+        containing all elements that are in A and are different in B.
+        """
+        diff_pattern = {}
+
+        for key in ['adj', 'diag_adj']:
+            adj_A = context_A.get(key, {})
+            adj_B = context_B.get(key, {})
+            all_adj_ids = set(adj_A.keys()) | set(adj_B.keys())
+
+            for obj_id in all_adj_ids:
+                contacts_A = tuple(adj_A.get(obj_id, ['na']*4))
+                contacts_B = tuple(adj_B.get(obj_id, ['na']*4))
+                
+                if contacts_A != contacts_B:
+                    if obj_id in adj_A:
+                        diff_pattern.setdefault(key, {})[obj_id] = contacts_A
+
+        for key in ['rels', 'align', 'match']:
+            rels_A = context_A.get(key, {})
+            rels_B = context_B.get(key, {})
+            all_rel_types = set(rels_A.keys()) | set(rels_B.keys())
+
+            for rel_type in all_rel_types:
+                groups_A = rels_A.get(rel_type, {})
+                groups_B = rels_B.get(rel_type, {})
+                all_values = set(groups_A.keys()) | set(groups_B.keys())
+                
+                for value in all_values:
+                    ids_A = groups_A.get(value, set())
+                    ids_B = groups_B.get(value, set())
+                    
+                    if ids_A != ids_B:
+                        if value in groups_A:
+                            diff_pattern.setdefault(key, {}).setdefault(rel_type, {})[value] = ids_A
+
+        key = 'diag_align'
+        rels_A = context_A.get(key, {})
+        rels_B = context_B.get(key, {})
+        all_rel_types = set(rels_A.keys()) | set(rels_B.keys())
+
+        for rel_type in all_rel_types:
+            groups_A = rels_A.get(rel_type, [])
+            groups_B = rels_B.get(rel_type, [])
+            
+            frozensets_A = {frozenset(s) for s in groups_A}
+            frozensets_B = {frozenset(s) for s in groups_B}
+
+            if frozensets_A != frozensets_B:
+                if rel_type in rels_A:
+                    diff_pattern.setdefault(key, {})[rel_type] = groups_A
+
+        return diff_pattern
+    
+    def _intersect_contexts(self, context_A: dict, context_B: dict) -> dict:
+        """
+        Finds the intersection of two context patterns (A and B).
+        A context pattern is a (potentially partial) context.
+        """
+        if not context_A: return context_B
+        if not context_B: return context_A
+        
+        intersection = {}
+
+        for key in ['adj', 'diag_adj']:
+            adj_A = context_A.get(key, {})
+            adj_B = context_B.get(key, {})
+            
+            common_ids = set(adj_A.keys()) & set(adj_B.keys())
+            for obj_id in common_ids:
+                if adj_A[obj_id] == adj_B[obj_id]:
+                    intersection.setdefault(key, {})[obj_id] = adj_A[obj_id]
+
+        for key in ['rels', 'align', 'match']:
+            rels_A = context_A.get(key, {})
+            rels_B = context_B.get(key, {})
+            
+            common_rel_types = set(rels_A.keys()) & set(rels_B.keys())
+            for rel_type in common_rel_types:
+                groups_A = rels_A[rel_type]
+                groups_B = rels_B[rel_type]
+                
+                common_values = set(groups_A.keys()) & set(groups_B.keys())
+                for value in common_values:
+                    if groups_A[value] == groups_B[value]:
+                        intersection.setdefault(key, {}).setdefault(rel_type, {})[value] = groups_A[value]
+
+        key = 'diag_align'
+        rels_A = context_A.get(key, {})
+        rels_B = context_B.get(key, {})
+        common_rel_types = set(rels_A.keys()) & set(rels_B.keys())
+
+        for rel_type in common_rel_types:
+            groups_A = rels_A[rel_type]
+            groups_B = rels_B[rel_type]
+            
+            frozensets_A = {frozenset(s) for s in groups_A}
+            frozensets_B = {frozenset(s) for s in groups_B}
+            
+            common_lines_frozensets = frozensets_A & frozensets_B
+            
+            if common_lines_frozensets:
+                intersection.setdefault(key, {})[rel_type] = [set(fs) for fs in common_lines_frozensets]
+
+        return intersection
+
+    def _analyze_ambiguity(self, action_key: tuple, hypothesis: dict):
+        """
+        Analyzes an ambiguous hypothesis (one with multiple outcomes) by comparing
+        every outcome to every *other* outcome to find a unique, differentiating context.
+        """
+        outcome_keys = list(hypothesis['outcomes'].keys())
+        if len(outcome_keys) < 2:
+            return
+
+        if self.debug_channels['FAILURE']:
+            print(f"\n--- Ambiguity Analysis for {action_key} ---")
+            print(f"  Hypothesis has {len(outcome_keys)} outcomes. Running full comparison.")
+
+        try:
+            # Step 1: Get the common context for every outcome
+            all_common_contexts = {}
+            for key in outcome_keys:
+                contexts = hypothesis['outcomes'][key].get('contexts', [])
+                if not contexts:
+                    if self.debug_channels['FAILURE']: print(f"  Analysis failed: Contexts not stored for outcome {key}.")
+                    return
+                all_common_contexts[key] = self._find_common_context(contexts)
+
+            # Step 2: For each outcome, find its unique rule
+            differentiated_rules = {}
+            
+            for i in range(len(outcome_keys)):
+                target_key = outcome_keys[i]
+                common_target = all_common_contexts[target_key]
+                
+                intersection_of_diffs = None
+                
+                for j in range(len(outcome_keys)):
+                    if i == j: continue
+                    
+                    compare_key = outcome_keys[j]
+                    common_compare = all_common_contexts[compare_key]
+                    
+                    # Find what's in Target that is different from Compare
+                    current_diff = self._find_context_difference(common_target, common_compare)
+                    
+                    if intersection_of_diffs is None:
+                        intersection_of_diffs = current_diff
+                    else:
+                        # Keep refining the rule by finding the intersection of all differences
+                        intersection_of_diffs = self._intersect_contexts(intersection_of_diffs, current_diff)
+                
+                # The final `intersection_of_diffs` is the unique rule for this outcome
+                differentiated_rules[target_key] = intersection_of_diffs
+                
+                if self.debug_channels['HYPOTHESIS']:
+                    if intersection_of_diffs:
+                        # This print statement is now more descriptive
+                        print(f"  - Found Rule for Outcome {i+1} (Result: {target_key}): {intersection_of_diffs}")
+                    else:
+                        # This print statement is now more descriptive
+                        print(f"  - No unique rule found for Outcome {i+1} (Result: {target_key}).")
+
+            hypothesis['differentiated_rules'] = differentiated_rules
+
+        except Exception as e:
+            if self.debug_channels['FAILURE']:
+                print(f"  Ambiguity analysis failed with error: {e}")
 
     def _analyze_relationships(self, object_summary: list[dict]) -> tuple:
         """
