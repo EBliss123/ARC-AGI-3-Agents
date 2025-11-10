@@ -80,7 +80,7 @@ class Swarm:
         # submit start of scorecard
         self.card_id = self.open_scorecard()
 
-        # create all the agents
+        # create and run all the agents, ONE AT A TIME
         for i in range(len(self.GAMES)):
             g = self.GAMES[i % len(self.GAMES)]
             a = self.agent_class(
@@ -92,21 +92,18 @@ class Swarm:
                 cookies=self._session.cookies,
                 tags=self.tags,
                 params=self.agent_params,
-                api_lock=self.api_lock,
+                api_lock=self.api_lock, # This lock will no longer be contended
             )
             self.agents.append(a)
 
-        # create all the threads
-        for a in self.agents:
-            self.threads.append(Thread(target=a.main, daemon=True))
+            # --- Run the agent's main loop directly ---
+            # This will block and wait for the agent to finish
+            # before starting the next one.
+            logger.info(f"--- Starting serial run for game: {g} ---")
+            a.main()
+            logger.info(f"--- Finished serial run for game: {g} ---")
 
-        # start all the threads
-        for t in self.threads:
-            t.start()
-
-        # wait for all agent to finish
-        for t in self.threads:
-            t.join()
+        # All agents have finished, one by one.
 
         # Stagger the cleanup to avoid a final burst of API calls.
         time.sleep(random.uniform(0.5, 5.0))
