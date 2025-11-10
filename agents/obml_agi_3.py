@@ -48,6 +48,34 @@ class ObmlAgi3Agent(Agent):
             'CONTEXT_DETAILS': False # Keep or remove large prints
         }
 
+    def _reset_agent_memory(self):
+        """
+        Resets all agent learning and memory to a clean state.
+        This is called at the start of a new game.
+        """
+        self.object_id_counter = 0
+        self.removed_objects_memory = {}
+        self.last_object_summary = []
+        self.last_relationships = {}
+        self.last_adjacencies = {}
+        self.last_diag_adjacencies = {}
+        self.last_alignments = {}
+        self.last_diag_alignments = {}
+        self.last_match_groups = {}
+        self.is_new_level = True
+        self.final_summary_before_level_change = None
+        self.current_level_id_map = {}
+        self.last_action_context = None
+        self.success_contexts = {}
+        self.failure_contexts = {}
+        self.failure_patterns = {}
+        self.rule_hypotheses = {}
+        self.seen_outcomes = set()
+        self.level_state_history = []
+        self.win_condition_hypotheses = []
+        self.actions_printed = False
+        self.last_score = 0
+
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
         Analyzes the current frame, compares it to the previous frame,
@@ -76,17 +104,17 @@ class ObmlAgi3Agent(Agent):
         if not self.last_object_summary or self.is_new_level:
             # --- FIRST FRAME LOGIC ---
             current_score = latest_frame.score
+            
+            # --- Perform a full "brain wipe" ---
+            self._reset_agent_memory()
+            
             if self.debug_channels['PERCEPTION'] and current_score > self.last_score:
                 print(f"\n--- Level Cleared (Score: {current_score}): Resetting history. ---")
+            
+            # Now, set the state for the new level
             self.is_new_level = False
-            self.final_summary_before_level_change = None
-            self.current_level_id_map = {}
-            self.last_action_context = None
-            self.success_contexts = {}
-            self.failure_contexts = {}
             self.last_score = current_score
-            self.seen_outcomes = set()
-            self.level_state_history = []
+
             id_map = {}
             new_obj_to_old_id_map = {}
             
@@ -1086,23 +1114,30 @@ class ObmlAgi3Agent(Agent):
             # or hasn't completed. Treat as unknown.
             return None
 
-        # We must check specific rules first
-        matching_rule_outcome = None
+        # --- Deterministic Prediction Logic ---
+        # We must separate positive rules from the default rule.
+        positive_rules = []
         default_rule_outcome = None
 
         for outcome_fingerprint, rule_pattern in differentiated_rules.items():
-            if rule_pattern: # This is a specific, POSITIVE rule
-                if self._context_matches_pattern(current_context, rule_pattern):
-                    # Found a specific rule that matches. This is our prediction.
-                    matching_rule_outcome = outcome_fingerprint
-                    break
+            if rule_pattern:
+                # This is a specific, POSITIVE rule
+                positive_rules.append((outcome_fingerprint, rule_pattern))
             else:
                 # This is a NEGATIVE (default) rule
                 default_rule_outcome = outcome_fingerprint
         
-        if matching_rule_outcome is not None:
-            return matching_rule_outcome
+        # 1. Check all positive rules first.
+        # We check them in a sorted order to be 100% deterministic.
+        # We sort by the string representation of the rule pattern dict.
+        positive_rules.sort(key=lambda x: str(x[1])) 
         
+        for outcome_fingerprint, rule_pattern in positive_rules:
+            if self._context_matches_pattern(current_context, rule_pattern):
+                # Found a specific rule that matches. This is our prediction.
+                return outcome_fingerprint
+        
+        # 2. If no positive rule matched, check for a default rule.
         if default_rule_outcome is not None:
             # No specific rule matched, so the default rule applies
             return default_rule_outcome
@@ -1214,13 +1249,13 @@ class ObmlAgi3Agent(Agent):
             for group in exact_groups_dict.values():
                 processed_ids.update(group)
 
-        partial_match_definitions = {
-            "Color":       lambda o: (o['fingerprint'], o['size'], o['pixels']),
-            "Fingerprint": lambda o: (o['color'], o['size'], o['pixels']),
-            "Size":        lambda o: (o['color'], o['fingerprint'], o['pixels']),
-            "Pixels":      lambda o: (o['color'], o['fingerprint'], o['size']),
-        }
-        for match_type, key_func in partial_match_definitions.items():
+        partial_match_definitions = [
+            ("Color",       lambda o: (o['fingerprint'], o['size'], o['pixels'])),
+            ("Fingerprint", lambda o: (o['color'], o['size'], o['pixels'])),
+            ("Size",        lambda o: (o['color'], o['fingerprint'], o['pixels'])),
+            ("Pixels",      lambda o: (o['color'], o['fingerprint'], o['size'])),
+        ]
+        for match_type, key_func in partial_match_definitions:
             temp_groups = {}
             unprocessed_objects = [o for o in object_summary if o['id'] not in processed_ids]
             for obj in unprocessed_objects:
@@ -1411,7 +1446,7 @@ class ObmlAgi3Agent(Agent):
         movable_ids = set(old_map_by_id.keys()) & set(new_map_by_id.keys())
         
         moves_to_remove = []
-        for stable_id in movable_ids:
+        for stable_id in sorted(list(movable_ids)):
             old_instances = old_map_by_id[stable_id]
             new_instances = new_map_by_id[stable_id]
             
@@ -1581,7 +1616,7 @@ class ObmlAgi3Agent(Agent):
         """Finds a removed object that matches the new object in all but one property."""
         new_stable_id = self._get_stable_id(new_obj)
         
-        for old_stable_id in self.removed_objects_memory.keys():
+        for old_stable_id in sorted(list(self.removed_objects_memory.keys())):
             diffs = {}
             if new_stable_id[0] != old_stable_id[0]:
                 diffs['shape'] = (old_stable_id[0], new_stable_id[0])
