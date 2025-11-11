@@ -223,9 +223,8 @@ class ObmlAgi3Agent(Agent):
 
             # --- Analyze the outcome of the previous action ---
             if self.last_action_context:
-                prev_action_name, prev_target_id = self.last_action_context
-                learning_key = self._get_learning_key(prev_action_name, prev_target_id)
-                
+                learning_key = self.last_action_context # This is now 'ACTION4' or 'ACTION6_obj_2'
+        
                 # This is the full context of the *previous* state, when the action was taken.
                 prev_context = {
                     'summary': prev_summary,
@@ -238,79 +237,68 @@ class ObmlAgi3Agent(Agent):
                 }
 
                 if changes:
-                    # --- SUCCESS: Log for failure analysis ---
-                    self.success_contexts.setdefault(learning_key, []).append(prev_context)
-                    
-                    # --- SUCCESS: Learn rules from the outcome ---
+                    # --- SUCCESS: Learn rules from the outcome (Unified Logic) ---
                     prev_summary_map = {obj['id']: obj for obj in prev_summary}
                     
-                    if prev_target_id:
-                        # --- Case 1: This was a TARGETED action (e.g., ACTION6 on obj_14) ---
-                        # The "outcome" includes ALL changes (including side effects).
-                        hypothesis_key = (prev_action_name, prev_target_id)
-                        self._analyze_and_report(hypothesis_key, changes, prev_context)
-                        
-                    else:
-                        # --- Case 2: This was a GLOBAL action (e.g., ACTION4) ---
-                        # Find all objects that *changed*
-                        affected_ids = set()
-                        for change_str in changes:
-                             if "Object id_" in change_str:
+                    # Find all objects that *changed*
+                    affected_ids = set()
+                    for change_str in changes:
+                            if "Object id_" in change_str:
                                 try:
                                     id_num_str = change_str.split('id_')[1].split()[0]
                                     affected_ids.add(f"obj_{id_num_str}")
                                 except IndexError:
                                     continue
-                        
-                        # 1. Learn rules for all AFFECTED objects
-                        for obj_id in affected_ids:
-                            if obj_id in prev_summary_map:
-                                hypothesis_key = (prev_action_name, obj_id)
-                                obj_id_str = obj_id.replace('obj_', 'id_')
-                                object_specific_changes = [c for c in changes if f"Object {obj_id_str}" in c]
+                    
+                    # 1. Learn rules for all AFFECTED objects
+                    for obj_id in affected_ids:
+                        if obj_id in prev_summary_map:
+                            # The key is (action_key, affected_object_id)
+                            # e.g., ('ACTION6_obj_2', 'obj_5') or ('ACTION4', 'obj_5')
+                            hypothesis_key = (learning_key, obj_id) 
+                            
+                            self.success_contexts.setdefault(hypothesis_key, []).append(prev_context) # Log success
+                            
+                            obj_id_str = obj_id.replace('obj_', 'id_')
+                            object_specific_changes = [c for c in changes if f"Object {obj_id_str}" in c]
 
-                                if object_specific_changes:
-                                    self._analyze_and_report(hypothesis_key, object_specific_changes, prev_context)
-                        
-                        # 2. Learn "no change" rules for all UNAFFECTED objects
-                        all_prev_ids = set(prev_summary_map.keys())
-                        unaffected_ids = all_prev_ids - affected_ids
-                        
-                        for obj_id in unaffected_ids:
-                            if obj_id in prev_summary_map: # Check if object still exists
-                                hypothesis_key = (prev_action_name, obj_id)
-                                # Pass an EMPTY list of changes to learn "no change"
-                                self._analyze_and_report(hypothesis_key, [], prev_context)
+                            if object_specific_changes:
+                                self._analyze_and_report(hypothesis_key, object_specific_changes, prev_context)
+                    
+                    # 2. Learn "no change" rules for all UNAFFECTED objects
+                    all_prev_ids = set(prev_summary_map.keys())
+                    unaffected_ids = all_prev_ids - affected_ids
+                    
+                    for obj_id in unaffected_ids:
+                        if obj_id in prev_summary_map: # Check if object still exists
+                            hypothesis_key = (learning_key, obj_id) # e.g., ('ACTION6_obj_2', 'obj_1') or ('ACTION4', 'obj_1')
+                            
+                            self.success_contexts.setdefault(hypothesis_key, []).append(prev_context) # Log success
+                            
+                            # Pass an EMPTY list of changes to learn "no change"
+                            self._analyze_and_report(hypothesis_key, [], prev_context)
                 
                 else:
                     # --- FAILURE (No changes occurred) ---
+                    if self.debug_channels['FAILURE']:
+                        print(f"\n--- Global Failure Detected for Action {learning_key} (No Changes) ---")
                     
-                    if prev_target_id:
-                        # --- Case 1: This was a TARGETED action (e.g., ACTION6) ---
-                        if self.debug_channels['FAILURE']:
-                            print(f"\n--- Failure Detected for Action {learning_key} ---")
+                    # We must log a "no change" failure for EVERY object on the screen.
+                    for obj in prev_summary:
+                        obj_id = obj['id']
+                        # The key is (action_key, affected_object_id)
+                        hypothesis_key = (learning_key, obj_id) # e.g., ('ACTION6_obj_2', 'obj_1') or ('ACTION4', 'obj_1')
                         
-                        self.failure_contexts.setdefault(learning_key, []).append(prev_context)
-                        successes = self.success_contexts.get(learning_key, [])
-                        failures = self.failure_contexts.get(learning_key, [])
-                        self._analyze_failures(learning_key, successes, failures, prev_context)
-
-                    else:
-                        # --- Case 2: This was a GLOBAL action (e.g., ACTION1) ---
-                        # We must log a "no change" failure for EVERY object on the screen.
-                        if self.debug_channels['FAILURE']:
-                            print(f"\n--- Global Failure Detected for Action {learning_key} (No Changes) ---")
+                        self.failure_contexts.setdefault(hypothesis_key, []).append(prev_context)
                         
-                        for obj in prev_summary:
-                            obj_id = obj['id']
-                            hypothesis_key = (prev_action_name, obj_id)
-                            
-                            self.failure_contexts.setdefault(hypothesis_key, []).append(prev_context)
-                            
-                            # Analyze this specific object's failure history
-                            successes = self.success_contexts.get(hypothesis_key, [])
-                            failures = self.failure_contexts.get(hypothesis_key, [])
-                            self._analyze_failures(hypothesis_key, successes, failures, prev_context)
+                        # Analyze this specific object's failure history
+                        successes = self.success_contexts.get(hypothesis_key, [])
+                        failures = self.failure_contexts.get(hypothesis_key, [])
+                        self._analyze_failures(hypothesis_key, successes, failures, prev_context)
+                        
+                        # ALSO learn "no change" as a predictable, "boring" outcome
+                        # so we don't get stuck in a U:1 loop.
+                        self._analyze_and_report(hypothesis_key, [], prev_context)
 
         # --- 3. Update Memory For Next Turn ---
         # This runs every frame, saving the state we just analyzed
@@ -362,67 +350,51 @@ class ObmlAgi3Agent(Agent):
             base_action_key_str = self._get_learning_key(action_template.name, target_id)
             
             profile = {'unknowns': 0, 'discoveries': 0, 'boring': 0, 'failures': 0}
-            predicted_outcomes_for_this_move = set()
+            predicted_fingerprints_for_this_move = set()
+            all_predicted_events_for_move = []
 
-            if target_id:
-                # --- Case 1: This is a TARGETED action (e.g., ACTION6_obj_1) ---
-                # We only need to check this one specific hypothesis.
+            # --- Unified Profiling Logic ---
+            # We profile the effect of this action (Global or Targeted)
+            # on ALL objects on the screen.
+            for obj in current_summary:
+                obj_id = obj['id']
                 
-                # 1. Check for a predicted FAILURE for this specific action
-                if base_action_key_str in self.failure_patterns:
-                    failure_rule = self.failure_patterns[base_action_key_str]
+                # The hypothesis key is (action_key, affected_object_id)
+                # e.g., ('ACTION4', 'obj_1') or ('ACTION6_obj_2', 'obj_1')
+                hypothesis_key = (base_action_key_str, obj_id)
+
+                # 1. Check for a predicted per-object FAILURE
+                if hypothesis_key in self.failure_patterns:
+                    failure_rule = self.failure_patterns[hypothesis_key]
                     if self._context_matches_pattern(current_full_context, failure_rule):
-                        profile['failures'] = 1
-                    
+                        profile['failures'] += 1
+                        continue # This object will fail, check the next object
+
+                # 2. If no failure, predict the per-object SUCCESS outcome
+                predicted_event_list = self._predict_outcome(hypothesis_key, current_full_context)
+                
+                # --- Convert event list to a hashable fingerprint ---
+                predicted_outcome_fingerprint = None
+                if predicted_event_list is not None:
+                    hashable_events = [tuple(sorted(e.items())) for e in predicted_event_list]
+                    predicted_outcome_fingerprint = tuple(sorted(hashable_events))
+                    all_predicted_events_for_move.extend(predicted_event_list)
+                # --- End conversion ---
+                
+                # 3. Tally the results
+                if predicted_event_list is None:
+                    profile['unknowns'] += 1
+                elif predicted_outcome_fingerprint == ():
+                    profile['boring'] += 1 # Predicted "no change"
+                elif predicted_outcome_fingerprint in self.seen_outcomes:
+                    profile['boring'] += 1 # Predicted "repetitive change"
                 else:
-                    # 2. If no failure, predict the SUCCESS outcome
-                    hypothesis_key = (base_action_key_str.split('_')[0], target_id)
-                    predicted_outcome = self._predict_outcome(hypothesis_key, current_full_context)
-                    
-                    # 3. Tally the result
-                    if predicted_outcome is None:
-                        profile['unknowns'] = 1
-                    elif predicted_outcome == ():
-                        profile['boring'] = 1 # Predicted "no change"
-                    elif predicted_outcome in self.seen_outcomes:
-                        profile['boring'] = 1 # Predicted "repetitive change"
-                    else:
-                        profile['discoveries'] = 1 # Predicted "new, novel change"
-                        predicted_outcomes_for_this_move.add(predicted_outcome)
+                    profile['discoveries'] += 1 # Predicted "new, novel change"
+                    predicted_fingerprints_for_this_move.add(predicted_outcome_fingerprint)
 
-            else:
-                # --- Case 2: This is a GLOBAL action (e.g., ACTION4) ---
-                # We profile its effect on ALL objects on the screen.
-                for obj in current_summary:
-                    obj_id = obj['id']
-                    
-                    # The hypothesis key is always (base_action_name, affected_object_id)
-                    hypothesis_key = (base_action_key_str.split('_')[0], obj_id)
+            move_profiles.append((move, profile, predicted_fingerprints_for_this_move, all_predicted_events_for_move))
 
-                    # 1. Check for a predicted per-object FAILURE
-                    if hypothesis_key in self.failure_patterns:
-                        failure_rule = self.failure_patterns[hypothesis_key]
-                        if self._context_matches_pattern(current_full_context, failure_rule):
-                            profile['failures'] += 1
-                            continue # This object will fail, check the next object
-
-                    # 2. If no failure, predict the per-object SUCCESS outcome
-                    predicted_outcome = self._predict_outcome(hypothesis_key, current_full_context)
-                    
-                    # 3. Tally the results
-                    if predicted_outcome is None:
-                        profile['unknowns'] += 1
-                    elif predicted_outcome == ():
-                        profile['boring'] += 1 # Predicted "no change"
-                    elif predicted_outcome in self.seen_outcomes:
-                        profile['boring'] += 1 # Predicted "repetitive change"
-                    else:
-                        profile['discoveries'] += 1 # Predicted "new, novel change"
-                        predicted_outcomes_for_this_move.add(predicted_outcome)
-
-            move_profiles.append((move, profile, predicted_outcomes_for_this_move))
-
-        # --- Deterministic Priority-Based Sorting ---
+# --- Deterministic Priority-Based Sorting ---
         if move_profiles:
             # Sort by:
             # 1. Most Unknowns (desc)
@@ -436,14 +408,80 @@ class ObmlAgi3Agent(Agent):
                 x[1]['boring']
             ), reverse=True)
             
-            # Choose the best move (the first one after sorting)
-            chosen_move, best_profile, new_outcomes_to_add = move_profiles[0]
+            # --- NEW: 1-Step Lookahead Tie-Breaker ---
+            top_profile_score = (
+                move_profiles[0][1]['unknowns'], 
+                move_profiles[0][1]['discoveries'], 
+                -move_profiles[0][1]['failures']
+            )
+            
+            # Find all moves tied with the best score
+            tied_moves = []
+            for move_tuple in move_profiles:
+                # move_tuple is (move, profile, fingerprints, events)
+                move, profile, fingerprints, events = move_tuple
+                current_score = (profile['unknowns'], profile['discoveries'], -profile['failures'])
+                
+                if current_score == top_profile_score:
+                    # Only check "boring" moves (U=0, D=0) for lookahead
+                    if profile['unknowns'] == 0 and profile['discoveries'] == 0:
+                        tied_moves.append(move_tuple)
+                    elif not tied_moves: 
+                        # This is the first (and best) non-boring move.
+                        # No lookahead needed, just pick this one.
+                        tied_moves.append(move_tuple)
+                        break
+                else:
+                    # We are past the tied scores
+                    break
+            
+            chosen_move_tuple = None
+            if len(tied_moves) > 1:
+                # --- Run Lookahead ---
+                if self.debug_channels['ACTION_SCORE']: 
+                    print(f"\n--- Running 1-Step Lookahead for {len(tied_moves)} Boring Moves ---")
+                
+                lookahead_scores = []
+                for move_tuple in tied_moves:
+                    move, profile, fingerprints, events = move_tuple
+                    
+                    # 1. Simulate the state
+                    hypothetical_summary = self._get_hypothetical_summary(current_summary, events)
+                    
+                    # 2. Profile the *future* state
+                    future_profile = self._get_hypothetical_profile(hypothetical_summary, latest_frame.available_actions)
+                    
+                    if self.debug_channels['ACTION_SCORE']:
+                        target_name = f" on {move['object']['id']}" if move['object'] else ""
+                        print(f"  - Move {move['template'].name}{target_name} -> Future Profile: "
+                              f"U:{future_profile['unknowns']} D:{future_profile['discoveries']} "
+                              f"B:{future_profile['boring']} F:{future_profile['failures']}")
+                    
+                    lookahead_scores.append((move_tuple, future_profile))
+                
+                # Sort by best *future* profile
+                lookahead_scores.sort(key=lambda x: (
+                    x[1]['unknowns'], 
+                    x[1]['discoveries'], 
+                    -x[1]['failures']
+                ), reverse=True)
+                
+                # The best move is the winner of this sort
+                chosen_move_tuple = lookahead_scores[0][0]
+            
+            else:
+                # No tie, or only one move, just pick the first one
+                chosen_move_tuple = tied_moves[0]
+            # --- End Lookahead ---
+
+            # Choose the best move
+            chosen_move, best_profile, new_fingerprints_to_add, _best_events = chosen_move_tuple
             
             action_to_return = chosen_move['template']
             chosen_object = chosen_move['object']
             
             # Add any new discoveries to our "seen" list
-            self.seen_outcomes.update(new_outcomes_to_add)
+            self.seen_outcomes.update(new_fingerprints_to_add)
 
             # --- Logging ---
             action_name = action_to_return.name
@@ -463,7 +501,8 @@ class ObmlAgi3Agent(Agent):
             action_to_return = GameAction.RESET # Fallback
 
         # --- Store action for next turn's analysis ---
-        self.last_action_context = (action_to_return.name, chosen_object_id if chosen_object else None)
+        learning_key_for_storage = self._get_learning_key(action_to_return.name, chosen_object_id if chosen_object else None)
+        self.last_action_context = learning_key_for_storage
         
         # --- Store state for level history ---
         current_context = {
@@ -753,6 +792,20 @@ class ObmlAgi3Agent(Agent):
             try:
                 change_type, details = log_str.replace('- ', '', 1).split(': ', 1)
                 event = {'type': change_type}
+                
+                # --- NEW: Extract object ID ---
+                obj_id_str = ""
+                if 'Object id_' in details:
+                    if change_type in ['NEW', 'REMOVED']:
+                         # Format: "Object id_X (ID ...)"
+                        obj_id_str = details.split(' ')[1].replace('id_', '')
+                    else:
+                        # Format: "Object id_X moved..."
+                        obj_id_str = details.split(' ')[1].replace('id_', '')
+                
+                if obj_id_str.isdigit():
+                    event['id'] = f"obj_{obj_id_str}"
+                # --- End NEW ---
 
                 if change_type == 'MOVED':
                     parts = details.split(' moved from ')
@@ -796,7 +849,7 @@ class ObmlAgi3Agent(Agent):
                         'color': id_tuple[1], 'size': id_tuple[2], 'pixels': id_tuple[3]
                     })
                     events.append(event)
-            except (ValueError, IndexError, SyntaxError):
+            except (ValueError, IndexError, SyntaxError, AttributeError):
                 continue
         return events
 
@@ -1095,12 +1148,12 @@ class ObmlAgi3Agent(Agent):
 
         return True # All pattern checks passed
 
-    def _predict_outcome(self, hypothesis_key: tuple, current_context: dict) -> tuple | None:
+    def _predict_outcome(self, hypothesis_key: tuple, current_context: dict) -> list[dict] | None:
         """
-        Predicts the outcome_fingerprint of an action given the current context.
+        Predicts the outcome (as a list of event dicts) of an action given the current context.
         Returns:
-        - The outcome_fingerprint (a tuple of events) if a rule matches.
-        - An empty tuple () if the rule predicts "no change".
+        - A list of event dicts if a rule matches.
+        - An empty list [] if the rule predicts "no change".
         - None if the action is completely unknown.
         """
         hypothesis = self.rule_hypotheses.get(hypothesis_key)
@@ -1110,41 +1163,226 @@ class ObmlAgi3Agent(Agent):
 
         differentiated_rules = hypothesis.get('differentiated_rules', {})
         if not differentiated_rules:
-            # This can happen if ambiguity was detected but analysis failed
-            # or hasn't completed. Treat as unknown.
             return None
 
-        # --- Deterministic Prediction Logic ---
-        # We must separate positive rules from the default rule.
         positive_rules = []
-        default_rule_outcome = None
+        default_rule_outcome_key = None # This will be the fingerprint
 
         for outcome_fingerprint, rule_pattern in differentiated_rules.items():
             if rule_pattern:
-                # This is a specific, POSITIVE rule
                 positive_rules.append((outcome_fingerprint, rule_pattern))
             else:
-                # This is a NEGATIVE (default) rule
-                default_rule_outcome = outcome_fingerprint
+                default_rule_outcome_key = outcome_fingerprint
         
-        # 1. Check all positive rules first.
-        # We check them in a sorted order to be 100% deterministic.
-        # We sort by the string representation of the rule pattern dict.
         positive_rules.sort(key=lambda x: str(x[1])) 
         
         for outcome_fingerprint, rule_pattern in positive_rules:
             if self._context_matches_pattern(current_context, rule_pattern):
-                # Found a specific rule that matches. This is our prediction.
-                return outcome_fingerprint
+                # Found a specific rule. Return its event list.
+                return hypothesis['outcomes'][outcome_fingerprint]['rules']
         
-        # 2. If no positive rule matched, check for a default rule.
-        if default_rule_outcome is not None:
-            # No specific rule matched, so the default rule applies
-            return default_rule_outcome
+        if default_rule_outcome_key is not None:
+            # No specific rule matched, so the default rule applies.
+            return hypothesis['outcomes'][default_rule_outcome_key]['rules']
 
-        # If we are here, rules exist but none matched the context.
-        # This implies our rules are incomplete. Treat as unknown.
+        # No rules matched the context. Treat as unknown.
         return None
+
+    def _get_hypothetical_summary(self, current_summary: list[dict], predicted_events_list: list[dict]) -> list[dict]:
+        """
+        Takes a summary and a list of predicted events and builds a
+        hypothetical future state summary.
+        """
+        hypothetical_summary = copy.deepcopy(current_summary)
+        obj_map = {obj['id']: obj for obj in hypothetical_summary}
+        ids_to_remove = set()
+        new_objects = []
+        
+        # We must process removals first
+        for event in predicted_events_list:
+            if event.get('type') == 'REMOVED':
+                obj_id = event.get('id')
+                if obj_id:
+                    ids_to_remove.add(obj_id)
+
+        # Apply all other changes
+        for event in predicted_events_list:
+            obj_id = event.get('id')
+            event_type = event.get('type')
+            
+            if event_type == 'NEW':
+                # Create a new object. We can't know the 'pixel_coords',
+                # but this is enough for relationship/alignment analysis.
+                new_obj = {
+                    'id': obj_id,
+                    'color': event['color'],
+                    'pixels': event['pixels'],
+                    'position': event['position'],
+                    'size': event['size'],
+                    'fingerprint': event['fingerprint'],
+                    'pixel_coords': frozenset(), # Adjacency analysis will fail, but others will work
+                }
+                new_objects.append(new_obj)
+                continue
+            
+            # For all other events, find the target object
+            if not obj_id or obj_id not in obj_map or obj_id in ids_to_remove:
+                continue
+                
+            target_obj = obj_map[obj_id]
+
+            if event_type == 'MOVED':
+                dr, dc = event['vector']
+                r, c = target_obj['position']
+                target_obj['position'] = (r + dr, c + dc)
+            elif event_type == 'RECOLORED':
+                target_obj['color'] = event['to_color']
+            elif event_type == 'SHAPE_CHANGED':
+                target_obj['fingerprint'] = event['to_fingerprint']
+            elif event_type in ['GROWTH', 'SHRINK', 'TRANSFORM']:
+                # These events have absolute 'to' states
+                if 'end_position' in event:
+                    target_obj['position'] = event['end_position']
+                if 'to_size' in event:
+                    target_obj['size'] = event['to_size']
+                if 'pixel_delta' in event:
+                    # Note: 'pixels' is an int, not a list
+                    target_obj['pixels'] = target_obj.get('pixels', 0) + event['pixel_delta']
+                if 'to_fingerprint' in event:
+                     target_obj['fingerprint'] = event['to_fingerprint']
+        
+        # Build the final list
+        final_summary = [obj for obj_id, obj in obj_map.items() if obj_id not in ids_to_remove]
+        final_summary.extend(new_objects)
+        return final_summary
+    
+    def _get_hypothetical_profile(self, hypothetical_summary: list[dict], available_actions: list[GameAction]) -> dict:
+        """
+        Analyzes a hypothetical future state and returns the
+        profile of the *best* action that could be taken from it.
+        """
+        # --- 1. Analyze the hypothetical state ---
+        (current_relationships, current_adjacencies, current_diag_adjacencies, 
+         current_match_groups, current_alignments, current_diag_alignments, 
+         current_conjunctions) = self._analyze_relationships(hypothetical_summary)
+
+        current_full_context = {
+            'summary': hypothetical_summary,
+            'rels': current_relationships,
+            'adj': current_adjacencies,
+            'diag_adj': current_diag_adjacencies,
+            'align': current_alignments,
+            'diag_align': current_diag_alignments,
+            'match': current_match_groups
+        }
+
+        # --- 2. Build all possible moves ---
+        all_possible_moves = []
+        click_action_template = None
+        for action in available_actions:
+            if action.name == 'ACTION6':
+                click_action_template = action
+            else:
+                all_possible_moves.append({'template': action, 'object': None})
+        if click_action_template and hypothetical_summary:
+            for obj in hypothetical_summary:
+                all_possible_moves.append({'template': click_action_template, 'object': obj})
+        
+        # --- 3. Run the Discovery Profiler ---
+        move_profiles = []
+        default_profile = {'unknowns': 0, 'discoveries': 0, 'boring': 0, 'failures': 0}
+        
+        if not all_possible_moves:
+            return default_profile
+
+        for move in all_possible_moves:
+            action_template = move['template']
+            target_obj = move['object']
+            target_id = target_obj['id'] if target_obj else None
+            
+            base_action_key_str = self._get_learning_key(action_template.name, target_id)
+            
+            profile = {'unknowns': 0, 'discoveries': 0, 'boring': 0, 'failures': 0}
+            predicted_fingerprints_for_this_move = set()
+            all_predicted_events_for_move = []
+
+            if target_id:
+                # --- Case 1: This is a TARGETED action (e.g., ACTION6_obj_1) ---
+                
+                # 1. Check for a predicted FAILURE for this specific action
+                if base_action_key_str in self.failure_patterns:
+                    failure_rule = self.failure_patterns[base_action_key_str]
+                    if self._context_matches_pattern(current_full_context, failure_rule):
+                        profile['failures'] = 1
+                    
+                # 2. If no failure was triggered, predict the SUCCESS outcome
+                if profile['failures'] == 0:
+                    hypothesis_key = (base_action_key_str.split('_')[0], target_id)
+                    predicted_event_list = self._predict_outcome(hypothesis_key, current_full_context)
+                    
+                    # --- Convert event list to a hashable fingerprint ---
+                    predicted_outcome_fingerprint = None
+                    if predicted_event_list is not None:
+                        hashable_events = [tuple(sorted(e.items())) for e in predicted_event_list]
+                        predicted_outcome_fingerprint = tuple(sorted(hashable_events))
+                        all_predicted_events_for_move.extend(predicted_event_list)
+                    # --- End conversion ---
+                    
+                    # 3. Tally the result
+                    if predicted_event_list is None:
+                        profile['unknowns'] = 1
+                    elif predicted_outcome_fingerprint == ():
+                        profile['boring'] = 1 # Predicted "no change"
+                    elif predicted_outcome_fingerprint in self.seen_outcomes:
+                        profile['boring'] = 1 # Predicted "repetitive change"
+                    else:
+                        profile['discoveries'] = 1 # Predicted "new, novel change"
+                        predicted_fingerprints_for_this_move.add(predicted_outcome_fingerprint)
+            else:
+                for obj in hypothetical_summary:
+                    obj_id = obj['id']
+                    hypothesis_key = (base_action_key_str.split('_')[0], obj_id)
+
+                    if hypothesis_key in self.failure_patterns:
+                        failure_rule = self.failure_patterns[hypothesis_key]
+                        if self._context_matches_pattern(current_full_context, failure_rule):
+                            profile['failures'] += 1
+                            continue
+
+                    # 2. If no failure, predict the per-object SUCCESS outcome
+                    predicted_event_list = self._predict_outcome(hypothesis_key, current_full_context)
+                    
+                    # --- Convert event list to a hashable fingerprint ---
+                    predicted_outcome_fingerprint = None
+                    if predicted_event_list is not None:
+                        hashable_events = [tuple(sorted(e.items())) for e in predicted_event_list]
+                        predicted_outcome_fingerprint = tuple(sorted(hashable_events))
+                        all_predicted_events_for_move.extend(predicted_event_list)
+                    # --- End conversion ---
+                    
+                    # 3. Tally the results
+                    if predicted_event_list is None:
+                        profile['unknowns'] += 1
+                    elif predicted_outcome_fingerprint == ():
+                        profile['boring'] += 1 # Predicted "no change"
+                    elif predicted_outcome_fingerprint in self.seen_outcomes:
+                        profile['boring'] += 1 # Predicted "repetitive change"
+                    else:
+                        profile['discoveries'] += 1 # Predicted "new, novel change"
+                        predicted_fingerprints_for_this_move.add(predicted_outcome_fingerprint)
+
+            move_profiles.append((move, profile, predicted_fingerprints_for_this_move, all_predicted_events_for_move))
+
+        # --- 4. Sort and return the best profile ---
+        move_profiles.sort(key=lambda x: (
+            x[1]['unknowns'], 
+            x[1]['discoveries'], 
+            -x[1]['failures'], 
+            x[1]['boring']
+        ), reverse=True)
+            
+        _chosen_move, best_profile, _new_fingerprints, _best_events = move_profiles[0]
+        return best_profile
 
     def _analyze_relationships(self, object_summary: list[dict]) -> tuple:
         """
