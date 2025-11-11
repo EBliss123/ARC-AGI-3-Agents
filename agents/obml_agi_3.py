@@ -394,7 +394,31 @@ class ObmlAgi3Agent(Agent):
 
             move_profiles.append((move, profile, predicted_fingerprints_for_this_move, all_predicted_events_for_move))
 
-# --- Deterministic Priority-Based Sorting ---
+        # --- NEW: Debug print of all move profiles ---
+        if self.debug_channels['ACTION_SCORE']:
+            print("\n--- Full Profile List (Before Sort) ---")
+            if not move_profiles:
+                print("  (No moves to profile)")
+            
+            # Sort for display purposes only
+            sorted_for_print = sorted(move_profiles, key=lambda x: (
+                x[1]['unknowns'], 
+                x[1]['discoveries'], 
+                -x[1]['failures'], 
+                x[1]['boring']
+            ), reverse=True)
+
+            for i, (move, profile, _, _) in enumerate(sorted_for_print):
+                action_name = move['template'].name
+                target_name = f" on {move['object']['id']}" if move['object'] else ""
+                
+                prefix = "  -> " if i == 0 else "     " # Highlight the winner
+                
+                print(f"{prefix}{action_name}{target_name} -> "
+                        f"U:{profile['unknowns']} D:{profile['discoveries']} "
+                        f"B:{profile['boring']} F:{profile['failures']}")
+
+        # --- Deterministic Priority-Based Sorting ---
         if move_profiles:
             # Sort by:
             # 1. Most Unknowns (desc)
