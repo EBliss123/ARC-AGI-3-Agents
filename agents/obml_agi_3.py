@@ -1223,8 +1223,8 @@ class ObmlAgi3Agent(Agent):
         Predicts the outcome (as a list of event dicts) of an action given the current context.
         Returns:
         - A list of event dicts if a rule matches.
-        - An empty list [] if the rule predicts "no change".
-        - None if the action is completely unknown.
+        - An empty list [] if the rule predicts "no change" (and it's the *only* rule).
+        - None if the action is completely unknown OR if no specific rules match.
         """
         hypothesis = self.rule_hypotheses.get(hypothesis_key)
         
@@ -1233,10 +1233,10 @@ class ObmlAgi3Agent(Agent):
 
         differentiated_rules = hypothesis.get('differentiated_rules', {})
         if not differentiated_rules:
-            return None
+            return None # No rules learned yet, "Unknown"
 
         positive_rules = []
-        default_rule_outcome_key = None # This will be the fingerprint
+        default_rule_outcome_key = None # This will be the fingerprint for '()'
 
         for outcome_fingerprint, rule_pattern in differentiated_rules.items():
             if rule_pattern:
@@ -1246,16 +1246,40 @@ class ObmlAgi3Agent(Agent):
         
         positive_rules.sort(key=lambda x: str(x[1])) 
         
+        # --- NEW PREDICTION LOGIC ---
+
+        # 1. Check all specific, positive rules first.
         for outcome_fingerprint, rule_pattern in positive_rules:
             if self._context_matches_pattern(current_context, rule_pattern):
-                # Found a specific rule. Return its event list.
+                # Found a specific rule that matches. This is a confident prediction.
                 return hypothesis['outcomes'][outcome_fingerprint]['rules']
         
+        # 2. If NO positive rules matched:
+        if positive_rules:
+            # We HAD positive rules (e.g., for "Success"), but NONE of them
+            # matched the current context. This is a NEW, UNKNOWN situation.
+            
+            # --- NEW: Implement user's insight ---
+            action_name = hypothesis_key[0] # e.g., "ACTION1" or "ACTION6_obj_2"
+            
+            if action_name.startswith('ACTION6'):
+                # This is a TARGETED CLICK.
+                # Be PESSIMISTIC. If no specific success rule matched,
+                # fall through and assume the default rule (failure) applies.
+                pass
+            else:
+                # This is a GLOBAL ACTION (1-5).
+                # Be OPTIMISTIC. This is a genuinely new context.
+                return None # Treat as Unknown
+            # --- End New Logic ---
+        
+        # 3. If there were NO positive rules at all, *then* check the default.
         if default_rule_outcome_key is not None:
-            # No specific rule matched, so the default rule applies.
+            # This action *only* has a default outcome (e.g., "no change").
+            # This is a confident prediction.
             return hypothesis['outcomes'][default_rule_outcome_key]['rules']
 
-        # No rules matched the context. Treat as unknown.
+        # 4. If we had no positive rules AND no default, it's unknown.
         return None
 
     def _get_hypothetical_summary(self, current_summary: list[dict], predicted_events_list: list[dict]) -> list[dict]:
