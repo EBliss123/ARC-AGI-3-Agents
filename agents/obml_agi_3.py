@@ -42,7 +42,7 @@ class ObmlAgi3Agent(Agent):
             'CHANGES': True,         # All "Change Log" prints
             'STATE_GRAPH': True,     # State understanding
             'HYPOTHESIS': True,      # "Initial Hypotheses", "Refined Hypothesis"
-            'FAILURE': True,         # "Failure Analysis", "Failure Detected"
+            'FAILURE': False,         # "Failure Analysis", "Failure Detected"
             'WIN_CONDITION': True,   # "LEVEL CHANGE DETECTED", "Win Condition Analysis"
             'ACTION_SCORE': True,    # All scoring prints
             'CONTEXT_DETAILS': False # Keep or remove large prints
@@ -298,6 +298,7 @@ class ObmlAgi3Agent(Agent):
                         successes = self.success_contexts.get(hypothesis_key, [])
                         failures = self.failure_contexts.get(hypothesis_key, [])
                         self._analyze_failures(hypothesis_key, successes, failures, prev_context)
+                        self._analyze_and_report(hypothesis_key, [], prev_context)
                     
         # --- 3. Update Memory For Next Turn ---
         # This runs every frame, saving the state we just analyzed
@@ -309,7 +310,7 @@ class ObmlAgi3Agent(Agent):
         self.last_diag_alignments = current_diag_alignments
         self.last_match_groups = current_match_groups
 
-# --- 4. Choose an Action (Discovery Profiler Logic) ---
+        # --- 4. Choose an Action (Discovery Profiler Logic) ---
         action_to_return = None
         chosen_object = None
         chosen_object_id = None
@@ -661,34 +662,38 @@ class ObmlAgi3Agent(Agent):
         Analyzes failures by finding conditions that are consistent across all failures
         AND have never been observed in any past success.
         
-        This new version can learn from failures even if no successes have been seen.
+        This new version learns multiple rules:
+        1. A "default" rule if no successes exist.
+        2. A "common" rule (what all failures share).
+        3. A "differentiating" rule (what makes failures different from successes).
         """
-        # --- NEW: Check for failure-only history ---
         if not all_failure_contexts:
-            # Can't analyze failures if none have happened.
             return
 
+        # --- Rule 1: No Successes Ever ---
         if not all_success_contexts:
             # This action has ONLY ever failed. It should fail in ALL contexts.
             # An empty rule {} is a "default" rule that always matches.
-            common_failure_context = {} 
+            default_failure_rule = {} 
             
             if self.debug_channels['FAILURE']: 
                 print(f"\n--- Failure Analysis for {action_key}: (No successes on record) ---")
                 print(f"  Learning rule: Action *always* fails. (Default failure rule stored)")
             
-            self.failure_patterns[action_key] = common_failure_context
+            # Store this as the *only* rule in a new list.
+            self.failure_patterns[action_key] = [default_failure_rule]
             return
         
-        # --- End of new logic ---
-
-        # (The rest of the function is the same, but we must print the header here)
         if self.debug_channels['FAILURE']: 
             print(f"\n--- Failure Analysis for {action_key}: Consistent Differentiating Conditions ---")
         
         # --- Step 1: Find common contexts ---
         common_success_context = self._find_common_context(all_success_contexts)
         common_failure_context = self._find_common_context(all_failure_contexts)
+        
+        # --- Rule 2: The "Common Failure" Rule ---
+        # This is the rule for "what do all failures have in common?"
+        # We'll store this rule.
         
         # --- Step 2: Build a veto list of all states ever seen in *any* success ---
         observed_in_any_success = {
@@ -713,10 +718,14 @@ class ObmlAgi3Agent(Agent):
                 for line_set in groups:
                     observed_in_any_success['diag_align'].add((rel_type, frozenset(line_set)))
 
+        # --- Rule 3: The "Differentiating" Rule ---
+        # The rule is "what is in the failure context that is different from the success context"
+        differentiating_rule = self._find_context_difference(common_failure_context, common_success_context)
+        
+        # --- Step 4: Validate and Prune the Differentiating Rule ---
+        pruned_differentiating_rule = {}
         diffs_found = False
-        
-        # --- Step 3: Compare all perception modules ---
-        
+
         # Helper for logging
         def log_diff(module_name, identifier, success_val, failure_val):
             nonlocal diffs_found
@@ -725,62 +734,59 @@ class ObmlAgi3Agent(Agent):
                 if self.debug_channels['CONTEXT_DETAILS']:
                     print(f"- {module_name} Difference for {identifier}:")
                     print(f"  - In Successes: {success_val}")
-                    print(f"  - In FailFures:  {failure_val} (This state was never seen in a success)")
+                    print(f"  - In Failures:  {failure_val} (This state was never seen in a success)")
                 else:
                     print(f"- {module_name} Difference for {identifier}: Found a differentiating rule.")
 
         # Check Adj and Diag_Adj
         for key in ['adj', 'diag_adj']:
-            adj_s = common_success_context.get(key, {})
-            adj_f = common_failure_context.get(key, {})
-            all_ids = set(adj_s.keys()) | set(adj_f.keys())
-            for obj_id in all_ids:
-                contacts_s = tuple(adj_s.get(obj_id, ['na']*4))
-                contacts_f = tuple(adj_f.get(obj_id, ['na']*4))
-                if contacts_s != contacts_f:
-                    if (obj_id, contacts_f) not in observed_in_any_success[key]:
-                        log_diff(key.upper(), obj_id, contacts_s, contacts_f)
+            adj_f = differentiating_rule.get(key, {})
+            for obj_id, contacts_f in adj_f.items():
+                if (obj_id, contacts_f) not in observed_in_any_success[key]:
+                    pruned_differentiating_rule.setdefault(key, {})[obj_id] = contacts_f
+                    log_diff(key.upper(), obj_id, common_success_context.get(key, {}).get(obj_id, "na"), contacts_f)
 
         # Check Rels, Align, and Match
         for key in ['rels', 'align', 'match']:
-            rels_s = common_success_context.get(key, {})
-            rels_f = common_failure_context.get(key, {})
-            all_types = set(rels_s.keys()) | set(rels_f.keys())
-            for rel_type in all_types:
-                groups_s = rels_s.get(rel_type, {})
-                groups_f = rels_f.get(rel_type, {})
-                all_values = set(groups_s.keys()) | set(groups_f.keys())
-                for value in all_values:
-                    ids_s = groups_s.get(value, set())
-                    ids_f = groups_f.get(value, set())
-                    if ids_s != ids_f:
-                        if (rel_type, value, frozenset(ids_f)) not in observed_in_any_success[key]:
-                            log_diff(f"{key.upper()} Group", f"({rel_type}, {value})", ids_s, ids_f)
+            rels_f = differentiating_rule.get(key, {})
+            for rel_type, groups_f in rels_f.items():
+                for value, ids_f in groups_f.items():
+                    if (rel_type, value, frozenset(ids_f)) not in observed_in_any_success[key]:
+                        pruned_differentiating_rule.setdefault(key, {}).setdefault(rel_type, {})[value] = ids_f
+                        success_val = common_success_context.get(key, {}).get(rel_type, {}).get(value, "na")
+                        log_diff(f"{key.upper()} Group", f"({rel_type}, {value})", success_val, ids_f)
                             
         # Check Diag_Align
         key = 'diag_align'
-        rels_s = common_success_context.get(key, {})
-        rels_f = common_failure_context.get(key, {})
-        all_types = set(rels_s.keys()) | set(rels_f.keys())
-        for rel_type in all_types:
-            lines_s = {frozenset(s) for s in rels_s.get(rel_type, [])}
-            lines_f = {frozenset(s) for s in rels_f.get(rel_type, [])}
-            if lines_s != lines_f:
-                # Check each individual line that is unique to the failure
-                for line_f in lines_f - lines_s:
-                    if (rel_type, line_f) not in observed_in_any_success[key]:
-                        log_diff(f"{key.upper()} Line", f"({rel_type})", "Not present", line_f)
-                # Check for lines that disappeared
-                for line_s in lines_s - lines_f:
-                    if (rel_type, frozenset()) not in observed_in_any_success[key]: # A bit of a guess
-                        log_diff(f"{key.upper()} Line", f"({rel_type})", line_s, "Not present")
-
+        rels_f = differentiating_rule.get(key, {})
+        for rel_type, lines_f_list in rels_f.items():
+            lines_f = {frozenset(s) for s in lines_f_list}
+            for line_f in lines_f:
+                if (rel_type, line_f) not in observed_in_any_success[key]:
+                    pruned_differentiating_rule.setdefault(key, {}).setdefault(rel_type, []).append(line_f)
+                    log_diff(f"{key.upper()} Line", f"({rel_type})", "Not present", line_f)
         
-        if diffs_found:
-            self.failure_patterns[action_key] = common_failure_context
+        # --- Step 5: Store All Learned Rules ---
+        # We will store the rules in a list.
+        # Clear any old rules and add the new ones.
+        self.failure_patterns[action_key] = []
+        
+        # Add the common failure rule (what all failures share)
+        if common_failure_context:
+            self.failure_patterns[action_key].append(common_failure_context)
+            if self.debug_channels['FAILURE']: print(f"  Learning rule (Common): Stored common context of all failures.")
 
-        if not diffs_found:
+        # Add the pruned differentiating rule (what's unique to failures)
+        if diffs_found and pruned_differentiating_rule:
+            if pruned_differentiating_rule != common_failure_context:
+                self.failure_patterns[action_key].append(pruned_differentiating_rule)
+                if self.debug_channels['FAILURE']: print(f"  Learning rule (Diff): Stored differentiating context.")
+        elif not diffs_found:
             if self.debug_channels['FAILURE']: print(f"  (No unique differentiating conditions found for this key)")
+
+        if not self.failure_patterns[action_key]:
+            if self.debug_channels['FAILURE']: print(f"  (No failure rules could be learned)")
+            del self.failure_patterns[action_key]
 
     def _parse_change_logs_to_events(self, changes: list[str]) -> list[dict]:
         """Parses a list of human-readable change logs into a list of structured event dictionaries."""
@@ -1039,33 +1045,58 @@ class ObmlAgi3Agent(Agent):
                     return
                 all_common_contexts[key] = self._find_common_context(contexts)
 
-            # --- Step 2: Find all differentiated rules (no printing yet) ---
+            # --- Step 2: Find all differentiated rules ---
             differentiated_rules = {}
             all_outcome_keys = list(hypothesis['outcomes'].keys())
             
-            for i in range(len(all_outcome_keys)):
-                target_key = all_outcome_keys[i]
-                common_target = all_common_contexts[target_key]
+            no_change_key = () # The "no change" fingerprint
+            
+            if no_change_key not in all_common_contexts:
+                # --- Legacy/Fallback Logic ---
+                # This should not happen with the new failure logic, but as a fallback:
+                # We don't have a "no change" baseline, so just find any diffs.
+                if self.debug_channels['FAILURE']: print("  (Fallback: No 'no change' key found in ambiguity.)")
+                for i in range(len(all_outcome_keys)):
+                    target_key = all_outcome_keys[i]
+                    common_target = all_common_contexts[target_key]
+                    intersection_of_diffs = None
+                    for j in range(len(all_outcome_keys)):
+                        if i == j: continue
+                        compare_key = all_outcome_keys[j]
+                        common_compare = all_common_contexts[compare_key]
+                        current_diff = self._find_context_difference(common_target, common_compare)
+                        if intersection_of_diffs is None:
+                            intersection_of_diffs = current_diff
+                        else:
+                            intersection_of_diffs = self._intersect_contexts(intersection_of_diffs, current_diff)
+                    differentiated_rules[target_key] = intersection_of_diffs
+            
+            else:
+                # --- Standard Logic: Use "no change" as the baseline ---
+                if self.debug_channels['FAILURE']: print("  (Using 'no change' as baseline for ambiguity.)")
+                baseline_context = all_common_contexts[no_change_key]
                 
-                intersection_of_diffs = None
+                # 1. The "no change" rule is always the default
+                differentiated_rules[no_change_key] = {}
                 
-                for j in range(len(all_outcome_keys)):
-                    if i == j: continue
+                # 2. Find specific rules for all *other* outcomes
+                for target_key in all_outcome_keys:
+                    if target_key == no_change_key:
+                        continue
+                        
+                    target_context = all_common_contexts[target_key]
                     
-                    compare_key = all_outcome_keys[j]
-                    common_compare = all_common_contexts[compare_key]
+                    # Find what is different in this rule *compared to the failure baseline*
+                    diff_rule = self._find_context_difference(target_context, baseline_context)
                     
-                    # Find what's in Target that is different from Compare
-                    current_diff = self._find_context_difference(common_target, common_compare)
-                    
-                    if intersection_of_diffs is None:
-                        intersection_of_diffs = current_diff
+                    if diff_rule:
+                        # This is a valid, specific rule
+                        differentiated_rules[target_key] = diff_rule
                     else:
-                        # Keep refining the rule by finding the intersection of all differences
-                        intersection_of_diffs = self._intersect_contexts(intersection_of_diffs, current_diff)
-                
-                # The final `intersection_of_diffs` is the unique rule for this outcome
-                differentiated_rules[target_key] = intersection_of_diffs
+                        # This rule is a "lie". It happened in the *same context* as a failure.
+                        # The failure () takes precedence. Do NOT add a rule for this outcome.
+                        if self.debug_channels['FAILURE']:
+                            print(f"  (Pruning invalid rule for {target_key}: context matches failure.)")
 
             # --- NEW Step 3: Analyze and Print the rules ---
             if self.debug_channels['HYPOTHESIS']:
@@ -1098,7 +1129,24 @@ class ObmlAgi3Agent(Agent):
             if self.debug_channels['FAILURE']:
                 print(f"  Ambiguity analysis failed with error: {e}")
 
-    def _context_matches_pattern(self, current_context: dict, pattern: dict) -> bool:
+    def _context_matches_pattern(self, current_context: dict, pattern_data: dict | list) -> bool:
+        """
+        Checks if the current_context (live state) matches a stored pattern or ANY pattern in a list.
+        """
+        if isinstance(pattern_data, list):
+            if not pattern_data:
+                return False # No rules in the list to match
+            
+            # Check if ANY rule in the list matches
+            for pattern in pattern_data:
+                if self._context_matches_pattern_single(current_context, pattern):
+                    return True # Found a match
+            return False # No rules in the list matched
+        
+        # Original behavior: pattern_data is a single dict
+        return self._context_matches_pattern_single(current_context, pattern_data)
+
+    def _context_matches_pattern_single(self, current_context: dict, pattern: dict) -> bool:
         """
         Checks if the current_context (live state) matches a stored pattern.
         The pattern can be partial (e.g., only checking for one adjacency).
