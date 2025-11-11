@@ -273,10 +273,13 @@ class ObmlAgi3Agent(Agent):
                         if obj_id in prev_summary_map: # Check if object still exists
                             hypothesis_key = (learning_key, obj_id) # e.g., ('ACTION6_obj_2', 'obj_1') or ('ACTION4', 'obj_1')
                             
-                            self.success_contexts.setdefault(hypothesis_key, []).append(prev_context) # Log success
+                            # This is now treated as a "failure" (no change)
+                            self.failure_contexts.setdefault(hypothesis_key, []).append(prev_context)
                             
-                            # Pass an EMPTY list of changes to learn "no change"
-                            self._analyze_and_report(hypothesis_key, [], prev_context)
+                            # Analyze this specific object's failure history
+                            successes = self.success_contexts.get(hypothesis_key, [])
+                            failures = self.failure_contexts.get(hypothesis_key, [])
+                            self._analyze_failures(hypothesis_key, successes, failures, prev_context)
                 
                 else:
                     # --- FAILURE (No changes occurred) ---
@@ -295,11 +298,7 @@ class ObmlAgi3Agent(Agent):
                         successes = self.success_contexts.get(hypothesis_key, [])
                         failures = self.failure_contexts.get(hypothesis_key, [])
                         self._analyze_failures(hypothesis_key, successes, failures, prev_context)
-                        
-                        # ALSO learn "no change" as a predictable, "boring" outcome
-                        # so we don't get stuck in a U:1 loop.
-                        self._analyze_and_report(hypothesis_key, [], prev_context)
-
+                    
         # --- 3. Update Memory For Next Turn ---
         # This runs every frame, saving the state we just analyzed
         self.last_object_summary = current_summary
@@ -385,7 +384,7 @@ class ObmlAgi3Agent(Agent):
                 if predicted_event_list is None:
                     profile['unknowns'] += 1
                 elif predicted_outcome_fingerprint == ():
-                    profile['boring'] += 1 # Predicted "no change"
+                    profile['failures'] += 1 # Predicted "no change"
                 elif predicted_outcome_fingerprint in self.seen_outcomes:
                     profile['boring'] += 1 # Predicted "repetitive change"
                 else:
@@ -670,17 +669,15 @@ class ObmlAgi3Agent(Agent):
             return
 
         if not all_success_contexts:
-            # This action has ONLY ever failed. The common context *is* the failure rule.
-            common_failure_context = self._find_common_context(all_failure_contexts)
-            if common_failure_context:
-                if self.debug_channels['FAILURE']: 
-                    print(f"\n--- Failure Analysis for {action_key}: (No successes on record) ---")
-                    # --- MODIFIED PRINT ---
-                    if self.debug_channels['CONTEXT_DETAILS']:
-                        print(f"  Learning rule: Action fails in this common context: {common_failure_context}")
-                    else:
-                        print(f"  Learning rule: Action fails in this common context. (Rule stored)")
-                self.failure_patterns[action_key] = common_failure_context
+            # This action has ONLY ever failed. It should fail in ALL contexts.
+            # An empty rule {} is a "default" rule that always matches.
+            common_failure_context = {} 
+            
+            if self.debug_channels['FAILURE']: 
+                print(f"\n--- Failure Analysis for {action_key}: (No successes on record) ---")
+                print(f"  Learning rule: Action *always* fails. (Default failure rule stored)")
+            
+            self.failure_patterns[action_key] = common_failure_context
             return
         
         # --- End of new logic ---
@@ -889,11 +886,12 @@ class ObmlAgi3Agent(Agent):
             # --- Case 1: No Ambiguity ---
             # This is the first outcome, or a confirmation of the only outcome.
             # The "rule" is just the common context of all observations.
-            common_context = self._find_common_context(outcome_data['contexts'])
-            hypothesis['differentiated_rules'][outcome_fingerprint] = common_context
+            # This is the only outcome ever seen. It MUST be the default rule.
+            hypothesis['differentiated_rules'][outcome_fingerprint] = {} # An empty rule means "default"
+            common_context = {} # For the logging print below
             
             if self.debug_channels['HYPOTHESIS']:
-                print(f"\n--- Refined Rule for {action_key} (Outcome 1) ---")
+                print(f"\n--- Learned Default Rule for {action_key} (First Outcome) ---")
                 print(f"  Confirmations: {outcome_data['confirmations']}.")
                 # --- MODIFIED PRINT ---
                 if self.debug_channels['CONTEXT_DETAILS']:
@@ -1332,7 +1330,7 @@ class ObmlAgi3Agent(Agent):
                     if predicted_event_list is None:
                         profile['unknowns'] = 1
                     elif predicted_outcome_fingerprint == ():
-                        profile['boring'] = 1 # Predicted "no change"
+                        profile['failures'] += 1 # Predicted "no change"
                     elif predicted_outcome_fingerprint in self.seen_outcomes:
                         profile['boring'] = 1 # Predicted "repetitive change"
                     else:
@@ -1364,7 +1362,7 @@ class ObmlAgi3Agent(Agent):
                     if predicted_event_list is None:
                         profile['unknowns'] += 1
                     elif predicted_outcome_fingerprint == ():
-                        profile['boring'] += 1 # Predicted "no change"
+                        profile['failures'] += 1 # Predicted "no change"
                     elif predicted_outcome_fingerprint in self.seen_outcomes:
                         profile['boring'] += 1 # Predicted "repetitive change"
                     else:
