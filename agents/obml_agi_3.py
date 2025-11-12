@@ -717,17 +717,21 @@ class ObmlAgi3Agent(Agent):
         if not all_success_contexts:
             # This action has ONLY ever failed. It should fail in ALL contexts.
             # An empty rule {} is a "default" rule that always matches.
-            default_failure_rule = {} 
+            
+            # --- MODIFIED: Don't use a blank default rule. ---
+            # --- Use the common context of all failures seen so far. ---
+            common_failure_rule = self._find_common_context(all_failure_contexts)
             
             if self.debug_channels['FAILURE']: 
                 print(f"\n--- Failure Analysis for {action_key}: (No successes on record) ---")
                 print(f"  Learning rule: Action *always* fails. (Default failure rule stored)")
             
             # Store this as the *only* rule in a new list.
-            self.failure_patterns[action_key] = [default_failure_rule]
+            # --- MODIFIED: Store the *common failure context* rule ---
+            self.failure_patterns[action_key] = [common_failure_rule]
             return
         
-        if self.debug_channels['FAILURE']: 
+        if self.debug_channels['FAILURE']:
             print(f"\n--- Failure Analysis for {action_key}: Consistent Differentiating Conditions ---")
         
         # --- Step 1: Find common contexts ---
