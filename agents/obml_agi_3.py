@@ -715,20 +715,16 @@ class ObmlAgi3Agent(Agent):
 
         # --- Rule 1: No Successes Ever ---
         if not all_success_contexts:
-            # This action has ONLY ever failed. It should fail in ALL contexts.
-            # An empty rule {} is a "default" rule that always matches.
-            
-            # --- MODIFIED: Don't use a blank default rule. ---
-            # --- Use the common context of all failures seen so far. ---
-            common_failure_rule = self._find_common_context(all_failure_contexts)
+            # This action has ONLY ever failed. We have no successes to
+            # compare against, so we cannot learn a "clean" rule.
+            # We will learn *no rule* until we see at least one success.
             
             if self.debug_channels['FAILURE']: 
                 print(f"\n--- Failure Analysis for {action_key}: (No successes on record) ---")
-                print(f"  Learning rule: Action *always* fails. (Default failure rule stored)")
+                print(f"  (Cannot learn a rule yet. Waiting for a success to compare against.)")
             
-            # Store this as the *only* rule in a new list.
-            # --- MODIFIED: Store the *common failure context* rule ---
-            self.failure_patterns[action_key] = [common_failure_rule]
+            # Learn no rule.
+            self.failure_patterns[action_key] = []
             return
         
         if self.debug_channels['FAILURE']:
@@ -818,16 +814,15 @@ class ObmlAgi3Agent(Agent):
         # Clear any old rules and add the new ones.
         self.failure_patterns[action_key] = []
         
-        # Add the common failure rule (what all failures share)
-        if common_failure_context:
-            self.failure_patterns[action_key].append(common_failure_context)
-            if self.debug_channels['FAILURE']: print(f"  Learning rule (Common): Stored common context of all failures.")
+        # --- DELETED: Do not store the "dirty" common_failure_context rule. ---
+        # if common_failure_context:
+        #     self.failure_patterns[action_key].append(common_failure_context)
+        #     if self.debug_channels['FAILURE']: print(f"  Learning rule (Common): Stored common context of all failures.")
 
         # Add the pruned differentiating rule (what's unique to failures)
         if diffs_found and pruned_differentiating_rule:
-            if pruned_differentiating_rule != common_failure_context:
-                self.failure_patterns[action_key].append(pruned_differentiating_rule)
-                if self.debug_channels['FAILURE']: print(f"  Learning rule (Diff): Stored differentiating context.")
+            self.failure_patterns[action_key].append(pruned_differentiating_rule)
+            if self.debug_channels['FAILURE']: print(f"  Learning rule (Diff): Stored *only* the pruned, differentiating context.")
         elif not diffs_found:
             if self.debug_channels['FAILURE']: print(f"  (No unique differentiating conditions found for this key)")
 
@@ -1277,19 +1272,13 @@ class ObmlAgi3Agent(Agent):
                 # Found a specific rule that matches. This is a confident prediction.
                 return hypothesis['outcomes'][outcome_fingerprint]['rules']
         
-        # 2. If NO positive rules matched:
-        if positive_rules:
-            # We HAD positive rules (e.g., for "Success"), but NONE of them
-            # matched the current context. This is a new, UNKNOWN situation.
-            return None # Treat as Unknown
-        
-        # 3. If there were NO positive rules at all, *then* check the default.
+        # 2. If NO positive rules matched, check for the default rule.
         if default_rule_outcome_key is not None:
-            # This action *only* has a default outcome (e.g., "no change").
-            # This is a confident prediction.
+            # We had positive rules that didn't match, OR
+            # we only had a default rule. Either way, fall back to default.
             return hypothesis['outcomes'][default_rule_outcome_key]['rules']
 
-        # 4. If we had no positive rules AND no default, it's unknown.
+        # 3. If there are no positive rules AND no default, it's unknown.
         return None
 
     def _get_hypothetical_summary(self, current_summary: list[dict], predicted_events_list: list[dict]) -> list[dict]:
