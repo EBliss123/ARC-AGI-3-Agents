@@ -41,7 +41,7 @@ class ObmlAgi3Agent(Agent):
             'PERCEPTION': False,      # Object finding, relationships, new level setup
             'CHANGES': True,         # All "Change Log" prints
             'STATE_GRAPH': True,     # State understanding
-            'HYPOTHESIS': True,      # "Initial Hypotheses", "Refined Hypothesis"
+            'HYPOTHESIS': False,      # "Initial Hypotheses", "Refined Hypothesis"
             'FAILURE': False,         # "Failure Analysis", "Failure Detected"
             'WIN_CONDITION': True,   # "LEVEL CHANGE DETECTED", "Win Condition Analysis"
             'ACTION_SCORE': True,    # All scoring prints
@@ -76,7 +76,6 @@ class ObmlAgi3Agent(Agent):
         self.last_alignments = {}
         self.last_diag_alignments = {}
         self.last_match_groups = {}
-        self.is_new_level = True
         self.final_summary_before_level_change = None
         self.current_level_id_map = {}
         self.last_action_context = None
@@ -114,15 +113,25 @@ class ObmlAgi3Agent(Agent):
         # --- 2. Compare Current State to Previous State ---
         if not self.last_object_summary or self.is_new_level:
             # --- FIRST FRAME LOGIC ---
+            # This block runs on the first frame of a new level, OR a retry.
             current_score = latest_frame.score
             
-            self._reset_level_state()
-            
-            if self.debug_channels['PERCEPTION'] and current_score > self.last_score:
-                print(f"\n--- Level Cleared (Score: {current_score}): Resetting history. ---")
-            
-            # Now, set the state for the new level
-            self.is_new_level = False
+            if self.is_new_level:
+                # --- This is a NEW LEVEL (from score increase) ---
+                # We must wipe the brain.
+                self._reset_agent_memory()
+                if self.debug_channels['PERCEPTION']:
+                     print(f"\n--- Level Cleared (Score: {current_score}): Wiping brain and resetting history. ---")
+
+            else:
+                # --- This is a RETRY (from GAME_OVER) ---
+                # We are just re-perceiving the level. DO NOT wipe the brain.
+                # The brain was preserved by the GAME_OVER check.
+                if self.debug_channels['PERCEPTION']:
+                    print(f"\n--- Retrying Level (Score: {current_score}): Re-perceiving level. ---")
+
+            # Now, set the state for this "first frame" (applies to both cases)
+            self.is_new_level = False # We have now handled the "new level" state
             self.last_score = current_score
 
             id_map = {}
@@ -1234,7 +1243,7 @@ class ObmlAgi3Agent(Agent):
         Returns:
         - A list of event dicts if a rule matches.
         - An empty list [] if the rule predicts "no change" (and it's the *only* rule).
-        - None if the action is completely unknown OR if no specific rules match.
+        - None (Unknown) if the context does not match any specific, known rules.
         """
         hypothesis = self.rule_hypotheses.get(hypothesis_key)
         
@@ -1256,7 +1265,7 @@ class ObmlAgi3Agent(Agent):
         
         positive_rules.sort(key=lambda x: str(x[1])) 
         
-        # --- NEW PREDICTION LOGIC ---
+        # --- FOOLPROOF PREDICTION LOGIC ---
 
         # 1. Check all specific, positive rules first.
         for outcome_fingerprint, rule_pattern in positive_rules:
@@ -1267,21 +1276,8 @@ class ObmlAgi3Agent(Agent):
         # 2. If NO positive rules matched:
         if positive_rules:
             # We HAD positive rules (e.g., for "Success"), but NONE of them
-            # matched the current context. This is a NEW, UNKNOWN situation.
-            
-            # --- NEW: Implement user's insight ---
-            action_name = hypothesis_key[0] # e.g., "ACTION1" or "ACTION6_obj_2"
-            
-            if action_name.startswith('ACTION6'):
-                # This is a TARGETED CLICK.
-                # Be PESSIMISTIC. If no specific success rule matched,
-                # fall through and assume the default rule (failure) applies.
-                pass
-            else:
-                # This is a GLOBAL ACTION (1-5).
-                # Be OPTIMISTIC. This is a genuinely new context.
-                return None # Treat as Unknown
-            # --- End New Logic ---
+            # matched the current context. This is a new, UNKNOWN situation.
+            return None # Treat as Unknown
         
         # 3. If there were NO positive rules at all, *then* check the default.
         if default_rule_outcome_key is not None:
