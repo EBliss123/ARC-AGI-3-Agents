@@ -53,6 +53,20 @@ class ObmlAgi3Agent(Agent):
         Resets all agent learning and memory to a clean state.
         This is called at the start of a new game.
         """
+        # Reset the "brain" (long-term learning)
+        self.success_contexts = {}
+        self.failure_contexts = {}
+        self.failure_patterns = {}
+        self.rule_hypotheses = {}
+        self.seen_outcomes = set()
+        self.win_condition_hypotheses = []
+        self.last_score = 0
+        
+        # Also reset the level state
+        self._reset_level_state()
+
+    def _reset_level_state(self):
+        """Resets only the memory for the current level."""
         self.object_id_counter = 0
         self.removed_objects_memory = {}
         self.last_object_summary = []
@@ -66,26 +80,23 @@ class ObmlAgi3Agent(Agent):
         self.final_summary_before_level_change = None
         self.current_level_id_map = {}
         self.last_action_context = None
-        self.success_contexts = {}
-        self.failure_contexts = {}
-        self.failure_patterns = {}
-        self.rule_hypotheses = {}
-        self.seen_outcomes = set()
         self.level_state_history = []
-        self.win_condition_hypotheses = []
-        self.actions_printed = False
-        self.last_score = 0
+        self.actions_printed = False # This is per-level, not per-game
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
         Analyzes the current frame, compares it to the previous frame,
         and logs all perceived changes.
         """
-        # If the game is over or hasn't started, the correct action is to reset.
-        if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
-            self.object_id_counter = 0
-            self.is_new_level = True # Reset for the next game
-            self.actions_printed = False # Reset the print flag
+        # If the game hasn't started, this is a new game. Do a full "brain wipe".
+        if latest_frame.state == GameState.NOT_PLAYED:
+            self._reset_agent_memory()
+            return GameAction.RESET
+        
+        # If the game is over, this is a "retry" of the same level.
+        # Only reset the level state, but KEEP the learned rules.
+        if latest_frame.state == GameState.GAME_OVER:
+            self._reset_level_state()
             return GameAction.RESET
         
         # --- 1. Perceive Raw Objects ---
@@ -105,8 +116,7 @@ class ObmlAgi3Agent(Agent):
             # --- FIRST FRAME LOGIC ---
             current_score = latest_frame.score
             
-            # --- Perform a full "brain wipe" ---
-            self._reset_agent_memory()
+            self._reset_level_state()
             
             if self.debug_channels['PERCEPTION'] and current_score > self.last_score:
                 print(f"\n--- Level Cleared (Score: {current_score}): Resetting history. ---")
