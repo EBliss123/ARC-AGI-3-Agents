@@ -42,7 +42,7 @@ class ObmlAgi3Agent(Agent):
             'CHANGES': True,         # All "Change Log" prints
             'STATE_GRAPH': True,     # State understanding
             'HYPOTHESIS': False,      # "Initial Hypotheses", "Refined Hypothesis"
-            'FAILURE': False,         # "Failure Analysis", "Failure Detected"
+            'FAILURE': True,         # "Failure Analysis", "Failure Detected"
             'WIN_CONDITION': True,   # "LEVEL CHANGE DETECTED", "Win Condition Analysis"
             'ACTION_SCORE': True,    # All scoring prints
             'CONTEXT_DETAILS': False # Keep or remove large prints
@@ -241,10 +241,10 @@ class ObmlAgi3Agent(Agent):
             self._log_alignment_changes(self.last_diag_alignments, current_diag_alignments, is_diagonal=True)
 
             # --- Analyze the outcome of the previous action ---
-            if self.last_action_context:
-                learning_key = self.last_action_context # This is now 'ACTION4' or 'ACTION6_obj_2'
+            if self.last_action_context and self.last_object_summary:
+                learning_key = self.last_action_context 
         
-                # This is the full context of the *previous* state, when the action was taken.
+                # This is the full context of the *previous* state
                 prev_context = {
                     'summary': prev_summary,
                     'rels': self.last_relationships,
@@ -255,69 +255,28 @@ class ObmlAgi3Agent(Agent):
                     'match': self.last_match_groups
                 }
 
-                if changes:
-                    # --- SUCCESS: Learn rules from the outcome (Unified Logic) ---
-                    prev_summary_map = {obj['id']: obj for obj in prev_summary}
-                    
-                    # Find all objects that *changed*
-                    affected_ids = set()
-                    for change_str in changes:
-                            if "Object id_" in change_str:
-                                try:
-                                    id_num_str = change_str.split('id_')[1].split()[0]
-                                    affected_ids.add(f"obj_{id_num_str}")
-                                except IndexError:
-                                    continue
-                    
-                    # 1. Learn rules for all AFFECTED objects
-                    for obj_id in affected_ids:
-                        if obj_id in prev_summary_map:
-                            # The key is (action_key, affected_object_id)
-                            # e.g., ('ACTION6_obj_2', 'obj_5') or ('ACTION4', 'obj_5')
-                            hypothesis_key = (learning_key, obj_id) 
-                            
-                            self.success_contexts.setdefault(hypothesis_key, []).append(prev_context) # Log success
-                            
-                            obj_id_str = obj_id.replace('obj_', 'id_')
-                            object_specific_changes = [c for c in changes if f"Object {obj_id_str}" in c]
-
-                            if object_specific_changes:
-                                self._analyze_and_report(hypothesis_key, object_specific_changes, prev_context)
-                    
-                    # 2. Learn "no change" rules for all UNAFFECTED objects
-                    all_prev_ids = set(prev_summary_map.keys())
-                    unaffected_ids = all_prev_ids - affected_ids
-                    
-                    for obj_id in unaffected_ids:
-                        if obj_id in prev_summary_map: # Check if object still exists
-                            hypothesis_key = (learning_key, obj_id) # e.g., ('ACTION6_obj_2', 'obj_1') or ('ACTION4', 'obj_1')
-                            
-                            # This is now treated as a "failure" (no change)
-                            self.failure_contexts.setdefault(hypothesis_key, []).append(prev_context)
-                            
-                            # Analyze this specific object's failure history
-                            successes = self.success_contexts.get(hypothesis_key, [])
-                            failures = self.failure_contexts.get(hypothesis_key, [])
-                            self._analyze_failures(hypothesis_key, successes, failures, prev_context)
+                # 1. Parse text changes back to structured event dicts
+                events = self._parse_change_logs_to_events(changes)
                 
-                else:
-                    # --- FAILURE (No changes occurred) ---
-                    if self.debug_channels['FAILURE']:
-                        print(f"\n--- Global Failure Detected for Action {learning_key} (No Changes) ---")
+                # 2. Map events to specific objects
+                # Initialize empty lists for all objects; if no event occurred, it stays empty (= Failure/No Change)
+                obj_events_map = {obj['id']: [] for obj in self.last_object_summary}
+                
+                for event in events:
+                    if 'id' in event and event['id'] in obj_events_map:
+                        obj_events_map[event['id']].append(event)
+
+                # 3. Unified Learning Loop
+                # We process EVERY object from the previous frame.
+                for obj in self.last_object_summary:
+                    obj_id = obj['id']
+                    specific_events = obj_events_map[obj_id]
                     
-                    # We must log a "no change" failure for EVERY object on the screen.
-                    for obj in prev_summary:
-                        obj_id = obj['id']
-                        # The key is (action_key, affected_object_id)
-                        hypothesis_key = (learning_key, obj_id) # e.g., ('ACTION6_obj_2', 'obj_1') or ('ACTION4', 'obj_1')
-                        
-                        self.failure_contexts.setdefault(hypothesis_key, []).append(prev_context)
-                        
-                        # Analyze this specific object's failure history
-                        successes = self.success_contexts.get(hypothesis_key, [])
-                        failures = self.failure_contexts.get(hypothesis_key, [])
-                        self._analyze_failures(hypothesis_key, successes, failures, prev_context)
-                        self._analyze_and_report(hypothesis_key, [], prev_context)
+                    # Key: (ActionName, TargetID)
+                    hypothesis_key = (learning_key, obj_id)
+                    
+                    # Learn (Success OR Failure is handled uniformly inside this function)
+                    self._analyze_result(hypothesis_key, specific_events, prev_context)
                     
         # --- 3. Update Memory For Next Turn ---
         # This runs every frame, saving the state we just analyzed
@@ -373,44 +332,31 @@ class ObmlAgi3Agent(Agent):
             all_predicted_events_for_move = []
 
             # --- Unified Profiling Logic ---
-            # We profile the effect of this action (Global or Targeted)
-            # on ALL objects on the screen.
             for obj in current_summary:
                 obj_id = obj['id']
-                
-                # The hypothesis key is (action_key, affected_object_id)
-                # e.g., ('ACTION4', 'obj_1') or ('ACTION6_obj_2', 'obj_1')
                 hypothesis_key = (base_action_key_str, obj_id)
 
-                # 1. Check for a predicted per-object FAILURE
-                if hypothesis_key in self.failure_patterns:
-                    failure_rule = self.failure_patterns[hypothesis_key]
-                    if self._context_matches_pattern(current_full_context, failure_rule):
-                        profile['failures'] += 1
-                        continue # This object will fail, check the next object
-
-                # 2. If no failure, predict the per-object SUCCESS outcome
-                predicted_event_list = self._predict_outcome(hypothesis_key, current_full_context)
+                # 1. Strict Prediction
+                predicted_events, confidence = self._predict_outcome(hypothesis_key, current_full_context)
                 
-                # --- Convert event list to a hashable fingerprint ---
-                predicted_outcome_fingerprint = None
-                if predicted_event_list is not None:
-                    hashable_events = [tuple(sorted(e.items())) for e in predicted_event_list]
-                    predicted_outcome_fingerprint = tuple(sorted(hashable_events))
-                    all_predicted_events_for_move.extend(predicted_event_list)
-                # --- End conversion ---
-                
-                # 3. Tally the results
-                if predicted_event_list is None:
+                # 2. Categorize
+                if predicted_events is None:
+                    # Unknown: We have NO rule (Success or Failure) that matches this state.
                     profile['unknowns'] += 1
-                elif predicted_outcome_fingerprint == ():
-                    profile['failures'] += 1 # Predicted "no change"
-                elif predicted_outcome_fingerprint in self.seen_outcomes:
-                    profile['boring'] += 1 # Predicted "repetitive change"
+                elif not predicted_events:
+                    # Failure: We matched a "No Change" consistency rule.
+                    profile['failures'] += 1
                 else:
-                    profile['discoveries'] += 1 # Predicted "new, novel change"
-                    predicted_fingerprints_for_this_move.add(predicted_outcome_fingerprint)
-
+                    # Success: We matched a "Change" consistency rule.
+                    hashable_events = [tuple(sorted(e.items())) for e in predicted_events]
+                    fp = tuple(sorted(hashable_events))
+                    predicted_fingerprints_for_this_move.add(fp)
+                    all_predicted_events_for_move.extend(predicted_events)
+                    
+                    if fp in self.seen_outcomes and confidence >= 2:
+                        profile['boring'] += 1
+                    else:
+                        profile['discoveries'] += 1
             move_profiles.append((move, profile, predicted_fingerprints_for_this_move, all_predicted_events_for_move))
 
         # --- NEW: Debug print of all move profiles ---
@@ -640,195 +586,91 @@ class ObmlAgi3Agent(Agent):
 
     def _find_common_context(self, contexts: list[dict]) -> dict:
         """
-        Finds the common context across a list of attempts.
-        This new version checks all perception modules.
+        Finds the GLOBAL intersection of multiple game states.
+        Returns a rule containing ONLY the elements present in EVERY context.
         """
         if not contexts:
             return {}
 
-        # Start with the first context as the baseline
-        common_context = copy.deepcopy(contexts[0])
+        # Start with the first Universe as the candidate Rule
+        common_rule = copy.deepcopy(contexts[0])
         
-        # Remove summary, we only care about the analysis
-        common_context.pop('summary', None) 
+        # Remove non-structural data
+        common_rule.pop('summary', None)
+        common_rule.pop('events', None)
 
-        # Iteratively find the intersection
+        # Intersect with every other Universe observed
         for i in range(1, len(contexts)):
-            next_context = contexts[i]
-            intersection = {} # The intersection of common_context and next_context
+            next_ctx = contexts[i]
             
-            # 1. Adjacency and Diagonal Adjacency
+            # --- 1. Intersect Adjacencies (Global) ---
             for key in ['adj', 'diag_adj']:
-                adj_A = common_context.get(key, {})
-                adj_B = next_context.get(key, {})
-                common_ids = set(adj_A.keys()) & set(adj_B.keys())
-                for obj_id in common_ids:
-                    if adj_A[obj_id] == adj_B[obj_id]:
-                        intersection.setdefault(key, {})[obj_id] = adj_A[obj_id]
+                if key not in common_rule: continue
+                current_map = common_rule[key]
+                next_map = next_ctx.get(key, {})
+                
+                ids_to_remove = []
+                for obj_id, current_contacts in current_map.items():
+                    if obj_id not in next_map:
+                        ids_to_remove.append(obj_id)
+                        continue
+                    if current_contacts != next_map[obj_id]:
+                        ids_to_remove.append(obj_id)
+                for obj_id in ids_to_remove:
+                    del current_map[obj_id]
+                if not current_map: del common_rule[key]
 
-            # 2. Relationship, Alignment, and Match Diffs (dict-of-dicts)
+            # --- 2. Intersect Global Relationships (Global) ---
             for key in ['rels', 'align', 'match']:
-                rels_A = common_context.get(key, {})
-                rels_B = next_context.get(key, {})
-                common_rel_types = set(rels_A.keys()) & set(rels_B.keys())
-                for rel_type in common_rel_types:
-                    groups_A = rels_A[rel_type]
-                    groups_B = rels_B[rel_type]
-                    common_values = set(groups_A.keys()) & set(groups_B.keys())
-                    for value in common_values:
-                        if groups_A[value] == groups_B[value]:
-                            intersection.setdefault(key, {}).setdefault(rel_type, {})[value] = groups_A[value]
+                if key not in common_rule: continue
+                current_types = common_rule[key]
+                next_types = next_ctx.get(key, {})
+                
+                types_to_remove = []
+                for t_name, curr_groups in current_types.items():
+                    if t_name not in next_types:
+                        types_to_remove.append(t_name)
+                        continue
+                    
+                    next_groups = next_types[t_name]
+                    values_to_remove = []
+                    for val, curr_ids in curr_groups.items():
+                        if val not in next_groups:
+                            values_to_remove.append(val)
+                            continue
+                        if set(curr_ids) != set(next_groups[val]):
+                            values_to_remove.append(val)
+                    for val in values_to_remove:
+                        del curr_groups[val]
+                    if not curr_groups: types_to_remove.append(t_name)
+                for t_name in types_to_remove:
+                    del current_types[t_name]
+                if not current_types: del common_rule[key]
 
-            # 3. Diagonal Alignment Diffs (dict-of-lists)
+            # --- 3. Intersect Diagonal Alignments ---
             key = 'diag_align'
-            rels_A = common_context.get(key, {})
-            rels_B = next_context.get(key, {})
-            common_rel_types = set(rels_A.keys()) & set(rels_B.keys())
-            for rel_type in common_rel_types:
-                groups_A = rels_A[rel_type]
-                groups_B = rels_B[rel_type]
-                frozensets_A = {frozenset(s) for s in groups_A}
-                frozensets_B = {frozenset(s) for s in groups_B}
-                common_lines_frozensets = frozensets_A & frozensets_B
-                if common_lines_frozensets:
-                    intersection.setdefault(key, {})[rel_type] = [set(fs) for fs in common_lines_frozensets]
-            
-            # The new common_context is this intersection
-            common_context = intersection
+            if key in common_rule:
+                current_types = common_rule[key]
+                next_types = next_ctx.get(key, {})
+                types_to_remove = []
+                for t_name, curr_lines_list in current_types.items():
+                    if t_name not in next_types:
+                        types_to_remove.append(t_name)
+                        continue
+                    
+                    curr_lines = {frozenset(l) for l in curr_lines_list}
+                    next_lines = {frozenset(l) for l in next_types[t_name]}
+                    common_lines = curr_lines & next_lines
+                    
+                    if common_lines:
+                        current_types[t_name] = [set(fs) for fs in common_lines]
+                    else:
+                        types_to_remove.append(t_name)
+                for t_name in types_to_remove:
+                    del current_types[t_name]
+                if not current_types: del common_rule[key]
 
-        # We don't need wildcards ('x') for this method,
-        # because we're intersecting full contexts, not patterns.
-        return common_context
-
-    def _analyze_failures(self, action_key: str, all_success_contexts: list[dict], all_failure_contexts: list[dict], current_failure_context: dict):
-        """
-        Analyzes failures by finding conditions that are consistent across all failures
-        AND have never been observed in any past success.
-        
-        This new version learns multiple rules:
-        1. A "default" rule if no successes exist.
-        2. A "common" rule (what all failures share).
-        3. A "differentiating" rule (what makes failures different from successes).
-        """
-        if not all_failure_contexts:
-            return
-
-        # --- Rule 1: No Successes Ever ---
-        if not all_success_contexts:
-            # This action has ONLY ever failed. We have no successes to
-            # compare against, so we cannot learn a "clean" rule.
-            # We will learn *no rule* until we see at least one success.
-            
-            if self.debug_channels['FAILURE']: 
-                print(f"\n--- Failure Analysis for {action_key}: (No successes on record) ---")
-                print(f"  (Cannot learn a rule yet. Waiting for a success to compare against.)")
-            
-            # Learn no rule.
-            self.failure_patterns[action_key] = []
-            return
-        
-        if self.debug_channels['FAILURE']:
-            print(f"\n--- Failure Analysis for {action_key}: Consistent Differentiating Conditions ---")
-        
-        # --- Step 1: Find common contexts ---
-        common_success_context = self._find_common_context(all_success_contexts)
-        common_failure_context = self._find_common_context(all_failure_contexts)
-        
-        # --- Rule 2: The "Common Failure" Rule ---
-        # This is the rule for "what do all failures have in common?"
-        # We'll store this rule.
-        
-        # --- Step 2: Build a veto list of all states ever seen in *any* success ---
-        observed_in_any_success = {
-            'adj': set(), 'diag_adj': set(), 'rels': set(),
-            'align': set(), 'diag_align': set(), 'match': set()
-        }
-        for context in all_success_contexts:
-            for obj_id, contacts in context.get('adj', {}).items():
-                observed_in_any_success['adj'].add((obj_id, tuple(contacts)))
-            for obj_id, contacts in context.get('diag_adj', {}).items():
-                observed_in_any_success['diag_adj'].add((obj_id, tuple(contacts)))
-            for rel_type, groups in context.get('rels', {}).items():
-                for value, ids in groups.items():
-                    observed_in_any_success['rels'].add((rel_type, value, frozenset(ids)))
-            for rel_type, groups in context.get('align', {}).items():
-                for value, ids in groups.items():
-                    observed_in_any_success['align'].add((rel_type, value, frozenset(ids)))
-            for rel_type, groups in context.get('match', {}).items():
-                for value, ids in groups.items():
-                    observed_in_any_success['match'].add((rel_type, value, frozenset(ids)))
-            for rel_type, groups in context.get('diag_align', {}).items():
-                for line_set in groups:
-                    observed_in_any_success['diag_align'].add((rel_type, frozenset(line_set)))
-
-        # --- Rule 3: The "Differentiating" Rule ---
-        # The rule is "what is in the failure context that is different from the success context"
-        differentiating_rule = self._find_context_difference(common_failure_context, common_success_context)
-        
-        # --- Step 4: Validate and Prune the Differentiating Rule ---
-        pruned_differentiating_rule = {}
-        diffs_found = False
-
-        # Helper for logging
-        def log_diff(module_name, identifier, success_val, failure_val):
-            nonlocal diffs_found
-            diffs_found = True
-            if self.debug_channels['FAILURE']:
-                if self.debug_channels['CONTEXT_DETAILS']:
-                    print(f"- {module_name} Difference for {identifier}:")
-                    print(f"  - In Successes: {success_val}")
-                    print(f"  - In Failures:  {failure_val} (This state was never seen in a success)")
-                else:
-                    print(f"- {module_name} Difference for {identifier}: Found a differentiating rule.")
-
-        # Check Adj and Diag_Adj
-        for key in ['adj', 'diag_adj']:
-            adj_f = differentiating_rule.get(key, {})
-            for obj_id, contacts_f in adj_f.items():
-                if (obj_id, contacts_f) not in observed_in_any_success[key]:
-                    pruned_differentiating_rule.setdefault(key, {})[obj_id] = contacts_f
-                    log_diff(key.upper(), obj_id, common_success_context.get(key, {}).get(obj_id, "na"), contacts_f)
-
-        # Check Rels, Align, and Match
-        for key in ['rels', 'align', 'match']:
-            rels_f = differentiating_rule.get(key, {})
-            for rel_type, groups_f in rels_f.items():
-                for value, ids_f in groups_f.items():
-                    if (rel_type, value, frozenset(ids_f)) not in observed_in_any_success[key]:
-                        pruned_differentiating_rule.setdefault(key, {}).setdefault(rel_type, {})[value] = ids_f
-                        success_val = common_success_context.get(key, {}).get(rel_type, {}).get(value, "na")
-                        log_diff(f"{key.upper()} Group", f"({rel_type}, {value})", success_val, ids_f)
-                            
-        # Check Diag_Align
-        key = 'diag_align'
-        rels_f = differentiating_rule.get(key, {})
-        for rel_type, lines_f_list in rels_f.items():
-            lines_f = {frozenset(s) for s in lines_f_list}
-            for line_f in lines_f:
-                if (rel_type, line_f) not in observed_in_any_success[key]:
-                    pruned_differentiating_rule.setdefault(key, {}).setdefault(rel_type, []).append(line_f)
-                    log_diff(f"{key.upper()} Line", f"({rel_type})", "Not present", line_f)
-        
-        # --- Step 5: Store All Learned Rules ---
-        # We will store the rules in a list.
-        # Clear any old rules and add the new ones.
-        self.failure_patterns[action_key] = []
-        
-        # --- DELETED: Do not store the "dirty" common_failure_context rule. ---
-        # if common_failure_context:
-        #     self.failure_patterns[action_key].append(common_failure_context)
-        #     if self.debug_channels['FAILURE']: print(f"  Learning rule (Common): Stored common context of all failures.")
-
-        # Add the pruned differentiating rule (what's unique to failures)
-        if diffs_found and pruned_differentiating_rule:
-            self.failure_patterns[action_key].append(pruned_differentiating_rule)
-            if self.debug_channels['FAILURE']: print(f"  Learning rule (Diff): Stored *only* the pruned, differentiating context.")
-        elif not diffs_found:
-            if self.debug_channels['FAILURE']: print(f"  (No unique differentiating conditions found for this key)")
-
-        if not self.failure_patterns[action_key]:
-            if self.debug_channels['FAILURE']: print(f"  (No failure rules could be learned)")
-            del self.failure_patterns[action_key]
+        return common_rule
 
     def _parse_change_logs_to_events(self, changes: list[str]) -> list[dict]:
         """Parses a list of human-readable change logs into a list of structured event dictionaries."""
@@ -898,63 +740,44 @@ class ObmlAgi3Agent(Agent):
                 continue
         return events
 
-    def _analyze_and_report(self, action_key: tuple, changes: list[str], full_context: dict):
+    def _analyze_result(self, action_key: tuple, events: list[dict], full_context: dict):
         """
-        Learns from a successful action by storing the full context
-        and re-analyzing rule ambiguities.
+        Unified Learner. 
+        Whether it's a Success (events) or Failure (empty events), 
+        we calculate the Strict Consistency Rule for that outcome.
         """
-        new_events = self._parse_change_logs_to_events(changes)
-
+        # 1. Create Fingerprint (Empty tuple = Failure)
         hashable_events = []
-        if new_events: # Only loop if there are events
-            for event in new_events:
+        if events:
+            for event in events:
                 stable_event_tuple = tuple(sorted(event.items()))
                 hashable_events.append(stable_event_tuple)
-        
-        # An empty tuple () is the fingerprint for "no change"
         outcome_fingerprint = tuple(sorted(hashable_events))
 
-        # 1. Get or create the hypothesis
-        hypothesis = self.rule_hypotheses.setdefault(action_key, {
-            'outcomes': {},          # Stores the raw contexts for each outcome
-            'differentiated_rules': {} # Stores the *learned rule* (common context) for each outcome
-        })
-
-        # 2. Add this event's context to the history for this outcome
-        outcome_data = hypothesis['outcomes'].setdefault(outcome_fingerprint, {
-            'contexts': [],
-            'confirmations': 0,
-            'rules': new_events # Store the parsed outcome for prediction
-        })
+        # 2. Get Hypothesis Structure
+        hypothesis = self.rule_hypotheses.setdefault(action_key, {})
+        
+        # 3. Get or Initialize Outcome Data
+        if outcome_fingerprint not in hypothesis:
+            hypothesis[outcome_fingerprint] = {
+                'contexts': [],
+                'rule': None,  # The consistency rule
+                'raw_events': events
+            }
+        
+        outcome_data = hypothesis[outcome_fingerprint]
         outcome_data['contexts'].append(full_context)
-        outcome_data['confirmations'] += 1
         
-        # 3. Check for ambiguity
-        if len(hypothesis['outcomes']) == 1:
-            # --- Case 1: No Ambiguity ---
-            # This is the first outcome, or a confirmation of the only outcome.
-            # The "rule" is just the common context of all observations.
-            # This is the only outcome ever seen. It MUST be the default rule.
-            hypothesis['differentiated_rules'][outcome_fingerprint] = {} # An empty rule means "default"
-            common_context = {} # For the logging print below
-            
-            if self.debug_channels['HYPOTHESIS']:
-                print(f"\n--- Learned Default Rule for {action_key} (First Outcome) ---")
-                print(f"  Confirmations: {outcome_data['confirmations']}.")
-                # --- MODIFIED PRINT ---
-                if self.debug_channels['CONTEXT_DETAILS']:
-                    print(f"  Rule (Common Context): {common_context}")
-                else:
-                    print(f"  Rule (Common Context) refined.")
-        
-        else:
-            # --- Case 2: Ambiguity Detected ---
-            # We have multiple possible outcomes for this action.
-            # We must re-calculate all rules by finding the *differences*
-            # between all outcomes.
-            if self.debug_channels['HYPOTHESIS']:
-                print(f"\n--- Ambiguity Detected for {action_key}. Re-analyzing all outcomes. ---")
-            self._analyze_ambiguity(action_key, hypothesis)
+        # 4. Update the Consistency Rule (The Intersection)
+        # If this is the first time, the rule IS the context (specific).
+        # If this is the Nth time, the rule is the Intersection(All Contexts).
+        outcome_data['rule'] = self._find_common_context(outcome_data['contexts'])
+
+        if self.debug_channels['HYPOTHESIS']:
+            lbl = "FAILURE" if not events else "SUCCESS"
+            print(f"  Learned {lbl} Consistency Rule for {action_key} (seen {len(outcome_data['contexts'])} times).")
+            # if self.debug_channels['CONTEXT_DETAILS']:
+            #    print(f"  Rule: {outcome_data['rule']}")
 
     def _find_context_difference(self, context_A: dict, context_B: dict) -> dict:
         """
@@ -1171,22 +994,60 @@ class ObmlAgi3Agent(Agent):
             if self.debug_channels['FAILURE']:
                 print(f"  Ambiguity analysis failed with error: {e}")
 
-    def _context_matches_pattern(self, current_context: dict, pattern_data: dict | list) -> bool:
+    def _context_matches_pattern(self, current_context: dict, rule: dict) -> bool:
         """
-        Checks if the current_context (live state) matches a stored pattern or ANY pattern in a list.
+        Checks if the 'current_context' (the live screen) satisfies 
+        EVERY global condition in the 'rule'.
         """
-        if isinstance(pattern_data, list):
-            if not pattern_data:
-                return False # No rules in the list to match
-            
-            # Check if ANY rule in the list matches
-            for pattern in pattern_data:
-                if self._context_matches_pattern_single(current_context, pattern):
-                    return True # Found a match
-            return False # No rules in the list matched
-        
-        # Original behavior: pattern_data is a single dict
-        return self._context_matches_pattern_single(current_context, pattern_data)
+        if not rule:
+            # Empty rule = "No specific conditions required" = Matches everything
+            return True
+
+        try:
+            # 1. Check Global Adjacencies (e.g. Is Obj 7 touching Obj 12?)
+            for key in ['adj', 'diag_adj']:
+                if key not in rule: continue
+                rule_map = rule[key]
+                curr_map = current_context.get(key, {})
+                
+                for obj_id, rule_contacts in rule_map.items():
+                    # If the rule says Obj 7 exists, it must exist now
+                    if obj_id not in curr_map: return False
+                    
+                    # If the rule says Obj 7 touches Obj 12, it must touch Obj 12 now
+                    if curr_map[obj_id] != rule_contacts: return False
+
+            # 2. Check Global Relationships (e.g. Is Obj 5 the same color as Obj 9?)
+            for key in ['rels', 'align', 'match']:
+                if key not in rule: continue
+                rule_types = rule[key]
+                curr_types = current_context.get(key, {})
+                
+                for t_name, rule_groups in rule_types.items():
+                    if t_name not in curr_types: return False
+                    curr_groups = curr_types[t_name]
+                    
+                    for val, rule_ids in rule_groups.items():
+                        if val not in curr_groups: return False
+                        # The group membership must be identical
+                        if set(curr_groups[val]) != set(rule_ids): return False
+
+            # 3. Check Diagonal Alignments
+            key = 'diag_align'
+            if key in rule:
+                rule_types = rule[key]
+                curr_types = current_context.get(key, {})
+                for t_name, rule_lines in rule_types.items():
+                    if t_name not in curr_types: return False
+                    
+                    curr_lines_fs = {frozenset(l) for l in curr_types[t_name]}
+                    for line in rule_lines:
+                        if frozenset(line) not in curr_lines_fs: return False
+
+            return True
+
+        except Exception:
+            return False
 
     def _context_matches_pattern_single(self, current_context: dict, pattern: dict) -> bool:
         """
@@ -1236,50 +1097,58 @@ class ObmlAgi3Agent(Agent):
 
         return True # All pattern checks passed
 
-    def _predict_outcome(self, hypothesis_key: tuple, current_context: dict) -> list[dict] | None:
+    def _predict_outcome(self, hypothesis_key: tuple, current_context: dict) -> tuple[list|None, int]:
         """
-        Predicts the outcome (as a list of event dicts) of an action given the current context.
-        Returns:
-        - A list of event dicts if a rule matches.
-        - An empty list [] if the rule predicts "no change" (and it's the *only* rule).
-        - None (Unknown) if the context does not match any specific, known rules.
+        Checks the current context against ALL learned consistency rules.
+        
+        CRITICAL UPDATE: Implements 'Safety Override'. 
+        If a known Failure Rule matches the current context, we PREDICT FAILURE,
+        ignoring any optimistic Success Rules that might also match.
+        This prevents infinite loops where the agent thinks "It worked before, so it must work now."
         """
         hypothesis = self.rule_hypotheses.get(hypothesis_key)
-        
         if not hypothesis:
-            return None # This action is an "Unknown"
-
-        differentiated_rules = hypothesis.get('differentiated_rules', {})
-        if not differentiated_rules:
-            return None # No rules learned yet, "Unknown"
-
-        positive_rules = []
-        default_rule_outcome_key = None # This will be the fingerprint for '()'
-
-        for outcome_fingerprint, rule_pattern in differentiated_rules.items():
-            if rule_pattern:
-                positive_rules.append((outcome_fingerprint, rule_pattern))
-            else:
-                default_rule_outcome_key = outcome_fingerprint
+            return None, 0
         
-        positive_rules.sort(key=lambda x: str(x[1])) 
-        
-        # --- FOOLPROOF PREDICTION LOGIC ---
+        matches = []
+        for fingerprint, data in hypothesis.items():
+            rule = data['rule']
+            if self._context_matches_pattern(current_context, rule):
+                matches.append(data)
 
-        # 1. Check all specific, positive rules first.
-        for outcome_fingerprint, rule_pattern in positive_rules:
-            if self._context_matches_pattern(current_context, rule_pattern):
-                # Found a specific rule that matches. This is a confident prediction.
-                return hypothesis['outcomes'][outcome_fingerprint]['rules']
+        if not matches:
+            return None, 0
         
-        # 2. If NO positive rules matched, check for the default rule.
-        if default_rule_outcome_key is not None:
-            # We had positive rules that didn't match, OR
-            # we only had a default rule. Either way, fall back to default.
-            return hypothesis['outcomes'][default_rule_outcome_key]['rules']
+        # --- Safety Override Logic ---
+        # Check if ANY of the matching rules is a Failure (empty events)
+        failure_matches = [m for m in matches if not m['raw_events']]
+        
+        if failure_matches:
+            # We found a reason to believe this will fail.
+            # Even if we also have a rule that says it will succeed, the Failure
+            # represents a specific 'Exception' or 'Constraint' we have discovered.
+            # We must respect it to break the loop.
+            
+            # Pick the failure with the most evidence (confirmations)
+            best_failure = max(failure_matches, key=lambda m: len(m['contexts']))
+            return [], len(best_failure['contexts'])
 
-        # 3. If there are no positive rules AND no default, it's unknown.
-        return None
+        # --- Standard Logic (Only Successes Matched) ---
+        # If we only have Success matches, pick the most specific/complex one.
+        def get_rule_complexity(rule_data):
+            r = rule_data.get('rule', {})
+            if not r: return 0
+            score = 0
+            for k in ['adj', 'diag_adj']: score += len(r.get(k, {}))
+            for k in ['rels', 'align', 'match']:
+                for t, groups in r.get(k, {}).items(): score += len(groups)
+            score += len(r.get('diag_align', {}))
+            return score
+
+        matches.sort(key=get_rule_complexity, reverse=True)
+        best_match = matches[0]
+
+        return best_match['raw_events'], len(best_match['contexts'])
 
     def _get_hypothetical_summary(self, current_summary: list[dict], predicted_events_list: list[dict]) -> list[dict]:
         """
@@ -1411,7 +1280,8 @@ class ObmlAgi3Agent(Agent):
                 # 2. If no failure was triggered, predict the SUCCESS outcome
                 if profile['failures'] == 0:
                     hypothesis_key = (base_action_key_str.split('_')[0], target_id)
-                    predicted_event_list = self._predict_outcome(hypothesis_key, current_full_context)
+                    # FIX: Unpack tuple (events, confidence)
+                    predicted_event_list, confidence = self._predict_outcome(hypothesis_key, current_full_context)
                     
                     # --- Convert event list to a hashable fingerprint ---
                     predicted_outcome_fingerprint = None
@@ -1426,7 +1296,7 @@ class ObmlAgi3Agent(Agent):
                         profile['unknowns'] = 1
                     elif predicted_outcome_fingerprint == ():
                         profile['failures'] += 1 # Predicted "no change"
-                    elif predicted_outcome_fingerprint in self.seen_outcomes:
+                    elif predicted_outcome_fingerprint in self.seen_outcomes and confidence >= 2:
                         profile['boring'] = 1 # Predicted "repetitive change"
                     else:
                         profile['discoveries'] = 1 # Predicted "new, novel change"
@@ -1443,7 +1313,8 @@ class ObmlAgi3Agent(Agent):
                             continue
 
                     # 2. If no failure, predict the per-object SUCCESS outcome
-                    predicted_event_list = self._predict_outcome(hypothesis_key, current_full_context)
+                    # FIX: Unpack tuple (events, confidence)
+                    predicted_event_list, confidence = self._predict_outcome(hypothesis_key, current_full_context)
                     
                     # --- Convert event list to a hashable fingerprint ---
                     predicted_outcome_fingerprint = None
@@ -1458,7 +1329,7 @@ class ObmlAgi3Agent(Agent):
                         profile['unknowns'] += 1
                     elif predicted_outcome_fingerprint == ():
                         profile['failures'] += 1 # Predicted "no change"
-                    elif predicted_outcome_fingerprint in self.seen_outcomes:
+                    elif predicted_outcome_fingerprint in self.seen_outcomes and confidence >= 2:
                         profile['boring'] += 1 # Predicted "repetitive change"
                     else:
                         profile['discoveries'] += 1 # Predicted "new, novel change"
