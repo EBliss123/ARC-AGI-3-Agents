@@ -175,3 +175,42 @@ class TestObmlAgi3AgentLearning:
         _ = agent.choose_action([frame], frame)
         # After choosing, seen_outcomes should be a set (possibly empty)
         assert isinstance(agent.seen_outcomes, set)
+dict_outcome
+    def test_get_learning_key_click_target_specific(self):
+        agent = make_agent()
+        # direct method check to ensure ACTION6 with target id is specific
+        key_targeted = agent._get_learning_key("ACTION6", "obj_3")
+        key_non_target = agent._get_learning_key("ACTION6", None)
+        key_other = agent._get_learning_key("ACTION1", None)
+        assert key_targeted == "ACTION6_obj_3"
+        assert key_non_target == "ACTION6"
+        assert key_other == "ACTION1"
+
+    def test_predict_outcome_none_when_no_hypothesis(self):
+        agent = make_agent()
+        # empty rule_hypotheses -> predict returns (None, 0)
+        events, confidence = agent._predict_outcome(("ACTION1", "obj_1"), current_context={})
+        assert events is None and confidence == 0
+
+    def test_context_matches_pattern_and_single(self):
+        agent = make_agent()
+        # Build a simple context and matching rule/pattern
+        context = {
+            "adj": {"obj_1": ["na", "obj_2", "na", "na"]},
+            "rels": {"Color": {1: {"obj_1", "obj_2"}}},
+            "diag_align": {"top_left_to_bottom_right": [{"obj_1", "obj_2"}]},
+        }
+        # Exact rule should match
+        assert agent._context_matches_pattern(context, {
+            "adj": {"obj_1": ["na", "obj_2", "na", "na"]},
+            "rels": {"Color": {1: {"obj_1", "obj_2"}}},
+            "diag_align": {"top_left_to_bottom_right": [{"obj_1", "obj_2"}]},
+        }) is True
+        # Partial pattern should match via single matcher
+        assert agent._context_matches_pattern_single(context, {
+            "adj": {"obj_1": ["na", "obj_2", "na", "na"]}
+        }) is True
+        # Mismatch should fail
+        assert agent._context_matches_pattern_single(context, {
+            "adj": {"obj_1": ["na", "obj_3", "na", "na"]}
+        }) is False
