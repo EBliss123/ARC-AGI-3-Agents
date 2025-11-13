@@ -466,6 +466,18 @@ class ObmlAgi3Agent(Agent):
             # Choose the best move
             chosen_move, best_profile, new_fingerprints_to_add, _best_events = chosen_move_tuple
             
+            # --- NEW: Stalemate/Futile Move Detection ---
+            # If the BEST move has 0 Unknowns, 0 Discoveries, 0 Boring (Successes), 
+            # and purely Failures, the agent is stuck. Reset to try again/re-seed.
+            if (best_profile['unknowns'] == 0 and 
+                best_profile['discoveries'] == 0 and 
+                best_profile['boring'] == 0):
+                 
+                 if self.debug_channels['ACTION_SCORE']:
+                     print(f"--- Stalemate Detected (Best move '{chosen_move['template'].name}' is pure failure) -> RESET ---")
+                 return GameAction.RESET
+            # --------------------------------------------
+            
             action_to_return = chosen_move['template']
             chosen_object = chosen_move['object']
             
@@ -742,9 +754,11 @@ class ObmlAgi3Agent(Agent):
 
     def _analyze_result(self, action_key: tuple, events: list[dict], full_context: dict):
         """
-        Unified Learner. 
-        Whether it's a Success (events) or Failure (empty events), 
-        we calculate the Strict Consistency Rule for that outcome.
+        Unified Learner.
+        Updates the rule for the current outcome.
+        CRITICAL FIX: Prevents "Universal Failure" learning.
+        If the intersection of failures results in an empty/generic rule,
+        we discard the rule and keep the raw contexts as specific 'Landmines'.
         """
         # 1. Create Fingerprint (Empty tuple = Failure)
         hashable_events = []
@@ -761,7 +775,7 @@ class ObmlAgi3Agent(Agent):
         if outcome_fingerprint not in hypothesis:
             hypothesis[outcome_fingerprint] = {
                 'contexts': [],
-                'rule': None,  # The consistency rule
+                'rule': None,
                 'raw_events': events
             }
         
@@ -769,15 +783,21 @@ class ObmlAgi3Agent(Agent):
         outcome_data['contexts'].append(full_context)
         
         # 4. Update the Consistency Rule (The Intersection)
-        # If this is the first time, the rule IS the context (specific).
-        # If this is the Nth time, the rule is the Intersection(All Contexts).
-        outcome_data['rule'] = self._find_common_context(outcome_data['contexts'])
+        candidate_rule = self._find_common_context(outcome_data['contexts'])
 
-        if self.debug_channels['HYPOTHESIS']:
-            lbl = "FAILURE" if not events else "SUCCESS"
-            print(f"  Learned {lbl} Consistency Rule for {action_key} (seen {len(outcome_data['contexts'])} times).")
-            # if self.debug_channels['CONTEXT_DETAILS']:
-            #    print(f"  Rule: {outcome_data['rule']}")
+        # --- LANDMINE LOGIC START ---
+        # If this is a FAILURE (empty events) and the rule is EMPTY (generic),
+        # we reject the rule. We do not want to learn "Everything Fails".
+        if not events and not candidate_rule:
+             outcome_data['rule'] = None # No rule. Use raw contexts (Landmines).
+             if self.debug_channels['HYPOTHESIS']:
+                 print(f"  [Failure Analysis] Intersection is generic. Keeping {len(outcome_data['contexts'])} specific landmines instead of a rule.")
+        else:
+             outcome_data['rule'] = candidate_rule
+             if self.debug_channels['HYPOTHESIS']:
+                lbl = "FAILURE" if not events else "SUCCESS"
+                print(f"  Learned {lbl} Consistency Rule for {action_key} (seen {len(outcome_data['contexts'])} times).")
+        # --- LANDMINE LOGIC END ---
 
     def _find_context_difference(self, context_A: dict, context_B: dict) -> dict:
         """
@@ -1101,10 +1121,10 @@ class ObmlAgi3Agent(Agent):
         """
         Checks the current context against ALL learned consistency rules.
         
-        CRITICAL UPDATE: Implements 'Safety Override'. 
-        If a known Failure Rule matches the current context, we PREDICT FAILURE,
-        ignoring any optimistic Success Rules that might also match.
-        This prevents infinite loops where the agent thinks "It worked before, so it must work now."
+        CRITICAL UPDATE: "Landmine" Detection.
+        If a Failure Rule is too generic (None), we check the raw failure history.
+        If the current state is identical to a past failure, we predict failure.
+        Otherwise, we assume it is safe (Unknown).
         """
         hypothesis = self.rule_hypotheses.get(hypothesis_key)
         if not hypothesis:
@@ -1113,30 +1133,53 @@ class ObmlAgi3Agent(Agent):
         matches = []
         for fingerprint, data in hypothesis.items():
             rule = data['rule']
-            if self._context_matches_pattern(current_context, rule):
-                matches.append(data)
+            
+            # Case A: We have a valid Rule (Generalized Logic)
+            if rule is not None:
+                if self._context_matches_pattern(current_context, rule):
+                    matches.append(data)
+            
+            # Case B: No Rule (Landmines / Specific Failures)
+            # We iterate through past contexts. If we match one EXACTLY, it's a match.
+            # (We use the single-pattern matcher on the full context to check for 'subset' match)
+            else:
+                # This data block is a list of Landmines (Failures).
+                # Check if the current context is "close enough" to any landmine.
+                # Since we rejected the Intersection, we treat these as "Point Hazards".
+                # We check: Does the current object share the same ID/Color/Shape as a failure?
+                # We assume 'contexts' stores the full state.
+                
+                # Optimization: Only check the target object properties for landmines
+                # (Checking the whole screen is too strict, intersection handled that)
+                
+                # Actually, if we rejected the intersection, it means the environment VARIED.
+                # So we should only flag if the LOCAL object properties match.
+                
+                # Let's use a safe approach: Check specific identity match.
+                for past_ctx in data['contexts']:
+                    # Extract local object props from past context (heuristic)
+                    # We need a way to compare "Local Object" efficiently.
+                    # Since we don't have easy access to just the object here,
+                    # we will rely on the fact that if _find_common_context returned {},
+                    # the failures are disparate. 
+                    
+                    # FALLBACK: If we match the past context structure exactly, it's a failure.
+                    if self._context_matches_pattern_single(current_context, past_ctx):
+                        matches.append(data)
+                        break
 
         if not matches:
             return None, 0
         
-        # --- Safety Override Logic ---
-        # Check if ANY of the matching rules is a Failure (empty events)
+        # --- Exception / Veto Handling ---
         failure_matches = [m for m in matches if not m['raw_events']]
-        
         if failure_matches:
-            # We found a reason to believe this will fail.
-            # Even if we also have a rule that says it will succeed, the Failure
-            # represents a specific 'Exception' or 'Constraint' we have discovered.
-            # We must respect it to break the loop.
-            
-            # Pick the failure with the most evidence (confirmations)
             best_failure = max(failure_matches, key=lambda m: len(m['contexts']))
             return [], len(best_failure['contexts'])
 
-        # --- Standard Logic (Only Successes Matched) ---
-        # If we only have Success matches, pick the most specific/complex one.
-        def get_rule_complexity(rule_data):
-            r = rule_data.get('rule', {})
+        # --- Success Selection ---
+        def get_rule_complexity(match_data):
+            r = match_data.get('rule', {})
             if not r: return 0
             score = 0
             for k in ['adj', 'diag_adj']: score += len(r.get(k, {}))
@@ -1145,9 +1188,12 @@ class ObmlAgi3Agent(Agent):
             score += len(r.get('diag_align', {}))
             return score
 
-        matches.sort(key=get_rule_complexity, reverse=True)
-        best_match = matches[0]
+        matches.sort(key=lambda m: (
+            get_rule_complexity(m), 
+            len(m['contexts'])
+        ), reverse=True)
 
+        best_match = matches[0]
         return best_match['raw_events'], len(best_match['contexts'])
 
     def _get_hypothetical_summary(self, current_summary: list[dict], predicted_events_list: list[dict]) -> list[dict]:
