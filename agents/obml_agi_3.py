@@ -1108,52 +1108,60 @@ class ObmlAgi3Agent(Agent):
         """
         Checks the current context against ALL learned consistency rules.
         
-        CRITICAL UPDATE: "Landmine" Detection.
-        If a Failure Rule is too generic (None), we check the raw failure history.
-        If the current state is identical to a past failure, we predict failure.
-        Otherwise, we assume it is safe (Unknown).
+        CRITICAL UPDATE: "Local Landmine" Priority.
+        We ALWAYS check the raw failure history for a direct match on the target object.
+        If the target object (ID/Color/Shape/Size) is identical to a past failure,
+        we predict Failure immediately, overriding any broad intersection rules.
         """
         hypothesis = self.rule_hypotheses.get(hypothesis_key)
         if not hypothesis:
             return None, 0
         
         matches = []
+        
+        # Extract the target object from the current context for local comparison.
+        target_id = hypothesis_key[1]
+        current_target_obj = None
+        if target_id:
+            for obj in current_context['summary']:
+                if obj['id'] == target_id:
+                    current_target_obj = obj
+                    break
+
         for fingerprint, data in hypothesis.items():
             rule = data['rule']
             
-            # Case A: We have a valid Rule (Generalized Logic)
+            # --- 1. Local Landmine Check (High Priority) ---
+            # Check raw history for an exact match on the target object's intrinsic properties.
+            # This runs regardless of whether a generic 'rule' exists.
+            is_local_landmine = False
+            if current_target_obj and not data['raw_events']: # Only check if this is a Failure outcome
+                 for past_ctx in data['contexts']:
+                    past_target_obj = None
+                    # Optimization: We assume past_ctx structure holds the summary
+                    for obj in past_ctx['summary']:
+                        if obj['id'] == target_id:
+                            past_target_obj = obj
+                            break
+                    
+                    if past_target_obj:
+                        # Strict check: If intrinsic properties are identical, it's the same "Dead Object"
+                        if (current_target_obj['color'] == past_target_obj['color'] and
+                            current_target_obj['fingerprint'] == past_target_obj['fingerprint'] and
+                            current_target_obj['size'] == past_target_obj['size']):
+                            
+                            is_local_landmine = True
+                            break
+            
+            if is_local_landmine:
+                matches.append(data)
+                continue # We found a match, move to next hypothesis item
+
+            # --- 2. Standard Rule Match ---
+            # If it wasn't a direct landmine hit, check the learned rule (if any)
             if rule is not None:
                 if self._context_matches_pattern(current_context, rule):
                     matches.append(data)
-            
-            # Case B: No Rule (Landmines / Specific Failures)
-            # We iterate through past contexts. If we match one EXACTLY, it's a match.
-            # (We use the single-pattern matcher on the full context to check for 'subset' match)
-            else:
-                # This data block is a list of Landmines (Failures).
-                # Check if the current context is "close enough" to any landmine.
-                # Since we rejected the Intersection, we treat these as "Point Hazards".
-                # We check: Does the current object share the same ID/Color/Shape as a failure?
-                # We assume 'contexts' stores the full state.
-                
-                # Optimization: Only check the target object properties for landmines
-                # (Checking the whole screen is too strict, intersection handled that)
-                
-                # Actually, if we rejected the intersection, it means the environment VARIED.
-                # So we should only flag if the LOCAL object properties match.
-                
-                # Let's use a safe approach: Check specific identity match.
-                for past_ctx in data['contexts']:
-                    # Extract local object props from past context (heuristic)
-                    # We need a way to compare "Local Object" efficiently.
-                    # Since we don't have easy access to just the object here,
-                    # we will rely on the fact that if _find_common_context returned {},
-                    # the failures are disparate. 
-                    
-                    # FALLBACK: If we match the past context structure exactly, it's a failure.
-                    if self._context_matches_pattern_single(current_context, past_ctx):
-                        matches.append(data)
-                        break
 
         if not matches:
             return None, 0
