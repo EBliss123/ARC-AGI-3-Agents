@@ -397,70 +397,57 @@ class ObmlAgi3Agent(Agent):
                 x[1]['boring']
             ), reverse=True)
             
-            # --- NEW: 1-Step Lookahead Tie-Breaker ---
-            top_profile_score = (
-                move_profiles[0][1]['unknowns'], 
-                move_profiles[0][1]['discoveries'], 
-                -move_profiles[0][1]['failures']
-            )
-            
-            # Find all moves tied with the best score
-            tied_moves = []
-            for move_tuple in move_profiles:
-                # move_tuple is (move, profile, fingerprints, events)
-                move, profile, fingerprints, events = move_tuple
-                current_score = (profile['unknowns'], profile['discoveries'], -profile['failures'])
-                
-                if current_score == top_profile_score:
-                    # Only check "boring" moves (U=0, D=0) for lookahead
-                    if profile['unknowns'] == 0 and profile['discoveries'] == 0:
-                        tied_moves.append(move_tuple)
-                    elif not tied_moves: 
-                        # This is the first (and best) non-boring move.
-                        # No lookahead needed, just pick this one.
-                        tied_moves.append(move_tuple)
-                        break
-                else:
-                    # We are past the tied scores
-                    break
+            # --- Updated: Recursive Lookahead Tie-Breaker ---
             
             chosen_move_tuple = None
-            if len(tied_moves) > 1:
-                # --- Run Lookahead ---
-                if self.debug_channels['ACTION_SCORE']: 
-                    print(f"\n--- Running 1-Step Lookahead for {len(tied_moves)} Boring Moves ---")
-                
-                lookahead_scores = []
-                for move_tuple in tied_moves:
-                    move, profile, fingerprints, events = move_tuple
-                    
-                    # 1. Simulate the state
-                    hypothetical_summary = self._get_hypothetical_summary(current_summary, events)
-                    
-                    # 2. Profile the *future* state
-                    future_profile = self._get_hypothetical_profile(hypothetical_summary, latest_frame.available_actions)
-                    
-                    if self.debug_channels['ACTION_SCORE']:
-                        target_name = f" on {move['object']['id']}" if move['object'] else ""
-                        print(f"  - Move {move['template'].name}{target_name} -> Future Profile: "
-                              f"U:{future_profile['unknowns']} D:{future_profile['discoveries']} "
-                              f"B:{future_profile['boring']} F:{future_profile['failures']}")
-                    
-                    lookahead_scores.append((move_tuple, future_profile))
-                
-                # Sort by best *future* profile
-                lookahead_scores.sort(key=lambda x: (
-                    x[1]['unknowns'], 
-                    x[1]['discoveries'], 
-                    -x[1]['failures']
-                ), reverse=True)
-                
-                # The best move is the winner of this sort
-                chosen_move_tuple = lookahead_scores[0][0]
             
+            # If we have multiple best moves, and they are "Boring" (U=0, D=0),
+            # we need to check which one sets up a better future.
+            top_score_is_boring = (move_profiles[0][1]['unknowns'] == 0 and 
+                                   move_profiles[0][1]['discoveries'] == 0 and
+                                   move_profiles[0][1]['failures'] == 0)
+
+            if top_score_is_boring:
+                # Find all ties for first place
+                tied_moves = []
+                top_score = (move_profiles[0][1]['unknowns'], move_profiles[0][1]['discoveries'], -move_profiles[0][1]['failures'])
+                
+                for mp in move_profiles:
+                    current_score = (mp[1]['unknowns'], mp[1]['discoveries'], -mp[1]['failures'])
+                    if current_score == top_score:
+                        tied_moves.append(mp)
+                    else:
+                        break # Sorted list, so we can stop
+                
+                if len(tied_moves) > 1:
+                    if self.debug_channels['ACTION_SCORE']: 
+                        print(f"\n--- Running Recursive Lookahead (Depth 3) for {len(tied_moves)} Boring Moves ---")
+
+                    best_deep_score = (-999, -999, -999, -999)
+                    best_move_idx = 0
+                    
+                    for i, move_tuple in enumerate(tied_moves):
+                        move, _, _, _ = move_tuple
+                        
+                        # Call the recursive function
+                        # Returns (Unknowns, Discoveries, -Failures, -Distance)
+                        deep_score = self._recursive_lookahead_score(current_summary, move['template'], move['object'], 0)
+                        
+                        if self.debug_channels['ACTION_SCORE']:
+                             target = f" on {move['object']['id']}" if move['object'] else ""
+                             print(f"  - Move {move['template'].name}{target} -> Chain Score: {deep_score}")
+
+                        if deep_score > best_deep_score:
+                            best_deep_score = deep_score
+                            best_move_idx = i
+                    
+                    chosen_move_tuple = tied_moves[best_move_idx]
+                else:
+                    chosen_move_tuple = tied_moves[0] # No ties
             else:
-                # No tie, or only one move, just pick the first one
-                chosen_move_tuple = tied_moves[0]
+                # If the best move is already an Unknown or Discovery, just take it!
+                chosen_move_tuple = move_profiles[0]
+            
             # --- End Lookahead ---
 
             # Choose the best move
@@ -1393,6 +1380,111 @@ class ObmlAgi3Agent(Agent):
             
         _chosen_move, best_profile, _new_fingerprints, _best_events = move_profiles[0]
         return best_profile
+
+    def _recursive_lookahead_score(self, current_summary: list[dict], action_template, target_obj, depth: int) -> tuple:
+        """
+        Recursively simulates moves to find the long-term value of an action.
+        Returns a score tuple: (Has_Unknowns, Has_Discoveries, -Failures, -Steps_To_Reward)
+        """
+        MAX_DEPTH = 10  # Don't look deeper than X turns to save CPU/prevent loops
+        
+        # 1. Build Context for Prediction
+        # We need to re-analyze relationships for the simulation to be accurate
+        (rels, adj, diag_adj, match, align, diag_align, conj) = self._analyze_relationships(current_summary)
+        
+        context = {
+            'summary': current_summary,
+            'rels': rels, 'adj': adj, 'diag_adj': diag_adj,
+            'align': align, 'diag_align': diag_align, 'match': match
+        }
+        
+        # 2. Predict Outcome of THIS move
+        target_id = target_obj['id'] if target_obj else None
+        action_key = self._get_learning_key(action_template.name, target_id)
+        
+        # We need to predict for ALL objects (Global) or just the Target
+        predicted_events = []
+        
+        if target_id:
+            # Targeted Action
+            base_key = (action_key.split('_')[0], target_id)
+            
+            # Check Failure Landmines first (Veto)
+            if action_key in self.failure_patterns and self._context_matches_pattern(context, self.failure_patterns[action_key]):
+                return (0, 0, -1, 0) # Immediate Failure
+            
+            events, conf = self._predict_outcome(base_key, context)
+            if events is None: return (1, 0, 0, 0) # Found an Unknown! Immediate reward.
+            if not events: return (0, 0, -1, 0) # Failure
+            predicted_events = events
+            
+            # Check if this specific outcome is a Discovery
+            hashable = tuple(sorted([tuple(sorted(e.items())) for e in events]))
+            if hashable not in self.seen_outcomes or conf < 2:
+                return (0, 1, 0, 0) # Found a Discovery!
+                
+        else:
+            # Global Action (simulate for all objects)
+            # For simplicity in lookahead, we just check if ANY object triggers Unknown/Discovery
+            total_events = []
+            for obj in current_summary:
+                base_key = (action_key, obj['id'])
+                events, conf = self._predict_outcome(base_key, context)
+                
+                if events is None: return (1, 0, 0, 0) # Unknown
+                if events:
+                    hashable = tuple(sorted([tuple(sorted(e.items())) for e in events]))
+                    if hashable not in self.seen_outcomes or conf < 2:
+                        return (0, 1, 0, 0) # Discovery
+                    total_events.extend(events)
+            
+            if not total_events: return (0, 0, -1, 0) # All objects failed
+            predicted_events = total_events
+
+        # 3. If we are here, the move was "Boring" (Success, but known).
+        # We must look deeper.
+        
+        if depth >= MAX_DEPTH:
+            return (0, 0, 0, 0) # Hit bottom, nothing found.
+
+        # 4. Simulate the Future State
+        future_summary = self._get_hypothetical_summary(current_summary, predicted_events)
+        
+        # 5. Find the BEST move from this future state
+        # (We reuse the logic from choose_action, simplified)
+        best_future_score = (-999, -999, -999, -999)
+        
+        # Construct next possible moves
+        next_moves = []
+        if not future_summary: return (0, 0, 0, 0) # Empty board
+
+        click_template = None
+        if action_template.name == 'ACTION6': click_template = action_template # Reuse current template if it's ACTION6
+        
+        # Only test ACTION6 on objects for speed in recursion
+        if click_template:
+            for obj in future_summary:
+                next_moves.append((click_template, obj))
+        
+        # Evaluate next moves
+        for next_action, next_obj in next_moves:
+            # RECURSE: Add 1 to depth
+            score = self._recursive_lookahead_score(future_summary, next_action, next_obj, depth + 1)
+            
+            # The score tuple is (U, D, -F, -Steps). 
+            # We want to maximize U, D, and minimize F and Steps.
+            # Current score format doesn't account for steps, let's adjust it.
+            # If score found something (U>0 or D>0), we subtract depth from a "Urgency" score.
+            
+            found_u, found_d, neg_f, neg_steps = score
+            
+            # Decay the value slightly for being further away
+            current_recursive_score = (found_u, found_d, neg_f, neg_steps - 1)
+            
+            if current_recursive_score > best_future_score:
+                best_future_score = current_recursive_score
+                
+        return best_future_score
 
     def _analyze_relationships(self, object_summary: list[dict]) -> tuple:
         """
