@@ -36,6 +36,7 @@ class ObmlAgi3Agent(Agent):
         self.last_score = 0
         self.banned_action_keys = set()
         self.permanent_banned_actions = set()
+        self.successful_click_actions = set()
 
         # --- Debug Channels ---
         # Set these to True or False to control the debug output.
@@ -64,6 +65,7 @@ class ObmlAgi3Agent(Agent):
         self.win_condition_hypotheses = []
         self.last_score = 0
         self.permanent_banned_actions = set()
+        self.successful_click_actions = set()
         
         # Also reset the level state
         self._reset_level_state()
@@ -213,6 +215,11 @@ class ObmlAgi3Agent(Agent):
             # --- SUBSEQUENT FRAME LOGIC ---
             prev_summary = self.last_object_summary
             
+            # --- NEW: Check for score increase *before* analysis ---
+            current_score = latest_frame.score
+            score_increased = current_score > self.last_score
+            # --- End NEW ---
+            
             # This function compares old and new summaries, assigns persistent IDs,
             # and returns a list of change strings.
             changes, current_summary = self._log_changes(prev_summary, current_summary)
@@ -223,8 +230,7 @@ class ObmlAgi3Agent(Agent):
              current_conjunctions) = self._analyze_relationships(current_summary)
 
             # --- Check for score changes (win detection) ---
-            current_score = latest_frame.score
-            if current_score > self.last_score:
+            if score_increased:
                 if self.debug_channels['WIN_CONDITION']:
                     print(f"\n--- LEVEL CHANGE DETECTED (Score increased from {self.last_score} to {current_score}) ---")
                 # (Win analysis logic will go here)
@@ -262,22 +268,32 @@ class ObmlAgi3Agent(Agent):
                 # 1. Parse text changes back to structured event dicts
                 events = self._parse_change_logs_to_events(changes)
                 
-                # --- Failsafe: Track banned actions ---
-                if not events and self.last_action_context: # Last action was a total failure
+                # --- Failsafe: Track banned actions (NOW CHECKS SCORE) ---
+                action_succeeded = bool(events) or score_increased
+
+                if not action_succeeded and self.last_action_context: # Last action was a total failure
                     self.banned_action_keys.add(self.last_action_context)
                     if self.debug_channels['FAILURE']:
                         print(f"--- Failsafe: Banning action '{self.last_action_context}' due to failure. Total banned: {len(self.banned_action_keys)} ---")
-                # --- NEW: Permanent Ban Logic ---
-                if self.last_action_context.startswith('ACTION6_'):
-                    self.permanent_banned_actions.add(self.last_action_context)
-                    if self.debug_channels['FAILURE']:
-                        print(f"--- Failsafe: Permanently banning '{self.last_action_context}'. Total permanent: {len(self.permanent_banned_actions)} ---")
-                # --- End NEW --- 
-                elif events: # Last action had *some* success
+                    
+                    # --- MODIFIED: Permanent Ban Logic ---
+                    if (self.last_action_context.startswith('ACTION6_') and
+                        self.last_action_context not in self.successful_click_actions):
+                        self.permanent_banned_actions.add(self.last_action_context)
+                        if self.debug_channels['FAILURE']:
+                            print(f"--- Failsafe: Permanently banning '{self.last_action_context}' (never succeeded). Total permanent: {len(self.permanent_banned_actions)} ---")
+                    # --- End MODIFIED ---
+                
+                elif action_succeeded: # Last action had *some* success
                     if self.banned_action_keys:
                         if self.debug_channels['FAILURE']:
                             print(f"--- Failsafe: Success detected. Clearing {len(self.banned_action_keys)} banned actions. ---")
                         self.banned_action_keys.clear() # Clear ban
+                    
+                    # --- NEW: Track Successful Clicks ---
+                    if self.last_action_context and self.last_action_context.startswith('ACTION6_'):
+                        self.successful_click_actions.add(self.last_action_context)
+                    # --- End NEW ---
                 # --- End Failsafe ---
 
                 # 2. Map events to specific objects
@@ -1237,12 +1253,6 @@ class ObmlAgi3Agent(Agent):
         if not matches:
             return None, 0
         
-        # --- Exception / Veto Handling ---
-        failure_matches = [m for m in matches if not m['raw_events']]
-        if failure_matches:
-            best_failure = max(failure_matches, key=lambda m: len(m['contexts']))
-            return [], len(best_failure['contexts'])
-
         # --- Success Selection ---
         def get_rule_complexity(match_data):
             r = match_data.get('rule', {})
