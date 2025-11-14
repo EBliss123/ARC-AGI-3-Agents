@@ -35,6 +35,7 @@ class ObmlAgi3Agent(Agent):
         self.actions_printed = False
         self.last_score = 0
         self.banned_action_keys = set()
+        self.permanent_banned_actions = set()
 
         # --- Debug Channels ---
         # Set these to True or False to control the debug output.
@@ -62,6 +63,7 @@ class ObmlAgi3Agent(Agent):
         self.seen_outcomes = set()
         self.win_condition_hypotheses = []
         self.last_score = 0
+        self.permanent_banned_actions = set()
         
         # Also reset the level state
         self._reset_level_state()
@@ -265,6 +267,12 @@ class ObmlAgi3Agent(Agent):
                     self.banned_action_keys.add(self.last_action_context)
                     if self.debug_channels['FAILURE']:
                         print(f"--- Failsafe: Banning action '{self.last_action_context}' due to failure. Total banned: {len(self.banned_action_keys)} ---")
+                # --- NEW: Permanent Ban Logic ---
+                if self.last_action_context.startswith('ACTION6_'):
+                    self.permanent_banned_actions.add(self.last_action_context)
+                    if self.debug_channels['FAILURE']:
+                        print(f"--- Failsafe: Permanently banning '{self.last_action_context}'. Total permanent: {len(self.permanent_banned_actions)} ---")
+                # --- End NEW --- 
                 elif events: # Last action had *some* success
                     if self.banned_action_keys:
                         if self.debug_channels['FAILURE']:
@@ -373,28 +381,60 @@ class ObmlAgi3Agent(Agent):
                         profile['discoveries'] += 1
             move_profiles.append((move, profile, predicted_fingerprints_for_this_move, all_predicted_events_for_move))
 
-        # --- Failsafe: Filter out banned actions ---
+# --- Failsafe: 2-Stage Ban Filtering ---
+        
+        # --- Stage 1: Temporary "banned_action_keys" (cleared on success) ---
         if self.banned_action_keys and len(move_profiles) > 1:
-            initial_count = len(move_profiles)
-            filtered_profiles = []
+            initial_count_temp = len(move_profiles)
+            filtered_profiles_temp = []
             for move_tuple in move_profiles:
                 move, _, _, _ = move_tuple
                 move_key = self._get_learning_key(move['template'].name, move['object']['id'] if move['object'] else None)
                 if move_key not in self.banned_action_keys:
-                    filtered_profiles.append(move_tuple)
+                    filtered_profiles_temp.append(move_tuple)
             
-            if filtered_profiles and len(filtered_profiles) < initial_count:
-                # We successfully filtered at least one banned move and have options left
-                move_profiles = filtered_profiles
+            if not filtered_profiles_temp:
+                # All moves are *temporarily* banned. This is a stalemate.
+                # Clear the temporary list and proceed with all original moves.
                 if self.debug_channels['FAILURE']:
-                    print(f"--- Failsafe: Removed {initial_count - len(filtered_profiles)} banned actions from consideration. ---")
-            elif not filtered_profiles:
-                # All moves are banned! This is a true stalemate.
-                # We must un-ban everything to prevent a crash.
-                if self.debug_channels['FAILURE']:
-                    print(f"--- Failsafe: All possible moves are banned. Clearing ban list to prevent stalemate. ---")
+                    print(f"--- Failsafe: All moves temporarily banned. Clearing {len(self.banned_action_keys)} temp bans. ---")
                 self.banned_action_keys.clear()
-                # We proceed with the original move_profiles list
+                # We proceed with the original move_profiles
+            
+            elif len(filtered_profiles_temp) < initial_count_temp:
+                # We filtered some temp bans and have options left.
+                move_profiles = filtered_profiles_temp
+                if self.debug_channels['FAILURE']:
+                    print(f"--- Failsafe: Removed {initial_count_temp - len(filtered_profiles_temp)} temp banned actions. ---")
+            
+            # else: no temp bans were found, proceed with original move_profiles
+        
+        # --- Stage 2: Permanent "permanent_banned_actions" (ACTION6 only) ---
+        if self.permanent_banned_actions and len(move_profiles) > 1:
+            initial_count_perm = len(move_profiles)
+            filtered_profiles_perm = []
+            for move_tuple in move_profiles:
+                move, _, _, _ = move_tuple
+                move_key = self._get_learning_key(move['template'].name, move['object']['id'] if move['object'] else None)
+                if move_key not in self.permanent_banned_actions:
+                    filtered_profiles_perm.append(move_tuple)
+            
+            if not filtered_profiles_perm:
+                # All *remaining* moves are *permanently* banned.
+                # This is the "last resort" scenario.
+                # We do NOT clear the permanent list. We just ignore it for this turn.
+                if self.debug_channels['FAILURE']:
+                    print(f"--- Failsafe: All valid moves are permanently banned. Ignoring {len(self.permanent_banned_actions)} permanent bans for this turn. ---")
+                # We proceed with the move_profiles list from Stage 1
+            
+            elif len(filtered_profiles_perm) < initial_count_perm:
+                # We successfully filtered permanent bans.
+                move_profiles = filtered_profiles_perm
+                if self.debug_channels['FAILURE']:
+                    print(f"--- Failsafe: Removed {initial_count_perm - len(filtered_profiles_perm)} permanent banned actions. ---")
+            
+            # else: no permanent bans were found, proceed
+        
         # --- End Failsafe ---
 
         # --- NEW: Debug print of all move profiles ---
