@@ -1158,9 +1158,14 @@ class ObmlAgi3Agent(Agent):
             rule = data['rule']
             
             # --- 1. Local Landmine Check (High Priority) ---
-            # Check raw history for an exact match on the target object's intrinsic properties.
-            # This runs regardless of whether a generic 'rule' exists.
             is_local_landmine = False
+
+            # --- MODIFIED: Only run this check for ACTION6 (clicks) ---
+            action_name_str = hypothesis_key[0]
+            if action_name_str.startswith('ACTION6') and current_target_obj and not data['raw_events']: # Only check if this is a Failure outcome
+                 for past_ctx in data['contexts']:
+                    past_target_obj = None
+                    
             if current_target_obj and not data['raw_events']: # Only check if this is a Failure outcome
                  for past_ctx in data['contexts']:
                     past_target_obj = None
