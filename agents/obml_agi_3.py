@@ -452,19 +452,7 @@ class ObmlAgi3Agent(Agent):
 
             # Choose the best move
             chosen_move, best_profile, new_fingerprints_to_add, _best_events = chosen_move_tuple
-            
-            # --- NEW: Stalemate/Futile Move Detection ---
-            # If the BEST move has 0 Unknowns, 0 Discoveries, 0 Boring (Successes), 
-            # and purely Failures, the agent is stuck. Reset to try again/re-seed.
-            if (best_profile['unknowns'] == 0 and 
-                best_profile['discoveries'] == 0 and 
-                best_profile['boring'] == 0):
-                 
-                 if self.debug_channels['ACTION_SCORE']:
-                     print(f"--- Stalemate Detected (Best move '{chosen_move['template'].name}' is pure failure) -> RESET ---")
-                 return GameAction.RESET
-            # --------------------------------------------
-            
+        
             action_to_return = chosen_move['template']
             chosen_object = chosen_move['object']
             
