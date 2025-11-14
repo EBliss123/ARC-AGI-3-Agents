@@ -34,6 +34,7 @@ class ObmlAgi3Agent(Agent):
         self.win_condition_hypotheses = []
         self.actions_printed = False
         self.last_score = 0
+        self.banned_action_keys = set()
 
         # --- Debug Channels ---
         # Set these to True or False to control the debug output.
@@ -80,6 +81,7 @@ class ObmlAgi3Agent(Agent):
         self.current_level_id_map = {}
         self.last_action_context = None
         self.level_state_history = []
+        self.banned_action_keys = set()
         self.actions_printed = False # This is per-level, not per-game
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
@@ -258,6 +260,18 @@ class ObmlAgi3Agent(Agent):
                 # 1. Parse text changes back to structured event dicts
                 events = self._parse_change_logs_to_events(changes)
                 
+                # --- Failsafe: Track banned actions ---
+                if not events and self.last_action_context: # Last action was a total failure
+                    self.banned_action_keys.add(self.last_action_context)
+                    if self.debug_channels['FAILURE']:
+                        print(f"--- Failsafe: Banning action '{self.last_action_context}' due to failure. Total banned: {len(self.banned_action_keys)} ---")
+                elif events: # Last action had *some* success
+                    if self.banned_action_keys:
+                        if self.debug_channels['FAILURE']:
+                            print(f"--- Failsafe: Success detected. Clearing {len(self.banned_action_keys)} banned actions. ---")
+                        self.banned_action_keys.clear() # Clear ban
+                # --- End Failsafe ---
+
                 # 2. Map events to specific objects
                 # Initialize empty lists for all objects; if no event occurred, it stays empty (= Failure/No Change)
                 obj_events_map = {obj['id']: [] for obj in self.last_object_summary}
@@ -358,6 +372,30 @@ class ObmlAgi3Agent(Agent):
                     else:
                         profile['discoveries'] += 1
             move_profiles.append((move, profile, predicted_fingerprints_for_this_move, all_predicted_events_for_move))
+
+        # --- Failsafe: Filter out banned actions ---
+        if self.banned_action_keys and len(move_profiles) > 1:
+            initial_count = len(move_profiles)
+            filtered_profiles = []
+            for move_tuple in move_profiles:
+                move, _, _, _ = move_tuple
+                move_key = self._get_learning_key(move['template'].name, move['object']['id'] if move['object'] else None)
+                if move_key not in self.banned_action_keys:
+                    filtered_profiles.append(move_tuple)
+            
+            if filtered_profiles and len(filtered_profiles) < initial_count:
+                # We successfully filtered at least one banned move and have options left
+                move_profiles = filtered_profiles
+                if self.debug_channels['FAILURE']:
+                    print(f"--- Failsafe: Removed {initial_count - len(filtered_profiles)} banned actions from consideration. ---")
+            elif not filtered_profiles:
+                # All moves are banned! This is a true stalemate.
+                # We must un-ban everything to prevent a crash.
+                if self.debug_channels['FAILURE']:
+                    print(f"--- Failsafe: All possible moves are banned. Clearing ban list to prevent stalemate. ---")
+                self.banned_action_keys.clear()
+                # We proceed with the original move_profiles list
+        # --- End Failsafe ---
 
         # --- NEW: Debug print of all move profiles ---
         if self.debug_channels['ACTION_SCORE']:
