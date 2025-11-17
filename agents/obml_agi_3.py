@@ -38,14 +38,19 @@ class ObmlAgi3Agent(Agent):
         self.permanent_banned_actions = set()
         self.successful_click_actions = set()
 
+        # --- Physics / Causality ---
+        self.global_physics_events = set() # Stores exact event tuples
+        self.global_physics_hypotheses = {} # Stores pattern -> {'contexts': [], 'rule': None}
+        self.action_outcome_history = list() # Stores (action_key, full_outcome_fingerprint)
+
         # --- Debug Channels ---
         # Set these to True or False to control the debug output.
         self.debug_channels = {
             'PERCEPTION': False,      # Object finding, relationships, new level setup
             'CHANGES': True,         # All "Change Log" prints
-            'STATE_GRAPH': True,     # State understanding
-            'HYPOTHESIS': False,      # "Initial Hypotheses", "Refined Hypothesis"
-            'FAILURE': True,         # "Failure Analysis", "Failure Detected"
+            'STATE_GRAPH': False,     # State understanding
+            'HYPOTHESIS': True,      # "Initial Hypotheses", "Refined Hypothesis"
+            'FAILURE': False,         # "Failure Analysis", "Failure Detected"
             'WIN_CONDITION': True,   # "LEVEL CHANGE DETECTED", "Win Condition Analysis"
             'ACTION_SCORE': True,    # All scoring prints
             'CONTEXT_DETAILS': False # Keep or remove large prints
@@ -268,6 +273,15 @@ class ObmlAgi3Agent(Agent):
                 # 1. Parse text changes back to structured event dicts
                 events = self._parse_change_logs_to_events(changes)
                 
+                # --- Global Physics Analysis ---
+                # 1. Fingerprint the *entire* outcome of the last action
+                full_outcome_fingerprint = self._fingerprint_events(events)
+                
+                # 2. Update our understanding of "physics" by comparing this
+                #    outcome to the outcomes of *other* recent actions.
+                self._update_global_physics(learning_key, full_outcome_fingerprint, events, prev_context)
+                # --- End Global Physics Analysis ---
+                                
                 # --- Failsafe: Track banned actions (NOW CHECKS SCORE) ---
                 action_succeeded = bool(events) or score_increased
 
@@ -820,6 +834,210 @@ class ObmlAgi3Agent(Agent):
             except (ValueError, IndexError, SyntaxError, AttributeError):
                 continue
         return events
+    
+    def _fingerprint_events(self, events: list[dict]) -> tuple:
+        """
+        Converts a list of event dictionaries into a stable, hashable,
+        and sorted tuple of tuples.
+        """
+        hashable_events = []
+        if events:
+            for event in events:
+                # Convert event dict to a tuple of (key, value) pairs
+                # This is stable because tuple(sorted(dict.items())) is stable
+                stable_event_tuple = tuple(sorted(event.items()))
+                hashable_events.append(stable_event_tuple)
+        
+        # Return a sorted tuple of all event tuples
+        return tuple(sorted(hashable_events))
+
+    def _templatize_event_tuple(self, event_tuple: tuple) -> tuple:
+        """
+        Converts a full event tuple into a "pattern" tuple by removing
+        object-specific fields like 'id' and 'position'.
+        
+        Example: ('type': 'RECOLORED', 'id': 'obj_1', 'to_color': 5)
+        Becomes: ('type': 'RECOLORED', 'to_color': 5)
+        """
+        # Properties that are object-specific and should be wildcarded
+        volatile_keys = {'id', 'position', 'start_position', 'end_position'}
+        
+        pattern_pairs = []
+        for key, value in event_tuple:
+            if key not in volatile_keys:
+                pattern_pairs.append((key, value))
+        
+        # The list of pairs is already sorted, so tuple() is stable
+        return tuple(pattern_pairs)
+    
+    def _get_local_context(self, obj_id: str, full_context: dict) -> dict:
+        """
+        Extracts a "feature" dictionary for a single object, including
+        generalized adjacency, alignment, and group information.
+        """
+        local_context = {}
+        target_obj = None
+        
+        obj_map = {obj['id']: obj for obj in full_context['summary']}
+        if obj_id not in obj_map:
+            return {} # Object not found
+            
+        target_obj = obj_map[obj_id]
+        
+        # 1. Add intrinsic properties
+        local_context['rels'] = {
+            'Color': {target_obj['color']: {obj_id}},
+            'Shape': {target_obj['fingerprint']: {obj_id}},
+            'Size': {target_obj['size']: {obj_id}},
+        }
+        
+        # 2. Add adjacency properties (Generalized)
+        adj_map = full_context.get('adj', {})
+        diag_adj_map = full_context.get('diag_adj', {})
+        
+        def get_neighbor_props(neighbor_id_str, adj_key_prefix):
+            if neighbor_id_str in obj_map:
+                neighbor_obj = obj_map[neighbor_id_str]
+                return {
+                    f"{adj_key_prefix}_color": neighbor_obj['color'],
+                    f"{adj_key_prefix}_shape": neighbor_obj['fingerprint'],
+                    f"{adj_key_prefix}_size": neighbor_obj['size'],
+                }
+            return {}
+
+        if obj_id in adj_map:
+            contacts = adj_map[obj_id] # [top, right, bottom, left]
+            if contacts[0] != 'na':
+                local_context.setdefault('adj_props', {}).update(get_neighbor_props(contacts[0], 'adj_top'))
+            if contacts[1] != 'na':
+                local_context.setdefault('adj_props', {}).update(get_neighbor_props(contacts[1], 'adj_right'))
+            if contacts[2] != 'na':
+                local_context.setdefault('adj_props', {}).update(get_neighbor_props(contacts[2], 'adj_bottom'))
+            if contacts[3] != 'na':
+                local_context.setdefault('adj_props', {}).update(get_neighbor_props(contacts[3], 'adj_left'))
+
+        if obj_id in diag_adj_map:
+            contacts = diag_adj_map[obj_id] # [TR, BR, BL, TL]
+            if contacts[0] != 'na':
+                local_context.setdefault('adj_props', {}).update(get_neighbor_props(contacts[0], 'diag_tr'))
+            if contacts[1] != 'na':
+                local_context.setdefault('adj_props', {}).update(get_neighbor_props(contacts[1], 'diag_br'))
+            if contacts[2] != 'na':
+                local_context.setdefault('adj_props', {}).update(get_neighbor_props(contacts[2], 'diag_bl'))
+            if contacts[3] != 'na':
+                local_context.setdefault('adj_props', {}).update(get_neighbor_props(contacts[3], 'diag_tl'))
+
+        # --- NEW: Section 3 ---
+        # 3. Add Relational Group Properties (Alignments, Matches)
+        rel_props = {}
+
+        # Check Alignments
+        for align_type, groups in full_context.get('align', {}).items():
+            for coord, ids in groups.items():
+                if obj_id in ids and len(ids) > 1:
+                    rel_props[f'align_{align_type}_coord'] = coord
+                    rel_props[f'align_{align_type}_size'] = len(ids)
+                    # Find properties of other objects in the alignment
+                    other_colors = {obj_map[i]['color'] for i in ids if i != obj_id and i in obj_map}
+                    other_shapes = {obj_map[i]['fingerprint'] for i in ids if i != obj_id and i in obj_map}
+                    if other_colors:
+                        rel_props[f'align_{align_type}_has_color'] = min(other_colors) # Use min for stable heuristic
+                    if other_shapes:
+                        rel_props[f'align_{align_type}_has_shape'] = min(other_shapes)
+
+        # Check Diagonal Alignments
+        for align_type, lines in full_context.get('diag_align', {}).items():
+            for line_set in lines:
+                if obj_id in line_set and len(line_set) > 1:
+                    rel_props[f'diag_align_{align_type}_size'] = len(line_set)
+                    other_colors = {obj_map[i]['color'] for i in line_set if i != obj_id and i in obj_map}
+                    other_shapes = {obj_map[i]['fingerprint'] for i in line_set if i != obj_id and i in obj_map}
+                    if other_colors:
+                        rel_props[f'diag_align_{align_type}_has_color'] = min(other_colors)
+                    if other_shapes:
+                        rel_props[f'diag_align_{align_type}_has_shape'] = min(other_shapes)
+        
+        # Check Match Groups
+        for match_type, groups in full_context.get('match', {}).items():
+            for props, ids in groups.items():
+                if obj_id in ids: # (len(ids) is > 1 by definition)
+                    rel_props[f'match_{match_type}_size'] = len(ids)
+
+        if rel_props:
+            local_context['rel_props'] = rel_props
+        # --- End NEW Section 3 ---
+
+        return local_context
+
+    def _update_global_physics(self, action_key: str, full_outcome_fingerprint: tuple, events: list[dict], prev_context: dict):
+        """
+        Analyzes the full outcome of an action to find "Global Effects" (physics).
+        It learns the *triggering context* for any observed event pattern.
+        """
+        if not events or not prev_context:
+            return # Nothing to learn from
+
+        # 1. Store the full outcome for cross-action comparison (legacy, for static)
+        self.action_outcome_history.append((action_key, full_outcome_fingerprint))
+        
+        # --- Logic A: Find *Static* Physics (Unchanged) ---
+        if len(self.action_outcome_history) >= 2:
+            last_action_key, last_outcome = self.action_outcome_history[-1]
+            prev_outcome = None
+            for i in range(len(self.action_outcome_history) - 2, -1, -1):
+                prev_action_key, outcome = self.action_outcome_history[i]
+                if prev_action_key != last_action_key:
+                    prev_outcome = outcome
+                    break
+            
+            if prev_outcome is not None:
+                events_A = set(last_outcome)
+                events_B = set(prev_outcome)
+                static_physics_events = events_A & events_B
+                new_static = static_physics_events - self.global_physics_events
+                if new_static:
+                    self.global_physics_events.update(new_static)
+                    if self.debug_channels['HYPOTHESIS']:
+                        print(f"  [Physics] Discovered {len(new_static)} new *static* global effects.")
+
+        # --- Logic B: Find *Dynamic* Physics (Your New Logic) ---
+        # For each event that just happened...
+        for event_dict in events:
+            if 'id' not in event_dict:
+                continue # Can't learn a local rule for a non-local event
+                
+            obj_id = event_dict['id']
+            
+            # 1. Get the event "pattern" (e.g., "RECOLORED to 3")
+            event_tuple = tuple(sorted(event_dict.items()))
+            event_pattern = self._templatize_event_tuple(event_tuple)
+            
+            if not event_pattern:
+                continue # Skip empty patterns
+                
+            # 2. Get the *local context* of the object *before* the event
+            local_context = self._get_local_context(obj_id, prev_context)
+            if not local_context:
+                continue # Couldn't find the object
+                
+            # 3. Get/Initialize the hypothesis for this pattern
+            hypo = self.global_physics_hypotheses.setdefault(event_pattern, {
+                'contexts': [],
+                'rule': None
+            })
+            
+            # 4. Add the context and re-learn the rule
+            hypo['contexts'].append(local_context)
+            
+            # 5. Update the consistency rule (the intersection)
+            candidate_rule = self._find_common_context(hypo['contexts'])
+            
+            if not candidate_rule:
+                hypo['rule'] = None # Generic rule, use "landmines" (raw contexts)
+            else:
+                hypo['rule'] = candidate_rule
+                if self.debug_channels['HYPOTHESIS']:
+                    print(f"  [Physics] Refined rule for pattern {event_pattern} (seen {len(hypo['contexts'])} times).")
 
     def _analyze_result(self, action_key: tuple, events: list[dict], full_context: dict):
         """
@@ -829,15 +1047,55 @@ class ObmlAgi3Agent(Agent):
         If the intersection of failures results in an empty/generic rule,
         we discard the rule and keep the raw contexts as specific 'Landmines'.
         """
-        # 1. Create Fingerprint (Empty tuple = Failure)
-        hashable_events = []
-        if events:
-            for event in events:
-                stable_event_tuple = tuple(sorted(event.items()))
-                hashable_events.append(stable_event_tuple)
-        outcome_fingerprint = tuple(sorted(hashable_events))
+        # 1. Create a stable fingerprint from the SPECIFIC events for this object
+        specific_event_tuples = self._fingerprint_events(events)
+        
+        # 2. "Clean" the events by removing any known "physics"
+        #    This isolates the *Direct Effect* of the action.
+        cleaned_event_tuples = []
+        
+        # We need the local context of *this* object to check rules
+        obj_id = action_key[1] # e.g., ('ACTION6_obj_1', 'obj_1')
+        current_local_context = self._get_local_context(obj_id, full_context)
 
-        # 2. Get Hypothesis Structure
+        for e_tuple in specific_event_tuples:
+            is_physics = False
+            
+            # Check A: Is it a *static* (exact) physics event?
+            if e_tuple in self.global_physics_events:
+                is_physics = True
+            
+            # Check B: Is it a *dynamic* (pattern) physics event?
+            else:
+                template = self._templatize_event_tuple(e_tuple)
+                if template in self.global_physics_hypotheses:
+                    hypo = self.global_physics_hypotheses[template]
+                    trigger_rule = hypo['rule']
+                    
+                    if trigger_rule is not None:
+                        # We have a rule. Check if our current context matches it.
+                        if self.debug_channels['HYPOTHESIS']:
+                             print(f"  [Physics Check] Checking if {obj_id} matches rule for {template}")
+                        if self._context_matches_pattern(current_local_context, trigger_rule):
+                             is_physics = True
+                             if self.debug_channels['HYPOTHESIS']:
+                                 print(f"  [Physics Check]... Match! Event is physics.")
+                    else:
+                        # No rule, check raw "landmine" contexts
+                        for ctx in hypo['contexts']:
+                            if self._context_matches_pattern(current_local_context, ctx):
+                                is_physics = True
+                                if self.debug_channels['HYPOTHESIS']:
+                                     print(f"  [Physics Check]... Landmine match! Event is physics.")
+                                break
+            
+            if not is_physics:
+                cleaned_event_tuples.append(e_tuple)
+
+        # The new outcome_fingerprint is based *only* on the cleaned events
+        outcome_fingerprint = tuple(cleaned_event_tuples)
+        
+        # 3. Get Hypothesis Structure
         hypothesis = self.rule_hypotheses.setdefault(action_key, {})
         
         # 3. Get or Initialize Outcome Data
@@ -845,7 +1103,8 @@ class ObmlAgi3Agent(Agent):
             hypothesis[outcome_fingerprint] = {
                 'contexts': [],
                 'rule': None,
-                'raw_events': events
+                # Store the *cleaned* events, re-hydrated back into dicts
+                'raw_events': [dict(e) for e in cleaned_event_tuples]
             }
         
         outcome_data = hypothesis[outcome_fingerprint]
