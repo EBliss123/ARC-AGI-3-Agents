@@ -349,7 +349,7 @@ class ObmlAgi3Agent(Agent):
                         print(f"  [Global] Discovered {len(new_static_physics)} new *static* global effects.")
 
                     for pattern, (rule, count) in new_dynamic_physics.items():
-                        print(f"  [Global] Refined *cross-action* rule for pattern {pattern} (seen {count} times).")
+                        print(f"  [Global] Refined *cross-action* rule for pattern {pattern} (seen {count} times). Trigger: {rule if rule else 'None (Generic)'}")
 
                     # --- 2. Direct Effects ---
                     if learned_direct_effects:
@@ -744,7 +744,7 @@ class ObmlAgi3Agent(Agent):
 
         # Intersect with every other Universe observed
         for i in range(1, len(contexts)):
-            next_ctx = contexts[i]
+            next_ctx = copy.deepcopy(contexts[i])
             
             # --- 1. Intersect Adjacencies (Global) ---
             for key in ['adj', 'diag_adj']:
@@ -812,6 +812,24 @@ class ObmlAgi3Agent(Agent):
                 for t_name in types_to_remove:
                     del current_types[t_name]
                 if not current_types: del common_rule[key]
+            
+            # --- 4. NEW: Intersect Local Properties (adj_props, rel_props) ---
+            for key in ['adj_props', 'rel_props']:
+                if key not in common_rule: continue
+                current_props = common_rule[key]
+                next_props = next_ctx.get(key, {})
+                
+                props_to_remove = []
+                for prop_key, prop_value in current_props.items():
+                    if prop_key not in next_props or next_props[prop_key] != prop_value:
+                        props_to_remove.append(prop_key)
+                
+                for prop_key in props_to_remove:
+                    del current_props[prop_key]
+                
+                if not current_props:
+                    del common_rule[key]
+            # --- End NEW ---
 
         return common_rule
 
@@ -1016,6 +1034,53 @@ class ObmlAgi3Agent(Agent):
         # --- End NEW Section 3 ---
 
         return local_context
+
+    def _predict_global_effects_for_object(self, obj_id: str, local_context: dict) -> list[dict]:
+        """
+        Checks a single object's context against all global physics rules.
+        Returns a list of predicted events if a trigger rule is matched.
+        """
+        predicted_events = []
+        
+        # We need the object's current intrinsic properties to "hydrate" the event
+        current_color = None
+        current_shape = None
+        try:
+            current_color = list(local_context['rels']['Color'].keys())[0]
+            current_shape = list(local_context['rels']['Shape'].keys())[0]
+        except Exception:
+            pass # Object might not have these, or context is malformed
+
+        # Check this context against *all* global rules
+        for pattern, hypo in self.global_physics_hypotheses.items():
+            trigger_rule = hypo['rule']
+            matches_rule = False
+            
+            if trigger_rule is not None:
+                # We have a rule. Check if our current context matches it.
+                if self._context_matches_pattern(local_context, trigger_rule):
+                     matches_rule = True
+            else:
+                # No rule, check raw "landmine" contexts
+                for ctx in hypo['contexts']:
+                    if self._context_matches_pattern(local_context, ctx):
+                        matches_rule = True
+                        break
+            
+            if matches_rule:
+                # We have a match! Generate the predicted event.
+                predicted_event_dict = dict(pattern)
+                predicted_event_dict['id'] = obj_id # Add the specific ID
+                
+                # Fill in any "wildcarded" fields from the object itself
+                if 'from_color' in predicted_event_dict and current_color is not None:
+                    predicted_event_dict['from_color'] = current_color
+                if 'from_fingerprint' in predicted_event_dict and current_shape is not None:
+                    predicted_event_dict['from_fingerprint'] = current_shape
+
+                predicted_events.append(predicted_event_dict)
+                
+        return predicted_events
 
     def _update_global_physics(self, action_key: str, full_outcome_fingerprint: tuple, events: list[dict], prev_context: dict):
         """
@@ -1531,6 +1596,10 @@ class ObmlAgi3Agent(Agent):
         hypothesis = self.rule_hypotheses.get(hypothesis_key)
         if not hypothesis:
             return None, 0
+
+        # We need the local context of the target object to check for global physics
+        target_id = hypothesis_key[1]
+        local_context = self._get_local_context(target_id, current_context)
         
         matches = []
         
@@ -1603,6 +1672,29 @@ class ObmlAgi3Agent(Agent):
         ), reverse=True)
 
         best_match = matches[0]
+
+        # --- Start Physics-Aware Prediction ---
+        # 1. Get the predicted Direct Effects
+        direct_events = best_match['raw_events']
+        confidence = len(best_match['contexts'])
+
+        # 2. Get the predicted Global Effects
+        global_events = []
+        if local_context:
+            global_events = self._predict_global_effects_for_object(target_id, local_context)
+
+        # 3. Combine them
+        # We must avoid adding duplicate events if a (buggy) rule exists in both
+        final_events = list(direct_events)
+        if global_events:
+            direct_fingerprints = {tuple(sorted(e.items())) for e in direct_events}
+            for g_event in global_events:
+                g_fp = tuple(sorted(g_event.items()))
+                if g_fp not in direct_fingerprints:
+                    final_events.append(g_event)
+
+        return final_events, confidence
+        # --- End Physics-Aware Prediction ---
         return best_match['raw_events'], len(best_match['contexts'])
 
     def _get_hypothetical_summary(self, current_summary: list[dict], predicted_events_list: list[dict]) -> list[dict]:
