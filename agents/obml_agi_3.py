@@ -279,7 +279,7 @@ class ObmlAgi3Agent(Agent):
                 
                 # 2. Update our understanding of "physics" by comparing this
                 #    outcome to the outcomes of *other* recent actions.
-                self._update_global_physics(learning_key, full_outcome_fingerprint, events, prev_context)
+                new_static_physics, new_dynamic_physics = self._update_global_physics(learning_key, full_outcome_fingerprint, events, prev_context)
                 # --- End Global Physics Analysis ---
                                 
                 # --- Failsafe: Track banned actions (NOW CHECKS SCORE) ---
@@ -318,6 +318,10 @@ class ObmlAgi3Agent(Agent):
                     if 'id' in event and event['id'] in obj_events_map:
                         obj_events_map[event['id']].append(event)
 
+                learned_direct_effects = []
+                learned_failures = []
+                learned_landmines = 0
+
                 # 3. Unified Learning Loop
                 # We process EVERY object from the previous frame.
                 for obj in self.last_object_summary:
@@ -328,7 +332,39 @@ class ObmlAgi3Agent(Agent):
                     hypothesis_key = (learning_key, obj_id)
                     
                     # Learn (Success OR Failure is handled uniformly inside this function)
-                    self._analyze_result(hypothesis_key, specific_events, prev_context)
+                    result_type = self._analyze_result(hypothesis_key, specific_events, prev_context)
+                    if result_type == "Direct Effect":
+                        learned_direct_effects.append(hypothesis_key[1]) # Just store obj_id
+                    elif result_type == "Failure":
+                        learned_failures.append(hypothesis_key[1])
+                    elif result_type == "Landmine":
+                        learned_landmines += 1
+
+                # --- Learning Summary (NEW) ---
+                if self.debug_channels['HYPOTHESIS']:
+                    print(f"\n--- Learning Summary for {learning_key} ---")
+
+                    if new_static_physics:
+                        print(f"  [Global] Discovered {len(new_static_physics)} new *static* global effects.")
+
+                    for pattern, (rule, count) in new_dynamic_physics.items():
+                        print(f"  [Global] Refined *cross-action* rule for pattern {pattern} (seen {count} times).")
+
+                    if learned_direct_effects:
+                        if len(learned_direct_effects) > 5:
+                            print(f"  [Direct] Learned {len(learned_direct_effects)} Direct Effect rules (e.g., for {learned_direct_effects[0]}).")
+                        else:
+                            print(f"  [Direct] Learned Direct Effect rules for: {', '.join(learned_direct_effects)}")
+
+                    if learned_failures:
+                        print(f"  [Failure] Learned {len(learned_failures)} Failure rules.")
+
+                    if learned_landmines > 0:
+                        print(f"  [Failure] Kept {learned_landmines} specific 'landmine' failures.")
+
+                    if not (new_static_physics or new_dynamic_physics or learned_direct_effects or learned_failures or learned_landmines):
+                        print("  (No new rules learned this turn.)")
+                # --- End Learning Summary ---
                     
         # --- 3. Update Memory For Next Turn ---
         # This runs every frame, saving the state we just analyzed
@@ -972,74 +1008,100 @@ class ObmlAgi3Agent(Agent):
     def _update_global_physics(self, action_key: str, full_outcome_fingerprint: tuple, events: list[dict], prev_context: dict):
         """
         Analyzes the full outcome of an action to find "Global Effects" (physics).
-        It learns the *triggering context* for any observed event pattern.
+        It learns the *triggering context* for any observed event pattern
+        *only if* that pattern is seen across multiple *different* actions.
         """
-        if not events or not prev_context:
-            return # Nothing to learn from
-
-        # 1. Store the full outcome for cross-action comparison (legacy, for static)
+        new_static_events_found = set()
+        new_dynamic_rules_found = {}
+        
+        # 1. Store the full outcome for cross-action comparison
         self.action_outcome_history.append((action_key, full_outcome_fingerprint))
         
-        # --- Logic A: Find *Static* Physics (Unchanged) ---
-        if len(self.action_outcome_history) >= 2:
-            last_action_key, last_outcome = self.action_outcome_history[-1]
-            prev_outcome = None
-            for i in range(len(self.action_outcome_history) - 2, -1, -1):
-                prev_action_key, outcome = self.action_outcome_history[i]
-                if prev_action_key != last_action_key:
-                    prev_outcome = outcome
-                    break
-            
-            if prev_outcome is not None:
-                events_A = set(last_outcome)
-                events_B = set(prev_outcome)
-                static_physics_events = events_A & events_B
-                new_static = static_physics_events - self.global_physics_events
-                if new_static:
-                    self.global_physics_events.update(new_static)
-                    if self.debug_channels['HYPOTHESIS']:
-                        print(f"  [Physics] Discovered {len(new_static)} new *static* global effects.")
+        if len(self.action_outcome_history) < 2:
+            return new_static_events_found, new_dynamic_rules_found # Not enough history
 
-        # --- Logic B: Find *Dynamic* Physics (Your New Logic) ---
-        # For each event that just happened...
-        for event_dict in events:
-            if 'id' not in event_dict:
-                continue # Can't learn a local rule for a non-local event
-                
-            obj_id = event_dict['id']
+        # 2. Look for two *different* recent actions to compare
+        last_action_key, last_outcome = self.action_outcome_history[-1]
+        
+        prev_outcome = None
+        for i in range(len(self.action_outcome_history) - 2, -1, -1):
+            prev_action_key, outcome = self.action_outcome_history[i]
+            if prev_action_key != last_action_key:
+                prev_outcome = outcome
+                break
+        
+        if prev_outcome is None:
+            return new_static_events_found, new_dynamic_rules_found # Not enough history
             
-            # 1. Get the event "pattern" (e.g., "RECOLORED to 3")
+        # 3. Get event sets for comparison
+        events_A = set(last_outcome)
+        events_B = set(prev_outcome)
+
+        # --- Logic A: Find *Static* Physics (Exact event match) ---
+        static_physics_events = events_A & events_B
+        new_static = static_physics_events - self.global_physics_events
+        if new_static:
+            self.global_physics_events.update(new_static)
+            if self.debug_channels['HYPOTHESIS']:
+                new_static_events_found = new_static
+
+        # --- Logic B: Find *Dynamic* Physics (Your Corrected Logic) ---
+        
+        # 1. Get all *patterns* from both outcomes
+        templates_A = {self._templatize_event_tuple(e) for e in events_A}
+        templates_B = {self._templatize_event_tuple(e) for e in events_B}
+        
+        # 2. Find the intersection of *patterns*. These are our "Global" patterns.
+        common_dynamic_patterns = templates_A & templates_B
+        
+        if not common_dynamic_patterns:
+            return new_static_events_found, new_dynamic_rules_found # No common physics
+
+        # 3. Now, iterate through the *actual events* from the *last action*
+        for event_dict in events:
+            
+            # 4. Check if this event's pattern is one of the *proven global* ones
             event_tuple = tuple(sorted(event_dict.items()))
             event_pattern = self._templatize_event_tuple(event_tuple)
             
-            if not event_pattern:
-                continue # Skip empty patterns
+            if event_pattern in common_dynamic_patterns:
+                # --- This is a certified Global Physics event! ---
+                # Now we learn its context, as planned.
                 
-            # 2. Get the *local context* of the object *before* the event
-            local_context = self._get_local_context(obj_id, prev_context)
-            if not local_context:
-                continue # Couldn't find the object
+                if 'id' not in event_dict:
+                    continue # Can't learn a local rule for a non-local event
                 
-            # 3. Get/Initialize the hypothesis for this pattern
-            hypo = self.global_physics_hypotheses.setdefault(event_pattern, {
-                'contexts': [],
-                'rule': None
-            })
-            
-            # 4. Add the context and re-learn the rule
-            hypo['contexts'].append(local_context)
-            
-            # 5. Update the consistency rule (the intersection)
-            candidate_rule = self._find_common_context(hypo['contexts'])
-            
-            if not candidate_rule:
-                hypo['rule'] = None # Generic rule, use "landmines" (raw contexts)
-            else:
-                hypo['rule'] = candidate_rule
-                if self.debug_channels['HYPOTHESIS']:
-                    print(f"  [Physics] Refined rule for pattern {event_pattern} (seen {len(hypo['contexts'])} times).")
+                obj_id = event_dict['id']
+                
+                # 5. Get the *local context* of the object *before* the event
+                local_context = self._get_local_context(obj_id, prev_context)
+                if not local_context:
+                    continue # Couldn't find the object
+                    
+                # 6. Get/Initialize the hypothesis for this pattern
+                hypo = self.global_physics_hypotheses.setdefault(event_pattern, {
+                    'contexts': [],
+                    'rule': None
+                })
+                
+                # 7. Add the context and re-learn the rule
+                hypo['contexts'].append(local_context)
+                
+                # 8. Update the consistency rule (the intersection)
+                candidate_rule = self._find_common_context(hypo['contexts'])
+                
+                if not candidate_rule:
+                    hypo['rule'] = None # Generic rule, use "landmines" (raw contexts)
+                    if event_pattern not in self.global_physics_hypotheses or self.global_physics_hypotheses[event_pattern]['rule'] is not None:
+                        new_dynamic_rules_found[event_pattern] = (None, len(hypo['contexts']))
+                else:
+                    hypo['rule'] = candidate_rule
+                    if self.debug_channels['HYPOTHESIS']:
+                        new_dynamic_rules_found[event_pattern] = (candidate_rule, len(hypo['contexts']))
 
-    def _analyze_result(self, action_key: tuple, events: list[dict], full_context: dict):
+        return new_static_events_found, new_dynamic_rules_found
+
+    def _analyze_result(self, action_key: tuple, events: list[dict], full_context: dict) -> str:
         """
         Unified Learner.
         Updates the rule for the current outcome.
@@ -1124,7 +1186,8 @@ class ObmlAgi3Agent(Agent):
              outcome_data['rule'] = candidate_rule
              if self.debug_channels['HYPOTHESIS']:
                 lbl = "FAILURE" if not events else "SUCCESS"
-                print(f"  Learned {lbl} Consistency Rule for {action_key} (seen {len(outcome_data['contexts'])} times).")
+                rule_type = "Direct Effect" if events else "Failure"
+                print(f"  Learned {rule_type} Rule for {action_key} (seen {len(outcome_data['contexts'])} times).")
         # --- LANDMINE LOGIC END ---
 
     def _find_context_difference(self, context_A: dict, context_B: dict) -> dict:
