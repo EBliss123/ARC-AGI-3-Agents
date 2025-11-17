@@ -318,8 +318,8 @@ class ObmlAgi3Agent(Agent):
                     if 'id' in event and event['id'] in obj_events_map:
                         obj_events_map[event['id']].append(event)
 
-                learned_direct_effects = []
-                learned_failures = []
+                learned_direct_effects = {} # Store obj_id -> events_list
+                learned_failures = 0
                 learned_landmines = 0
 
                 # 3. Unified Learning Loop
@@ -332,11 +332,11 @@ class ObmlAgi3Agent(Agent):
                     hypothesis_key = (learning_key, obj_id)
                     
                     # Learn (Success OR Failure is handled uniformly inside this function)
-                    result_type = self._analyze_result(hypothesis_key, specific_events, prev_context)
+                    result_type, events_list = self._analyze_result(hypothesis_key, specific_events, prev_context)
                     if result_type == "Direct Effect":
-                        learned_direct_effects.append(hypothesis_key[1]) # Just store obj_id
+                        learned_direct_effects[hypothesis_key[1]] = events_list
                     elif result_type == "Failure":
-                        learned_failures.append(hypothesis_key[1])
+                        learned_failures += 1
                     elif result_type == "Landmine":
                         learned_landmines += 1
 
@@ -344,20 +344,32 @@ class ObmlAgi3Agent(Agent):
                 if self.debug_channels['HYPOTHESIS']:
                     print(f"\n--- Learning Summary for {learning_key} ---")
 
+                    # --- 1. Global Effects ---
                     if new_static_physics:
                         print(f"  [Global] Discovered {len(new_static_physics)} new *static* global effects.")
 
                     for pattern, (rule, count) in new_dynamic_physics.items():
                         print(f"  [Global] Refined *cross-action* rule for pattern {pattern} (seen {count} times).")
 
+                    # --- 2. Direct Effects ---
                     if learned_direct_effects:
-                        if len(learned_direct_effects) > 5:
-                            print(f"  [Direct] Learned {len(learned_direct_effects)} Direct Effect rules (e.g., for {learned_direct_effects[0]}).")
-                        else:
-                            print(f"  [Direct] Learned Direct Effect rules for: {', '.join(learned_direct_effects)}")
+                        print("  [Direct] Learned Direct Effect rules:")
+                        for obj_id, events_list in learned_direct_effects.items():
+                            # Format events for printing
+                            event_strs = []
+                            if not events_list:
+                                event_strs.append("NO_CHANGE")
+                            for e in events_list:
+                                e_type = e.get('type', 'Unknown')
+                                if e_type == 'MOVED': event_strs.append(f"MOVED{e.get('vector')}")
+                                elif e_type == 'RECOLORED': event_strs.append(f"RECOLORED(to {e.get('to_color')})")
+                                elif e_type == 'SHAPE_CHANGED': event_strs.append("SHAPE_CHANGED")
+                                else: event_strs.append(e_type)
+                            print(f"    - {obj_id}: Causes [{', '.join(event_strs)}]")
 
-                    if learned_failures:
-                        print(f"  [Failure] Learned {len(learned_failures)} Failure rules.")
+                    # --- 3. Failures ---
+                    if learned_failures > 0:
+                        print(f"  [Failure] Learned {learned_failures} Failure rules.")
 
                     if learned_landmines > 0:
                         print(f"  [Failure] Kept {learned_landmines} specific 'landmine' failures.")
@@ -365,7 +377,7 @@ class ObmlAgi3Agent(Agent):
                     if not (new_static_physics or new_dynamic_physics or learned_direct_effects or learned_failures or learned_landmines):
                         print("  (No new rules learned this turn.)")
                 # --- End Learning Summary ---
-                    
+                        
         # --- 3. Update Memory For Next Turn ---
         # This runs every frame, saving the state we just analyzed
         self.last_object_summary = current_summary
@@ -1101,7 +1113,7 @@ class ObmlAgi3Agent(Agent):
 
         return new_static_events_found, new_dynamic_rules_found
 
-    def _analyze_result(self, action_key: tuple, events: list[dict], full_context: dict) -> str:
+    def _analyze_result(self, action_key: tuple, events: list[dict], full_context: dict) -> tuple[str, list[dict]]:
         """
         Unified Learner.
         Updates the rule for the current outcome.
@@ -1180,14 +1192,13 @@ class ObmlAgi3Agent(Agent):
         # we reject the rule. We do not want to learn "Everything Fails".
         if not events and not candidate_rule:
              outcome_data['rule'] = None # No rule. Use raw contexts (Landmines).
-             if self.debug_channels['HYPOTHESIS']:
-                 print(f"  [Failure Analysis] Intersection is generic. Keeping {len(outcome_data['contexts'])} specific landmines instead of a rule.")
+             return "Landmine", []
         else:
              outcome_data['rule'] = candidate_rule
-             if self.debug_channels['HYPOTHESIS']:
-                lbl = "FAILURE" if not events else "SUCCESS"
-                rule_type = "Direct Effect" if events else "Failure"
-                print(f"  Learned {rule_type} Rule for {action_key} (seen {len(outcome_data['contexts'])} times).")
+             if not cleaned_event_tuples:
+                return "Failure", []
+             else:
+                return "Direct Effect", outcome_data['raw_events']
         # --- LANDMINE LOGIC END ---
 
     def _find_context_difference(self, context_A: dict, context_B: dict) -> dict:
