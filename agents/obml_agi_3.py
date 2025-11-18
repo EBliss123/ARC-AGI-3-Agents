@@ -37,6 +37,8 @@ class ObmlAgi3Agent(Agent):
         self.banned_action_keys = set()
         self.permanent_banned_actions = set()
         self.successful_click_actions = set()
+        self.concrete_event_counts = {}
+        self.phenomenal_event_counts = {}
 
         # --- Debug Channels ---
         # Set these to True or False to control the debug output.
@@ -72,6 +74,11 @@ class ObmlAgi3Agent(Agent):
         self.concrete_witness_registry = {}
         # Mapping: Abstract Signature -> Set of Action Names seen with it
         self.abstract_witness_registry = {}
+        # Mapping: Phenomenal Signature -> Set of Action Names seen with it
+        self.phenomenal_witness_registry = {}
+        # Count how many times a specific event has occurred total (Fix for KeyError)
+        self.concrete_event_counts = {}
+        self.phenomenal_event_counts = {}
 
         # Also reset the level state
         self._reset_level_state()
@@ -917,26 +924,28 @@ class ObmlAgi3Agent(Agent):
         """
         Classifies events into three categories:
         1. GLOBAL: Concrete Event seen with >1 Action Types.
-        2. AMBIGUOUS: Abstract Event seen with >1 Action Types OR insufficient history.
-        3. DIRECT: Concrete AND Abstract are Unique to this Action.
+        2. AMBIGUOUS: Abstract OR Phenomenal Event seen with >1 Action Types.
+        3. DIRECT: Unique to this Action AND seen repeatedly (Concrete OR Phenomenal consistency).
         """
         direct_events = []
         global_events = []
         ambiguous_events = []
         
-        # 1. Record that we have performed this action type
-        # CHANGE: Use the FULL key. Clicking 'obj_1' is a different experiment than 'obj_2'.
         base_action = current_action_key
         self.performed_action_types.add(base_action)
         
-        # We can only be "Sure" something is Direct if we have a control group 
         has_control_group = len(self.performed_action_types) > 1
 
         for event in current_events:
             conc_sig = self._get_concrete_signature(event)
             abst_sig = self._get_abstract_signature(event)
+            phen_sig = self._get_phenomenal_signature(event)
             
-            # Update Registries
+            # --- Update Counts ---
+            self.concrete_event_counts[conc_sig] = self.concrete_event_counts.get(conc_sig, 0) + 1
+            self.phenomenal_event_counts[phen_sig] = self.phenomenal_event_counts.get(phen_sig, 0) + 1 # <--- New Count
+            
+            # --- Update Registries ---
             if conc_sig not in self.concrete_witness_registry:
                 self.concrete_witness_registry[conc_sig] = set()
             self.concrete_witness_registry[conc_sig].add(base_action)
@@ -944,26 +953,46 @@ class ObmlAgi3Agent(Agent):
             if abst_sig not in self.abstract_witness_registry:
                 self.abstract_witness_registry[abst_sig] = set()
             self.abstract_witness_registry[abst_sig].add(base_action)
+
+            if phen_sig not in self.phenomenal_witness_registry:
+                self.phenomenal_witness_registry[phen_sig] = set()
+            self.phenomenal_witness_registry[phen_sig].add(base_action)
             
             # --- Classification Logic ---
             
-            # 1. Check Global (Exact Persistence: Same ID, Same Event, Different Action)
+            # 1. Check Global (Exact Persistence)
             if len(self.concrete_witness_registry[conc_sig]) > 1:
                 global_events.append(event)
                 continue
 
-            # 2. Check Ambiguous (Abstract Persistence: Different ID, Same Event, Different Action)
-            # If "Recolor to 3" happens in Action 1 and Action 2, it's likely a Global Rule affecting a sequence.
+            # 2. Check Ambiguous (Abstract Persistence)
             if len(self.abstract_witness_registry[abst_sig]) > 1:
                 ambiguous_events.append(event)
                 continue
 
-            # 3. Check Direct
+            # 3. Check Ambiguous (Phenomenal Persistence)
+            if len(self.phenomenal_witness_registry[phen_sig]) > 1:
+                ambiguous_events.append(event)
+                continue
+
+            # 4. Check Direct vs Ambiguous (Safety Net)
             if has_control_group:
-                # Unique to this action, and we have tried others to verify.
-                direct_events.append(event)
+                # We trust the event if:
+                # A) We have seen this EXACT change before (Concrete Count >= 2)
+                # OR
+                # B) We have seen this TYPE of change to this object before (Phenomenal Count >= 2)
+                #    (This covers cycles: Red->Blue->Green. Values change, but "Recoloring" persists).
+                
+                is_concrete_reliable = self.concrete_event_counts[conc_sig] >= 2
+                is_phenomenal_reliable = self.phenomenal_event_counts[phen_sig] >= 2
+                
+                if is_concrete_reliable or is_phenomenal_reliable:
+                    direct_events.append(event)
+                else:
+                    # It's the FIRST time we've ever touched this object in this way.
+                    # We wait one more turn to confirm it wasn't a coincidence.
+                    ambiguous_events.append(event)
             else:
-                # Unique so far, but we haven't tried any other buttons yet.
                 ambiguous_events.append(event)
                 
         return direct_events, global_events, ambiguous_events
@@ -2501,3 +2530,20 @@ class ObmlAgi3Agent(Agent):
                 for line in sorted(output_lines):
                     print(line)
                 print()
+
+
+    def _get_phenomenal_signature(self, event: dict):
+        """
+        Returns (Type, ID). Ignores the specific Value/Result.
+        Used to detect if a specific object is 'unstable' across different actions.
+        Example: Obj_27 shrinking (regardless of how much).
+        """
+        e_type = event['type']
+        obj_id = event.get('id')
+        
+        # For NEW events, the 'ID' is essentially the spawning phenomenon itself
+        if e_type == 'NEW':
+             # We treat ALL spawns as the same phenomenon for safety
+            return ('NEW', 'ANY')
+            
+        return (e_type, obj_id)
