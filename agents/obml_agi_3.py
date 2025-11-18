@@ -24,7 +24,7 @@ class ObmlAgi3Agent(Agent):
         self.is_new_level = True
         self.final_summary_before_level_change = None
         self.current_level_id_map = {}
-        self.last_action_context = None  # Stores the action we just took
+        self.last_action_context = None
         self.success_contexts = {}
         self.failure_contexts = {}
         self.failure_patterns = {}
@@ -38,17 +38,28 @@ class ObmlAgi3Agent(Agent):
         self.permanent_banned_actions = set()
         self.successful_click_actions = set()
 
+        # --- Global Rule Detection (Dual Fingerprint System) ---
+        self.unprocessed_turn_history = [] # Stores raw data until we learn
+        
+        # Trackers: Map Fingerprint -> Set of Action Keys that caused it
+        self.object_centric_tracker = {} 
+        self.event_centric_tracker = {}
+        
+        # Confirmed Rules: The "Filter" lists
+        self.confirmed_global_ocf = set() # Object-Centric
+        self.confirmed_global_ecf = set() # Event-Centric
+
         # --- Debug Channels ---
-        # Set these to True or False to control the debug output.
         self.debug_channels = {
-            'PERCEPTION': False,      # Object finding, relationships, new level setup
-            'CHANGES': True,         # All "Change Log" prints
-            'STATE_GRAPH': True,     # State understanding
-            'HYPOTHESIS': False,      # "Initial Hypotheses", "Refined Hypothesis"
-            'FAILURE': True,         # "Failure Analysis", "Failure Detected"
-            'WIN_CONDITION': True,   # "LEVEL CHANGE DETECTED", "Win Condition Analysis"
-            'ACTION_SCORE': True,    # All scoring prints
-            'CONTEXT_DETAILS': False # Keep or remove large prints
+            'PERCEPTION': False,
+            'CHANGES': True,
+            'STATE_GRAPH': True,
+            'HYPOTHESIS': True,     
+            'FAILURE': True,
+            'WIN_CONDITION': True,
+            'ACTION_SCORE': True,
+            'CONTEXT_DETAILS': False,
+            'GLOBAL_RULES': True     
         }
 
     def _reset_agent_memory(self):
@@ -86,7 +97,14 @@ class ObmlAgi3Agent(Agent):
         self.last_action_context = None
         self.level_state_history = []
         self.banned_action_keys = set()
-        self.actions_printed = False # This is per-level, not per-game
+        self.actions_printed = False
+
+        # --- Reset Global Rule Trackers ---
+        self.unprocessed_turn_history = []
+        self.object_centric_tracker = {}
+        self.event_centric_tracker = {}
+        self.confirmed_global_ocf = set()
+        self.confirmed_global_ecf = set()
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
@@ -220,24 +238,21 @@ class ObmlAgi3Agent(Agent):
             score_increased = current_score > self.last_score
             # --- End NEW ---
             
-            # This function compares old and new summaries, assigns persistent IDs,
-            # and returns a list of change strings.
+            # This function compares old and new summaries
             changes, current_summary = self._log_changes(prev_summary, current_summary)
 
-            # Now, analyze the new summary *after* persistent IDs are assigned
+            # Analyze new summary
             (current_relationships, current_adjacencies, current_diag_adjacencies, 
              current_match_groups, current_alignments, current_diag_alignments, 
              current_conjunctions) = self._analyze_relationships(current_summary)
 
-            # --- Check for score changes (win detection) ---
             if score_increased:
                 if self.debug_channels['WIN_CONDITION']:
-                    print(f"\n--- LEVEL CHANGE DETECTED (Score increased from {self.last_score} to {current_score}) ---")
-                # (Win analysis logic will go here)
-                self.is_new_level = True # Signal for the *next* frame
+                    print(f"\n--- LEVEL CHANGE DETECTED (Score: {self.last_score} -> {current_score}) ---")
+                self.is_new_level = True
             self.last_score = current_score
 
-            # --- Log all changes found ---
+            # --- Log changes ---
             if changes and self.debug_channels['CHANGES']:
                 print("--- Change Log ---")
                 for change in changes:
@@ -250,11 +265,13 @@ class ObmlAgi3Agent(Agent):
             self._log_alignment_changes(self.last_alignments, current_alignments, is_diagonal=False)
             self._log_alignment_changes(self.last_diag_alignments, current_diag_alignments, is_diagonal=True)
 
-            # --- Analyze the outcome of the previous action ---
+            # --- DELAYED LEARNING LOGIC START ---
             if self.last_action_context and self.last_object_summary:
-                learning_key = self.last_action_context 
-        
-                # This is the full context of the *previous* state
+                
+                # 1. Prepare the Data
+                current_events = self._parse_change_logs_to_events(changes)
+                
+                # Full context of the PREVIOUS state (when action was taken)
                 prev_context = {
                     'summary': prev_summary,
                     'rels': self.last_relationships,
@@ -265,56 +282,34 @@ class ObmlAgi3Agent(Agent):
                     'match': self.last_match_groups
                 }
 
-                # 1. Parse text changes back to structured event dicts
-                events = self._parse_change_logs_to_events(changes)
-                
-                # --- Failsafe: Track banned actions (NOW CHECKS SCORE) ---
-                action_succeeded = bool(events) or score_increased
+                # 2. Record Observation (Do NOT learn yet)
+                turn_data = {
+                    'action_key': self.last_action_context,
+                    'events': current_events,
+                    'context': prev_context,
+                    'score_increased': score_increased
+                }
+                self.unprocessed_turn_history.append(turn_data)
 
-                if not action_succeeded and self.last_action_context: # Last action was a total failure
+                # 3. Update Trackers & Check for Global Rules
+                self._update_global_trackers(self.last_action_context, current_events)
+
+                # 4. Check for Direct Rule Matches (Intersection Logic)
+                # This finds Direct rules, separates Global candidates, and triggers learning
+                self._process_delayed_learning()
+                
+                # --- Failsafe Logic (Preserved) ---
+                action_succeeded = bool(current_events) or score_increased
+                if not action_succeeded: 
                     self.banned_action_keys.add(self.last_action_context)
-                    if self.debug_channels['FAILURE']:
-                        print(f"--- Failsafe: Banning action '{self.last_action_context}' due to failure. Total banned: {len(self.banned_action_keys)} ---")
-                    
-                    # --- MODIFIED: Permanent Ban Logic ---
-                    if (self.last_action_context.startswith('ACTION6_') and
+                    if (self.last_action_context.startswith('ACTION6_') and 
                         self.last_action_context not in self.successful_click_actions):
                         self.permanent_banned_actions.add(self.last_action_context)
-                        if self.debug_channels['FAILURE']:
-                            print(f"--- Failsafe: Permanently banning '{self.last_action_context}' (never succeeded). Total permanent: {len(self.permanent_banned_actions)} ---")
-                    # --- End MODIFIED ---
-                
-                elif action_succeeded: # Last action had *some* success
-                    if self.banned_action_keys:
-                        if self.debug_channels['FAILURE']:
-                            print(f"--- Failsafe: Success detected. Clearing {len(self.banned_action_keys)} banned actions. ---")
-                        self.banned_action_keys.clear() # Clear ban
-                    
-                    # --- NEW: Track Successful Clicks ---
-                    if self.last_action_context and self.last_action_context.startswith('ACTION6_'):
+                elif action_succeeded:
+                    if self.banned_action_keys: self.banned_action_keys.clear()
+                    if self.last_action_context.startswith('ACTION6_'):
                         self.successful_click_actions.add(self.last_action_context)
-                    # --- End NEW ---
-                # --- End Failsafe ---
-
-                # 2. Map events to specific objects
-                # Initialize empty lists for all objects; if no event occurred, it stays empty (= Failure/No Change)
-                obj_events_map = {obj['id']: [] for obj in self.last_object_summary}
-                
-                for event in events:
-                    if 'id' in event and event['id'] in obj_events_map:
-                        obj_events_map[event['id']].append(event)
-
-                # 3. Unified Learning Loop
-                # We process EVERY object from the previous frame.
-                for obj in self.last_object_summary:
-                    obj_id = obj['id']
-                    specific_events = obj_events_map[obj_id]
-                    
-                    # Key: (ActionName, TargetID)
-                    hypothesis_key = (learning_key, obj_id)
-                    
-                    # Learn (Success OR Failure is handled uniformly inside this function)
-                    self._analyze_result(hypothesis_key, specific_events, prev_context)
+            # --- DELAYED LEARNING LOGIC END ---
                     
         # --- 3. Update Memory For Next Turn ---
         # This runs every frame, saving the state we just analyzed
@@ -2354,3 +2349,162 @@ class ObmlAgi3Agent(Agent):
                 for line in sorted(output_lines):
                     print(line)
                 print()
+
+    def _get_dual_fingerprints(self, event: dict) -> tuple[str, str]:
+        """
+        Generates both Object-Centric (OCF) and Event-Centric (ECF) fingerprints.
+        Returns: (OCF, ECF)
+        """
+        # Create the core event signature (Type + Params, NO ID)
+        event_copy = event.copy()
+        obj_id = event_copy.pop('id', None)
+        
+        # Sort keys for stability
+        event_signature = tuple(sorted(event_copy.items()))
+        
+        ecf = str(event_signature) # Event-Centric
+        ocf = str((obj_id, event_signature)) # Object-Centric
+        
+        return ocf, ecf
+
+    def _update_global_trackers(self, action_key: str, events: list[dict]):
+        """
+        Updates the 'lab notebook' with observations from this turn.
+        Checks if any event is proven Global by appearing across different actions.
+        """
+        # If no events happened, there's nothing to track
+        if not events: return
+
+        for event in events:
+            ocf, ecf = self._get_dual_fingerprints(event)
+            
+            # 1. Update Trackers
+            self.object_centric_tracker.setdefault(ocf, set()).add(action_key)
+            self.event_centric_tracker.setdefault(ecf, set()).add(action_key)
+
+            # 2. Check for Global "Fit" (Cross-Action Confirmation)
+            # Does this specific event happen with at least 2 DIFFERENT actions?
+            
+            # Check Object-Centric Global Rule (Specific Object always does X)
+            if ocf not in self.confirmed_global_ocf:
+                if len(self.object_centric_tracker[ocf]) >= 2:
+                    if self.debug_channels['GLOBAL_RULES']:
+                        print(f"  [GLOBAL RULE] Confirmed Object-Centric Rule: {ocf}")
+                        print(f"    (Seen with actions: {self.object_centric_tracker[ocf]})")
+                    self.confirmed_global_ocf.add(ocf)
+
+            # Check Event-Centric Global Rule (ANY object always does X)
+            if ecf not in self.confirmed_global_ecf:
+                if len(self.event_centric_tracker[ecf]) >= 2:
+                    # Ensure it's not just the same object triggering it
+                    # We need to verify this event type happened to different objects or contexts
+                    # But for now, the action-independence is the strongest signal.
+                    if self.debug_channels['GLOBAL_RULES']:
+                        print(f"  [GLOBAL RULE] Confirmed Event-Centric Rule: {ecf}")
+                        print(f"    (Seen with actions: {self.event_centric_tracker[ecf]})")
+                    self.confirmed_global_ecf.add(ecf)
+
+    def _process_delayed_learning(self):
+        """
+        The Core Brain.
+        1. Groups history by Action.
+        2. Separates Successes (Events) from Failures (No Events).
+        3. Finds Direct Rules via Intersection ONLY on Successes.
+        4. Commits Failures immediately (as Landmines).
+        5. Commits Successes only if enough data exists to prove a rule.
+        """
+        # Group unprocessed turns by action
+        turns_by_action = {}
+        for i, turn in enumerate(self.unprocessed_turn_history):
+            turns_by_action.setdefault(turn['action_key'], []).append(i)
+
+        indices_to_learn = set()
+
+        for action_key, turn_indices in turns_by_action.items():
+            # 1. Split into Successes (events happened) and Failures (nothing happened)
+            success_indices = [i for i in turn_indices if self.unprocessed_turn_history[i]['events']]
+            failure_indices = [i for i in turn_indices if not self.unprocessed_turn_history[i]['events']]
+
+            # 2. Always process Failures immediately (we don't need intersection to know nothing happened)
+            indices_to_learn.update(failure_indices)
+
+            # 3. Check if we have enough POSITIVE data to find a Direct Rule
+            if len(success_indices) < 2:
+                continue # Not enough evidence yet, keep these successes pending
+
+            # --- Step 1: Find Intersection (The Direct Rule) on SUCCESSES ONLY ---
+            # We look for OCFs that appear in EVERY successful turn for this action
+            common_ocfs = None
+            
+            for idx in success_indices:
+                turn = self.unprocessed_turn_history[idx]
+                turn_ocfs = set()
+                for event in turn['events']:
+                    ocf, _ = self._get_dual_fingerprints(event)
+                    turn_ocfs.add(ocf)
+                
+                if common_ocfs is None:
+                    common_ocfs = turn_ocfs
+                else:
+                    common_ocfs = common_ocfs.intersection(turn_ocfs)
+            
+            # --- DEBUG LOG ---
+            if common_ocfs and self.debug_channels['HYPOTHESIS']:
+                print(f"  [DIRECT RULE] Confirmed Direct Rule for {action_key}:")
+                for ocf in common_ocfs:
+                    print(f"    - {ocf}")
+            elif common_ocfs is not None and not common_ocfs and self.debug_channels['HYPOTHESIS']:
+                 print(f"  [DIRECT RULE] No intersection found for {action_key} (Variable outcome or all Global).")
+
+            # --- Step 2: Commit Successes ---
+            indices_to_learn.update(success_indices)
+            
+            # We now learn the Direct Rule using ONLY the intersected events.
+            # Note: We process the successes separately from failures here to apply the filter.
+            for idx in success_indices:
+                turn = self.unprocessed_turn_history[idx]
+                
+                direct_events_to_learn = []
+                for event in turn['events']:
+                    ocf, ecf = self._get_dual_fingerprints(event)
+                    
+                    # CRITICAL FILTER:
+                    # We only learn it if it is part of the PROVEN intersection (Direct)
+                    # AND it is not a known Global Rule (Safety check)
+                    
+                    is_global = (ocf in self.confirmed_global_ocf or ecf in self.confirmed_global_ecf)
+                    
+                    if common_ocfs and ocf in common_ocfs and not is_global:
+                        direct_events_to_learn.append(event)
+                
+                # Map events to objects for the learner
+                obj_events_map = {obj['id']: [] for obj in turn['context']['summary']}
+                for event in direct_events_to_learn:
+                    if 'id' in event and event['id'] in obj_events_map:
+                        obj_events_map[event['id']].append(event)
+                
+                # Send to _analyze_result
+                for obj in turn['context']['summary']:
+                    obj_id = obj['id']
+                    specific_events = obj_events_map[obj_id]
+                    hypothesis_key = (action_key, obj_id)
+                    self._analyze_result(hypothesis_key, specific_events, turn['context'])
+
+        # --- Step 3: Cleanup & Process Failures ---
+        # We remove everything we marked (Successes + Failures)
+        # But first, we must make sure to actually CALL _analyze_result for the failures we marked
+        for idx in sorted(list(indices_to_learn), reverse=True):
+            turn = self.unprocessed_turn_history[idx]
+            
+            # If it was a failure (no events), we haven't processed it yet in the loop above
+            if not turn['events']:
+                # Learn the Failure (Empty events)
+                # For failures, we send the update to ALL objects in the context
+                # to establish Landmines for them.
+                for obj in turn['context']['summary']:
+                    obj_id = obj['id']
+                    hypothesis_key = (turn['action_key'], obj_id)
+                    self._analyze_result(hypothesis_key, [], turn['context'])
+            
+            # Remove from history
+            self.unprocessed_turn_history.pop(idx)
