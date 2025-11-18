@@ -923,9 +923,9 @@ class ObmlAgi3Agent(Agent):
     def _classify_event_stream(self, current_events: list[dict], current_action_key: str) -> tuple[list[dict], list[dict], list[dict]]:
         """
         Classifies events into three categories:
-        1. GLOBAL: Concrete Event seen with >1 Action Types.
-        2. AMBIGUOUS: Abstract OR Phenomenal Event seen with >1 Action Types.
-        3. DIRECT: Unique to this Action AND seen repeatedly (Concrete OR Phenomenal consistency).
+        1. GLOBAL: Concrete Event seen with > 2 Action Types (Strict Environment).
+        2. DIRECT: Unique to this Action AND seen repeatedly (Concrete Reliability).
+        3. AMBIGUOUS: Everything else (New events, Phenomenal overlaps, Abstract patterns).
         """
         direct_events = []
         global_events = []
@@ -943,7 +943,7 @@ class ObmlAgi3Agent(Agent):
             
             # --- Update Counts ---
             self.concrete_event_counts[conc_sig] = self.concrete_event_counts.get(conc_sig, 0) + 1
-            self.phenomenal_event_counts[phen_sig] = self.phenomenal_event_counts.get(phen_sig, 0) + 1 # <--- New Count
+            self.phenomenal_event_counts[phen_sig] = self.phenomenal_event_counts.get(phen_sig, 0) + 1
             
             # --- Update Registries ---
             if conc_sig not in self.concrete_witness_registry:
@@ -960,43 +960,53 @@ class ObmlAgi3Agent(Agent):
             
             # --- Classification Logic ---
             
-            # 1. Check Global (Exact Persistence)
-            if len(self.concrete_witness_registry[conc_sig]) > 1:
+            num_concrete_witnesses = len(self.concrete_witness_registry[conc_sig])
+
+            # 1. Check Global (High Threshold Persistence)
+            # We only filter as Global if we are very sure (seen in > 2 different actions).
+            # If seen in only 2 (e.g. Left and Right keys), it might be a convergent result.
+            if num_concrete_witnesses > 2:
                 global_events.append(event)
                 continue
-
-            # 2. Check Ambiguous (Abstract Persistence)
-            if len(self.abstract_witness_registry[abst_sig]) > 1:
-                ambiguous_events.append(event)
-                continue
-
-            # 3. Check Ambiguous (Phenomenal Persistence)
-            if len(self.phenomenal_witness_registry[phen_sig]) > 1:
-                ambiguous_events.append(event)
-                continue
-
-            # 4. Check Direct vs Ambiguous (Safety Net)
+            
+            # --- 2. Check Direct Reliability (The Fix) ---
+            # If we have seen this EXACT event multiple times with this action, trust it.
+            # This overrides the "Phenomenal Ambiguity" check below.
             if has_control_group:
-                # We trust the event if:
-                # A) We have seen this EXACT change before (Concrete Count >= 2)
-                # OR
-                # B) We have seen this TYPE of change to this object before (Phenomenal Count >= 2)
-                #    (This covers cycles: Red->Blue->Green. Values change, but "Recoloring" persists).
-                
                 is_concrete_reliable = self.concrete_event_counts[conc_sig] >= 2
+                
+                if is_concrete_reliable:
+                    # We have seen (MOVED, Left) twice with Action 1.
+                    # Since it passed the Global check (didn't happen in >2 actions),
+                    # we assume it is caused by Action 1.
+                    direct_events.append(event)
+                    continue
+
+            # 3. Check Ambiguous (Phenomenal/Abstract Overlap)
+            # If we are here, the event is NOT reliably Direct yet.
+            # If it shares a pattern with other actions, mark Ambiguous.
+            if (num_concrete_witnesses > 1 or 
+                len(self.abstract_witness_registry[abst_sig]) > 1 or 
+                len(self.phenomenal_witness_registry[phen_sig]) > 1):
+                ambiguous_events.append(event)
+                continue
+
+            # 4. Check Direct vs Ambiguous (Safety Net for New Events)
+            if has_control_group:
+                # Concrete Reliability failed above, but maybe Phenomenal Reliability holds?
+                # (e.g. Color Cycle: Red->Blue. Values change, but "Recolor" is consistent).
                 is_phenomenal_reliable = self.phenomenal_event_counts[phen_sig] >= 2
                 
-                if is_concrete_reliable or is_phenomenal_reliable:
+                if is_phenomenal_reliable:
                     direct_events.append(event)
                 else:
-                    # It's the FIRST time we've ever touched this object in this way.
-                    # We wait one more turn to confirm it wasn't a coincidence.
+                    # First time seeing this. Wait.
                     ambiguous_events.append(event)
             else:
                 ambiguous_events.append(event)
                 
         return direct_events, global_events, ambiguous_events
-
+    
     def _analyze_result(self, action_key: tuple, events: list[dict], full_context: dict):
         """
         Unified Learner.

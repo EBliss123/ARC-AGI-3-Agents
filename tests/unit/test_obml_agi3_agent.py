@@ -175,7 +175,7 @@ class TestObmlAgi3AgentLearning:
         _ = agent.choose_action([frame], frame)
         # After choosing, seen_outcomes should be a set (possibly empty)
         assert isinstance(agent.seen_outcomes, set)
-dict_outcome
+
     def test_get_learning_key_click_target_specific(self):
         agent = make_agent()
         # direct method check to ensure ACTION6 with target id is specific
@@ -214,3 +214,71 @@ dict_outcome
         assert agent._context_matches_pattern_single(context, {
             "adj": {"obj_1": ["na", "obj_3", "na", "na"]}
         }) is False
++
++
++@pytest.mark.unit
++class TestObmlAgi3AdditionalBehaviors:
++    def _stub_noop(self, agent, objects):
++        agent._perceive_objects = lambda latest_frame: objects
++        agent._analyze_relationships = lambda summary: ({}, {}, {}, {}, {}, {}, {})
++        agent._log_changes = lambda prev_summary, curr_summary: ([], curr_summary)
++
++    def test_get_stable_id_invariant(self):
++        agent = make_agent()
++        obj = {"fingerprint": 123, "color": 4, "size": (2, 3), "pixels": 6}
++        sid1 = agent._get_stable_id(obj)
++        sid2 = agent._get_stable_id(dict(obj))
++        assert sid1 == sid2 == (123, 4, (2, 3), 6)
++
++    def test_get_learning_key_action6_target_specificity(self):
++        agent = make_agent()
++        assert agent._get_learning_key("ACTION6", "obj_1") == "ACTION6_obj_1"
++        assert agent._get_learning_key("ACTION6", None) == "ACTION6"
++        assert agent._get_learning_key("ACTION1", None) == "ACTION1"
++
++    def test_permanent_ban_applies_only_to_action6(self):
++        agent = make_agent()
++        # Silence and prepare
++        for k in agent.debug_channels: agent.debug_channels[k] = False
++
++        # First frame to initialize state
++        frame = make_frame(state=GameState.NOT_FINISHED, actions=[GameAction.ACTION6, GameAction.ACTION1])
++        objects = [{"position": (0,0), "id": "obj_1", "color": 1, "size": (1,1), "fingerprint": 1, "pixels": 1, "pixel_coords": frozenset()}]
++        self._stub_noop(agent, objects)
++        _ = agent.choose_action([frame], frame)
++
++        # Simulate last action context as an unsuccessful ACTION6 click on obj_1
++        agent.last_action_context = agent._get_learning_key("ACTION6", "obj_1")
++        # Next tick: still no changes -> failure -> should permanently ban that click
++        _ = agent.choose_action([frame], frame)
++        assert any(key.startswith("ACTION6_") for key in agent.permanent_banned_actions)
++
++    def test_banned_action_keys_cleared_on_success(self):
++        agent = make_agent()
++        frame = make_frame(state=GameState.NOT_FINISHED, actions=[GameAction.ACTION6, GameAction.ACTION1])
++
++        # First call to set last_action_context
++        objects0 = [{"position": (0,0), "id": "obj_1", "color": 1, "size": (1,1), "fingerprint": 9, "pixels": 1, "pixel_coords": frozenset()}]
++        self._stub_noop(agent, objects0)
++        _ = agent.choose_action([frame], frame)
++        # Simulate a previous failure ban
++        agent.banned_action_keys.add(agent.last_action_context)
++
++        # Next frame: produce a direct event (e.g., MOVED) to be considered success
++        objects1 = [{"position": (0,1), "id": "obj_1", "color": 1, "size": (1,1), "fingerprint": 9, "pixels": 1, "pixel_coords": frozenset()}]
++        agent._perceive_objects = lambda latest_frame: objects1
++        agent._analyze_relationships = lambda summary: ({}, {}, {}, {}, {}, {}, {})
++        agent._log_changes = lambda prev_summary, curr_summary: (["- MOVED: Object id_1 moved from (0, 0) to (0, 1)."], objects1)
++
++        _ = agent.choose_action([frame], frame)
++        assert len(agent.banned_action_keys) == 0
++
++    def test_parse_change_logs_new_and_removed(self):
++        agent = make_agent()
++        logs = [
++            "- NEW: Object id_2 (ID (123, 5, (1, 1), 1)) appeared at (2, 3).",
++            "- REMOVED: Object id_2 (ID (123, 5, (1, 1), 1)) removed at (2, 3).",
++        ]
++        events = agent._parse_change_logs_to_events(logs)
++        types = [e["type"] for e in events]
++        assert "NEW" in types and "REMOVED" in types
