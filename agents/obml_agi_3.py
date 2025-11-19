@@ -286,9 +286,20 @@ class ObmlAgi3Agent(Agent):
                 events = self._parse_change_logs_to_events(changes)
 
                 # --- NEW: Classify Events (Tri-State) ---
-                # We now get three lists. We ONLY learn from 'direct_events'.
                 direct_events, global_events, ambiguous_events = self._classify_event_stream(events, learning_key)
                 
+                # --- NEW: Reactive Analysis ---
+                # Check if ambiguous events are actually interaction results
+                if ambiguous_events:
+                    self._analyze_reactive_triggers(
+                        ambiguous_events, 
+                        events, 
+                        current_summary, 
+                        prev_summary, 
+                        current_adjacencies, 
+                        self.last_adjacencies
+                    )
+
                 # --- DETAILED PRINTING START ---
                 if self.debug_channels['CHANGES']:
                     if global_events: 
@@ -1994,6 +2005,34 @@ class ObmlAgi3Agent(Agent):
         # --- 5. Return All Results ---
         return relationships, adjacency_map, diag_adjacency_map, match_groups, alignments, diag_alignments, conjunctions
     
+    def _detect_pixel_overlaps(self, active_obj: dict, previous_summary: list[dict]) -> list[str]:
+        """
+        Checks if 'active_obj' (from current frame) intersects with any object 
+        from the PREVIOUS frame (excluding itself).
+        
+        Used to detect 'Virtual Interactions' where one object moves on top of another,
+        causing the bottom object to disappear (occlusion or consumption).
+        
+        Returns: List of object IDs from the PREVIOUS frame that are being overlapped.
+        """
+        overlapped_ids = []
+        
+        # The set of absolute (row, col) coordinates for the active object
+        current_pixels = active_obj['pixel_coords']
+        
+        for prev_obj in previous_summary:
+            # 1. Skip the object itself 
+            # (We don't care that the Player overlaps the Player's old position)
+            if prev_obj['id'] == active_obj['id']:
+                continue
+            
+            # 2. Check for intersection
+            # We use isdisjoint() for efficiency. If sets are NOT disjoint, they overlap.
+            if not current_pixels.isdisjoint(prev_obj['pixel_coords']):
+                overlapped_ids.append(prev_obj['id'])
+                
+        return overlapped_ids
+
     def _log_changes(self, old_summary: list[dict], new_summary: list[dict], assign_new_ids=True) -> tuple[list[str], list[dict]]:
         """Compares summaries by identifying in-place changes, moves, and new/removed objects."""
         if not old_summary and not new_summary:
@@ -2562,3 +2601,72 @@ class ObmlAgi3Agent(Agent):
             return ('NEW', 'ANY')
             
         return (e_type, obj_id)
+    
+    def _analyze_reactive_triggers(self, ambiguous_events: list[dict], current_events: list[dict], 
+                                   current_summary: list[dict], prev_summary: list[dict],
+                                   current_adj: dict, prev_adj: dict):
+        """
+        Analyzes 'Ambiguous' events to see if they were triggered by specific
+        interactions (Overlap or Adjacency Changes), rather than being random Global events.
+        """
+        if not ambiguous_events:
+            return
+
+        # 1. Identify "Agitators" (Objects that moved this turn)
+        # We need their CURRENT state to check where they are standing now.
+        mover_ids = {e['id'] for e in current_events if e['type'] == 'MOVED'}
+        movers = [obj for obj in current_summary if obj['id'] in mover_ids]
+
+        for event in ambiguous_events:
+            victim_id = event.get('id')
+            if not victim_id: continue
+
+            # --- TRIGGER CHECK 1: OVERLAP (The "Bulldozer" Logic) ---
+            # Did a moving object step on the victim?
+            
+            # Case A: The Victim was REMOVED. 
+            # We check if any Mover is currently standing where the Victim WAS.
+            if event['type'] == 'REMOVED':
+                for mover in movers:
+                    # We use the helper we just added
+                    overlapped_ids = self._detect_pixel_overlaps(mover, prev_summary)
+                    
+                    if victim_id in overlapped_ids:
+                        if self.debug_channels['HYPOTHESIS']:
+                            print(f"  [Reactive Analysis] EXPLAINED: {victim_id} was REMOVED because {mover['id']} overlapped it.")
+                        # TODO: Store this rule: IF Overlap(Target) -> REMOVE(Target)
+                        return # Found the cause, move to next event
+
+            # Case B: The Victim CHANGED (Color/Shape).
+            # Did the Victim move onto something? (It is the Mover)
+            if victim_id in mover_ids:
+                # The victim itself moved. Did it step on something?
+                actor = next((obj for obj in current_summary if obj['id'] == victim_id), None)
+                if actor:
+                    overlapped_ids = self._detect_pixel_overlaps(actor, prev_summary)
+                    if overlapped_ids:
+                        if self.debug_channels['HYPOTHESIS']:
+                            # We grab the first overlapped object as the likely cause
+                            trigger_obj = overlapped_ids[0] 
+                            print(f"  [Reactive Analysis] EXPLAINED: {victim_id} {event['type']} because it overlapped {trigger_obj}.")
+                        return
+
+            # --- TRIGGER CHECK 2: ADJACENCY (The "Electric Fence" Logic) ---
+            # Did the object touch something NEW this turn?
+            
+            curr_contacts = set(current_adj.get(victim_id, []))
+            prev_contacts = set(prev_adj.get(victim_id, []))
+            
+            # Filter out 'na'
+            curr_contacts.discard('na')
+            prev_contacts.discard('na')
+            
+            new_contacts = curr_contacts - prev_contacts
+            
+            if new_contacts:
+                # We found a new interaction!
+                trigger_obj = list(new_contacts)[0] # Just grab one for now
+                if self.debug_channels['HYPOTHESIS']:
+                    print(f"  [Reactive Analysis] EXPLAINED: {victim_id} {event['type']} because it touched {trigger_obj}.")
+                # TODO: Store this rule: IF Touch(Trigger) -> Event(Actor)
+                return
