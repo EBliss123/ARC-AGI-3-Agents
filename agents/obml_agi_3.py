@@ -39,6 +39,7 @@ class ObmlAgi3Agent(Agent):
         self.successful_click_actions = set()
         self.concrete_event_counts = {}
         self.phenomenal_event_counts = {}
+        self.action_consistency_counts = {}
 
         # --- Debug Channels ---
         # Set these to True or False to control the debug output.
@@ -79,6 +80,8 @@ class ObmlAgi3Agent(Agent):
         # Count how many times a specific event has occurred total (Fix for KeyError)
         self.concrete_event_counts = {}
         self.phenomenal_event_counts = {}
+        self.action_consistency_counts = {} 
+        self.performed_action_types = set()
 
         # Also reset the level state
         self._reset_level_state()
@@ -923,9 +926,9 @@ class ObmlAgi3Agent(Agent):
     def _classify_event_stream(self, current_events: list[dict], current_action_key: str) -> tuple[list[dict], list[dict], list[dict]]:
         """
         Classifies events into three categories:
-        1. GLOBAL: Concrete Event seen with > 2 Action Types (Strict Environment).
-        2. DIRECT: Unique to this Action AND seen repeatedly (Concrete Reliability).
-        3. AMBIGUOUS: Everything else (New events, Phenomenal overlaps, Abstract patterns).
+        1. GLOBAL: Concrete Event seen with > 2 Action Types.
+        2. DIRECT: Unique to this Action AND seen repeatedly (Action-Specific Consistency).
+        3. AMBIGUOUS: Everything else.
         """
         direct_events = []
         global_events = []
@@ -941,9 +944,17 @@ class ObmlAgi3Agent(Agent):
             abst_sig = self._get_abstract_signature(event)
             phen_sig = self._get_phenomenal_signature(event)
             
-            # --- Update Counts ---
+            # --- Update Global Counts ---
             self.concrete_event_counts[conc_sig] = self.concrete_event_counts.get(conc_sig, 0) + 1
             self.phenomenal_event_counts[phen_sig] = self.phenomenal_event_counts.get(phen_sig, 0) + 1
+
+            # --- Update Action-Specific Consistency Counts (The Fix) ---
+            # We track: (ActionName, Signature) -> Count
+            act_conc_key = (base_action, conc_sig)
+            act_phen_key = (base_action, phen_sig)
+            
+            self.action_consistency_counts[act_conc_key] = self.action_consistency_counts.get(act_conc_key, 0) + 1
+            self.action_consistency_counts[act_phen_key] = self.action_consistency_counts.get(act_phen_key, 0) + 1
             
             # --- Update Registries ---
             if conc_sig not in self.concrete_witness_registry:
@@ -963,44 +974,38 @@ class ObmlAgi3Agent(Agent):
             num_concrete_witnesses = len(self.concrete_witness_registry[conc_sig])
 
             # 1. Check Global (High Threshold Persistence)
-            # We only filter as Global if we are very sure (seen in > 2 different actions).
-            # If seen in only 2 (e.g. Left and Right keys), it might be a convergent result.
             if num_concrete_witnesses > 2:
                 global_events.append(event)
                 continue
             
-            # --- 2. Check Direct Reliability (The Fix) ---
-            # If we have seen this EXACT event multiple times with this action, trust it.
-            # This overrides the "Phenomenal Ambiguity" check below.
+            # --- 2. Check Direct Reliability (Action-Specific) ---
             if has_control_group:
-                is_concrete_reliable = self.concrete_event_counts[conc_sig] >= 2
+                # We check if THIS action has caused THIS event at least twice.
+                is_concrete_reliable = self.action_consistency_counts[act_conc_key] >= 2
                 
                 if is_concrete_reliable:
-                    # We have seen (MOVED, Left) twice with Action 1.
-                    # Since it passed the Global check (didn't happen in >2 actions),
-                    # we assume it is caused by Action 1.
+                    # Consistent repetition with no contradictions -> Direct
                     direct_events.append(event)
                     continue
 
             # 3. Check Ambiguous (Phenomenal/Abstract Overlap)
-            # If we are here, the event is NOT reliably Direct yet.
-            # If it shares a pattern with other actions, mark Ambiguous.
             if (num_concrete_witnesses > 1 or 
                 len(self.abstract_witness_registry[abst_sig]) > 1 or 
                 len(self.phenomenal_witness_registry[phen_sig]) > 1):
                 ambiguous_events.append(event)
                 continue
 
-            # 4. Check Direct vs Ambiguous (Safety Net for New Events)
+            # 4. Check Direct vs Ambiguous (Phenomenal Fallback)
             if has_control_group:
-                # Concrete Reliability failed above, but maybe Phenomenal Reliability holds?
-                # (e.g. Color Cycle: Red->Blue. Values change, but "Recolor" is consistent).
-                is_phenomenal_reliable = self.phenomenal_event_counts[phen_sig] >= 2
+                # Concrete isn't reliable yet (count < 2).
+                # Check if Phenomenal is reliable (e.g. Color Cycle).
+                # MUST be reliable for THIS action specifically.
+                is_phenomenal_reliable = self.action_consistency_counts[act_phen_key] >= 2
                 
                 if is_phenomenal_reliable:
                     direct_events.append(event)
                 else:
-                    # First time seeing this. Wait.
+                    # First time seeing this result for this action. Wait.
                     ambiguous_events.append(event)
             else:
                 ambiguous_events.append(event)
