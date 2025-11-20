@@ -37,9 +37,17 @@ class ObmlAgi3Agent(Agent):
         self.banned_action_keys = set()
         self.permanent_banned_actions = set()
         self.successful_click_actions = set()
+        # --- NEW: CLASSIFICATION MEMORY ---
+        self.concrete_witness_registry = {}
+        self.abstract_witness_registry = {}
+        self.phenomenal_witness_registry = {}
+        
         self.concrete_event_counts = {}
         self.phenomenal_event_counts = {}
-        self.action_consistency_counts = {}
+        
+        self.action_consistency_counts = {} 
+        self.performed_action_types = set()
+        self.productive_action_types = set() # Tracks actions that caused change
 
         # --- Debug Channels ---
         # Set these to True or False to control the debug output.
@@ -285,39 +293,88 @@ class ObmlAgi3Agent(Agent):
                 # 1. Parse text changes back to structured event dicts
                 events = self._parse_change_logs_to_events(changes)
 
-                # --- NEW: Classify Events (Tri-State) ---
+                # 2. Classify Events (Strict Logic)
                 direct_events, global_events, ambiguous_events = self._classify_event_stream(events, learning_key)
                 
-                # --- NEW: Reactive Analysis ---
-                # Check if ambiguous events are actually interaction results
-                if ambiguous_events:
-                    self._analyze_reactive_triggers(
-                        ambiguous_events, 
-                        events, 
-                        current_summary, 
-                        prev_summary, 
-                        current_adjacencies, 
-                        self.last_adjacencies
-                    )
+                # 3. Resolve Ambiguity (The Pipeline)
+                promoted_events = self._resolve_ambiguous_events(
+                    ambiguous_events, events, current_summary, prev_summary, 
+                    current_adjacencies, self.last_adjacencies, learning_key
+                )
+                
+                # Merge promoted events into Direct for learning
+                direct_events.extend(promoted_events)
+                ambiguous_events = [e for e in ambiguous_events if e not in promoted_events]
 
-                # --- DETAILED PRINTING START ---
+                # 4. Map events to specific objects for DIRECT learning
+                obj_events_map = {obj['id']: [] for obj in self.last_object_summary}
+                for event in direct_events:
+                    if 'id' in event and event['id'] in obj_events_map:
+                        obj_events_map[event['id']].append(event)
+
+                # 5. Unified Learning Loop (RUN BEFORE PRINTING)
+                
+                # A. Learn Direct Rules (Action -> Result)
+                for obj in self.last_object_summary:
+                    obj_id = obj['id']
+                    specific_events = obj_events_map[obj_id]
+                    hypothesis_key = (learning_key, obj_id)
+                    self._analyze_result(hypothesis_key, specific_events, prev_context)
+                
+                # B. Learn Global Rules (Environment -> Result)
+                for event in global_events:
+                    abst_sig = self._get_abstract_signature(event)
+                    global_key = ('GLOBAL', str(abst_sig)) 
+                    self._analyze_result(global_key, [event], prev_context)
+
+                # --- DETAILED PRINTING (Now uses updated brain) ---
                 if self.debug_channels['CHANGES']:
-                    if global_events: 
-                        print(f"  -> Filtered {len(global_events)} Global events (Environment):")
-                        for e in global_events:
-                            print(f"     * {e['type']} on {e.get('id', 'Unknown')}")
                     
-                    if ambiguous_events:
-                        print(f"  -> Ignored {len(ambiguous_events)} Ambiguous events (insufficient data):")
-                        for e in ambiguous_events:
+                    def _fmt_val(e):
+                        if 'vector' in e: return f"Move {e['vector']}"
+                        if 'to_color' in e: return f"Recolor to {e['to_color']}"
+                        if 'pixel_delta' in e: return f"Size {'+' if e['pixel_delta']>0 else ''}{e['pixel_delta']}"
+                        if 'to_fingerprint' in e: return f"Shape {e['to_fingerprint']}"
+                        if 'type' in e and e['type'] == 'NEW': return f"Spawn ({e.get('color')}, {e.get('size')})"
+                        return e['type']
+
+                    if global_events: 
+                        print(f"  -> Filtered {len(global_events)} Global events:")
+                        for e in global_events:
+                            abst_sig = self._get_abstract_signature(e)
+                            # Call with single tuple key
+                            global_key = ('GLOBAL', str(abst_sig))
+                            rule_str = self._format_rule_description(global_key)
+                            
                             print(f"     * {e['type']} on {e.get('id', 'Unknown')}")
+                            print(f"       [Explanation] Global Rule: Inevitable '{_fmt_val(e)}'.")
+                            print(f"       [Prediction]  {rule_str}")
 
                     if direct_events: 
-                        print(f"  -> Processing {len(direct_events)} Direct events (Causality Confirmed):")
+                        print(f"  -> Processing {len(direct_events)} Direct events:")
                         for e in direct_events:
+                            conc_sig = self._get_concrete_signature(e)
+                            act_conc_key = (learning_key, conc_sig)
+                            c_count = self.action_consistency_counts.get(act_conc_key, 0)
+                            
+                            # Call with single tuple key
+                            direct_key = (learning_key, e.get('id'))
+                            rule_str = self._format_rule_description(direct_key)
+                            
+                            reason = f"Action consistently causes '{_fmt_val(e)}'"
+                            if c_count < 2:
+                                reason = f"Cycle/Variable Result '{e['type']}' (State ruled out). Observed: {_fmt_val(e)}"
+                                
                             print(f"     * {e['type']} on {e.get('id', 'Unknown')}")
-                # --- DETAILED PRINTING END ---
+                            print(f"       [Explanation] Direct Causality: {reason}.")
+                            print(f"       [Prediction]  {rule_str}")
 
+                    if ambiguous_events:
+                        print(f"  -> Ignored {len(ambiguous_events)} Ambiguous events:")
+                        for e in ambiguous_events:
+                            print(f"     * {e['type']} on {e.get('id', 'Unknown')}")
+                            print(f"       [Explanation] Insufficient Data: New event or inconsistent results.")
+                            
                 # --- Failsafe: Track banned actions ---
                 # Note: We count success if there are DIRECT events or score increased.
                 # Ambiguous events are NOT considered success yet (conservative).
@@ -937,9 +994,9 @@ class ObmlAgi3Agent(Agent):
     def _classify_event_stream(self, current_events: list[dict], current_action_key: str) -> tuple[list[dict], list[dict], list[dict]]:
         """
         Classifies events into three categories:
-        1. GLOBAL: Concrete Event seen with > 2 Action Types.
-        2. DIRECT: Unique to this Action AND seen repeatedly (Action-Specific Consistency).
-        3. AMBIGUOUS: Everything else.
+        1. GLOBAL: Exact Event OR Abstract Pattern seen in ALL productive action types.
+        2. DIRECT: Unique to this Action AND seen repeatedly (Reliable).
+        3. AMBIGUOUS: Everything else (Cycles, Reactive candidates, First-timers).
         """
         direct_events = []
         global_events = []
@@ -948,22 +1005,25 @@ class ObmlAgi3Agent(Agent):
         base_action = current_action_key
         self.performed_action_types.add(base_action)
         
+        # If events occurred, this action was productive
+        if current_events:
+            self.productive_action_types.add(base_action)
+        
         has_control_group = len(self.performed_action_types) > 1
+        total_productive = len(self.productive_action_types)
 
         for event in current_events:
             conc_sig = self._get_concrete_signature(event)
             abst_sig = self._get_abstract_signature(event)
             phen_sig = self._get_phenomenal_signature(event)
             
-            # --- Update Global Counts ---
+            # --- Update Counts ---
             self.concrete_event_counts[conc_sig] = self.concrete_event_counts.get(conc_sig, 0) + 1
             self.phenomenal_event_counts[phen_sig] = self.phenomenal_event_counts.get(phen_sig, 0) + 1
 
-            # --- Update Action-Specific Consistency Counts (The Fix) ---
-            # We track: (ActionName, Signature) -> Count
+            # --- Update Action-Specific Consistency Counts ---
             act_conc_key = (base_action, conc_sig)
             act_phen_key = (base_action, phen_sig)
-            
             self.action_consistency_counts[act_conc_key] = self.action_consistency_counts.get(act_conc_key, 0) + 1
             self.action_consistency_counts[act_phen_key] = self.action_consistency_counts.get(act_phen_key, 0) + 1
             
@@ -983,43 +1043,30 @@ class ObmlAgi3Agent(Agent):
             # --- Classification Logic ---
             
             num_concrete_witnesses = len(self.concrete_witness_registry[conc_sig])
+            num_abstract_witnesses = len(self.abstract_witness_registry[abst_sig])
 
-            # 1. Check Global (High Threshold Persistence)
-            if num_concrete_witnesses > 2:
+            # 1a. Check Global Concrete (Gravity: Same Object, Same Result)
+            if total_productive > 1 and num_concrete_witnesses == total_productive:
                 global_events.append(event)
                 continue
-            
-            # --- 2. Check Direct Reliability (Action-Specific) ---
+
+            # 1b. Check Global Abstract (Sequencer: Different Object, Same Result)
+            # If "Recolor to 3" happens in EVERY productive action, it is Global.
+            if total_productive > 1 and num_abstract_witnesses == total_productive:
+                global_events.append(event)
+                continue
+
+            # 2. Check Direct Reliability (Action-Specific)
             if has_control_group:
-                # We check if THIS action has caused THIS event at least twice.
-                is_concrete_reliable = self.action_consistency_counts[act_conc_key] >= 2
+                # We check if THIS action has caused THIS exact event at least twice.
+                is_concrete_reliable = self.action_consistency_counts.get(act_conc_key, 0) >= 2
                 
                 if is_concrete_reliable:
-                    # Consistent repetition with no contradictions -> Direct
                     direct_events.append(event)
                     continue
 
-            # 3. Check Ambiguous (Phenomenal/Abstract Overlap)
-            if (num_concrete_witnesses > 1 or 
-                len(self.abstract_witness_registry[abst_sig]) > 1 or 
-                len(self.phenomenal_witness_registry[phen_sig]) > 1):
-                ambiguous_events.append(event)
-                continue
-
-            # 4. Check Direct vs Ambiguous (Phenomenal Fallback)
-            if has_control_group:
-                # Concrete isn't reliable yet (count < 2).
-                # Check if Phenomenal is reliable (e.g. Color Cycle).
-                # MUST be reliable for THIS action specifically.
-                is_phenomenal_reliable = self.action_consistency_counts[act_phen_key] >= 2
-                
-                if is_phenomenal_reliable:
-                    direct_events.append(event)
-                else:
-                    # First time seeing this result for this action. Wait.
-                    ambiguous_events.append(event)
-            else:
-                ambiguous_events.append(event)
+            # 3. Default to Ambiguous
+            ambiguous_events.append(event)
                 
         return direct_events, global_events, ambiguous_events
     
@@ -1069,6 +1116,67 @@ class ObmlAgi3Agent(Agent):
                 lbl = "FAILURE" if not events else "SUCCESS"
                 print(f"  Learned {lbl} Consistency Rule for {action_key} (seen {len(outcome_data['contexts'])} times).")
         # --- LANDMINE LOGIC END ---
+
+    def _format_rule_description(self, hypothesis_key: tuple) -> str:
+        """
+        Looks up the learned rule for a specific key and returns a 
+        readable string of the conditions.
+        """
+        hypothesis = self.rule_hypotheses.get(hypothesis_key)
+        
+        # Case 1: No history at all
+        if not hypothesis:
+            return "(No rule learned yet)"
+            
+        # Find the most frequent outcome (best guess)
+        best_outcome = None
+        max_seen = -1
+        
+        # We look for the "Success" outcome with the most examples
+        for fingerprint, data in hypothesis.items():
+            # We prioritize outcomes that have actual events (Successes)
+            if data['raw_events'] and len(data['contexts']) > max_seen:
+                max_seen = len(data['contexts'])
+                best_outcome = data
+        
+        # Case 2: Only failures found in history
+        if not best_outcome:
+             return "(History: Consistently No Change)"
+            
+        rule = best_outcome['rule']
+        
+        # Case 3: Rule exists but is empty (Intersection found no constraints)
+        # This means the action works Unconditionally.
+        if not rule:
+            return "IF (Always/Unconditional)"
+            
+        conditions = []
+        
+        # Format Adjacencies
+        for key in ['adj', 'diag_adj']:
+            if key in rule:
+                for obj, contacts in rule[key].items():
+                    specifics = [c for c in contacts if c != 'x' and c != 'na']
+                    if specifics:
+                        conditions.append(f"Adj({obj} to {specifics})")
+
+        # Format Relationships/Alignments
+        for key in ['rels', 'align', 'match']:
+            if key in rule:
+                for type_name, groups in rule[key].items():
+                    for val, ids in groups.items():
+                        conditions.append(f"{type_name}={val}")
+        
+        # Format Diagonal Alignments
+        if 'diag_align' in rule:
+             for type_name in rule['diag_align']:
+                conditions.append(f"DiagAlign({type_name})")
+
+        # Case 4: Rule structure exists but no specific conditions were found
+        if not conditions:
+            return "IF (Generic Context)"
+            
+        return "IF " + " AND ".join(conditions)
 
     def _find_context_difference(self, context_A: dict, context_B: dict) -> dict:
         """
@@ -2670,3 +2778,241 @@ class ObmlAgi3Agent(Agent):
                     print(f"  [Reactive Analysis] EXPLAINED: {victim_id} {event['type']} because it touched {trigger_obj}.")
                 # TODO: Store this rule: IF Touch(Trigger) -> Event(Actor)
                 return
+            
+    def _get_phenomenal_signature(self, event: dict):
+        """
+        Returns (Type, ID). Ignores the specific Value/Result.
+        Used to detect if a specific object is 'unstable' across different actions.
+        """
+        e_type = event['type']
+        obj_id = event.get('id')
+        
+        # Normalize unstable appearance events (The "Cycle" detector)
+        if e_type in ['TRANSFORM', 'SHAPE_CHANGED', 'RECOLORED']:
+            e_type = 'APPEARANCE_CHANGE'
+        
+        # Normalize size changes
+        elif e_type in ['GROWTH', 'SHRINK']:
+            e_type = 'SIZE_CHANGE'
+            
+        # For NEW events, the 'ID' is essentially the spawning phenomenon itself
+        if e_type == 'NEW':
+             return ('NEW', 'ANY')
+            
+        return (e_type, obj_id)
+
+    def _classify_event_stream(self, current_events: list[dict], current_action_key: str) -> tuple[list[dict], list[dict], list[dict]]:
+        """
+        Classifies events into three categories:
+        1. GLOBAL: Exact Event seen in ALL productive action types (Inevitable).
+        2. DIRECT: Unique to this Action AND seen repeatedly (Reliable).
+        3. AMBIGUOUS: Everything else (Cycles, Reactive candidates, First-timers).
+        """
+        direct_events = []
+        global_events = []
+        ambiguous_events = []
+        
+        base_action = current_action_key
+        self.performed_action_types.add(base_action)
+        
+        # If events occurred, this action was productive
+        if current_events:
+            self.productive_action_types.add(base_action)
+        
+        has_control_group = len(self.performed_action_types) > 1
+        total_productive = len(self.productive_action_types)
+
+        for event in current_events:
+            conc_sig = self._get_concrete_signature(event)
+            abst_sig = self._get_abstract_signature(event)
+            phen_sig = self._get_phenomenal_signature(event)
+            
+            # --- Update Counts ---
+            self.concrete_event_counts[conc_sig] = self.concrete_event_counts.get(conc_sig, 0) + 1
+            self.phenomenal_event_counts[phen_sig] = self.phenomenal_event_counts.get(phen_sig, 0) + 1
+
+            # --- Update Action-Specific Consistency Counts ---
+            act_conc_key = (base_action, conc_sig)
+            act_phen_key = (base_action, phen_sig)
+            self.action_consistency_counts[act_conc_key] = self.action_consistency_counts.get(act_conc_key, 0) + 1
+            self.action_consistency_counts[act_phen_key] = self.action_consistency_counts.get(act_phen_key, 0) + 1
+            
+            # --- Update Registries ---
+            if conc_sig not in self.concrete_witness_registry:
+                self.concrete_witness_registry[conc_sig] = set()
+            self.concrete_witness_registry[conc_sig].add(base_action)
+
+            if abst_sig not in self.abstract_witness_registry:
+                self.abstract_witness_registry[abst_sig] = set()
+            self.abstract_witness_registry[abst_sig].add(base_action)
+
+            if phen_sig not in self.phenomenal_witness_registry:
+                self.phenomenal_witness_registry[phen_sig] = set()
+            self.phenomenal_witness_registry[phen_sig].add(base_action)
+            
+            # --- Classification Logic ---
+            
+            num_concrete_witnesses = len(self.concrete_witness_registry[conc_sig])
+
+            # 1. Check Global (The "Passenger" Rule)
+            # Must happen in EVERY productive action type so far (and we need at least 2 to judge).
+            if total_productive > 1 and num_concrete_witnesses == total_productive:
+                global_events.append(event)
+                continue
+
+            # 2. Check Direct Reliability (Action-Specific)
+            if has_control_group:
+                # We check if THIS action has caused THIS exact event at least twice.
+                # If it varies (Shape 1 -> Shape 2), this count will be 1, and it fails here.
+                # It goes to Ambiguous -> Resolution Phase.
+                is_concrete_reliable = self.action_consistency_counts.get(act_conc_key, 0) >= 2
+                
+                if is_concrete_reliable:
+                    direct_events.append(event)
+                    continue
+
+            # 3. Default to Ambiguous
+            # Includes: New events, Direct Cycles (Red->Blue), Reactive Events.
+            ambiguous_events.append(event)
+                
+        return direct_events, global_events, ambiguous_events
+
+    def _resolve_ambiguous_events(self, ambiguous_events: list[dict], current_events: list[dict], 
+                                  current_summary: list[dict], prev_summary: list[dict],
+                                  current_adj: dict, prev_adj: dict, learning_key: str):
+        """
+        The Resolution Phase.
+        Takes Ambiguous events and tries to categorize them by checking for:
+        1. REACTIVE triggers (State-Dependent).
+        2. DIRECT CYCLES (Action-Dependent, State-Independent).
+        
+        Returns: A list of events that were 'Promoted' to Direct.
+        """
+        promoted_direct_events = []
+        
+        if not ambiguous_events:
+            return promoted_direct_events
+
+        # Identify "Agitators" (Objects that moved this turn)
+        mover_ids = {e['id'] for e in current_events if e['type'] == 'MOVED'}
+        movers = [obj for obj in current_summary if obj['id'] in mover_ids]
+
+        for event in ambiguous_events:
+            victim_id = event.get('id')
+            if not victim_id: continue
+            
+            resolved = False
+
+            # --- TEST 1: REACTIVE CHECK (The "State" Test) ---
+            # Did the object touch or overlap something new?
+            
+            # Case A: Overlap (Bulldozer)
+            if event['type'] == 'REMOVED':
+                for mover in movers:
+                    overlapped_ids = self._detect_pixel_overlaps(mover, prev_summary)
+                    if victim_id in overlapped_ids:
+                        if self.debug_channels['HYPOTHESIS']:
+                            print(f"  [Resolution] EXPLAINED REACTIVE: {victim_id} was REMOVED because {mover['id']} overlapped it.")
+                        resolved = True; break
+
+            # Case B: Overlap (Self-Move)
+            if not resolved and victim_id in mover_ids:
+                actor = next((obj for obj in current_summary if obj['id'] == victim_id), None)
+                if actor:
+                    overlapped_ids = self._detect_pixel_overlaps(actor, prev_summary)
+                    if overlapped_ids:
+                        if self.debug_channels['HYPOTHESIS']:
+                            trigger_obj = overlapped_ids[0] 
+                            print(f"  [Resolution] EXPLAINED REACTIVE: {victim_id} {event['type']} because it overlapped {trigger_obj}.")
+                        resolved = True
+
+            # Case C: Adjacency (Electric Fence)
+            if not resolved:
+                curr_contacts = set(current_adj.get(victim_id, [])); curr_contacts.discard('na')
+                prev_contacts = set(prev_adj.get(victim_id, [])); prev_contacts.discard('na')
+                new_contacts = curr_contacts - prev_contacts
+                if new_contacts:
+                    trigger_obj = list(new_contacts)[0]
+                    if self.debug_channels['HYPOTHESIS']:
+                        print(f"  [Resolution] EXPLAINED REACTIVE: {victim_id} {event['type']} because it touched {trigger_obj}.")
+                    resolved = True
+
+            if resolved:
+                continue # It is Reactive. Do not add to Direct.
+
+            # --- TEST 2: DIRECT CYCLE CHECK (The "Elimination" Test) ---
+            # If it wasn't Reactive, and it wasn't Global (already filtered),
+            # AND the Action has consistently caused this *Phenomenon*...
+            # Then it must be a Direct Cycle (Action-Driven).
+            
+            phen_sig = self._get_phenomenal_signature(event)
+            act_phen_key = (learning_key, phen_sig)
+            p_count = self.action_consistency_counts.get(act_phen_key, 0)
+            
+            if p_count >= 2:
+                if self.debug_channels['HYPOTHESIS']:
+                    print(f"  [Resolution] EXPLAINED DIRECT CYCLE: Action consistently causes '{event['type']}' (State ruled out).")
+                promoted_direct_events.append(event)
+
+        return promoted_direct_events
+    
+    def _format_rule_description(self, hypothesis_key: tuple) -> str:
+        """
+        Looks up the learned rule for a specific key and returns a 
+        readable string of the conditions.
+        """
+        hypothesis = self.rule_hypotheses.get(hypothesis_key)
+        
+        # Case 1: No history at all
+        if not hypothesis:
+            return "(No rule learned yet)"
+            
+        # Find the most frequent outcome (best guess)
+        best_outcome = None
+        max_seen = -1
+        
+        # We look for the "Success" outcome with the most examples
+        for fingerprint, data in hypothesis.items():
+            # We prioritize outcomes that have actual events (Successes)
+            if data['raw_events'] and len(data['contexts']) > max_seen:
+                max_seen = len(data['contexts'])
+                best_outcome = data
+        
+        # Case 2: Only failures found in history
+        if not best_outcome:
+             return "(History: Consistently No Change)"
+            
+        rule = best_outcome['rule']
+        
+        # Case 3: Rule exists but is empty (Intersection found no constraints)
+        # This means the action works Unconditionally.
+        if not rule:
+            return "IF (Always/Unconditional)"
+            
+        conditions = []
+        
+        # Format Adjacencies
+        for key in ['adj', 'diag_adj']:
+            if key in rule:
+                for obj, contacts in rule[key].items():
+                    specifics = [c for c in contacts if c != 'x' and c != 'na']
+                    if specifics:
+                        conditions.append(f"Adj({obj} to {specifics})")
+
+        # Format Relationships/Alignments
+        for key in ['rels', 'align', 'match']:
+            if key in rule:
+                for type_name, groups in rule[key].items():
+                    for val, ids in groups.items():
+                        conditions.append(f"{type_name}={val}")
+        
+        # Format Diagonal Alignments
+        if 'diag_align' in rule:
+             for type_name in rule['diag_align']:
+                conditions.append(f"DiagAlign({type_name})")
+
+        # Case 4: Rule structure exists but no specific conditions were found
+        if not conditions:
+            return "IF (Generic Context)"
+            
+        return "IF " + " AND ".join(conditions)
