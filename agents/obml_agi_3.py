@@ -1889,10 +1889,11 @@ class ObmlAgi3Agent(Agent):
             rel_data['Size'].setdefault(obj['size'], set()).add(obj_id)
             rel_data['Pixel'].setdefault(obj['pixels'], set()).add(obj_id)
 
-        # Filter out groups with only one member
+        # --- FIX: Allow Singleton Groups (len >= 1) ---
+        # We must allow unique properties (e.g. "The only Green object") to be part of the rule.
         for rel_type, groups in rel_data.items():
             relationships[rel_type] = {
-                value: ids for value, ids in groups.items() if len(ids) > 1
+                value: ids for value, ids in groups.items() if len(ids) >= 1
             }
         relationships = {k: v for k, v in relationships.items() if v} # Clean empty types
 
