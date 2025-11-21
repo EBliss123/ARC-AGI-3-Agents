@@ -358,7 +358,6 @@ class ObmlAgi3Agent(Agent):
                         print(f"  -> Filtered {len(global_events)} Global events:")
                         for e in global_events:
                             abst_sig = self._get_abstract_signature(e)
-                            # Call with single tuple key
                             global_key = ('GLOBAL', str(abst_sig))
                             rule_str = self._format_rule_description(global_key)
                             
@@ -369,27 +368,24 @@ class ObmlAgi3Agent(Agent):
                     if direct_events: 
                         print(f"  -> Processing {len(direct_events)} Direct events:")
                         for e in direct_events:
-                            conc_sig = self._get_concrete_signature(e)
-                            act_conc_key = (learning_key, conc_sig)
-                            c_count = self.action_consistency_counts.get(act_conc_key, 0)
-                            
                             # Call with single tuple key
                             direct_key = (learning_key, e.get('id'))
                             rule_str = self._format_rule_description(direct_key)
                             
-                            reason = f"Action consistently causes '{_fmt_val(e)}'"
-                            if c_count < 2:
-                                reason = f"Cycle/Variable Result '{e['type']}' (State ruled out). Observed: {_fmt_val(e)}"
-                                
                             print(f"     * {e['type']} on {e.get('id', 'Unknown')}")
-                            print(f"       [Explanation] Direct Causality: {reason}.")
+                            print(f"       [Explanation] Direct Causality: Action consistently causes '{_fmt_val(e)}'")
                             print(f"       [Prediction]  {rule_str}")
 
                     if ambiguous_events:
                         print(f"  -> Ignored {len(ambiguous_events)} Ambiguous events:")
-                        for e in ambiguous_events:
+                        for wrapper in ambiguous_events:
+                            e = wrapper['event']
+                            reason = wrapper['reason']
+                            fix = wrapper['fix']
+                            
                             print(f"     * {e['type']} on {e.get('id', 'Unknown')}")
-                            print(f"       [Explanation] Insufficient Data: New event or inconsistent results.")
+                            print(f"       [Status] {reason}")
+                            print(f"       [Needs]  {fix}")
                             
                 # --- Failsafe: Track banned actions ---
                 # Note: We count success if there are DIRECT events or score increased.
@@ -2775,12 +2771,11 @@ class ObmlAgi3Agent(Agent):
 
     def _classify_event_stream(self, current_events: list[dict], current_action_key: str) -> tuple[list[dict], list[dict], list[dict]]:
         """
-        Classifies events using Strict Logic Proofs (Zero Tolerance).
-        Uses Action IDs to ensure Sample Size (N) represents independent trials.
+        Classifies events using Strict Logic Proofs and attaches specific reasons for Ambiguity.
         """
         direct_events = []
         global_events = []
-        ambiguous_events = []
+        ambiguous_events = [] 
         
         # 1. Identify the Action Family
         action_family = current_action_key.split('_')[0]
@@ -2792,15 +2787,13 @@ class ObmlAgi3Agent(Agent):
         if current_events:
             self.productive_action_types.add(action_family)
             
-        # --- NEW: Retrieve the timestamp of the action that caused this ---
         current_trial_id = self.last_action_id
-        # ----------------------------------------------------------------
 
         # 2. Build the list of Transitions to Analyze
         transitions_to_analyze = []
         changed_obj_ids = {e['id']: e for e in current_events if 'id' in e}
         
-        # A. Explicit Events (Changes)
+        # A. Explicit Events
         for event in current_events:
             if 'id' not in event: continue
             obj_id = event['id']
@@ -2809,18 +2802,17 @@ class ObmlAgi3Agent(Agent):
             if prev_obj:
                 start_state = self._get_object_state(prev_obj)
                 end_state_sig = self._get_concrete_signature(event)
+                
                 transitions_to_analyze.append({
                     'event': event, 'start': start_state, 'end': end_state_sig
                 })
 
-        # B. Implicit Events (Failures/No Change)
+        # B. Implicit Events (Failures)
         if target_id_from_action and target_id_from_action not in changed_obj_ids:
             prev_obj = next((o for o in self.last_object_summary if o['id'] == target_id_from_action), None)
             if prev_obj:
                 start_state = self._get_object_state(prev_obj)
                 end_state_sig = ('NO_CHANGE', target_id_from_action, None)
-                
-                # Log the failure with the timestamp
                 self._update_transition_memory(start_state, action_family, end_state_sig, current_trial_id)
 
         # 3. Update Memory & Classify
@@ -2829,21 +2821,22 @@ class ObmlAgi3Agent(Agent):
             end = item['end']
             event = item['event']
             
-            # Log the success with the timestamp
             self._update_transition_memory(start, action_family, end, current_trial_id)
             
             # --- LOGIC SOLVER ---
             history = self.transition_counts.get(start, {})
             this_action_history = history.get(action_family, {})
             
-            # ZERO TOLERANCE CHECK (Internal Consistency)
-            # If this action has produced ANY result other than 'end' for this start state,
-            # it is internally inconsistent.
+            # 1. CHECK INTERNAL CONSISTENCY (Zero Tolerance)
             if len(this_action_history) > 1: 
-                ambiguous_events.append(event)
+                ambiguous_events.append({
+                    'event': event, 
+                    'reason': "Contradiction Found",
+                    'fix': "Action produces variable results. Needs Context Refinement."
+                })
                 continue
                 
-            # Proof 1: Global Convergence
+            # 2. CHECK GLOBAL CONVERGENCE
             is_global = False
             for other_action, outcomes in history.items():
                 if other_action == action_family: continue
@@ -2854,7 +2847,7 @@ class ObmlAgi3Agent(Agent):
                 global_events.append(event)
                 continue
 
-            # Proof 2: Direct Divergence (Control Group)
+            # 3. CHECK DIRECT DIVERGENCE (Control Group)
             has_control_group = False
             for other_action, outcomes in history.items():
                 if other_action == action_family: continue
@@ -2864,21 +2857,23 @@ class ObmlAgi3Agent(Agent):
                 if has_control_group: break
             
             if has_control_group:
-                # --- REPRODUCIBILITY CHECK (Scientific Standard) ---
-                # We check the SIZE OF THE SET (number of unique timestamps).
-                # If 50 objects changed in 1 turn, len(set) is 1. N=1. 
-                # We need N >= 2 independent trials.
-                
-                # Get the set of trials for this specific outcome
+                # 4. CHECK REPRODUCIBILITY (Scientific Standard)
                 success_trials = this_action_history.get(end, set())
-                
                 if len(success_trials) >= 2:
                     direct_events.append(event)
                 else:
-                    # N=1 (Anecdote) -> Ambiguous
-                    ambiguous_events.append(event)
+                    ambiguous_events.append({
+                        'event': event,
+                        'reason': "New Event (N=1)",
+                        'fix': "Hypothesis formed. Needs replication (re-test)."
+                    })
             else:
-                ambiguous_events.append(event)
+                # Consistent (so far), but no Control Group.
+                ambiguous_events.append({
+                    'event': event,
+                    'reason': "Correlation Only",
+                    'fix': "Needs Negative Control (Divergence) to prove Causality."
+                })
 
         return direct_events, global_events, ambiguous_events
 
@@ -2899,35 +2894,28 @@ class ObmlAgi3Agent(Agent):
         # The set automatically handles duplicates (e.g., multiple events in one turn = N=1).
         self.transition_counts[start][action][end].add(trial_id)
 
-    def _resolve_ambiguous_events(self, ambiguous_events: list[dict], current_events: list[dict], 
+    def _resolve_ambiguous_events(self, ambiguous_wrappers: list[dict], current_events: list[dict], 
                                   current_summary: list[dict], prev_summary: list[dict],
                                   current_adj: dict, prev_adj: dict, learning_key: str):
         """
         The Resolution Phase.
         Analyzes Ambiguous events to checks for REACTIVE triggers (State-Dependent).
-        
-        CRITICAL FIX: Removed "Direct Cycle Check". 
-        We no longer promote events to 'Direct' based on simple consistency counts.
-        To be Direct, they must pass the 'Zero Tolerance' logic in _classify_event_stream.
         """
         promoted_direct_events = []
         
-        if not ambiguous_events:
+        if not ambiguous_wrappers:
             return promoted_direct_events
 
         # Identify "Agitators" (Objects that moved this turn)
         mover_ids = {e['id'] for e in current_events if e['type'] == 'MOVED'}
         movers = [obj for obj in current_summary if obj['id'] in mover_ids]
 
-        for event in ambiguous_events:
+        for wrapper in ambiguous_wrappers:
+            event = wrapper['event'] # Extract raw event from the wrapper
             victim_id = event.get('id')
             if not victim_id: continue
             
             # --- TEST 1: REACTIVE CHECK (The "State" Test) ---
-            # Did the object touch or overlap something new?
-            # NOTE: These explain WHY it happened, but they imply GLOBAL (Physics) rules,
-            # not DIRECT (Action) rules. So we print the explanation but do NOT promote
-            # to Direct Learning.
             
             # Case A: Overlap (Bulldozer)
             if event['type'] == 'REMOVED':
@@ -2957,11 +2945,6 @@ class ObmlAgi3Agent(Agent):
                     trigger_obj = list(new_contacts)[0]
                     if self.debug_channels['HYPOTHESIS']:
                         print(f"  [Resolution] EXPLAINED REACTIVE: {victim_id} {event['type']} because it touched {trigger_obj}.")
-
-            # --- REMOVED: TEST 2 (Direct Cycle Check) ---
-            # We previously promoted events if p_count >= 2. 
-            # This violated the Scientific Standard (No Control Group). 
-            # Deleted to ensure Zero Tolerance.
 
         return promoted_direct_events
     
