@@ -37,10 +37,16 @@ class ObmlAgi3Agent(Agent):
         self.banned_action_keys = set()
         self.permanent_banned_actions = set()
         self.successful_click_actions = set()
+
         # --- NEW: CLASSIFICATION MEMORY ---
         self.concrete_witness_registry = {}
         self.abstract_witness_registry = {}
         self.phenomenal_witness_registry = {}
+
+        # --- NEW: TRANSITION MEMORY (Scientific Standard) ---
+        # Structure: self.transition_counts[start_state][action_family][end_state] = count
+        # Start/End State Signature: (Color, Fingerprint, Size)
+        self.transition_counts = {}
         
         self.concrete_event_counts = {}
         self.phenomenal_event_counts = {}
@@ -77,6 +83,9 @@ class ObmlAgi3Agent(Agent):
         self.last_score = 0
         self.permanent_banned_actions = set()
         self.successful_click_actions = set()
+
+        # NEW: Reset Transition Memory
+        self.transition_counts = {}
         
         # NEW: Registry for Concrete Exclusivity Check
         # Mapping: Concrete Signature -> Set of Action Names seen with it
@@ -961,6 +970,19 @@ class ObmlAgi3Agent(Agent):
              val = 'unknown_change'
 
         return (e_type, obj_id, val)
+
+    def _get_object_state(self, obj_summary: dict) -> tuple:
+        """
+        Extracts the Intrinsic State signature for an object.
+        Used to define the 'Start State' for scientific comparison.
+        Signature: (Color, Fingerprint, Size) - Position is excluded!
+        """
+        return (
+            obj_summary['color'], 
+            obj_summary['fingerprint'], 
+            obj_summary['size'],
+            obj_summary['pixels']
+        )
     
     def _get_abstract_signature(self, event: dict):
         """
@@ -993,82 +1015,136 @@ class ObmlAgi3Agent(Agent):
 
     def _classify_event_stream(self, current_events: list[dict], current_action_key: str) -> tuple[list[dict], list[dict], list[dict]]:
         """
-        Classifies events into three categories:
-        1. GLOBAL: Exact Event OR Abstract Pattern seen in ALL productive action types.
-        2. DIRECT: Unique to this Action AND seen repeatedly (Reliable).
-        3. AMBIGUOUS: Everything else (Cycles, Reactive candidates, First-timers).
+        Classifies events using Transition-Based Logic (Convergence vs. Divergence).
+        
+        1. GLOBAL (Convergence): Different Actions on SAME Start State -> SAME End State.
+        2. DIRECT (Divergence): Different Actions on SAME Start State -> DIFFERENT End States.
+        3. AMBIGUOUS (Ignorance): Insufficient data (N<2 or no Control Group).
         """
         direct_events = []
         global_events = []
         ambiguous_events = []
         
-        base_action = current_action_key
-        self.performed_action_types.add(base_action)
-        
-        # If events occurred, this action was productive
+        # 1. Identify the Action Family (e.g., "ACTION6" from "ACTION6_obj_5")
+        action_family = current_action_key.split('_')[0]
+        self.performed_action_types.add(action_family)
         if current_events:
-            self.productive_action_types.add(base_action)
+            self.productive_action_types.add(action_family)
+
+        # 2. Build the list of Transitions to Analyze
+        # We must include explicit events AND the "Null Result" for the target (if applicable).
+        transitions_to_analyze = []
         
-        has_control_group = len(self.performed_action_types) > 1
-        total_productive = len(self.productive_action_types)
-
+        # Map Object ID -> Event (to detect which objects changed)
+        changed_obj_ids = {e['id']: e for e in current_events if 'id' in e}
+        
+        # A. Process Explicit Events
         for event in current_events:
-            conc_sig = self._get_concrete_signature(event)
-            abst_sig = self._get_abstract_signature(event)
-            phen_sig = self._get_phenomenal_signature(event)
+            if 'id' not in event: continue
             
-            # --- Update Counts ---
-            self.concrete_event_counts[conc_sig] = self.concrete_event_counts.get(conc_sig, 0) + 1
-            self.phenomenal_event_counts[phen_sig] = self.phenomenal_event_counts.get(phen_sig, 0) + 1
-
-            # --- Update Action-Specific Consistency Counts ---
-            act_conc_key = (base_action, conc_sig)
-            act_phen_key = (base_action, phen_sig)
-            self.action_consistency_counts[act_conc_key] = self.action_consistency_counts.get(act_conc_key, 0) + 1
-            self.action_consistency_counts[act_phen_key] = self.action_consistency_counts.get(act_phen_key, 0) + 1
+            # Find the object in the PREVIOUS summary (Start State)
+            obj_id = event['id']
+            prev_obj = next((o for o in self.last_object_summary if o['id'] == obj_id), None)
             
-            # --- Update Registries ---
-            if conc_sig not in self.concrete_witness_registry:
-                self.concrete_witness_registry[conc_sig] = set()
-            self.concrete_witness_registry[conc_sig].add(base_action)
+            if prev_obj:
+                start_state = self._get_object_state(prev_obj)
+                
+                # Calculate End State based on the event type
+                # (Simplified: We use the Concrete Signature as the 'End State' difference)
+                # This distinguishes "Turning Red" from "Turning Blue" or "Moving"
+                end_state_sig = self._get_concrete_signature(event)
+                
+                transitions_to_analyze.append({
+                    'event': event,
+                    'obj_id': obj_id,
+                    'start': start_state,
+                    'end': end_state_sig
+                })
 
-            if abst_sig not in self.abstract_witness_registry:
-                self.abstract_witness_registry[abst_sig] = set()
-            self.abstract_witness_registry[abst_sig].add(base_action)
+        # B. Process Implicit "Identity Transitions" (The Negative Control)
+        # If we clicked "obj_5" and it DID NOT change, we must record that!
+        if 'ACTION6' in action_family:
+            target_id_part = current_action_key.replace('ACTION6_', '')
+            # Only if the target exists in previous summary and IS NOT in the change list
+            if target_id_part not in changed_obj_ids:
+                prev_obj = next((o for o in self.last_object_summary if o['id'] == target_id_part), None)
+                if prev_obj:
+                    start_state = self._get_object_state(prev_obj)
+                    # The "End State" is "No Change" (Identity)
+                    end_state_sig = ('NO_CHANGE', target_id_part, None)
+                    
+                    # We analyze this conceptually, but we don't add a dummy event to the lists
+                    # We just update the registry so it can serve as a control for OTHERS.
+                    self._update_transition_memory(start_state, action_family, end_state_sig)
 
-            if phen_sig not in self.phenomenal_witness_registry:
-                self.phenomenal_witness_registry[phen_sig] = set()
-            self.phenomenal_witness_registry[phen_sig].add(base_action)
+        # 3. Update Memory & Classify
+        for item in transitions_to_analyze:
+            start = item['start']
+            end = item['end']
+            event = item['event']
             
-            # --- Classification Logic ---
+            # Update the registry
+            self._update_transition_memory(start, action_family, end)
             
-            num_concrete_witnesses = len(self.concrete_witness_registry[conc_sig])
-            num_abstract_witnesses = len(self.abstract_witness_registry[abst_sig])
+            # --- CLASSIFICATION LOGIC ---
+            
+            # Get all outcomes we've ever seen for this Start State
+            # dict: { Action_Family -> { End_State: Count } }
+            history = self.transition_counts.get(start, {})
+            
+            # A. Check Consistency (N >= 2)
+            # Have we seen THIS transition (Action A -> Result X) at least twice?
+            this_action_history = history.get(action_family, {})
+            count = this_action_history.get(end, 0)
+            
+            if count < 2:
+                ambiguous_events.append(event)
+                continue
 
-            # 1a. Check Global Concrete (Gravity: Same Object, Same Result)
-            if total_productive > 1 and num_concrete_witnesses == total_productive:
+            # B. Check Global (Convergence)
+            # Is there ANOTHER action that causes the SAME result?
+            is_global = False
+            for other_action, outcomes in history.items():
+                if other_action == action_family: continue
+                if end in outcomes and outcomes[end] >= 1: # Seen at least once
+                    is_global = True
+                    break
+            
+            if is_global:
                 global_events.append(event)
                 continue
 
-            # 1b. Check Global Abstract (Sequencer: Different Object, Same Result)
-            # If "Recolor to 3" happens in EVERY productive action, it is Global.
-            if total_productive > 1 and num_abstract_witnesses == total_productive:
-                global_events.append(event)
-                continue
-
-            # 2. Check Direct Reliability (Action-Specific)
-            if has_control_group:
-                # We check if THIS action has caused THIS exact event at least twice.
-                is_concrete_reliable = self.action_consistency_counts.get(act_conc_key, 0) >= 2
+            # C. Check Direct (Divergence)
+            # Is there ANOTHER action that causes a DIFFERENT result (or No Change)?
+            has_control = False
+            for other_action, outcomes in history.items():
+                if other_action == action_family: continue
                 
-                if is_concrete_reliable:
-                    direct_events.append(event)
-                    continue
+                # Check if 'other_action' has produced ANY end state that is NOT 'end'
+                # This includes 'NO_CHANGE'
+                for other_end, other_count in outcomes.items():
+                    if other_end != end and other_count >= 1:
+                        has_control = True
+                        break
+                if has_control: break
+            
+            if has_control:
+                direct_events.append(event)
+            else:
+                # Consistent, but we haven't tested a control group yet.
+                ambiguous_events.append(event)
 
-            # 3. Default to Ambiguous
-            ambiguous_events.append(event)
-                
         return direct_events, global_events, ambiguous_events
+
+    def _update_transition_memory(self, start, action, end):
+        """Helper to update the nested transition dictionary safely."""
+        if start not in self.transition_counts:
+            self.transition_counts[start] = {}
+        if action not in self.transition_counts[start]:
+            self.transition_counts[start][action] = {}
+        
+        current_val = self.transition_counts[start][action].get(end, 0)
+        self.transition_counts[start][action][end] = current_val + 1
     
     def _analyze_result(self, action_key: tuple, events: list[dict], full_context: dict):
         """
@@ -1119,43 +1195,50 @@ class ObmlAgi3Agent(Agent):
 
     def _format_rule_description(self, hypothesis_key: tuple) -> str:
         """
-        Looks up the learned rule for a specific key and returns a 
-        readable string of the conditions.
+        Returns a readable rule string, subtracting the 'Static Background' 
+        (conditions true in 100% of history) to prevent walls of text.
         """
         hypothesis = self.rule_hypotheses.get(hypothesis_key)
-        
-        # Case 1: No history at all
-        if not hypothesis:
-            return "(No rule learned yet)"
+        if not hypothesis: return "(No rule learned yet)"
             
-        # Find the most frequent outcome (best guess)
         best_outcome = None
         max_seen = -1
-        
-        # We look for the "Success" outcome with the most examples
         for fingerprint, data in hypothesis.items():
-            # We prioritize outcomes that have actual events (Successes)
             if data['raw_events'] and len(data['contexts']) > max_seen:
                 max_seen = len(data['contexts'])
                 best_outcome = data
         
-        # Case 2: Only failures found in history
-        if not best_outcome:
-             return "(History: Consistently No Change)"
+        if not best_outcome: return "(History: Consistently No Change)"
             
         rule = best_outcome['rule']
-        
-        # Case 3: Rule exists but is empty (Intersection found no constraints)
-        # This means the action works Unconditionally.
-        if not rule:
-            return "IF (Always/Unconditional)"
+        if not rule: return "IF (Always/Unconditional)"
+
+        # --- Calculate Static Context (Background Subtraction) ---
+        static_context = None
+        if self.level_state_history:
+            # Sample indices for speed and coverage (Start, Middle, End)
+            indices = {0, len(self.level_state_history)-1}
+            if len(self.level_state_history) > 5:
+                indices.add(len(self.level_state_history)//2)
             
+            sample_history = [self.level_state_history[i] for i in indices]
+            static_context = sample_history[0]
+            for ctx in sample_history[1:]:
+                static_context = self._intersect_contexts(static_context, ctx)
+
         conditions = []
         
+        def is_static(key, sub_key, val):
+            if not static_context: return False
+            if key not in static_context: return False
+            if sub_key not in static_context[key]: return False
+            return static_context[key][sub_key] == val
+
         # Format Adjacencies
         for key in ['adj', 'diag_adj']:
             if key in rule:
                 for obj, contacts in rule[key].items():
+                    if is_static(key, obj, contacts): continue
                     specifics = [c for c in contacts if c != 'x' and c != 'na']
                     if specifics:
                         conditions.append(f"Adj({obj} to {specifics})")
@@ -1165,16 +1248,24 @@ class ObmlAgi3Agent(Agent):
             if key in rule:
                 for type_name, groups in rule[key].items():
                     for val, ids in groups.items():
-                        conditions.append(f"{type_name}={val}")
+                        # Check nested static structure
+                        is_group_static = False
+                        if static_context and key in static_context:
+                            static_types = static_context[key]
+                            if type_name in static_types:
+                                if val in static_types[type_name] and static_types[type_name][val] == ids:
+                                    is_group_static = True
+                        
+                        if not is_group_static:
+                            conditions.append(f"{type_name}={val}")
         
         # Format Diagonal Alignments
         if 'diag_align' in rule:
              for type_name in rule['diag_align']:
                 conditions.append(f"DiagAlign({type_name})")
 
-        # Case 4: Rule structure exists but no specific conditions were found
         if not conditions:
-            return "IF (Generic Context)"
+            return "IF (Generic/Background Context)"
             
         return "IF " + " AND ".join(conditions)
 
