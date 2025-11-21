@@ -1016,10 +1016,9 @@ class ObmlAgi3Agent(Agent):
     def _classify_event_stream(self, current_events: list[dict], current_action_key: str) -> tuple[list[dict], list[dict], list[dict]]:
         """
         Classifies events using Transition-Based Logic (Convergence vs. Divergence).
-        
         1. GLOBAL (Convergence): Different Actions on SAME Start State -> SAME End State.
         2. DIRECT (Divergence): Different Actions on SAME Start State -> DIFFERENT End States.
-        3. AMBIGUOUS (Ignorance): Insufficient data (N<2 or no Control Group).
+        3. AMBIGUOUS: Insufficient data or Inconsistent results.
         """
         direct_events = []
         global_events = []
@@ -1032,10 +1031,7 @@ class ObmlAgi3Agent(Agent):
             self.productive_action_types.add(action_family)
 
         # 2. Build the list of Transitions to Analyze
-        # We must include explicit events AND the "Null Result" for the target (if applicable).
         transitions_to_analyze = []
-        
-        # Map Object ID -> Event (to detect which objects changed)
         changed_obj_ids = {e['id']: e for e in current_events if 'id' in e}
         
         # A. Process Explicit Events
@@ -1048,10 +1044,7 @@ class ObmlAgi3Agent(Agent):
             
             if prev_obj:
                 start_state = self._get_object_state(prev_obj)
-                
-                # Calculate End State based on the event type
-                # (Simplified: We use the Concrete Signature as the 'End State' difference)
-                # This distinguishes "Turning Red" from "Turning Blue" or "Moving"
+                # The End State is the specific change (e.g., Recolor to 3)
                 end_state_sig = self._get_concrete_signature(event)
                 
                 transitions_to_analyze.append({
@@ -1065,16 +1058,12 @@ class ObmlAgi3Agent(Agent):
         # If we clicked "obj_5" and it DID NOT change, we must record that!
         if 'ACTION6' in action_family:
             target_id_part = current_action_key.replace('ACTION6_', '')
-            # Only if the target exists in previous summary and IS NOT in the change list
             if target_id_part not in changed_obj_ids:
                 prev_obj = next((o for o in self.last_object_summary if o['id'] == target_id_part), None)
                 if prev_obj:
                     start_state = self._get_object_state(prev_obj)
-                    # The "End State" is "No Change" (Identity)
+                    # The "End State" is "No Change"
                     end_state_sig = ('NO_CHANGE', target_id_part, None)
-                    
-                    # We analyze this conceptually, but we don't add a dummy event to the lists
-                    # We just update the registry so it can serve as a control for OTHERS.
                     self._update_transition_memory(start_state, action_family, end_state_sig)
 
         # 3. Update Memory & Classify
@@ -1083,21 +1072,23 @@ class ObmlAgi3Agent(Agent):
             end = item['end']
             event = item['event']
             
-            # Update the registry
             self._update_transition_memory(start, action_family, end)
             
             # --- CLASSIFICATION LOGIC ---
-            
             # Get all outcomes we've ever seen for this Start State
-            # dict: { Action_Family -> { End_State: Count } }
             history = self.transition_counts.get(start, {})
             
-            # A. Check Consistency (N >= 2)
-            # Have we seen THIS transition (Action A -> Result X) at least twice?
+            # A. Check Consistency (Internal Reliability)
+            # Does THIS action cause THIS result consistently?
             this_action_history = history.get(action_family, {})
-            count = this_action_history.get(end, 0)
+            success_count = this_action_history.get(end, 0)
+            total_trials = sum(this_action_history.values())
             
-            if count < 2:
+            # Strict Consistency: Must happen 100% of the time, and at least twice.
+            # This fixes your issue where it happened "many times without recolor".
+            is_consistent = (success_count >= 2 and success_count > (total_trials))
+
+            if not is_consistent:
                 ambiguous_events.append(event)
                 continue
 
@@ -1106,7 +1097,7 @@ class ObmlAgi3Agent(Agent):
             is_global = False
             for other_action, outcomes in history.items():
                 if other_action == action_family: continue
-                if end in outcomes and outcomes[end] >= 1: # Seen at least once
+                if end in outcomes and outcomes[end] >= 1:
                     is_global = True
                     break
             
@@ -1120,8 +1111,6 @@ class ObmlAgi3Agent(Agent):
             for other_action, outcomes in history.items():
                 if other_action == action_family: continue
                 
-                # Check if 'other_action' has produced ANY end state that is NOT 'end'
-                # This includes 'NO_CHANGE'
                 for other_end, other_count in outcomes.items():
                     if other_end != end and other_count >= 1:
                         has_control = True
@@ -1131,7 +1120,7 @@ class ObmlAgi3Agent(Agent):
             if has_control:
                 direct_events.append(event)
             else:
-                # Consistent, but we haven't tested a control group yet.
+                # Consistent, but untested against a control group.
                 ambiguous_events.append(event)
 
         return direct_events, global_events, ambiguous_events
