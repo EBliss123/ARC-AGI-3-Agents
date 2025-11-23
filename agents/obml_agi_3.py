@@ -309,8 +309,9 @@ class ObmlAgi3Agent(Agent):
                 # 1. Parse text changes back to structured event dicts
                 events = self._parse_change_logs_to_events(changes)
 
-                # 2. Classify Events (Strict Logic)
-                direct_events, global_events, ambiguous_events = self._classify_event_stream(events, learning_key)
+                # 2. Classify Events (Strict Logic + Exception Solving)
+                # FIX: Pass 'prev_context' so the solver can compare states
+                direct_events, global_events, ambiguous_events = self._classify_event_stream(events, learning_key, prev_context)
                 
                 # 3. Resolve Ambiguity (The Pipeline)
                 promoted_events = self._resolve_ambiguous_events(
@@ -372,9 +373,15 @@ class ObmlAgi3Agent(Agent):
                             direct_key = (learning_key, e.get('id'))
                             rule_str = self._format_rule_description(direct_key)
                             
+                            # --- NEW: Prepend Condition if found ---
+                            prefix = ""
+                            if 'condition' in e:
+                                prefix = f"[EXCEPTION FOUND] {e['condition']} => "
+                            # ---------------------------------------
+
                             print(f"     * {e['type']} on {e.get('id', 'Unknown')}")
                             print(f"       [Explanation] Direct Causality: Action consistently causes '{_fmt_val(e)}'")
-                            print(f"       [Prediction]  {rule_str}")
+                            print(f"       [Prediction]  {prefix}{rule_str}")
 
                     if ambiguous_events:
                         print(f"  -> Ignored {len(ambiguous_events)} Ambiguous events:")
@@ -2770,15 +2777,14 @@ class ObmlAgi3Agent(Agent):
             
         return (e_type, obj_id)
 
-    def _classify_event_stream(self, current_events: list[dict], current_action_key: str) -> tuple[list[dict], list[dict], list[dict]]:
+    def _classify_event_stream(self, current_events: list[dict], current_action_key: str, current_context: dict) -> tuple[list[dict], list[dict], list[dict]]:
         """
-        Classifies events using Strict Logic Proofs and attaches specific reasons for Ambiguity.
+        Classifies events using Strict Logic Proofs + Exception Solving.
         """
         direct_events = []
         global_events = []
         ambiguous_events = [] 
         
-        # 1. Identify the Action Family
         action_family = current_action_key.split('_')[0]
         target_id_from_action = None
         if 'ACTION6_' in current_action_key:
@@ -2790,25 +2796,21 @@ class ObmlAgi3Agent(Agent):
             
         current_trial_id = self.last_action_id
 
-        # 2. Build the list of Transitions to Analyze
+        # 2. Build Transitions
         transitions_to_analyze = []
         changed_obj_ids = {e['id']: e for e in current_events if 'id' in e}
         
-        # A. Explicit Events
         for event in current_events:
             if 'id' not in event: continue
             obj_id = event['id']
             prev_obj = next((o for o in self.last_object_summary if o['id'] == obj_id), None)
-            
             if prev_obj:
                 start_state = self._get_object_state(prev_obj)
                 end_state_sig = self._get_concrete_signature(event)
-                
                 transitions_to_analyze.append({
                     'event': event, 'start': start_state, 'end': end_state_sig
                 })
 
-        # B. Implicit Events (Failures)
         if target_id_from_action and target_id_from_action not in changed_obj_ids:
             prev_obj = next((o for o in self.last_object_summary if o['id'] == target_id_from_action), None)
             if prev_obj:
@@ -2816,7 +2818,7 @@ class ObmlAgi3Agent(Agent):
                 end_state_sig = ('NO_CHANGE', target_id_from_action, None)
                 self._update_transition_memory(start_state, action_family, end_state_sig, current_trial_id)
 
-        # 3. Update Memory & Classify
+        # 3. Logic Solver
         for item in transitions_to_analyze:
             start = item['start']
             end = item['end']
@@ -2824,17 +2826,27 @@ class ObmlAgi3Agent(Agent):
             
             self._update_transition_memory(start, action_family, end, current_trial_id)
             
-            # --- LOGIC SOLVER ---
             history = self.transition_counts.get(start, {})
             this_action_history = history.get(action_family, {})
             
             # 1. CHECK INTERNAL CONSISTENCY (Zero Tolerance)
             if len(this_action_history) > 1: 
-                ambiguous_events.append({
-                    'event': event, 
-                    'reason': "Contradiction Found",
-                    'fix': "Action produces variable results. Needs Context Refinement."
-                })
+                # --- EXCEPTION LOGIC START ---
+                # We found a contradiction. Is it a conditional rule?
+                condition_str = self._solve_conditional_rule(start, action_family, end, current_context)
+                
+                if condition_str:
+                    # Solved! It's Direct, but Conditional.
+                    event['condition'] = condition_str # Tag it for the printer
+                    direct_events.append(event)
+                else:
+                    # Unsolved Contradiction
+                    ambiguous_events.append({
+                        'event': event, 
+                        'reason': "Contradiction Found",
+                        'fix': "Action produces variable results. Needs Context Refinement."
+                    })
+                # --- EXCEPTION LOGIC END ---
                 continue
                 
             # 2. CHECK GLOBAL CONVERGENCE
@@ -2848,7 +2860,7 @@ class ObmlAgi3Agent(Agent):
                 global_events.append(event)
                 continue
 
-            # 3. CHECK DIRECT DIVERGENCE (Control Group)
+            # 3. CHECK DIRECT DIVERGENCE
             has_control_group = False
             for other_action, outcomes in history.items():
                 if other_action == action_family: continue
@@ -2858,7 +2870,6 @@ class ObmlAgi3Agent(Agent):
                 if has_control_group: break
             
             if has_control_group:
-                # 4. CHECK REPRODUCIBILITY (Scientific Standard)
                 success_trials = this_action_history.get(end, set())
                 if len(success_trials) >= 2:
                     direct_events.append(event)
@@ -2869,7 +2880,6 @@ class ObmlAgi3Agent(Agent):
                         'fix': "Hypothesis formed. Needs replication (re-test)."
                     })
             else:
-                # Consistent (so far), but no Control Group.
                 ambiguous_events.append({
                     'event': event,
                     'reason': "Correlation Only",
@@ -3016,3 +3026,75 @@ class ObmlAgi3Agent(Agent):
 
         if not conditions: return "IF (Generic/Background Context)"
         return "IF " + " AND ".join(conditions)
+
+    def _solve_conditional_rule(self, start_state, action_family, current_end_sig, current_context) -> str | None:
+        """
+        The 'Exception Solver'.
+        Called when a Contradiction is found. It compares the CURRENT context 
+        against the HISTORICAL context of the conflicting result.
+        
+        Returns a string describing the difference (The Condition), or None if no clear difference found.
+        """
+        history = self.transition_counts.get(start_state, {}).get(action_family, {})
+        
+        # 1. Find a conflicting outcome (anything that isn't the current result)
+        conflicting_end = None
+        conflicting_trial_ids = set()
+        
+        for end_sig, trials in history.items():
+            if end_sig != current_end_sig:
+                conflicting_end = end_sig
+                conflicting_trial_ids = trials
+                break # Just compare against the first conflict found for now
+        
+        if not conflicting_end or not conflicting_trial_ids:
+            return None
+
+        # 2. Time Travel: Retrieve the context of the conflicting trial
+        # We grab the most recent trial of the conflict
+        past_trial_id = max(conflicting_trial_ids)
+        
+        # Map Trial ID to History Index. 
+        # global_action_counter starts at 1. List index starts at 0.
+        history_index = past_trial_id - 1
+        
+        if history_index < 0 or history_index >= len(self.level_state_history):
+            return None # Safety check
+            
+        past_context = self.level_state_history[history_index]
+        
+        # 3. The Difference Engine: (Current - Past)
+        # What is present NOW that was NOT present THEN? (or vice versa)
+        
+        # Check Adjacency Differences
+        diffs = []
+        
+        # We only care about the TARGET object's context (from the start state)
+        # Since start_state doesn't contain ID, we rely on the current_context's focus.
+        # This is a heuristic: check differences in Adjacency for objects involved.
+        
+        curr_adj = current_context.get('adj', {})
+        past_adj = past_context.get('adj', {})
+        
+        # Find objects that have different adjacency sets
+        all_ids = set(curr_adj.keys()) | set(past_adj.keys())
+        for obj_id in all_ids:
+            c_contacts = set(curr_adj.get(obj_id, [])); c_contacts.discard('na')
+            p_contacts = set(past_adj.get(obj_id, [])); p_contacts.discard('na')
+            
+            if c_contacts != p_contacts:
+                # Found a difference!
+                # If it's in Current but not Past: "IF Adj(...)"
+                added = c_contacts - p_contacts
+                if added:
+                    diffs.append(f"Adj({obj_id} to {list(added)})")
+                
+                # If it's in Past but not Current: "IF NOT Adj(...)"
+                removed = p_contacts - c_contacts
+                if removed:
+                    diffs.append(f"NOT Adj({obj_id} to {list(removed)})")
+
+        if diffs:
+            return " AND ".join(diffs)
+            
+        return None
