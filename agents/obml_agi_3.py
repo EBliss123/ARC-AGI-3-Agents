@@ -2617,30 +2617,13 @@ class ObmlAgi3Agent(Agent):
 
     def _classify_event_stream(self, current_events: list[dict], current_action_key: str, current_context: dict) -> tuple[list[dict], list[dict], list[dict]]:
         """
-        Classifies events using the 'Survivor System' (Hypothesis Elimination).
-        
-        Hypotheses:
-        1. SPECIFIC GLOBAL: The exact result (ID+Value) happens regardless of action.
-        2. ABSTRACT GLOBAL: The phenomenon (Value) happens regardless of action.
-        3. DIRECT: The result is consistent AND exclusive to this action.
-        
-        Logic:
-        - Eliminate Global if a Control Group produces a DIFFERENT result (Specific OR Abstract).
-        - Eliminate Direct if a Control Group produces the SAME result (Loss of Exclusivity).
-        - Eliminate Direct if the Action itself is Inconsistent (Zero Tolerance).
-        
-        Outcomes:
-        - Only Global Survives -> GLOBAL (Specific preferred over Abstract).
-        - Only Direct Survives -> DIRECT.
-        - Both Survive -> AMBIGUOUS (Correlation Only / Need Control).
-        - All Die -> EXCEPTION (Requires Conditional Solver).
+        Classifies events using the 'Survivor System'.
+        FIX: Ensures Hypotheses are invalid until a Control Group is found.
         """
         direct_events = []
         global_events = []
         ambiguous_events = [] 
         
-        # --- CRITICAL CHANGE: Treat every target as a unique Action Family ---
-        # This prevents "Clicking Obj 1" and "Clicking Obj 2" from contradicting each other.
         action_family = current_action_key 
         
         target_id_from_action = None
@@ -2656,7 +2639,6 @@ class ObmlAgi3Agent(Agent):
         transitions_to_analyze = []
         changed_obj_ids = {e['id']: e for e in current_events if 'id' in e}
         
-        # A. Build Transitions (Explicit Changes)
         for event in current_events:
             if 'id' not in event: continue
             obj_id = event['id']
@@ -2668,7 +2650,6 @@ class ObmlAgi3Agent(Agent):
                     'event': event, 'start': start_state, 'end': end_state_sig
                 })
 
-        # B. Implicit Events (Failures/No Change)
         if target_id_from_action and target_id_from_action not in changed_obj_ids:
             prev_obj = next((o for o in self.last_object_summary if o['id'] == target_id_from_action), None)
             if prev_obj:
@@ -2676,10 +2657,9 @@ class ObmlAgi3Agent(Agent):
                 end_state_sig = ('NO_CHANGE', target_id_from_action, None)
                 self._update_transition_memory(start_state, action_family, end_state_sig, current_trial_id)
 
-        # C. Run The Survivor System
         for item in transitions_to_analyze:
             start = item['start']
-            end = item['end'] # (Type, ID, Value)
+            end = item['end']
             event = item['event']
             
             self._update_transition_memory(start, action_family, end, current_trial_id)
@@ -2688,21 +2668,21 @@ class ObmlAgi3Agent(Agent):
             this_action_history = history.get(action_family, {})
             
             # --- 1. Initialize Hypotheses ---
+            # Default to True (Possible), but we require 'control_group_found' to validate them later.
             is_specific_global = True
             is_abstract_global = True
             is_direct = True
             
             current_specific = end
-            current_abstract = (end[0], end[2]) # (Type, Value)
+            current_abstract = (end[0], end[2])
 
-            # --- 2. Internal Consistency Check (Self-Incrimination) ---
+            # --- 2. Internal Consistency Check ---
             if len(this_action_history) > 1:
-                # Contradiction found within THIS specific action's history.
                 is_specific_global = False
                 is_abstract_global = False
                 is_direct = False
 
-            # --- 3. External Control Check (Witness Testimony) ---
+            # --- 3. External Control Check ---
             control_group_found = False
             
             if is_direct or is_specific_global or is_abstract_global:
@@ -2714,22 +2694,32 @@ class ObmlAgi3Agent(Agent):
                         other_specific = other_end
                         other_abstract = (other_end[0], other_end[2])
                         
-                        # KILL GLOBAL: If other action produced a DIFFERENT result
                         if other_specific != current_specific:
                             is_specific_global = False
                         if other_abstract != current_abstract:
                             is_abstract_global = False
-                            
-                        # KILL DIRECT: If other action produced the SAME result (Lack of Exclusivity)
                         if other_specific == current_specific:
                             is_direct = False
 
             # --- 4. Final Verdict ---
             
-            # Case A: The Stipulation (All Dead / Exception)
+            # FIX: If no control group exists, we cannot prove Global OR Direct.
+            # The only exception is Direct if we have tons of internal consistency (N>=5)
+            # but even then it's technically a Correlation. We stick to strict science.
+            if not control_group_found:
+                # Check for internal consistency failure first (Stipulation)
+                if not (is_specific_global or is_abstract_global or is_direct):
+                     # Contradiction logic (same as before)
+                     pass # Fall through to stipulation block below
+                else:
+                    ambiguous_events.append({
+                        'event': event, 'reason': "Correlation Only",
+                        'fix': "Needs Negative Control (Divergence) to prove Causality."
+                    })
+                    continue # Skip to next event
+
+            # Case A: The Stipulation (All Dead)
             if not (is_specific_global or is_abstract_global or is_direct):
-                
-                # Check if it's a Global Pattern (Cycle)
                 is_global_pattern = False
                 for other_action, outcomes in history.items():
                     if other_action == action_family: continue
@@ -2739,7 +2729,6 @@ class ObmlAgi3Agent(Agent):
                     if is_global_pattern: break
 
                 condition_str = self._solve_conditional_rule(start, action_family, end, current_context)
-                
                 if condition_str:
                     event['condition'] = condition_str
                     success_trials = this_action_history.get(end, set())
@@ -2751,8 +2740,7 @@ class ObmlAgi3Agent(Agent):
                             direct_events.append(event) 
                     else:
                         ambiguous_events.append({
-                            'event': event, 
-                            'reason': "Exception Hypothesis (N=1)", 
+                            'event': event, 'reason': "Exception Hypothesis (N=1)", 
                             'fix': f"Found potential condition '{condition_str}'. Needs replication."
                         })
                 else:
@@ -2761,17 +2749,20 @@ class ObmlAgi3Agent(Agent):
                     ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix})
                 continue
 
-            # Case B: Global Survivor
+            # Case B: Specific Global
             if is_specific_global and not is_direct:
                 global_events.append(event)
                 continue
+            
+            # Case D: Abstract Global
+            # (Moved up priority slightly to catch obvious cycles if Direct is dead)
             if is_abstract_global and not is_direct:
                 event['_abstract_global'] = True 
                 global_events.append(event)
                 continue
 
             # Case C: Direct Survivor
-            if is_direct and not (is_specific_global or is_abstract_global):
+            if is_direct:
                 success_trials = this_action_history.get(end, set())
                 if len(success_trials) >= 2:
                     direct_events.append(event)
@@ -2782,17 +2773,11 @@ class ObmlAgi3Agent(Agent):
                     })
                 continue
 
-            # Case D: Ambiguous (Multiple Survivors)
-            if not control_group_found:
-                ambiguous_events.append({
-                    'event': event, 'reason': "Correlation Only",
-                    'fix': "Needs Negative Control (Divergence) to distinguish Global vs Direct."
-                })
-            else:
-                ambiguous_events.append({
-                    'event': event, 'reason': "Ambiguous Overlap",
-                    'fix': "Data supports both Global and Direct hypotheses."
-                })
+            # Case E: Ambiguous Overlap
+            ambiguous_events.append({
+                'event': event, 'reason': "Ambiguous Overlap",
+                'fix': "Data supports both Global and Direct hypotheses."
+            })
 
         return direct_events, global_events, ambiguous_events
 
