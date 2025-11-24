@@ -1077,82 +1077,6 @@ class ObmlAgi3Agent(Agent):
                 print(f"  Learned {lbl} Consistency Rule for {action_key} (seen {len(outcome_data['contexts'])} times).")
         # --- LANDMINE LOGIC END ---
 
-    def _format_rule_description(self, hypothesis_key: tuple) -> str:
-        """
-        Returns a readable rule string using the 'Difference Engine' approach.
-        Rule = (Success Context) - (Static Background Context).
-        """
-        hypothesis = self.rule_hypotheses.get(hypothesis_key)
-        if not hypothesis: return "(No rule learned yet)"
-            
-        best_outcome = None
-        max_seen = -1
-        for fingerprint, data in hypothesis.items():
-            if data['raw_events'] and len(data['contexts']) > max_seen:
-                max_seen = len(data['contexts'])
-                best_outcome = data
-        
-        if not best_outcome: return "(History: Consistently No Change)"
-        rule = best_outcome['rule']
-        if not rule: return "IF (Always/Unconditional)"
-
-        # --- Calculate Static Background (Intersection of ALL history) ---
-        static_context = None
-        if self.level_state_history:
-            # Sample start, middle, end to find the true static background
-            indices = {0, len(self.level_state_history)-1}
-            if len(self.level_state_history) > 5:
-                indices.add(len(self.level_state_history)//2)
-            sample_history = [self.level_state_history[i] for i in indices]
-            
-            static_context = sample_history[0]
-            for ctx in sample_history[1:]:
-                static_context = self._intersect_contexts(static_context, ctx)
-
-        # Helper: Check if a condition exists exactly in the static background
-        def is_static(key, sub_key, val):
-            if not static_context: return False
-            if key not in static_context: return False
-            if sub_key not in static_context[key]: return False
-            return static_context[key][sub_key] == val
-
-        conditions = []
-
-        # Format Adjacencies (Subtracting Static)
-        for key in ['adj', 'diag_adj']:
-            if key in rule:
-                for obj, contacts in rule[key].items():
-                    if is_static(key, obj, contacts): continue
-                    
-                    specifics = [c for c in contacts if c != 'x' and c != 'na']
-                    if specifics:
-                        conditions.append(f"Adj({obj} to {specifics})")
-
-        # Format Relationships/Alignments (Subtracting Static)
-        for key in ['rels', 'align', 'match']:
-            if key in rule:
-                for type_name, groups in rule[key].items():
-                    for val, ids in groups.items():
-                        # Check if this exact group exists in background
-                        is_group_static = False
-                        if static_context and key in static_context:
-                            static_types = static_context[key]
-                            if type_name in static_types:
-                                if val in static_types[type_name] and static_types[type_name][val] == ids:
-                                    is_group_static = True
-                        
-                        if not is_group_static:
-                            conditions.append(f"{type_name}={val}")
-        
-        if 'diag_align' in rule:
-             for type_name in rule['diag_align']:
-                conditions.append(f"DiagAlign({type_name})")
-
-        if not conditions:
-            return "IF (Generic/Background Context)"
-            
-        return "IF " + " AND ".join(conditions)
-
     def _find_context_difference(self, context_A: dict, context_B: dict) -> dict:
         """
         Compares two common_contexts (A and B) and returns a new context pattern
@@ -2668,92 +2592,6 @@ class ObmlAgi3Agent(Agent):
                 for line in sorted(output_lines):
                     print(line)
                 print()
-
-
-    def _get_phenomenal_signature(self, event: dict):
-        """
-        Returns (Type, ID). Ignores the specific Value/Result.
-        Used to detect if a specific object is 'unstable' across different actions.
-        Example: Obj_27 shrinking (regardless of how much).
-        """
-        e_type = event['type']
-        obj_id = event.get('id')
-        
-        # For NEW events, the 'ID' is essentially the spawning phenomenon itself
-        if e_type == 'NEW':
-             # We treat ALL spawns as the same phenomenon for safety
-            return ('NEW', 'ANY')
-            
-        return (e_type, obj_id)
-    
-    def _analyze_reactive_triggers(self, ambiguous_events: list[dict], current_events: list[dict], 
-                                   current_summary: list[dict], prev_summary: list[dict],
-                                   current_adj: dict, prev_adj: dict):
-        """
-        Analyzes 'Ambiguous' events to see if they were triggered by specific
-        interactions (Overlap or Adjacency Changes), rather than being random Global events.
-        """
-        if not ambiguous_events:
-            return
-
-        # 1. Identify "Agitators" (Objects that moved this turn)
-        # We need their CURRENT state to check where they are standing now.
-        mover_ids = {e['id'] for e in current_events if e['type'] == 'MOVED'}
-        movers = [obj for obj in current_summary if obj['id'] in mover_ids]
-
-        for event in ambiguous_events:
-            victim_id = event.get('id')
-            if not victim_id: continue
-
-            # --- TRIGGER CHECK 1: OVERLAP (The "Bulldozer" Logic) ---
-            # Did a moving object step on the victim?
-            
-            # Case A: The Victim was REMOVED. 
-            # We check if any Mover is currently standing where the Victim WAS.
-            if event['type'] == 'REMOVED':
-                for mover in movers:
-                    # We use the helper we just added
-                    overlapped_ids = self._detect_pixel_overlaps(mover, prev_summary)
-                    
-                    if victim_id in overlapped_ids:
-                        if self.debug_channels['HYPOTHESIS']:
-                            print(f"  [Reactive Analysis] EXPLAINED: {victim_id} was REMOVED because {mover['id']} overlapped it.")
-                        # TODO: Store this rule: IF Overlap(Target) -> REMOVE(Target)
-                        return # Found the cause, move to next event
-
-            # Case B: The Victim CHANGED (Color/Shape).
-            # Did the Victim move onto something? (It is the Mover)
-            if victim_id in mover_ids:
-                # The victim itself moved. Did it step on something?
-                actor = next((obj for obj in current_summary if obj['id'] == victim_id), None)
-                if actor:
-                    overlapped_ids = self._detect_pixel_overlaps(actor, prev_summary)
-                    if overlapped_ids:
-                        if self.debug_channels['HYPOTHESIS']:
-                            # We grab the first overlapped object as the likely cause
-                            trigger_obj = overlapped_ids[0] 
-                            print(f"  [Reactive Analysis] EXPLAINED: {victim_id} {event['type']} because it overlapped {trigger_obj}.")
-                        return
-
-            # --- TRIGGER CHECK 2: ADJACENCY (The "Electric Fence" Logic) ---
-            # Did the object touch something NEW this turn?
-            
-            curr_contacts = set(current_adj.get(victim_id, []))
-            prev_contacts = set(prev_adj.get(victim_id, []))
-            
-            # Filter out 'na'
-            curr_contacts.discard('na')
-            prev_contacts.discard('na')
-            
-            new_contacts = curr_contacts - prev_contacts
-            
-            if new_contacts:
-                # We found a new interaction!
-                trigger_obj = list(new_contacts)[0] # Just grab one for now
-                if self.debug_channels['HYPOTHESIS']:
-                    print(f"  [Reactive Analysis] EXPLAINED: {victim_id} {event['type']} because it touched {trigger_obj}.")
-                # TODO: Store this rule: IF Touch(Trigger) -> Event(Actor)
-                return
             
     def _get_phenomenal_signature(self, event: dict):
         """
@@ -2779,7 +2617,23 @@ class ObmlAgi3Agent(Agent):
 
     def _classify_event_stream(self, current_events: list[dict], current_action_key: str, current_context: dict) -> tuple[list[dict], list[dict], list[dict]]:
         """
-        Classifies events using Strict Logic Proofs + Exception Solving.
+        Classifies events using the 'Survivor System' (Hypothesis Elimination).
+        
+        Hypotheses:
+        1. SPECIFIC GLOBAL: The exact result (ID+Value) happens regardless of action.
+        2. ABSTRACT GLOBAL: The phenomenon (Value) happens regardless of action.
+        3. DIRECT: The result is consistent AND exclusive to this action.
+        
+        Logic:
+        - Eliminate Global if a Control Group produces a DIFFERENT result (Specific OR Abstract).
+        - Eliminate Direct if a Control Group produces the SAME result (Loss of Exclusivity).
+        - Eliminate Direct if the Action itself is Inconsistent (Zero Tolerance).
+        
+        Outcomes:
+        - Only Global Survives -> GLOBAL (Specific preferred over Abstract).
+        - Only Direct Survives -> DIRECT.
+        - Both Survive -> AMBIGUOUS (Correlation Only / Need Control).
+        - All Die -> EXCEPTION (Requires Conditional Solver).
         """
         direct_events = []
         global_events = []
@@ -2796,10 +2650,10 @@ class ObmlAgi3Agent(Agent):
             
         current_trial_id = self.last_action_id
 
-        # 2. Build Transitions
         transitions_to_analyze = []
         changed_obj_ids = {e['id']: e for e in current_events if 'id' in e}
         
+        # A. Build Transitions (Explicit Changes)
         for event in current_events:
             if 'id' not in event: continue
             obj_id = event['id']
@@ -2811,6 +2665,7 @@ class ObmlAgi3Agent(Agent):
                     'event': event, 'start': start_state, 'end': end_state_sig
                 })
 
+        # B. Implicit Events (Failures/No Change)
         if target_id_from_action and target_id_from_action not in changed_obj_ids:
             prev_obj = next((o for o in self.last_object_summary if o['id'] == target_id_from_action), None)
             if prev_obj:
@@ -2818,10 +2673,10 @@ class ObmlAgi3Agent(Agent):
                 end_state_sig = ('NO_CHANGE', target_id_from_action, None)
                 self._update_transition_memory(start_state, action_family, end_state_sig, current_trial_id)
 
-        # 3. Logic Solver
+        # C. Run The Survivor System
         for item in transitions_to_analyze:
             start = item['start']
-            end = item['end']
+            end = item['end'] # (Type, ID, Value)
             event = item['event']
             
             self._update_transition_memory(start, action_family, end, current_trial_id)
@@ -2829,61 +2684,121 @@ class ObmlAgi3Agent(Agent):
             history = self.transition_counts.get(start, {})
             this_action_history = history.get(action_family, {})
             
-            # 1. CHECK INTERNAL CONSISTENCY (Zero Tolerance)
-            if len(this_action_history) > 1: 
-                # --- EXCEPTION LOGIC START ---
-                # We found a contradiction. Is it a conditional rule?
+            # --- 1. Initialize Hypotheses ---
+            is_specific_global = True
+            is_abstract_global = True
+            is_direct = True
+            
+            current_specific = end
+            current_abstract = (end[0], end[2]) # (Type, Value)
+
+            # --- 2. Internal Consistency Check (Self-Incrimination) ---
+            if len(this_action_history) > 1:
+                # Contradiction found within THIS action's history.
+                # This kills Direct immediately.
+                # It technically kills Unconditional Global too (since the "world" failed).
+                is_specific_global = False
+                is_abstract_global = False
+                is_direct = False
+                # This will fall through to the "All Die" Exception Handler.
+
+            # --- 3. External Control Check (Witness Testimony) ---
+            control_group_found = False
+            
+            if is_direct or is_specific_global or is_abstract_global:
+                for other_action, outcomes in history.items():
+                    if other_action == action_family: continue
+                    control_group_found = True
+                    
+                    for other_end in outcomes:
+                        other_specific = other_end
+                        other_abstract = (other_end[0], other_end[2])
+                        
+                        # KILL GLOBAL: If other action produced a DIFFERENT result
+                        if other_specific != current_specific:
+                            is_specific_global = False
+                        if other_abstract != current_abstract:
+                            is_abstract_global = False
+                            
+                        # KILL DIRECT: If other action produced the SAME result (Lack of Exclusivity)
+                        # (We check specific matching first. Abstract matching might weaken Direct,
+                        # but doesn't strictly kill it in a Multi-Effect world).
+                        if other_specific == current_specific:
+                            is_direct = False
+
+            # --- 4. Final Verdict ---
+            
+            # Case A: The Stipulation (All Dead / Exception)
+            if not (is_specific_global or is_abstract_global or is_direct):
+                
+                # Check if it's a Global Pattern (Cycle) before calling it a contradiction
+                # If other actions consistently produce the same Abstract result, it's likely a Global Cycle
+                is_global_pattern = False
+                for other_action, outcomes in history.items():
+                    if other_action == action_family: continue
+                    for other_end in outcomes:
+                        if (other_end[0], other_end[2]) == current_abstract:
+                            is_global_pattern = True; break
+                    if is_global_pattern: break
+
                 condition_str = self._solve_conditional_rule(start, action_family, end, current_context)
                 
                 if condition_str:
-                    # Solved! It's Direct, but Conditional.
-                    event['condition'] = condition_str # Tag it for the printer
-                    direct_events.append(event)
+                    event['condition'] = condition_str
+                    
+                    # CONDITIONAL REPRODUCIBILITY CHECK (N>=2 for Exceptions)
+                    success_trials = this_action_history.get(end, set())
+                    if len(success_trials) >= 2:
+                        if is_global_pattern:
+                            event['_abstract_global'] = True
+                            global_events.append(event)
+                        else:
+                            direct_events.append(event) 
+                    else:
+                        ambiguous_events.append({
+                            'event': event, 
+                            'reason': "Exception Hypothesis (N=1)", 
+                            'fix': f"Found potential condition '{condition_str}'. Needs replication."
+                        })
                 else:
-                    # Unsolved Contradiction
-                    ambiguous_events.append({
-                        'event': event, 
-                        'reason': "Contradiction Found",
-                        'fix': "Action produces variable results. Needs Context Refinement."
-                    })
-                # --- EXCEPTION LOGIC END ---
+                    reason = "Global Cycle / Variable" if is_global_pattern else "Contradiction Found"
+                    fix = "Likely Time-Dependent or Global State Rotation." if is_global_pattern else "Action produces variable results. Needs Context Refinement."
+                    ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix})
                 continue
-                
-            # 2. CHECK GLOBAL CONVERGENCE
-            is_global = False
-            for other_action, outcomes in history.items():
-                if other_action == action_family: continue
-                if end in outcomes: 
-                    is_global = True; break
-            
-            if is_global:
+
+            # Case B: Global Survivor
+            if is_specific_global and not is_direct:
+                global_events.append(event)
+                continue
+            if is_abstract_global and not is_direct:
+                event['_abstract_global'] = True 
                 global_events.append(event)
                 continue
 
-            # 3. CHECK DIRECT DIVERGENCE
-            has_control_group = False
-            for other_action, outcomes in history.items():
-                if other_action == action_family: continue
-                for other_end in outcomes:
-                    if other_end != end:
-                        has_control_group = True; break
-                if has_control_group: break
-            
-            if has_control_group:
+            # Case C: Direct Survivor
+            if is_direct and not (is_specific_global or is_abstract_global):
+                # Sample Size Check (N>=2)
                 success_trials = this_action_history.get(end, set())
                 if len(success_trials) >= 2:
                     direct_events.append(event)
                 else:
                     ambiguous_events.append({
-                        'event': event,
-                        'reason': "New Event (N=1)",
-                        'fix': "Hypothesis formed. Needs replication (re-test)."
+                        'event': event, 'reason': "New Event (N=1)",
+                        'fix': "Hypothesis verified but needs sample size (N>=2)."
                     })
-            else:
+                continue
+
+            # Case D: Ambiguous (Multiple Survivors)
+            if not control_group_found:
                 ambiguous_events.append({
-                    'event': event,
-                    'reason': "Correlation Only",
-                    'fix': "Needs Negative Control (Divergence) to prove Causality."
+                    'event': event, 'reason': "Correlation Only",
+                    'fix': "Needs Negative Control (Divergence) to distinguish Global vs Direct."
+                })
+            else:
+                # Both Global and Direct are theoretically possible (rare)
+                ambiguous_events.append({
+                    'event': event, 'reason': "Ambiguous Overlap",
+                    'fix': "Data supports both Global and Direct hypotheses."
                 })
 
         return direct_events, global_events, ambiguous_events
@@ -2962,6 +2877,7 @@ class ObmlAgi3Agent(Agent):
     def _format_rule_description(self, hypothesis_key: tuple) -> str:
         """
         Returns a readable rule string using Background Subtraction.
+        Explicitly prints Object IDs for every condition to verify bindings.
         """
         hypothesis = self.rule_hypotheses.get(hypothesis_key)
         if not hypothesis: return "(No rule learned yet)"
@@ -3018,7 +2934,10 @@ class ObmlAgi3Agent(Agent):
                                 if val in static_types[type_name] and static_types[type_name][val] == ids:
                                     is_group_static = True
                         if not is_group_static:
-                            conditions.append(f"{type_name}={val}")
+                            # --- THE FIX: Print the IDs involved! ---
+                            # e.g. turns "Color=3" into "Color=3(['obj_34'])"
+                            id_list_str = str(list(ids))
+                            conditions.append(f"{type_name}={val}{id_list_str}")
         
         if 'diag_align' in rule:
              for type_name in rule['diag_align']:
@@ -3030,14 +2949,11 @@ class ObmlAgi3Agent(Agent):
     def _solve_conditional_rule(self, start_state, action_family, current_end_sig, current_context) -> str | None:
         """
         The 'Exception Solver'.
-        Called when a Contradiction is found. It compares the CURRENT context 
-        against the HISTORICAL context of the conflicting result.
-        
-        Returns a string describing the difference (The Condition), or None if no clear difference found.
+        Compares Current Context vs. Historical Conflict Context.
+        Returns a simple condition string, or None if the difference is too complex (overfitting).
         """
         history = self.transition_counts.get(start_state, {}).get(action_family, {})
         
-        # 1. Find a conflicting outcome (anything that isn't the current result)
         conflicting_end = None
         conflicting_trial_ids = set()
         
@@ -3045,56 +2961,36 @@ class ObmlAgi3Agent(Agent):
             if end_sig != current_end_sig:
                 conflicting_end = end_sig
                 conflicting_trial_ids = trials
-                break # Just compare against the first conflict found for now
+                break 
         
-        if not conflicting_end or not conflicting_trial_ids:
-            return None
+        if not conflicting_end or not conflicting_trial_ids: return None
 
-        # 2. Time Travel: Retrieve the context of the conflicting trial
-        # We grab the most recent trial of the conflict
         past_trial_id = max(conflicting_trial_ids)
-        
-        # Map Trial ID to History Index. 
-        # global_action_counter starts at 1. List index starts at 0.
         history_index = past_trial_id - 1
         
-        if history_index < 0 or history_index >= len(self.level_state_history):
-            return None # Safety check
+        if history_index < 0 or history_index >= len(self.level_state_history): return None
             
         past_context = self.level_state_history[history_index]
         
-        # 3. The Difference Engine: (Current - Past)
-        # What is present NOW that was NOT present THEN? (or vice versa)
-        
-        # Check Adjacency Differences
         diffs = []
-        
-        # We only care about the TARGET object's context (from the start state)
-        # Since start_state doesn't contain ID, we rely on the current_context's focus.
-        # This is a heuristic: check differences in Adjacency for objects involved.
-        
         curr_adj = current_context.get('adj', {})
         past_adj = past_context.get('adj', {})
         
-        # Find objects that have different adjacency sets
         all_ids = set(curr_adj.keys()) | set(past_adj.keys())
         for obj_id in all_ids:
             c_contacts = set(curr_adj.get(obj_id, [])); c_contacts.discard('na')
             p_contacts = set(past_adj.get(obj_id, [])); p_contacts.discard('na')
             
             if c_contacts != p_contacts:
-                # Found a difference!
-                # If it's in Current but not Past: "IF Adj(...)"
                 added = c_contacts - p_contacts
-                if added:
-                    diffs.append(f"Adj({obj_id} to {list(added)})")
+                if added: diffs.append(f"Adj({obj_id} to {list(added)})")
                 
-                # If it's in Past but not Current: "IF NOT Adj(...)"
                 removed = p_contacts - c_contacts
-                if removed:
-                    diffs.append(f"NOT Adj({obj_id} to {list(removed)})")
+                if removed: diffs.append(f"NOT Adj({obj_id} to {list(removed)})")
 
-        if diffs:
-            return " AND ".join(diffs)
-            
+        # Garbage Filter: If it's too complex, it's probably a hidden variable we can't see yet.
+        if len(diffs) > 3:
+            return None 
+
+        if diffs: return " AND ".join(diffs)
         return None
