@@ -2639,7 +2639,10 @@ class ObmlAgi3Agent(Agent):
         global_events = []
         ambiguous_events = [] 
         
-        action_family = current_action_key.split('_')[0]
+        # --- CRITICAL CHANGE: Treat every target as a unique Action Family ---
+        # This prevents "Clicking Obj 1" and "Clicking Obj 2" from contradicting each other.
+        action_family = current_action_key 
+        
         target_id_from_action = None
         if 'ACTION6_' in current_action_key:
             target_id_from_action = current_action_key.replace('ACTION6_', '')
@@ -2694,13 +2697,10 @@ class ObmlAgi3Agent(Agent):
 
             # --- 2. Internal Consistency Check (Self-Incrimination) ---
             if len(this_action_history) > 1:
-                # Contradiction found within THIS action's history.
-                # This kills Direct immediately.
-                # It technically kills Unconditional Global too (since the "world" failed).
+                # Contradiction found within THIS specific action's history.
                 is_specific_global = False
                 is_abstract_global = False
                 is_direct = False
-                # This will fall through to the "All Die" Exception Handler.
 
             # --- 3. External Control Check (Witness Testimony) ---
             control_group_found = False
@@ -2721,8 +2721,6 @@ class ObmlAgi3Agent(Agent):
                             is_abstract_global = False
                             
                         # KILL DIRECT: If other action produced the SAME result (Lack of Exclusivity)
-                        # (We check specific matching first. Abstract matching might weaken Direct,
-                        # but doesn't strictly kill it in a Multi-Effect world).
                         if other_specific == current_specific:
                             is_direct = False
 
@@ -2731,8 +2729,7 @@ class ObmlAgi3Agent(Agent):
             # Case A: The Stipulation (All Dead / Exception)
             if not (is_specific_global or is_abstract_global or is_direct):
                 
-                # Check if it's a Global Pattern (Cycle) before calling it a contradiction
-                # If other actions consistently produce the same Abstract result, it's likely a Global Cycle
+                # Check if it's a Global Pattern (Cycle)
                 is_global_pattern = False
                 for other_action, outcomes in history.items():
                     if other_action == action_family: continue
@@ -2745,8 +2742,6 @@ class ObmlAgi3Agent(Agent):
                 
                 if condition_str:
                     event['condition'] = condition_str
-                    
-                    # CONDITIONAL REPRODUCIBILITY CHECK (N>=2 for Exceptions)
                     success_trials = this_action_history.get(end, set())
                     if len(success_trials) >= 2:
                         if is_global_pattern:
@@ -2777,7 +2772,6 @@ class ObmlAgi3Agent(Agent):
 
             # Case C: Direct Survivor
             if is_direct and not (is_specific_global or is_abstract_global):
-                # Sample Size Check (N>=2)
                 success_trials = this_action_history.get(end, set())
                 if len(success_trials) >= 2:
                     direct_events.append(event)
@@ -2795,7 +2789,6 @@ class ObmlAgi3Agent(Agent):
                     'fix': "Needs Negative Control (Divergence) to distinguish Global vs Direct."
                 })
             else:
-                # Both Global and Direct are theoretically possible (rare)
                 ambiguous_events.append({
                     'event': event, 'reason': "Ambiguous Overlap",
                     'fix': "Data supports both Global and Direct hypotheses."
@@ -2950,7 +2943,8 @@ class ObmlAgi3Agent(Agent):
         """
         The 'Exception Solver'.
         Compares Current Context vs. Historical Conflict Context.
-        Returns a simple condition string, or None if the difference is too complex (overfitting).
+        Checks Adjacencies, Alignments, and Match Groups for a differentiator.
+        Returns a simple condition string, or None if the difference is too complex.
         """
         history = self.transition_counts.get(start_state, {}).get(action_family, {})
         
@@ -2973,6 +2967,8 @@ class ObmlAgi3Agent(Agent):
         past_context = self.level_state_history[history_index]
         
         diffs = []
+        
+        # --- 1. Check Adjacency Differences ---
         curr_adj = current_context.get('adj', {})
         past_adj = past_context.get('adj', {})
         
@@ -2987,6 +2983,47 @@ class ObmlAgi3Agent(Agent):
                 
                 removed = p_contacts - c_contacts
                 if removed: diffs.append(f"NOT Adj({obj_id} to {list(removed)})")
+
+        # --- 2. Check Alignment Differences (Position Context) ---
+        # This solves cases where "The Object in the Center" works but "The Object in the Corner" fails.
+        curr_align = current_context.get('align', {})
+        past_align = past_context.get('align', {})
+        
+        # We iterate over alignment types (center_x, top_y, etc.)
+        all_types = set(curr_align.keys()) | set(past_align.keys())
+        for align_type in all_types:
+            c_groups = curr_align.get(align_type, {})
+            p_groups = past_align.get(align_type, {})
+            
+            # Check if the involved objects have different alignment values
+            all_coords = set(c_groups.keys()) | set(p_groups.keys())
+            for coord in all_coords:
+                c_ids = c_groups.get(coord, set())
+                p_ids = p_groups.get(coord, set())
+                
+                if c_ids != p_ids:
+                    # Simplify: Just report the property existence for now to avoid clutter
+                    # We assume the diff is relevant if it involves the target implicitly
+                    # (We can't filter by target ID easily here as start_state doesn't have it, 
+                    # but strict diffs usually isolate the active object).
+                    if len(diffs) < 3: # Heuristic limit
+                        added = c_ids - p_ids
+                        if added: diffs.append(f"{align_type}={coord}{list(added)}")
+
+        # --- 3. Check Match Group Differences (Global Context) ---
+        # This solves "It only works if a Blue object exists"
+        curr_match = current_context.get('match', {})
+        past_match = past_context.get('match', {})
+        
+        for m_type in set(curr_match.keys()) | set(past_match.keys()):
+            c_groups = curr_match.get(m_type, {})
+            p_groups = past_match.get(m_type, {})
+            
+            for props, c_ids in c_groups.items():
+                p_ids = p_groups.get(props, [])
+                if set(c_ids) != set(p_ids):
+                     if len(diffs) < 3:
+                        diffs.append(f"{m_type}={props}") # e.g. "Color=5 Group Changed"
 
         # Garbage Filter: If it's too complex, it's probably a hidden variable we can't see yet.
         if len(diffs) > 3:
