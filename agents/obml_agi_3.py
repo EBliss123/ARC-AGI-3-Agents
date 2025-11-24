@@ -802,23 +802,18 @@ class ObmlAgi3Agent(Agent):
     def _find_common_context(self, contexts: list[dict]) -> dict:
         """
         Finds the GLOBAL intersection of multiple game states.
-        Returns a rule containing ONLY the elements present in EVERY context.
+        FIX: Uses Intersection for groups instead of Strict Equality.
         """
-        if not contexts:
-            return {}
+        if not contexts: return {}
 
-        # Start with the first Universe as the candidate Rule
         common_rule = copy.deepcopy(contexts[0])
-        
-        # Remove non-structural data
         common_rule.pop('summary', None)
         common_rule.pop('events', None)
 
-        # Intersect with every other Universe observed
         for i in range(1, len(contexts)):
             next_ctx = contexts[i]
             
-            # --- 1. Intersect Adjacencies (Global) ---
+            # --- 1. Intersect Adjacencies ---
             for key in ['adj', 'diag_adj']:
                 if key not in common_rule: continue
                 current_map = common_rule[key]
@@ -826,16 +821,13 @@ class ObmlAgi3Agent(Agent):
                 
                 ids_to_remove = []
                 for obj_id, current_contacts in current_map.items():
-                    if obj_id not in next_map:
-                        ids_to_remove.append(obj_id)
-                        continue
-                    if current_contacts != next_map[obj_id]:
+                    if obj_id not in next_map or current_contacts != next_map[obj_id]:
                         ids_to_remove.append(obj_id)
                 for obj_id in ids_to_remove:
                     del current_map[obj_id]
                 if not current_map: del common_rule[key]
 
-            # --- 2. Intersect Global Relationships (Global) ---
+            # --- 2. Intersect Global Relationships (The Fix) ---
             for key in ['rels', 'align', 'match']:
                 if key not in common_rule: continue
                 current_types = common_rule[key]
@@ -853,8 +845,16 @@ class ObmlAgi3Agent(Agent):
                         if val not in next_groups:
                             values_to_remove.append(val)
                             continue
-                        if set(curr_ids) != set(next_groups[val]):
+                        
+                        # FIX: Intersect the sets instead of requiring equality
+                        # If {7, 8} became {7, 8, 9}, we keep {7, 8}.
+                        common_ids = set(curr_ids) & set(next_groups[val])
+                        
+                        if common_ids:
+                            curr_groups[val] = common_ids
+                        else:
                             values_to_remove.append(val)
+
                     for val in values_to_remove:
                         del curr_groups[val]
                     if not curr_groups: types_to_remove.append(t_name)
