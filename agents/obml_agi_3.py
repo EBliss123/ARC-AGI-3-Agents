@@ -2686,8 +2686,6 @@ class ObmlAgi3Agent(Agent):
             current_abstract = (end[0], end[2])
 
             # --- 2. Internal Consistency Check (Zero Tolerance) ---
-            # If we find inconsistency for this Start State + Action, 
-            # Direct and Specific Global are impossible without conditions.
             if len(this_action_history) > 1:
                 is_specific_global = False
                 is_abstract_global = False
@@ -2711,15 +2709,13 @@ class ObmlAgi3Agent(Agent):
                         if other_abstract != current_abstract:
                             is_abstract_global = False
                             
-                        # RELAXED DIRECT: We DO NOT kill Direct if other action produced the same result.
-                        # Shared Causality is allowed. Direct is killed by Inconsistency (Step 2).
+                        # KILL DIRECT: If other action produced the SAME result (Loss of Exclusivity)
+                        if other_specific == current_specific:
+                            is_direct = False
 
             # --- 4. Final Verdict ---
             
             if not control_group_found:
-                # If no control group, we can't prove Global or Exclusivity.
-                # But if consistent, we might tentatively call it Direct if N is high?
-                # For strict science, we keep it Ambiguous/Correlation.
                 if not (is_specific_global or is_abstract_global or is_direct):
                      pass # Fall through to Exception Solver
                 else:
@@ -2758,30 +2754,22 @@ class ObmlAgi3Agent(Agent):
                             'event': event, 'reason': "Exception Hypothesis (N=1)", 
                             'fix': f"Found potential condition '{condition_str}'. Needs replication."
                         })
-                        
-                # --- NEW: If no condition found, but pattern exists, accept Abstract Global ---
                 elif is_global_pattern:
                     event['_abstract_global'] = True
-                    # We attach a note that it's likely time-based
                     event['condition'] = "(Time/Cycle Driven)" 
                     global_events.append(event)
-                # ---------------------------------------------------------------------------
-                
                 else:
-                    # Truly unsolved contradiction
-                    ambiguous_events.append({
-                        'event': event, 
-                        'reason': "Contradiction Found", 
-                        'fix': "Action produces variable results. Needs Context Refinement."
-                    })
+                    reason = "Contradiction Found"
+                    fix = "Action produces variable results. Needs Context Refinement."
+                    ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix})
                 continue
 
-            # Case B: Specific Global
+            # Case B: Specific Global (Priority 1)
             if is_specific_global:
                 global_events.append(event)
                 continue
 
-            # Case C: Direct Survivor
+            # Case C: Direct Survivor (Priority 2)
             if is_direct:
                 success_trials = this_action_history.get(end, set())
                 if len(success_trials) >= 2:
@@ -2793,7 +2781,7 @@ class ObmlAgi3Agent(Agent):
                     })
                 continue
             
-            # Case D: Abstract Global
+            # Case D: Abstract Global (Priority 3)
             if is_abstract_global:
                 event['_abstract_global'] = True 
                 global_events.append(event)
@@ -2810,7 +2798,7 @@ class ObmlAgi3Agent(Agent):
     def _update_transition_memory(self, start, action, end, trial_id):
         """
         Helper to update the nested transition dictionary safely.
-        Stores the TRIAL ID (timestamp) to ensure we count independent tests, not raw events.
+        STRICT: Only logs the specific action provided. No pooling.
         """
         if start not in self.transition_counts:
             self.transition_counts[start] = {}
