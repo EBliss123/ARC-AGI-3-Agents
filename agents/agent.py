@@ -85,6 +85,14 @@ class Agent(ABC):
         ):
             action = self.choose_action(self.frames, self.frames[-1])
             
+            # --- NEW: Handle "Wait/Pass" ---
+            if action is None:
+                logger.info(f"{self.game_id} - WAITING for stability/animation...")
+                time.sleep(0.5) 
+                self.refresh_frame() # <--- Force server update
+                continue
+            # -------------------------------
+            
             frame = self.take_action(action)
             
             if frame:
@@ -149,6 +157,35 @@ class Agent(ABC):
             self.guid = frame.guid
         if hasattr(self, "recorder") and not self.is_playback:
             self.recorder.record(json.loads(frame.model_dump_json()))
+
+    def refresh_frame(self) -> bool:
+        """Forces a server update by sending a calculated 'Pass' action."""
+        try:
+            # Delegate to the subclass to find a safe "No-Op" action
+            get_pass = getattr(self, "get_pass_action", None)
+            pass_action = get_pass() if get_pass else None
+            
+            if pass_action:
+                logger.info(f"{self.game_id} - Sending Active Wait: {pass_action.name}")
+                
+                # Execute the request directly
+                # We do NOT use take_action because we don't want to log/score this as a move
+                response = self.do_action_request(pass_action)
+                
+                if response.ok:
+                    data = response.json()
+                    # Validate and update the frame
+                    if 'frame' in data or 'state' in data:
+                        new_frame = FrameData.model_validate(data)
+                        self.frames[-1] = new_frame
+                        return True
+            else:
+                logger.warning("Agent did not provide a pass action for refresh.")
+                
+        except Exception as e:
+            logger.warning(f"Active Wait failed: {e}")
+            
+        return False
 
     def do_action_request(self, action: GameAction) -> Response:
         data = action.action_data.model_dump()
