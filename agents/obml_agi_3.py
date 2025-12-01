@@ -3,6 +3,7 @@ from .structs import GameAction, GameState
 from collections import deque
 import copy
 import ast
+from typing import Optional
 import statistics
 
 class ObmlAgi3Agent(Agent):
@@ -61,6 +62,11 @@ class ObmlAgi3Agent(Agent):
         self.action_consistency_counts = {} 
         self.performed_action_types = set()
         self.productive_action_types = set() # Tracks actions that caused change
+
+        # --- Stability Tracking ---
+        self.stability_streak = 0
+        self.forcing_wait = False
+        self.last_stable_pixels = None
 
         # --- Debug Channels ---
         # Set these to True or False to control the debug output.
@@ -131,19 +137,55 @@ class ObmlAgi3Agent(Agent):
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
-        Analyzes the current frame, compares it to the previous frame,
-        and logs all perceived changes.
+        Analyzes the current frame, checks for stability, and logs perceived changes.
         """
-        # If the game hasn't started, this is a new game. Do a full "brain wipe".
+        # --- 1. Game Start / Game Over Logic ---
         if latest_frame.state == GameState.NOT_PLAYED:
             self._reset_agent_memory()
             return GameAction.RESET
         
-        # If the game is over, this is a "retry" of the same level.
-        # Only reset the level state, but KEEP the learned rules.
         if latest_frame.state == GameState.GAME_OVER:
             self._reset_level_state()
+            self.forcing_wait = False
             return GameAction.RESET
+
+        # --- 2. Animation Guard: If server says busy, we wait ---
+        if not latest_frame.available_actions:
+            return None
+
+        # --- 3. Stability Check (Robust Streak Logic) ---
+        current_pixels = latest_frame.frame[0] if latest_frame.frame else []
+        
+        # A. Force wait after any action to see result
+        if self.forcing_wait:
+            self.forcing_wait = False
+            self.last_stable_pixels = current_pixels
+            self.stability_streak = 0
+            return None 
+            
+        # B. Compare pixels to last known state
+        is_visually_identical = (self.last_stable_pixels is not None and 
+                                 current_pixels == self.last_stable_pixels)
+
+        if not is_visually_identical:
+            if self.debug_channels['CHANGES'] and self.stability_streak > 0:
+                print("--- Stability Broken: Screen moved. Resetting streak. ---")
+            self.last_stable_pixels = current_pixels
+            self.stability_streak = 0
+            return None # Wait for stability
+        
+        else:
+            # Screen is stable. Increment streak.
+            self.stability_streak += 1
+            REQUIRED_STREAK = 2 # Wait for 2 consecutive stable frames (~1.0s)
+            
+            if self.stability_streak < REQUIRED_STREAK:
+                return None # Wait for confirmation
+        
+        # C. Authorized to ACT. Next time we must wait again.
+        self.forcing_wait = True 
+        self.last_stable_pixels = current_pixels
+        # -----------------------------------------------------
         
         # --- 1. Perceive Raw Objects ---
         # --- Print available actions once ---
@@ -696,7 +738,8 @@ class ObmlAgi3Agent(Agent):
                 print(f"Profile: U:{best_profile['unknowns']} D:{best_profile['discoveries']} B:{best_profile['boring']} F:{best_profile['failures']}")
         
         else:
-            action_to_return = GameAction.RESET # Fallback
+            # Modified: If no moves found, just WAIT. Don't reset.
+            action_to_return = None
 
         # --- Store action for next turn's analysis ---
         learning_key_for_storage = self._get_learning_key(action_to_return.name, chosen_object_id if chosen_object else None)
@@ -3030,3 +3073,43 @@ class ObmlAgi3Agent(Agent):
 
         if diffs: return " AND ".join(diffs)
         return None
+    
+    def get_pass_action(self) -> Optional[GameAction]:
+        """
+        Determines the safest action to take solely to refresh the game state.
+        Strategy:
+        1. Try an action that is NOT valid for the current state (1-7).
+        2. If all are valid, click (ACTION6) an object that has never caused a change.
+        """
+        latest_frame = self.frames[-1]
+        available_names = {a.name for a in latest_frame.available_actions}
+        
+        # --- Strategy 1: Use an Invalid Action ---
+        for i in range(1, 8):
+            try:
+                candidate = GameAction.from_id(i)
+                if candidate.name not in available_names:
+                    # Invalid actions are often treated as No-Ops
+                    if candidate.name == 'ACTION6':
+                         candidate.set_data({'x': 0, 'y': 0})
+                    return candidate
+            except ValueError:
+                continue
+
+        # --- Strategy 2: Click a "Safe" Object ---
+        current_summary = self.last_object_summary
+        for obj in current_summary:
+            obj_id = obj['id']
+            action_key = self._get_learning_key('ACTION6', obj_id)
+            
+            # If this object has never been productive, clicking it is likely safe
+            if action_key not in self.productive_action_types:
+                action = GameAction.ACTION6
+                r, c = obj['position']
+                action.set_data({'x': c, 'y': r}) 
+                return action
+        
+        # --- Fallback: Click Top-Left ---
+        action = GameAction.ACTION6
+        action.set_data({'x': 0, 'y': 0})
+        return action
