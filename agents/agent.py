@@ -88,7 +88,7 @@ class Agent(ABC):
             # --- NEW: Handle "Wait/Pass" ---
             if action is None:
                 logger.info(f"{self.game_id} - WAITING for stability/animation...")
-                time.sleep(0.5) 
+                time.sleep(0.05) 
                 self.refresh_frame() # <--- Force server update
                 continue
             # -------------------------------
