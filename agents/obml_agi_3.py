@@ -177,7 +177,7 @@ class ObmlAgi3Agent(Agent):
         else:
             # Screen is stable. Increment streak.
             self.stability_streak += 1
-            REQUIRED_STREAK = 2 # Wait for 2 consecutive stable frames (~1.0s)
+            REQUIRED_STREAK = 1 # Wait for 2 consecutive stable frames (~1.0s)
             
             if self.stability_streak < REQUIRED_STREAK:
                 return None # Wait for confirmation
