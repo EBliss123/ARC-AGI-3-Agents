@@ -63,6 +63,10 @@ class ObmlAgi3Agent(Agent):
         self.performed_action_types = set()
         self.productive_action_types = set() # Tracks actions that caused change
 
+        # --- NEW: Relational Color Memory ---
+        # Stores discovered laws like: ('ACTION6_obj_1', 'obj_5') -> {'Source: Adjacency(0,1)'}
+        self.relational_constraints = {}
+
         # --- Stability Tracking ---
         self.stability_streak = 0
         self.forcing_wait = False
@@ -74,7 +78,7 @@ class ObmlAgi3Agent(Agent):
             'PERCEPTION': False,      # Object finding, relationships, new level setup
             'CHANGES': True,         # All "Change Log" prints
             'STATE_GRAPH': False,     # State understanding
-            'HYPOTHESIS': True,      # "Initial Hypotheses", "Refined Hypothesis"
+            'HYPOTHESIS': False,      # "Initial Hypotheses", "Refined Hypothesis"
             'FAILURE': False,         # "Failure Analysis", "Failure Detected"
             'WIN_CONDITION': False,   # "LEVEL CHANGE DETECTED", "Win Condition Analysis"
             'ACTION_SCORE': True,    # All scoring prints
@@ -385,6 +389,35 @@ class ObmlAgi3Agent(Agent):
                     global_key = ('GLOBAL', str(abst_sig)) 
                     self._analyze_result(global_key, [event], prev_context)
 
+                # --- NEW: Rescue Ambiguous Events via Relational Logic ---
+                # Ambiguous events are usually contradictions (e.g. "Sometimes Red, Sometimes Blue").
+                # We check if a Relational Law (e.g. "Always Match Neighbor") resolves the contradiction.
+                rescued_events = []
+                remaining_ambiguous = []
+                
+                for wrapper in ambiguous_events:
+                    e = wrapper['event']
+                    if 'id' in e:
+                        # 1. Update memory manually
+                        check_key = (learning_key, e['id'])
+                        self._update_relational_constraints(check_key, [e], prev_context)
+                        
+                        # 2. Check Classification
+                        rel_class = self._get_relational_classification(learning_key, e['id'])
+                        
+                        # We only rescue if it is definitively DIRECT or GLOBAL (Consistency Proven)
+                        # If it's Global, we rescue it (it's predictable), but it will be printed as Global.
+                        if rel_class in ["DIRECT", "GLOBAL"]:
+                            rescued_events.append(e)
+                            continue
+                            
+                    remaining_ambiguous.append(wrapper)
+                
+                ambiguous_events = remaining_ambiguous
+                # Add rescued events to direct_events so they are printed in the Success block
+                direct_events.extend(rescued_events) 
+                # ---------------------------------------------------------
+
                 # --- DETAILED PRINTING (Now uses updated brain) ---
                 if self.debug_channels['CHANGES']:
                     
@@ -399,6 +432,25 @@ class ObmlAgi3Agent(Agent):
                     if global_events: 
                         print(f"  -> Filtered {len(global_events)} Global events:")
                         for e in global_events:
+                            obj_id = e.get('id')
+                            
+                            # --- NEW: Check Rigorous Relational Classification ---
+                            # We check the learning key used for this event
+                            # Note: Global events usually come from "passive" observations, 
+                            # so we check if the relation holds across the board.
+                            
+                            # Check if this object has a GLOBAL classification from the current action
+                            rel_class = self._get_relational_classification(learning_key, obj_id)
+                            
+                            if rel_class == "GLOBAL":
+                                data = self.relational_constraints[(learning_key, obj_id)]
+                                sources = list(data['rules'])
+                                source_str = " OR ".join(sources)
+                                print(f"     * {e['type']} on {obj_id}")
+                                print(f"       [Explanation] Global Relational Law: Inevitably matches '{source_str}'.")
+                                continue 
+                            # --------------------------------------------------------
+
                             abst_sig = self._get_abstract_signature(e)
                             global_key = ('GLOBAL', str(abst_sig))
                             rule_str = self._format_rule_description(global_key)
@@ -410,18 +462,35 @@ class ObmlAgi3Agent(Agent):
                     if direct_events: 
                         print(f"  -> Processing {len(direct_events)} Direct events:")
                         for e in direct_events:
-                            # The key for this specific object's rule
-                            direct_key = (learning_key, e.get('id'))
+                            obj_id = e.get('id')
+                            direct_key = (learning_key, obj_id)
                             
-                            # --- NEW: Check Relational Module First ---
-                            if direct_key in self.relational_constraints:
-                                # We have a "Smart" Rule! Print it cleanly.
-                                sources = list(self.relational_constraints[direct_key])
+                            # --- NEW: Check Rigorous Relational Classification ---
+                            rel_class = self._get_relational_classification(learning_key, obj_id)
+                            
+                            if rel_class:
+                                data = self.relational_constraints[direct_key]
+                                sources = list(data['rules'])
                                 source_str = " OR ".join(sources)
-                                print(f"     * {e['type']} on {e.get('id', 'Unknown')}")
-                                print(f"       [Explanation] Relational Law: Always matches '{source_str}'.")
-                                # We skip the messy standard prediction because we have a law.
-                            
+                                
+                                if rel_class == "DIRECT":
+                                    print(f"     * {e['type']} on {obj_id}")
+                                    print(f"       [Explanation] Direct Relational Law: Action CAUSES match with '{source_str}'.")
+                                    continue # Handled
+                                    
+                                elif rel_class == "GLOBAL":
+                                    # If it's Global, it shouldn't really be in Direct list, 
+                                    # but if it ended up here, label it correctly.
+                                    print(f"     * {e['type']} on {obj_id}")
+                                    print(f"       [Explanation] Global Relational Law: Matches '{source_str}' (Non-Unique).")
+                                    continue
+                                    
+                                elif rel_class == "HYPOTHESIS":
+                                    print(f"     * {e['type']} on {obj_id}")
+                                    print(f"       [Explanation] Relational Hypothesis (N=1): Matches '{source_str}'?")
+                                    continue
+                            # -----------------------------------------------------
+
                             else:
                                 # --- Fallback to Standard Learner ---
                                 rule_str = self._format_rule_description(direct_key)
@@ -440,8 +509,19 @@ class ObmlAgi3Agent(Agent):
                             reason = wrapper['reason']
                             fix = wrapper['fix']
                             
+                            # Check for Hypothesis
+                            rel_class = self._get_relational_classification(learning_key, e.get('id'))
+                            extra_note = ""
+                            
+                            if rel_class == "HYPOTHESIS":
+                                data = self.relational_constraints[(learning_key, e.get('id'))]
+                                sources = list(data['rules'])
+                                extra_note = f"\n       [Hypothesis] Potential Relation: {sources}"
+                            elif rel_class == "GLOBAL":
+                                extra_note = "\n       [Note] Confirmed Global Relation (happens elsewhere)."
+
                             print(f"     * {e['type']} on {e.get('id', 'Unknown')}")
-                            print(f"       [Status] {reason}")
+                            print(f"       [Status] {reason}{extra_note}")
                             print(f"       [Needs]  {fix}")
                             
                 # --- Failsafe: Track banned actions ---
@@ -3137,3 +3217,154 @@ class ObmlAgi3Agent(Agent):
         action = GameAction.ACTION6
         action.set_data({'x': 0, 'y': 0})
         return action
+    
+    def _find_color_source(self, target_obj_id: str, target_color: int, full_context: dict) -> set:
+        """
+        Scans the existing adjacency and alignment maps to find which object 'donated' the color.
+        Uses pre-computed context (adj, diag_adj, align) instead of raw grid scanning.
+        """
+        sources = set()
+        
+        objects = full_context.get('summary', [])
+        obj_map = {o['id']: o for o in objects}
+        
+        # 1. Check ID-Based (Global Link)
+        for obj in objects:
+            if obj['id'] != target_obj_id and obj['color'] == target_color:
+                sources.add(f"Source: ID({obj['id']})")
+
+        # 2. Check Adjacency (Cardinal) - Uses pre-computed 'adj' map
+        # adj_map format: {obj_id: [Top, Right, Bottom, Left]}
+        adj_map = full_context.get('adj', {})
+        if target_obj_id in adj_map:
+            neighbors = adj_map[target_obj_id]
+            # Offsets (dx, dy): Top(0,-1), Right(1,0), Bottom(0,1), Left(-1,0)
+            offsets = [(0, -1), (1, 0), (0, 1), (-1, 0)]
+            
+            for i, neighbor_id in enumerate(neighbors):
+                if neighbor_id not in ['na', 'x']:
+                    neighbor = obj_map.get(neighbor_id)
+                    if neighbor and neighbor['color'] == target_color:
+                        dx, dy = offsets[i]
+                        sources.add(f"Source: Adjacency({dx},{dy})")
+
+        # 3. Check Diagonal Adjacency - Uses pre-computed 'diag_adj' map
+        # diag_map format: {obj_id: [TR, BR, BL, TL]}
+        diag_map = full_context.get('diag_adj', {})
+        if target_obj_id in diag_map:
+            neighbors = diag_map[target_obj_id]
+            # Offsets (dx, dy): TR(1,-1), BR(1,1), BL(-1,1), TL(-1,-1)
+            offsets = [(1, -1), (1, 1), (-1, 1), (-1, -1)]
+            
+            for i, neighbor_id in enumerate(neighbors):
+                if neighbor_id not in ['na', 'x']:
+                    neighbor = obj_map.get(neighbor_id)
+                    if neighbor and neighbor['color'] == target_color:
+                        dx, dy = offsets[i]
+                        sources.add(f"Source: Adjacency({dx},{dy})")
+
+        # 4. Check Alignment (Infinite Axis) - Uses pre-computed 'align' map
+        # We check if the target shares an alignment group (row/col) with a matching color object
+        align_map = full_context.get('align', {})
+        for align_type, groups in align_map.items():
+            # align_type is e.g., 'center_x' (Vertical), 'top_y' (Horizontal)
+            axis = 'x' if 'x' in align_type else 'y'
+            
+            for coord_val, group_ids in groups.items():
+                if target_obj_id in group_ids:
+                    # Target is in this alignment line. Check other members.
+                    for other_id in group_ids:
+                        if other_id == target_obj_id: continue
+                        other_obj = obj_map.get(other_id)
+                        if other_obj and other_obj['color'] == target_color:
+                            sources.add(f"Source: Alignment({axis})")
+
+        return sources
+
+    def _update_relational_constraints(self, action_key: tuple, events: list[dict], full_context: dict):
+        """
+        Identifies if a color change was caused by a specific neighbor or relation.
+        Populates self.relational_constraints with 'Laws' found.
+        NOW TRACKS CONFIDENCE: Only becomes a Law if count >= 2.
+        """
+        if not events: return
+        
+        for event in events:
+            # We only care about events that define a Color (RECOLORED or NEW)
+            target_color = None
+            if event['type'] == 'RECOLORED':
+                target_color = event['to_color']
+            elif event['type'] == 'NEW' and 'color' in event:
+                target_color = event['color']
+            
+            if target_color is not None:
+                obj_id = event.get('id')
+                if not obj_id: continue
+
+                # Find potential sources in the PREVIOUS state (full_context)
+                detected_sources = self._find_color_source(obj_id, target_color, full_context)
+                
+                # Key format: (ActionName, TargetID)
+                dict_key = (action_key[0], obj_id) 
+                
+                if dict_key not in self.relational_constraints:
+                    if detected_sources:
+                        # First observation: It is a HYPOTHESIS (Count = 1)
+                        self.relational_constraints[dict_key] = {'rules': detected_sources, 'count': 1}
+                else:
+                    # Subsequent observation: INTERSECT and INCREMENT
+                    existing = self.relational_constraints[dict_key]
+                    
+                    if detected_sources:
+                        # Scientific Method: Intersect.
+                        # If I was Red because of "Alignment(x)" last time, and "Alignment(x)" this time...
+                        surviving_rules = existing['rules'] & detected_sources
+                        
+                        if surviving_rules:
+                            existing['rules'] = surviving_rules
+                            existing['count'] += 1 # validated!
+                        else:
+                            # Falsified: The rule I thought I had didn't hold up.
+                            del self.relational_constraints[dict_key]
+                    else:
+                        # Falsified: No relational explanation found this time.
+                        del self.relational_constraints[dict_key]
+
+    def _get_relational_classification(self, action_name: str, target_id: str) -> str:
+        """
+        Determines if a relational rule is DIRECT (Action-Specific) or GLOBAL (Universal).
+        Scientific Method:
+        1. Consistency: N >= 2 (proven via _update_relational_constraints intersection).
+        2. Exclusivity: Does this rule appear in Control Groups (other actions)?
+        """
+        key = (action_name, target_id)
+        if key not in self.relational_constraints:
+            return None
+            
+        my_data = self.relational_constraints[key]
+        my_rules = my_data['rules']
+        
+        # 1. Consistency Test
+        if not my_rules: return None # Falsified
+        if my_data['count'] < 2: return "HYPOTHESIS" # Not enough data yet
+        
+        # 2. Exclusivity Test (Compare against Control Groups)
+        is_found_elsewhere = False
+        
+        for other_key, other_data in self.relational_constraints.items():
+            other_action, other_id = other_key
+            
+            # We are looking for the SAME object, but a DIFFERENT action
+            if other_id == target_id and other_action != action_name:
+                
+                # Check if the rules overlap (e.g. both found "Adjacency(0,1)")
+                # If they share a mechanism, the mechanism is likely Global.
+                common_rules = my_rules & other_data['rules']
+                if common_rules:
+                    is_found_elsewhere = True
+                    break
+        
+        if is_found_elsewhere:
+            return "GLOBAL"
+        else:
+            return "DIRECT"
