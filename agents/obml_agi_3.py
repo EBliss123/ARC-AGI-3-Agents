@@ -2902,9 +2902,18 @@ class ObmlAgi3Agent(Agent):
                             'fix': f"Found potential condition '{condition_str}'. Needs replication."
                         })
                 elif is_global_pattern:
-                    event['_abstract_global'] = True
-                    event['condition'] = "(Time/Cycle Driven)" 
-                    global_events.append(event)
+                    # STRICT: Even for Cycle/Time patterns, we want to see if this specific
+                    # context/action reliably maps to it. If N=1, it's just a hypothesis.
+                    success_trials = this_action_history.get(end, set())
+                    if len(success_trials) >= 2:
+                        event['_abstract_global'] = True
+                        event['condition'] = "(Time/Cycle Driven)" 
+                        global_events.append(event)
+                    else:
+                        ambiguous_events.append({
+                            'event': event, 'reason': "Global Pattern Hypothesis (N=1)",
+                            'fix': "Phenomenon appears global (seen elsewhere) but context is noisy. Needs replication."
+                        })
                 else:
                     reason = "Contradiction Found"
                     fix = "Action produces variable results. Needs Context Refinement."
