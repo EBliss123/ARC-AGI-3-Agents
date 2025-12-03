@@ -44,6 +44,11 @@ class ObmlAgi3Agent(Agent):
         self.abstract_witness_registry = {}
         self.phenomenal_witness_registry = {}
 
+        # --- NEW: Relational Constraint Memory ---
+        # Stores strict rules for color sourcing.
+        # Key: Action Key (tuple) -> Value: Set of valid source strings (e.g., {'adj_top_color'})
+        self.relational_constraints = {}
+
         # --- NEW: Session/Trial Tracking ---
         self.global_action_counter = 0  # Tracks the passing of time/trials
         self.last_action_id = 0         # ID of the action that caused the current state
@@ -522,6 +527,17 @@ class ObmlAgi3Agent(Agent):
                 all_possible_moves.append({'template': action, 'object': None})
         if click_action_template and current_summary:
             for obj in current_summary:
+                # --- NEW: Permanent Ignore for Dead Clicks ---
+                # If we have clicked this specific object ID before (performed),
+                # and it has NEVER caused a change (not productive),
+                # we remove it from consideration entirely. It won't even go to the profiler.
+                action_key = self._get_learning_key(click_action_template.name, obj['id'])
+                
+                if (action_key in self.performed_action_types and 
+                    action_key not in self.productive_action_types):
+                    continue 
+                # ---------------------------------------------
+                
                 all_possible_moves.append({'template': click_action_template, 'object': obj})
         
         # --- Deterministic Profiling ---
@@ -1075,12 +1091,12 @@ class ObmlAgi3Agent(Agent):
 
     def _analyze_result(self, action_key: tuple, events: list[dict], full_context: dict):
         """
-        Unified Learner.
-        Updates the rule for the current outcome.
-        CRITICAL FIX: Prevents "Universal Failure" learning.
-        If the intersection of failures results in an empty/generic rule,
-        we discard the rule and keep the raw contexts as specific 'Landmines'.
+        Unified Learner: Updates Consistency Rules AND Relational Constraints.
         """
+        # --- NEW: Trigger Relational Learning Module ---
+        self._update_relational_constraints(action_key, events, full_context)
+        # -----------------------------------------------
+        
         # 1. Create Fingerprint (Empty tuple = Failure)
         hashable_events = []
         if events:
@@ -1439,14 +1455,49 @@ class ObmlAgi3Agent(Agent):
         return True # All pattern checks passed
 
     def _predict_outcome(self, hypothesis_key: tuple, current_context: dict) -> tuple[list|None, int]:
-        """
-        Checks the current context against ALL learned consistency rules.
+        """Predicts outcome using Relational Rules first, then Static Rules."""
         
-        CRITICAL UPDATE: "Local Landmine" Priority.
-        We ALWAYS check the raw failure history for a direct match on the target object.
-        If the target object (ID/Color/Shape/Size) is identical to a past failure,
-        we predict Failure immediately, overriding any broad intersection rules.
-        """
+        # --- 1. Relational Module Check ---
+        if hypothesis_key in self.relational_constraints:
+            valid_sources = self.relational_constraints[hypothesis_key]
+            if valid_sources:
+                source = list(valid_sources)[0] # Strict rule found
+                target_id = hypothesis_key[1]
+                predicted_color = None
+                
+                # Resolve Source (Look up the neighbor/object in CURRENT context)
+                if source.startswith('adj_'):
+                    parts = source.split('_') # adj, top, color
+                    if 'adj' in current_context and target_id in current_context['adj']:
+                        contacts = current_context['adj'][target_id]
+                        dirs = ['top', 'right', 'bottom', 'left']
+                        if parts[1] in dirs:
+                            neighbor_id = contacts[dirs.index(parts[1])]
+                            neighbor = next((o for o in current_context['summary'] if o['id'] == neighbor_id), None)
+                            if neighbor: predicted_color = neighbor['color']
+
+                elif source.startswith('align_'):
+                    parts = source.split('_') # align, center, x, color
+                    align_type = f"{parts[1]}_{parts[2]}"
+                    if 'align' in current_context and align_type in current_context['align']:
+                        for ids in current_context['align'][align_type].values():
+                            if target_id in ids:
+                                for other_id in ids:
+                                    if other_id == target_id: continue
+                                    other_obj = next((o for o in current_context['summary'] if o['id'] == other_id), None)
+                                    if other_obj: predicted_color = other_obj['color']; break
+                                break
+
+                elif source.startswith('id_'):
+                    parts = source.split('_') # id, obj, 5, color
+                    source_id = f"{parts[1]}_{parts[2]}"
+                    source_obj = next((o for o in current_context['summary'] if o['id'] == source_id), None)
+                    if source_obj: predicted_color = source_obj['color']
+
+                if predicted_color is not None:
+                    return [{'type': 'RECOLORED', 'id': target_id, 'to_color': predicted_color}], 100
+        # ----------------------------------
+
         hypothesis = self.rule_hypotheses.get(hypothesis_key)
         if not hypothesis:
             return None, 0
@@ -3113,3 +3164,94 @@ class ObmlAgi3Agent(Agent):
         action = GameAction.ACTION6
         action.set_data({'x': 0, 'y': 0})
         return action
+    
+    def _find_color_sources(self, target_id: str, target_color: int, context: dict) -> set[str]:
+        """
+        Module: Scans context to see who else has the target_color.
+        Returns signatures like 'adj_top_color', 'align_center_x_color', 'id_obj_5_color'.
+        """
+        sources = set()
+        if target_id is None: return sources
+
+        # 1. Adjacency Sources
+        if 'adj' in context and target_id in context['adj']:
+            contacts = context['adj'][target_id]
+            dirs = ['top', 'right', 'bottom', 'left']
+            for i, neighbor_id in enumerate(contacts):
+                if neighbor_id not in ['x', 'na']:
+                    neighbor = next((o for o in context['summary'] if o['id'] == neighbor_id), None)
+                    if neighbor and neighbor['color'] == target_color:
+                        sources.add(f"adj_{dirs[i]}_color")
+
+        # 2. Alignment Sources
+        if 'align' in context:
+            for align_type, groups in context['align'].items():
+                for coord, ids in groups.items():
+                    if target_id in ids:
+                        for other_id in ids:
+                            if other_id == target_id: continue
+                            other_obj = next((o for o in context['summary'] if o['id'] == other_id), None)
+                            if other_obj and other_obj['color'] == target_color:
+                                sources.add(f"align_{align_type}_color")
+
+        # 3. Specific Object ID Sources
+        for obj in context['summary']:
+            if obj['id'] == target_id: continue
+            if obj['color'] == target_color:
+                sources.add(f"id_{obj['id']}_color")
+                
+        return sources
+
+    def _update_relational_constraints(self, action_key: tuple, events: list[dict], context: dict):
+        """
+        Module: Learns if an outcome consistently matches a relative source.
+        """
+        if not events: return
+
+        # Extract the target color from the primary event
+        primary_event = events[0]
+        target_color = None
+        
+        if primary_event['type'] == 'RECOLORED':
+            target_color = primary_event.get('to_color')
+        elif primary_event['type'] == 'TRANSFORM' and 'to_color' in primary_event:
+            if primary_event.get('from_color') != primary_event.get('to_color'):
+                target_color = primary_event.get('to_color')
+
+        if target_color is not None:
+            target_id = primary_event.get('id')
+            
+            # 1. Find all possible explanations for this specific trial
+            current_sources = self._find_color_sources(target_id, target_color, context)
+            
+            # --- DEBUG: See what the agent is thinking ---
+            if self.debug_channels['HYPOTHESIS']:
+                print(f"  [Relational] Event: {target_id} turned Color {target_color}.")
+                # Filter for display so we see "id_obj_5" vs "adj_top" clearly
+                formatted_sources = [s.replace('_color', '') for s in current_sources]
+                print(f"  [Relational] Potential Sources this turn: {formatted_sources}")
+            # ---------------------------------------------
+
+            # 2. Intersect with previous knowledge
+            if action_key not in self.relational_constraints:
+                # First time seeing this action: Initialize with ALL possibilities
+                if current_sources:
+                    self.relational_constraints[action_key] = current_sources
+                    if self.debug_channels['HYPOTHESIS']:
+                        print(f"  [Relational] New Hypothesis Started. Candidates: {len(current_sources)}")
+            else:
+                # Subsequent times: Intersect (Keep only what is consistent)
+                old_count = len(self.relational_constraints[action_key])
+                self.relational_constraints[action_key] &= current_sources
+                new_count = len(self.relational_constraints[action_key])
+                
+                if self.debug_channels['HYPOTHESIS']:
+                    print(f"  [Relational] Refined Candidates: {old_count} -> {new_count}")
+                    if new_count > 0 and new_count < 5:
+                         print(f"  [Relational] Survivors: {self.relational_constraints[action_key]}")
+
+                # If intersection is empty, the rule is broken
+                if not self.relational_constraints[action_key]:
+                    if self.debug_channels['HYPOTHESIS']:
+                        print(f"  [Relational] Rule Broken! No consistent source found.")
+                    del self.relational_constraints[action_key]
