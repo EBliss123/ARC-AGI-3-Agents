@@ -138,7 +138,6 @@ class ObmlAgi3Agent(Agent):
         self.level_state_history = []
         self.banned_action_keys = set()
         self.actions_printed = False # This is per-level, not per-game
-        self.performed_action_types = set()
 
     def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
         """
