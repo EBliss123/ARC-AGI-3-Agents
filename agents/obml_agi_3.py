@@ -2913,7 +2913,15 @@ class ObmlAgi3Agent(Agent):
 
             # Case B: Specific Global (Priority 1)
             if is_specific_global:
-                global_events.append(event)
+                # NEW: Gate 1 Check (Consistency)
+                success_trials = this_action_history.get(end, set())
+                if len(success_trials) >= 2:
+                    global_events.append(event)
+                else:
+                    ambiguous_events.append({
+                        'event': event, 'reason': "Global Hypothesis (N=1)",
+                        'fix': "Hypothesis consistent with global rule, but needs replication (N>=2)."
+                    })
                 continue
 
             # Case C: Direct Survivor (Priority 2)
@@ -2930,8 +2938,16 @@ class ObmlAgi3Agent(Agent):
             
             # Case D: Abstract Global (Priority 3)
             if is_abstract_global:
-                event['_abstract_global'] = True 
-                global_events.append(event)
+                # NEW: Gate 1 Check (Consistency)
+                success_trials = this_action_history.get(end, set())
+                if len(success_trials) >= 2:
+                    event['_abstract_global'] = True 
+                    global_events.append(event)
+                else:
+                    ambiguous_events.append({
+                        'event': event, 'reason': "Abstract Global Hypothesis (N=1)",
+                        'fix': "Phenomenon consistent with global rule, but needs replication (N>=2)."
+                    })
                 continue
 
             # Case E: Ambiguous Overlap
@@ -3277,7 +3293,9 @@ class ObmlAgi3Agent(Agent):
                         if other_id == target_obj_id: continue
                         other_obj = obj_map.get(other_id)
                         if other_obj and other_obj['color'] == target_color:
-                            sources.add(f"Source: Alignment({axis})")
+                            # MODIFIED: Now includes the ID of the aligned object.
+                            # "I matched color because I am aligned on Y=5 with Object 12"
+                            sources.add(f"Source: Alignment({axis}={coord_val}, ID={other_id})")
 
         return sources
 
