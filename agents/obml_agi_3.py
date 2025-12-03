@@ -2875,7 +2875,7 @@ class ObmlAgi3Agent(Agent):
             # Case A: The Stipulation (All Dead / Exception)
             if not (is_specific_global or is_abstract_global or is_direct):
                 
-                # Check for Global Pattern
+                # Check for Global Pattern (Abstract Match)
                 is_global_pattern = False
                 for other_action, outcomes in history.items():
                     if other_action == action_family: continue
@@ -2890,6 +2890,7 @@ class ObmlAgi3Agent(Agent):
                 if condition_str:
                     event['condition'] = condition_str
                     success_trials = this_action_history.get(end, set())
+                    # If we found a condition AND we have consistency (N>=2), we can trust it
                     if len(success_trials) >= 2:
                         if is_global_pattern:
                             event['_abstract_global'] = True
@@ -2901,19 +2902,16 @@ class ObmlAgi3Agent(Agent):
                             'event': event, 'reason': "Exception Hypothesis (N=1)", 
                             'fix': f"Found potential condition '{condition_str}'. Needs replication."
                         })
+
                 elif is_global_pattern:
-                    # STRICT: Even for Cycle/Time patterns, we want to see if this specific
-                    # context/action reliably maps to it. If N=1, it's just a hypothesis.
-                    success_trials = this_action_history.get(end, set())
-                    if len(success_trials) >= 2:
-                        event['_abstract_global'] = True
-                        event['condition'] = "(Time/Cycle Driven)" 
-                        global_events.append(event)
-                    else:
-                        ambiguous_events.append({
-                            'event': event, 'reason': "Global Pattern Hypothesis (N=1)",
-                            'fix': "Phenomenon appears global (seen elsewhere) but context is noisy. Needs replication."
-                        })
+                    # STRICT FIX: Do NOT default to Global. 
+                    # If Direct failed (contradiction) but it matches a Global Pattern, 
+                    # it is AMBIGUOUS. We don't know if it's a global rule or just noise.
+                    ambiguous_events.append({
+                        'event': event, 'reason': "Ambiguous Global Pattern",
+                        'fix': "Matches global pattern, but local causality is contradictory. Needs isolation."
+                    })
+                
                 else:
                     reason = "Contradiction Found"
                     fix = "Action produces variable results. Needs Context Refinement."
