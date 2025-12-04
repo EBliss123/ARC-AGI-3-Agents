@@ -38,6 +38,7 @@ class ObmlAgi3Agent(Agent):
         self.banned_action_keys = set()
         self.permanent_banned_actions = set()
         self.successful_click_actions = set()
+        self.last_grid_size = (64, 64) # Default, updates on perceive
 
         # --- NEW: CLASSIFICATION MEMORY ---
         self.concrete_witness_registry = {}
@@ -877,6 +878,7 @@ class ObmlAgi3Agent(Agent):
 
         height = len(grid)
         width = len(grid[0])
+        self.last_grid_size = (height, width)
         visited = set()
         objects = []
         object_id_counter = 0
@@ -2764,22 +2766,15 @@ class ObmlAgi3Agent(Agent):
 
     def _classify_event_stream(self, current_events: list[dict], current_action_key: str, current_context: dict) -> tuple[list[dict], list[dict], list[dict]]:
         """
-        Classifies events using the 'Survivor System' (Hypothesis Elimination).
-        
-        Hypotheses:
-        1. SPECIFIC GLOBAL: The exact result (ID+Value) happens regardless of action.
-        2. DIRECT: The result is consistent AND exclusive to this action.
-        3. ABSTRACT GLOBAL: The phenomenon (Value) happens regardless of action.
-        
-        Priority: Specific Global > Direct > Abstract Global.
+        Classifies events using the 'Survivor System'. 
+        - Strict 'Control Group' requirement for general rules.
+        - 'Provisional Belief' for ambiguous movement mechanics (Vector vs Until).
         """
         direct_events = []
         global_events = []
         ambiguous_events = [] 
         
-        # --- CRITICAL: Treat every target as a unique Action Family ---
         action_family = current_action_key 
-        
         target_id_from_action = None
         if 'ACTION6_' in current_action_key:
             target_id_from_action = current_action_key.replace('ACTION6_', '')
@@ -2789,23 +2784,45 @@ class ObmlAgi3Agent(Agent):
             self.productive_action_types.add(action_family)
             
         current_trial_id = self.last_action_id
-
+        
+        # --- A. Build Transitions (With Movement Hypotheses) ---
         transitions_to_analyze = []
         changed_obj_ids = {e['id']: e for e in current_events if 'id' in e}
         
-        # A. Build Transitions (Explicit Changes)
         for event in current_events:
             if 'id' not in event: continue
             obj_id = event['id']
             prev_obj = next((o for o in self.last_object_summary if o['id'] == obj_id), None)
+            
             if prev_obj:
                 start_state = self._get_object_state(prev_obj)
-                end_state_sig = self._get_concrete_signature(event)
-                transitions_to_analyze.append({
-                    'event': event, 'start': start_state, 'end': end_state_sig
-                })
+                
+                # --- Movement Branching ---
+                if event['type'] == 'MOVED':
+                    # 1. Vector Hypothesis
+                    vec_sig = ('MOVED', obj_id, ('Vector', event['vector']))
+                    transitions_to_analyze.append({'event': event, 'start': start_state, 'end': vec_sig, 
+                                                   'is_move_hyp': True, 'hyp_type': 'Vector', 'hyp_val': event['vector']})
+                    
+                    # 2. Absolute Hypothesis
+                    end_r = prev_obj['position'][0] + event['vector'][0]
+                    end_c = prev_obj['position'][1] + event['vector'][1]
+                    abs_sig = ('MOVED', obj_id, ('Absolute', (end_r, end_c)))
+                    transitions_to_analyze.append({'event': event, 'start': start_state, 'end': abs_sig, 
+                                                   'is_move_hyp': True, 'hyp_type': 'Absolute', 'hyp_val': (end_r, end_c)})
+                    
+                    # 3. Until Hypotheses
+                    stop_conds = self._analyze_stop_condition(prev_obj['position'], (end_r, end_c), self.last_object_summary)
+                    for cond in stop_conds:
+                        until_sig = ('MOVED', obj_id, ('Until', cond))
+                        transitions_to_analyze.append({'event': event, 'start': start_state, 'end': until_sig, 
+                                                       'is_move_hyp': True, 'hyp_type': 'Until', 'hyp_val': cond})
+                else:
+                    # Standard Handling
+                    end_state_sig = self._get_concrete_signature(event)
+                    transitions_to_analyze.append({'event': event, 'start': start_state, 'end': end_state_sig, 'is_move_hyp': False})
 
-        # B. Implicit Events (Failures/No Change)
+        # --- B. Implicit Events (No Change) ---
         if target_id_from_action and target_id_from_action not in changed_obj_ids:
             prev_obj = next((o for o in self.last_object_summary if o['id'] == target_id_from_action), None)
             if prev_obj:
@@ -2813,10 +2830,12 @@ class ObmlAgi3Agent(Agent):
                 end_state_sig = ('NO_CHANGE', target_id_from_action, None)
                 self._update_transition_memory(start_state, action_family, end_state_sig, current_trial_id)
 
-        # C. Run The Survivor System
+        # --- C. Run The Survivor System ---
+        move_survivors = {} # Map obj_id -> List of surviving hypotheses
+
         for item in transitions_to_analyze:
             start = item['start']
-            end = item['end'] # (Type, ID, Value)
+            end = item['end']
             event = item['event']
             
             self._update_transition_memory(start, action_family, end, current_trial_id)
@@ -2824,7 +2843,7 @@ class ObmlAgi3Agent(Agent):
             history = self.transition_counts.get(start, {})
             this_action_history = history.get(action_family, {})
             
-            # --- 1. Initialize Hypotheses ---
+            # 1. Initialize Status
             is_specific_global = True
             is_abstract_global = True
             is_direct = True
@@ -2832,50 +2851,57 @@ class ObmlAgi3Agent(Agent):
             current_specific = end
             current_abstract = (end[0], end[2])
 
-            # --- 2. Internal Consistency Check (Zero Tolerance) ---
+            # 2. Internal Consistency Check
             if len(this_action_history) > 1:
                 is_specific_global = False
                 is_abstract_global = False
                 is_direct = False
 
-            # --- 3. External Control Check ---
+            # 3. External Control Check
             control_group_found = False
-            
             if is_direct or is_specific_global or is_abstract_global:
                 for other_action, outcomes in history.items():
                     if other_action == action_family: continue
                     control_group_found = True
-                    
                     for other_end in outcomes:
                         other_specific = other_end
                         other_abstract = (other_end[0], other_end[2])
                         
-                        # KILL GLOBAL: If other action produced a DIFFERENT result
-                        if other_specific != current_specific:
-                            is_specific_global = False
-                        if other_abstract != current_abstract:
-                            is_abstract_global = False
-                            
-                        # KILL DIRECT: If other action produced the SAME result (Loss of Exclusivity)
-                        if other_specific == current_specific:
-                            is_direct = False
+                        if other_specific != current_specific: is_specific_global = False
+                        if other_abstract != current_abstract: is_abstract_global = False
+                        if other_specific == current_specific: is_direct = False
 
-            # --- 4. Final Verdict ---
+            # --- D. Branching Logic ---
             
-            if not control_group_found:
-                if not (is_specific_global or is_abstract_global or is_direct):
-                     pass # Fall through to Exception Solver
-                else:
-                    ambiguous_events.append({
-                        'event': event, 'reason': "Correlation Only",
-                        'fix': "Needs Negative Control (Divergence) to prove Causality."
+            # Branch 1: Movement Hypotheses
+            if item.get('is_move_hyp'):
+                # For movement, we collect all consistent theories.
+                # We do NOT filter by control group yet; we settle that in the "Battle" phase.
+                success_trials = this_action_history.get(end, set())
+                is_consistent = (len(success_trials) >= 2) or (not control_group_found) 
+                
+                if is_consistent:
+                    classification = 'AMBIGUOUS'
+                    if is_specific_global: classification = 'GLOBAL'
+                    elif is_direct: classification = 'DIRECT'
+                    
+                    move_survivors.setdefault(event['id'], []).append({
+                        'type': item['hyp_type'],
+                        'val': item['hyp_val'],
+                        'classification': classification,
+                        'full_sig': end
                     })
+                continue 
+
+            # Branch 2: Standard Events (STRICT CONTROL GROUP LOGIC)
+            if not control_group_found:
+                if not (is_specific_global or is_abstract_global or is_direct): pass 
+                else:
+                    ambiguous_events.append({'event': event, 'reason': "Correlation Only", 'fix': "Needs Negative Control."})
                     continue
 
-            # Case A: The Stipulation (All Dead / Exception)
+            # Case A: The Stipulation (Exceptions)
             if not (is_specific_global or is_abstract_global or is_direct):
-                
-                # Check for Global Pattern (Abstract Match)
                 is_global_pattern = False
                 for other_action, outcomes in history.items():
                     if other_action == action_family: continue
@@ -2884,13 +2910,10 @@ class ObmlAgi3Agent(Agent):
                             is_global_pattern = True; break
                     if is_global_pattern: break
 
-                # Zoom Out: Try to solve the condition
                 condition_str = self._solve_conditional_rule(start, action_family, end, current_context)
-                
                 if condition_str:
                     event['condition'] = condition_str
                     success_trials = this_action_history.get(end, set())
-                    # If we found a condition AND we have consistency (N>=2), we can trust it
                     if len(success_trials) >= 2:
                         if is_global_pattern:
                             event['_abstract_global'] = True
@@ -2898,70 +2921,109 @@ class ObmlAgi3Agent(Agent):
                         else:
                             direct_events.append(event) 
                     else:
-                        ambiguous_events.append({
-                            'event': event, 'reason': "Exception Hypothesis (N=1)", 
-                            'fix': f"Found potential condition '{condition_str}'. Needs replication."
-                        })
-
+                        ambiguous_events.append({'event': event, 'reason': "Exception Hypothesis (N=1)", 'fix': f"Found condition '{condition_str}'. Needs replication."})
                 elif is_global_pattern:
-                    # STRICT FIX: Do NOT default to Global. 
-                    # If Direct failed (contradiction) but it matches a Global Pattern, 
-                    # it is AMBIGUOUS. We don't know if it's a global rule or just noise.
-                    ambiguous_events.append({
-                        'event': event, 'reason': "Ambiguous Global Pattern",
-                        'fix': "Matches global pattern, but local causality is contradictory. Needs isolation."
-                    })
-                
+                    ambiguous_events.append({'event': event, 'reason': "Ambiguous Global Pattern", 'fix': "Matches global pattern, but local causality is contradictory."})
                 else:
-                    reason = "Contradiction Found"
-                    fix = "Action produces variable results. Needs Context Refinement."
-                    ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix})
+                    ambiguous_events.append({'event': event, 'reason': "Contradiction Found", 'fix': "Variable results."})
                 continue
 
-            # Case B: Specific Global (Priority 1)
+            # Case B: Specific Global
             if is_specific_global:
-                # NEW: Gate 1 Check (Consistency)
-                success_trials = this_action_history.get(end, set())
-                if len(success_trials) >= 2:
-                    global_events.append(event)
-                else:
-                    ambiguous_events.append({
-                        'event': event, 'reason': "Global Hypothesis (N=1)",
-                        'fix': "Hypothesis consistent with global rule, but needs replication (N>=2)."
-                    })
+                if len(this_action_history.get(end, set())) >= 2: global_events.append(event)
+                else: ambiguous_events.append({'event': event, 'reason': "Global Hypothesis (N=1)", 'fix': "Needs replication."})
                 continue
 
-            # Case C: Direct Survivor (Priority 2)
+            # Case C: Direct Survivor
             if is_direct:
-                success_trials = this_action_history.get(end, set())
-                if len(success_trials) >= 2:
-                    direct_events.append(event)
-                else:
-                    ambiguous_events.append({
-                        'event': event, 'reason': "New Event (N=1)",
-                        'fix': "Hypothesis verified but needs sample size (N>=2)."
-                    })
+                if len(this_action_history.get(end, set())) >= 2: direct_events.append(event)
+                else: ambiguous_events.append({'event': event, 'reason': "New Event (N=1)", 'fix': "Needs replication."})
                 continue
             
-            # Case D: Abstract Global (Priority 3)
+            # Case D: Abstract Global
             if is_abstract_global:
-                # NEW: Gate 1 Check (Consistency)
-                success_trials = this_action_history.get(end, set())
-                if len(success_trials) >= 2:
+                if len(this_action_history.get(end, set())) >= 2:
                     event['_abstract_global'] = True 
                     global_events.append(event)
-                else:
-                    ambiguous_events.append({
-                        'event': event, 'reason': "Abstract Global Hypothesis (N=1)",
-                        'fix': "Phenomenon consistent with global rule, but needs replication (N>=2)."
-                    })
+                else: ambiguous_events.append({'event': event, 'reason': "Abstract Global Hypothesis (N=1)", 'fix': "Needs replication."})
                 continue
 
             # Case E: Ambiguous Overlap
-            ambiguous_events.append({
-                'event': event, 'reason': "Ambiguous Overlap",
-                'fix': "Data supports conflicting hypotheses."
-            })
+            ambiguous_events.append({'event': event, 'reason': "Ambiguous Overlap", 'fix': "Data supports conflicting hypotheses."})
+
+        # --- E. Resolve The Movement Battle (Provisional Laws) ---
+        for obj_id, survivors in move_survivors.items():
+            original_event = next((e for e in current_events if e.get('id') == obj_id), None)
+            if not original_event: continue
+            
+            winner = None
+            alternatives_note = ""
+
+            if len(survivors) > 1:
+                # We have multiple valid theories. 
+                # Pick the most physically robust one as the "Working Theory".
+                
+                # --- NEW: Prioritize Certainty First ---
+                # A DIRECT/GLOBAL theory (Consistency=2+) beats an AMBIGUOUS one (Consistency=1),
+                # even if the Ambiguous one has higher physics priority.
+                # Sort Key: (Certainty, Priority)
+                
+                def get_sort_key(s):
+                    # 1. Certainty Score
+                    certainty = 0
+                    if s['classification'] in ['DIRECT', 'GLOBAL']: certainty = 1
+                    
+                    # 2. Physics Priority
+                    priority = 1
+                    t = s['type']
+                    if t == 'Until': priority = 3
+                    elif t == 'Absolute': priority = 2
+                    
+                    return (certainty, priority)
+                
+                survivors.sort(key=get_sort_key, reverse=True)
+                winner = survivors[0]
+                
+                # Create a readable list of alternatives for the user
+                others = [s['type'] for s in survivors] # Include winner for context: "Vector, Until"
+                alternatives_note = f"Mechanisms: {others}"
+            
+            elif len(survivors) == 1:
+                winner = survivors[0]
+            
+            else:
+                ambiguous_events.append({'event': original_event, 'reason': "Movement Contradiction", 'fix': "Movement is inconsistent."})
+                continue
+
+            # Process the Winner
+            if winner:
+                clarified_event = copy.deepcopy(original_event)
+                
+                # Apply the specific nature of the winner
+                if winner['type'] == 'Absolute':
+                    clarified_event['is_absolute'] = True
+                    clarified_event['abs_coords'] = winner['val']
+                elif winner['type'] == 'Until':
+                    clarified_event['is_until'] = True
+                    clarified_event['until_cond'] = winner['val']
+                
+                # Add the "Ambiguity Note" if it exists
+                if alternatives_note:
+                    clarified_event['_tie_break_note'] = alternatives_note
+
+                # Route to correct list based on classification
+                # Note: We respect the classification determined during the branch phase
+                if winner['classification'] == 'DIRECT':
+                    direct_events.append(clarified_event)
+                elif winner['classification'] == 'GLOBAL':
+                    global_events.append(clarified_event)
+                else:
+                    # Still officially ambiguous (e.g. N=1)
+                    ambiguous_events.append({
+                        'event': original_event, 
+                        'reason': f"Movement Hypothesis (N=1)", 
+                        'fix': "Theory works so far, needs replication."
+                    })
 
         return direct_events, global_events, ambiguous_events
 
@@ -3393,3 +3455,38 @@ class ObmlAgi3Agent(Agent):
             return "GLOBAL"
         else:
             return "DIRECT"
+        
+    def _analyze_stop_condition(self, start_pos: tuple, end_pos: tuple, last_summary: list[dict]) -> list[str]:
+        """
+        Determines if a move stopped due to the Grid Edge or an Object.
+        Returns a LIST of potential reasons (e.g. ['UNTIL_OBJ_1', 'UNTIL_COLOR_2']).
+        """
+        r1, c1 = start_pos
+        r2, c2 = end_pos
+        
+        # Calculate Direction
+        dr, dc = r2 - r1, c2 - c1
+        step_r = 0 if dr == 0 else (1 if dr > 0 else -1)
+        step_c = 0 if dc == 0 else (1 if dc > 0 else -1)
+        
+        # The "Shadow Step" (1 step past the destination)
+        shadow_r, shadow_c = r2 + step_r, c2 + step_c
+        
+        # 1. Check Grid Edge
+        max_h, max_w = getattr(self, 'last_grid_size', (64, 64))
+        if shadow_r < 0 or shadow_r >= max_h or shadow_c < 0 or shadow_c >= max_w:
+            return ["UNTIL_EDGE"]
+            
+        # 2. Check Object Obstruction
+        # Find who occupies the shadow spot
+        for obj in last_summary:
+            if 'pixel_coords' in obj:
+                if (shadow_r, shadow_c) in obj['pixel_coords']:
+                    # Found the obstacle! Generate all property hypotheses.
+                    reasons = []
+                    reasons.append(f"UNTIL_OBJ_{obj['id']}")           # Specific ID
+                    reasons.append(f"UNTIL_COLOR_{obj['color']}")       # Specific Color
+                    reasons.append(f"UNTIL_SHAPE_{obj['fingerprint']}") # Specific Shape
+                    return reasons
+                    
+        return []
