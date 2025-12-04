@@ -2851,8 +2851,21 @@ class ObmlAgi3Agent(Agent):
             current_specific = end
             current_abstract = (end[0], end[2])
 
-            # 2. Internal Consistency Check
-            if len(this_action_history) > 1:
+            # 2. Internal Consistency Check (THE FIX)
+            # Instead of checking "Are there multiple outcomes?", we check "Did *this* outcome happen every time?"
+            # This allows multiple hypotheses (Vector, Absolute) to coexist as long as they are 100% consistent.
+            
+            all_trials_in_branch = set()
+            for outcome_set in this_action_history.values():
+                all_trials_in_branch.update(outcome_set)
+            total_trials_count = len(all_trials_in_branch)
+            
+            my_trials_count = len(this_action_history.get(end, set()))
+            
+            # Consistent = I appear in 100% of the trials for this action
+            is_consistent_outcome = (total_trials_count > 0 and my_trials_count == total_trials_count)
+
+            if not is_consistent_outcome:
                 is_specific_global = False
                 is_abstract_global = False
                 is_direct = False
@@ -2875,12 +2888,8 @@ class ObmlAgi3Agent(Agent):
             
             # Branch 1: Movement Hypotheses
             if item.get('is_move_hyp'):
-                # For movement, we collect all consistent theories.
-                # We do NOT filter by control group yet; we settle that in the "Battle" phase.
-                success_trials = this_action_history.get(end, set())
-                is_consistent = (len(success_trials) >= 2) or (not control_group_found) 
-                
-                if is_consistent:
+                # Collect consistent theories.
+                if is_consistent_outcome:
                     classification = 'AMBIGUOUS'
                     if is_specific_global: classification = 'GLOBAL'
                     elif is_direct: classification = 'DIRECT'
@@ -2960,13 +2969,9 @@ class ObmlAgi3Agent(Agent):
             alternatives_note = ""
 
             if len(survivors) > 1:
-                # We have multiple valid theories. 
-                # Pick the most physically robust one as the "Working Theory".
-                
-                # --- NEW: Prioritize Certainty First ---
-                # A DIRECT/GLOBAL theory (Consistency=2+) beats an AMBIGUOUS one (Consistency=1),
-                # even if the Ambiguous one has higher physics priority.
-                # Sort Key: (Certainty, Priority)
+                # Tie-Breaker: Certainty > Priority
+                # If we have a DIRECT/GLOBAL winner, prefer it over an AMBIGUOUS one,
+                # even if the Ambiguous one has higher "Physics Priority".
                 
                 def get_sort_key(s):
                     # 1. Certainty Score
@@ -2985,7 +2990,7 @@ class ObmlAgi3Agent(Agent):
                 winner = survivors[0]
                 
                 # Create a readable list of alternatives for the user
-                others = [s['type'] for s in survivors] # Include winner for context: "Vector, Until"
+                others = [s['type'] for s in survivors] 
                 alternatives_note = f"Mechanisms: {others}"
             
             elif len(survivors) == 1:
@@ -3012,7 +3017,6 @@ class ObmlAgi3Agent(Agent):
                     clarified_event['_tie_break_note'] = alternatives_note
 
                 # Route to correct list based on classification
-                # Note: We respect the classification determined during the branch phase
                 if winner['classification'] == 'DIRECT':
                     direct_events.append(clarified_event)
                 elif winner['classification'] == 'GLOBAL':
