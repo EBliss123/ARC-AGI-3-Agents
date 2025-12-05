@@ -2873,6 +2873,9 @@ class ObmlAgi3Agent(Agent):
 
             # 3. External Control Check
             control_group_found = False
+            found_same_outcome = False
+            found_diff_outcome = False
+
             if is_direct or is_specific_global or is_abstract_global:
                 for other_action, outcomes in history.items():
                     if other_action == action_family: continue
@@ -2881,9 +2884,31 @@ class ObmlAgi3Agent(Agent):
                         other_specific = other_end
                         other_abstract = (other_end[0], other_end[2])
                         
-                        if other_specific != current_specific: is_specific_global = False
+                        if other_specific == current_specific:
+                            found_same_outcome = True
+                        else:
+                            found_diff_outcome = True
+                        
                         if other_abstract != current_abstract: is_abstract_global = False
-                        if other_specific == current_specific: is_direct = False
+
+            # Logic Synthesis: Prioritize Direct Causality if Global is disproven
+            if control_group_found:
+                if found_diff_outcome:
+                    # Case: Variable results across actions.
+                    # This proves it is NOT a Global Law (universally true).
+                    is_specific_global = False
+                    
+                    # Since it is NOT Global, but it IS Consistent for this action (checked in Step 2),
+                    # it must be a Direct Law for this action.
+                    # (Even if other actions also cause it, A->X is a valid rule).
+                    is_direct = True
+                else:
+                    # Case: Consistent results across ALL observed actions.
+                    # This suggests a Global Law.
+                    is_specific_global = True
+                    
+                    # We prefer the Global label over Direct if possible.
+                    is_direct = False
 
             # --- D. Branching Logic ---
             
@@ -2910,15 +2935,16 @@ class ObmlAgi3Agent(Agent):
                         'count': total_trials_count 
                     })
                 else:
-                    # --- FIX: Log Inconsistent Movement ---
-                    # If the movement is inconsistent (sometimes +1, sometimes +2),
-                    # we must flag it so it appears in the "Ignored Ambiguous events" list.
-                    # We use a set to avoid adding the same event multiple times (once for Vector, once for Absolute, etc).
                     if event.get('id') not in flagged_contradictions:
+                        # --- NEW: Enhanced Debugging Info ---
+                        hyp_name = item['hyp_type']
+                        if hyp_name == 'Until':
+                            hyp_name += f"({item['hyp_val']})"
+                        
                         ambiguous_events.append({
                             'event': event,
                             'reason': "Movement Contradiction",
-                            'fix': "Variable results (e.g. sometimes moves, sometimes doesn't)."
+                            'fix': f"Hypothesis '{hyp_name}' failed. Seen in {my_trials_count}/{total_trials_count} trials."
                         })
                         flagged_contradictions.add(event.get('id'))
                 continue 
@@ -3482,7 +3508,7 @@ class ObmlAgi3Agent(Agent):
     def _analyze_stop_condition(self, start_pos: tuple, end_pos: tuple, last_summary: list[dict]) -> list[str]:
         """
         Determines if a move stopped due to the Grid Edge or an Object.
-        Returns a LIST of potential reasons (e.g. ['UNTIL_OBJ_1', 'UNTIL_COLOR_2']).
+        Returns a LIST of potential reasons (e.g. ['UNTIL_OBJ_1', 'UNTIL_OBSTRUCTION_LEFT']).
         """
         r1, c1 = start_pos
         r2, c2 = end_pos
@@ -3492,13 +3518,24 @@ class ObmlAgi3Agent(Agent):
         step_r = 0 if dr == 0 else (1 if dr > 0 else -1)
         step_c = 0 if dc == 0 else (1 if dc > 0 else -1)
         
+        # Determine Direction Name
+        dir_name = "UNKNOWN"
+        if step_r == -1 and step_c == 0: dir_name = "TOP"
+        elif step_r == 1 and step_c == 0: dir_name = "BOTTOM"
+        elif step_r == 0 and step_c == -1: dir_name = "LEFT"
+        elif step_r == 0 and step_c == 1: dir_name = "RIGHT"
+        elif step_r == -1 and step_c == -1: dir_name = "TOP_LEFT"
+        elif step_r == -1 and step_c == 1: dir_name = "TOP_RIGHT"
+        elif step_r == 1 and step_c == -1: dir_name = "BOTTOM_LEFT"
+        elif step_r == 1 and step_c == 1: dir_name = "BOTTOM_RIGHT"
+        
         # The "Shadow Step" (1 step past the destination)
         shadow_r, shadow_c = r2 + step_r, c2 + step_c
         
         # 1. Check Grid Edge
         max_h, max_w = getattr(self, 'last_grid_size', (64, 64))
         if shadow_r < 0 or shadow_r >= max_h or shadow_c < 0 or shadow_c >= max_w:
-            return ["UNTIL_EDGE"]
+            return ["UNTIL_EDGE", "UNTIL_OBSTRUCTION", f"UNTIL_OBSTRUCTION_{dir_name}"]
             
         # 2. Check Object Obstruction
         # Find who occupies the shadow spot
@@ -3510,6 +3547,8 @@ class ObmlAgi3Agent(Agent):
                     reasons.append(f"UNTIL_OBJ_{obj['id']}")           # Specific ID
                     reasons.append(f"UNTIL_COLOR_{obj['color']}")       # Specific Color
                     reasons.append(f"UNTIL_SHAPE_{obj['fingerprint']}") # Specific Shape
+                    reasons.append("UNTIL_OBSTRUCTION")                 # Generic Obstruction
+                    reasons.append(f"UNTIL_OBSTRUCTION_{dir_name}")     # Directional Obstruction
                     return reasons
                     
         return []
