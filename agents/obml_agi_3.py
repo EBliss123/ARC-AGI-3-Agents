@@ -423,6 +423,13 @@ class ObmlAgi3Agent(Agent):
                 if self.debug_channels['CHANGES']:
                     
                     def _fmt_val(e):
+                        # Prioritize Classification Tags over Raw Data
+                        if e.get('is_until'):
+                            return f"Move {e['vector']} (Until {e['until_cond']})"
+                        if e.get('is_absolute'):
+                            return f"Move to {e['abs_coords']}"
+                        
+                        # Fallback to Raw Data
                         if 'vector' in e: return f"Move {e['vector']}"
                         if 'to_color' in e: return f"Recolor to {e['to_color']}"
                         if 'pixel_delta' in e: return f"Size {'+' if e['pixel_delta']>0 else ''}{e['pixel_delta']}"
