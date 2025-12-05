@@ -2832,6 +2832,9 @@ class ObmlAgi3Agent(Agent):
 
         # --- C. Run The Survivor System ---
         move_survivors = {} # Map obj_id -> List of surviving hypotheses
+        
+        # Track which events we have already flagged as contradictory to avoid duplicates
+        flagged_contradictions = set()
 
         for item in transitions_to_analyze:
             start = item['start']
@@ -2851,10 +2854,8 @@ class ObmlAgi3Agent(Agent):
             current_specific = end
             current_abstract = (end[0], end[2])
 
-            # 2. Internal Consistency Check (THE FIX)
-            # Instead of checking "Are there multiple outcomes?", we check "Did *this* outcome happen every time?"
-            # This allows multiple hypotheses (Vector, Absolute) to coexist as long as they are 100% consistent.
-            
+            # 2. Internal Consistency Check (Fix: Per-Outcome Consistency)
+            # We allow multiple consistent outcomes (Vector AND Until) to coexist.
             all_trials_in_branch = set()
             for outcome_set in this_action_history.values():
                 all_trials_in_branch.update(outcome_set)
@@ -2894,12 +2895,32 @@ class ObmlAgi3Agent(Agent):
                     if is_specific_global: classification = 'GLOBAL'
                     elif is_direct: classification = 'DIRECT'
                     
+                    # --- NEW: Strict Scientific Check (N=1 Filter) ---
+                    # We require N >= 2 observations to confirm a Movement Law.
+                    # Even if a control group exists, N=1 is an anecdote, not a pattern.
+                    if total_trials_count < 2:
+                        classification = 'AMBIGUOUS'
+                    # -------------------------------------------------
+
                     move_survivors.setdefault(event['id'], []).append({
                         'type': item['hyp_type'],
                         'val': item['hyp_val'],
                         'classification': classification,
-                        'full_sig': end
+                        'full_sig': end,
+                        'count': total_trials_count 
                     })
+                else:
+                    # --- FIX: Log Inconsistent Movement ---
+                    # If the movement is inconsistent (sometimes +1, sometimes +2),
+                    # we must flag it so it appears in the "Ignored Ambiguous events" list.
+                    # We use a set to avoid adding the same event multiple times (once for Vector, once for Absolute, etc).
+                    if event.get('id') not in flagged_contradictions:
+                        ambiguous_events.append({
+                            'event': event,
+                            'reason': "Movement Contradiction",
+                            'fix': "Variable results (e.g. sometimes moves, sometimes doesn't)."
+                        })
+                        flagged_contradictions.add(event.get('id'))
                 continue 
 
             # Branch 2: Standard Events (STRICT CONTROL GROUP LOGIC)
@@ -2965,20 +2986,20 @@ class ObmlAgi3Agent(Agent):
             original_event = next((e for e in current_events if e.get('id') == obj_id), None)
             if not original_event: continue
             
+            # Remove from flagged contradictions if it turned out to have at least one valid theory
+            if obj_id in flagged_contradictions:
+                 # Remove the "Contradiction" entry from ambiguous_events since we found a Survivor
+                 ambiguous_events = [w for w in ambiguous_events if w['event'].get('id') != obj_id]
+            
             winner = None
             alternatives_note = ""
 
             if len(survivors) > 1:
                 # Tie-Breaker: Certainty > Priority
-                # If we have a DIRECT/GLOBAL winner, prefer it over an AMBIGUOUS one,
-                # even if the Ambiguous one has higher "Physics Priority".
-                
                 def get_sort_key(s):
-                    # 1. Certainty Score
                     certainty = 0
                     if s['classification'] in ['DIRECT', 'GLOBAL']: certainty = 1
                     
-                    # 2. Physics Priority
                     priority = 1
                     t = s['type']
                     if t == 'Until': priority = 3
@@ -2989,7 +3010,6 @@ class ObmlAgi3Agent(Agent):
                 survivors.sort(key=get_sort_key, reverse=True)
                 winner = survivors[0]
                 
-                # Create a readable list of alternatives for the user
                 others = [s['type'] for s in survivors] 
                 alternatives_note = f"Mechanisms: {others}"
             
@@ -2997,6 +3017,8 @@ class ObmlAgi3Agent(Agent):
                 winner = survivors[0]
             
             else:
+                # This should be handled by the 'else' block in the loop above,
+                # but as a failsafe:
                 ambiguous_events.append({'event': original_event, 'reason': "Movement Contradiction", 'fix': "Movement is inconsistent."})
                 continue
 
@@ -3004,7 +3026,6 @@ class ObmlAgi3Agent(Agent):
             if winner:
                 clarified_event = copy.deepcopy(original_event)
                 
-                # Apply the specific nature of the winner
                 if winner['type'] == 'Absolute':
                     clarified_event['is_absolute'] = True
                     clarified_event['abs_coords'] = winner['val']
@@ -3012,20 +3033,18 @@ class ObmlAgi3Agent(Agent):
                     clarified_event['is_until'] = True
                     clarified_event['until_cond'] = winner['val']
                 
-                # Add the "Ambiguity Note" if it exists
                 if alternatives_note:
                     clarified_event['_tie_break_note'] = alternatives_note
 
-                # Route to correct list based on classification
                 if winner['classification'] == 'DIRECT':
                     direct_events.append(clarified_event)
                 elif winner['classification'] == 'GLOBAL':
                     global_events.append(clarified_event)
                 else:
-                    # Still officially ambiguous (e.g. N=1)
+                    count = winner.get('count', 1)
                     ambiguous_events.append({
                         'event': original_event, 
-                        'reason': f"Movement Hypothesis (N=1)", 
+                        'reason': f"Movement Hypothesis (N={count})", 
                         'fix': "Theory works so far, needs replication."
                     })
 
