@@ -425,16 +425,25 @@ class ObmlAgi3Agent(Agent):
                     def _fmt_val(e):
                         # Prioritize Classification Tags over Raw Data
                         if e.get('is_until'):
-                            return f"Move {e['vector']} (Until {e['until_cond']})"
+                            # Handle both Move vectors and Growth deltas
+                            val = e.get('vector') if 'vector' in e else f"+{e.get('pixel_delta')}"
+                            action_verb = "Move" if 'vector' in e else "Grow"
+                            return f"{action_verb} {val} (Until {e['until_cond']})"
+                        
                         if e.get('is_absolute'):
-                            return f"Move to {e['abs_coords']}"
+                            if 'vector' in e: return f"Move to {e['abs_coords']}"
+                            if 'to_size' in e: return f"Grow to Size {e['abs_coords']}"
+                        
+                        # --- NEW: Variable Outcome Tag ---
+                        suffix = ""
+                        if e.get('_is_variable'):
+                            suffix = " (Variable Magnitude/Shape)"
                         
                         # Fallback to Raw Data
-                        if 'vector' in e: return f"Move {e['vector']}"
-                        if 'to_color' in e: return f"Recolor to {e['to_color']}"
-                        if 'pixel_delta' in e: return f"Size {'+' if e['pixel_delta']>0 else ''}{e['pixel_delta']}"
-                        if 'to_fingerprint' in e: return f"Shape {e['to_fingerprint']}"
-                        if 'type' in e and e['type'] == 'NEW': return f"Spawn ({e.get('color')}, {e.get('size')})"
+                        if 'vector' in e: return f"Move {e['vector']}{suffix}"
+                        if 'to_color' in e: return f"Recolor to {e['to_color']}{suffix}"
+                        if 'pixel_delta' in e: return f"Size {'+' if e['pixel_delta']>0 else ''}{e['pixel_delta']}{suffix}"
+                        if 'to_fingerprint' in e: return f"Shape {e['to_fingerprint']}{suffix}"
                         return e['type']
 
                     if global_events: 
@@ -1082,15 +1091,31 @@ class ObmlAgi3Agent(Agent):
                     end_pos_str = details.split('now at ')[1].replace('.', '')
                     end_pos = ast.literal_eval(end_pos_str)
                     event.update({'start_position': start_pos, 'end_position': end_pos})
+                    
                     if '(from ' in details:
                         from_size_str = details.split('(from ')[1].split(' to ')[0]
                         to_size_str = details.split(' to ')[1].split(')')[0]
+                        
+                        # Fix for potential 'and shape' suffix disrupting the split
+                        if ')' in to_size_str: to_size_str = to_size_str.split(')')[0]
+                            
                         pixel_diff = int(details.split(' by ')[1].split(' pixels')[0])
                         event.update({
                             'from_size': ast.literal_eval(from_size_str.replace('x', ',')),
                             'to_size': ast.literal_eval(to_size_str.replace('x', ',')),
                             'pixel_delta': pixel_diff if change_type == 'GROWTH' else -pixel_diff
                         })
+                        
+                    # --- NEW: Capture Shape Data if present ---
+                    if 'shape (' in details:
+                        fp_part = details.split('shape (')[1].split(')')[0]
+                        from_fp, to_fp = fp_part.split(' -> ')
+                        event.update({
+                            'from_fingerprint': int(from_fp),
+                            'to_fingerprint': int(to_fp)
+                        })
+                    # ------------------------------------------
+                    
                     events.append(event)
                 elif change_type in ['NEW', 'REMOVED']:
                     id_str = details.split(') ')[0] + ')'
@@ -2200,7 +2225,7 @@ class ObmlAgi3Agent(Agent):
     def _log_changes(self, old_summary: list[dict], new_summary: list[dict], assign_new_ids=True) -> tuple[list[str], list[dict]]:
         """Compares summaries by identifying in-place changes, moves, and new/removed objects."""
         if not old_summary and not new_summary:
-            return []
+            return [], []
 
         changes = []
         old_unexplained = list(old_summary)
@@ -2217,37 +2242,48 @@ class ObmlAgi3Agent(Agent):
                     continue
                 
                 if old_obj['position'] == new_obj['position']:
+                    # Propagate the persistent ID
+                    new_obj['id'] = old_obj['id']
+                    
                     color_changed = old_obj['color'] != new_obj['color']
                     shape_changed = (old_obj['fingerprint'] != new_obj['fingerprint'] or
                                      old_obj['size'] != new_obj['size'] or
                                      old_obj['pixels'] != new_obj['pixels'])
-
-                    # Propagate the persistent ID from the old object to its new version.
-                    new_obj['id'] = old_obj['id']
-
-                    # If anything changed, it's an event. If not, it's stable.
-                    # In either case, we've explained this pair of objects.
-                    if color_changed and shape_changed:
+                    
+                    # --- NEW: Explicit Growth/Shrink with Shape Tracking ---
+                    pixel_diff = new_obj['pixels'] - old_obj['pixels']
+                    size_str_old = f"{old_obj['size'][0]}x{old_obj['size'][1]}"
+                    size_str_new = f"{new_obj['size'][0]}x{new_obj['size'][1]}"
+                    
+                    # We now append the shape fingerprint change to the log string
+                    shape_str = f"shape ({old_obj['fingerprint']} -> {new_obj['fingerprint']})"
+                    
+                    if pixel_diff > 0:
                         changes.append(
-                            f"- TRANSFORM: Object {old_obj['id'].replace('obj_', 'id_')} changed shape "
-                            f"(fingerprint: {old_obj['fingerprint']} -> {new_obj['fingerprint']}) "
-                            f"and color (from {old_obj['color']} to {new_obj['color']})."
+                            f"- GROWTH: Object {old_obj['id'].replace('obj_', 'id_')} at {old_obj['position']} "
+                            f"grew by {pixel_diff} pixels (from {size_str_old} to {size_str_new}) and {shape_str}."
                         )
-                    elif color_changed:
-                        size_str = f"{old_obj['size'][0]}x{old_obj['size'][1]}"
+                    elif pixel_diff < 0:
                         changes.append(
-                            f"- RECOLORED: Object {old_obj['id'].replace('obj_', 'id_')} "
-                            f"changed color from {old_obj['color']} to {new_obj['color']}."
+                            f"- SHRINK: Object {old_obj['id'].replace('obj_', 'id_')} at {old_obj['position']} "
+                            f"shrank by {abs(pixel_diff)} pixels (from {size_str_old} to {size_str_new}) and {shape_str}."
                         )
-                    elif shape_changed:
-                        changes.append(
-                            f"- SHAPE_CHANGED: Object {old_obj['id'].replace('obj_', 'id_')} changed shape "
-                            f"(fingerprint: {old_obj['fingerprint']} -> {new_obj['fingerprint']})."
-                        )
+                    else:
+                        # Mass conserved
+                        color_changed = old_obj['color'] != new_obj['color']
+                        shape_changed = old_obj['fingerprint'] != new_obj['fingerprint']
+                        
+                        if color_changed and shape_changed:
+                            changes.append(f"- TRANSFORM: Object {old_obj['id'].replace('obj_', 'id_')} changed shape and color.")
+                        elif color_changed:
+                            changes.append(f"- RECOLORED: Object {old_obj['id'].replace('obj_', 'id_')} changed color from {old_obj['color']} to {new_obj['color']}.")
+                        elif shape_changed:
+                            changes.append(f"- SHAPE_CHANGED: Object {old_obj['id'].replace('obj_', 'id_')} changed shape (fingerprint: {old_obj['fingerprint']} -> {new_obj['fingerprint']}).")
+                    # ------------------------------------------------------------------
 
                     matches_to_remove.append((old_obj, new_obj))
                     processed_new_objs_in_pass1.add(id(new_obj))
-                    break  # Move to the next old_obj, as its position is now explained
+                    break  # Move to the next old_obj
         
         # Remove the explained objects before the next pass
         matched_old_in_pass1 = {id(o) for o, n in matches_to_remove}
@@ -2277,9 +2313,7 @@ class ObmlAgi3Agent(Agent):
             for _ in range(num_matches):
                 old_inst = old_instances.pop()
                 new_inst = new_instances.pop()
-                # Propagate the persistent ID.
                 new_inst['id'] = old_inst['id']
-                # A move is only a move if the position is different.
                 if old_inst['position'] != new_inst['position']:
                     changes.append(f"- MOVED: Object {old_inst['id'].replace('obj_', 'id_')} moved from {old_inst['position']} to {new_inst['position']}.")
                 moves_to_remove.append((old_inst, new_inst))
@@ -2289,27 +2323,23 @@ class ObmlAgi3Agent(Agent):
         old_unexplained = [obj for obj in old_unexplained if id(obj) not in matched_old_in_pass2]
         new_unexplained = [obj for obj in new_unexplained if id(obj) not in matched_new_in_pass2]
 
-        # --- Pass 3: Fuzzy Matching for GROWTH and SHRINK events ---
+        # --- Pass 3: Fuzzy Matching for GROWTH and SHRINK events (Moved Objects) ---
         if old_unexplained and new_unexplained:
             potential_pairs = []
             for old_obj in old_unexplained:
                 for new_obj in new_unexplained:
                     pos1 = old_obj['position']
                     pos2 = new_obj['position']
-                    # Calculate Manhattan distance between corners
                     distance = abs(pos1[0] - pos2[0]) + abs(pos1[1] - pos2[1])
                     potential_pairs.append({'old': old_obj, 'new': new_obj, 'dist': distance})
             
-            # Sort by distance to find the closest pairs first
             potential_pairs.sort(key=lambda p: p['dist'])
             
             matched_old = set()
             matched_new = set()
             for pair in potential_pairs:
                 old_obj, new_obj = pair['old'], pair['new']
-                # If neither object in a close pair has been matched yet, match them.
                 if id(old_obj) not in matched_old and id(new_obj) not in matched_new:
-                    # Propagate the persistent ID.
                     new_obj['id'] = old_obj['id']
                     old_pixels = old_obj['pixels']
                     new_pixels = new_obj['pixels']
@@ -2319,7 +2349,7 @@ class ObmlAgi3Agent(Agent):
                     elif old_pixels > new_pixels:
                         event_type = "SHRINK"
                     else:
-                        event_type = "TRANSFORM" # Same pixel count, but other properties changed
+                        event_type = "TRANSFORM"
 
                     pixel_diff = abs(new_obj['pixels'] - old_obj['pixels'])
                     old_size_str = f"{old_obj['size'][0]}x{old_obj['size'][1]}"
@@ -2329,20 +2359,15 @@ class ObmlAgi3Agent(Agent):
                         details = f"grew by {pixel_diff} pixels (from {old_size_str} to {new_size_str})"
                     elif event_type == "SHRINK":
                         details = f"shrank by {pixel_diff} pixels (from {old_size_str} to {new_size_str})"
-                    else:  # TRANSFORM
+                    else:
                         changed_parts = []
                         if old_obj['fingerprint'] != new_obj['fingerprint']:
                             changed_parts.append("shape")
                         if old_obj['color'] != new_obj['color']:
                             changed_parts.append(f"color from {old_obj['color']} to {new_obj['color']}")
-                        
                         size_changed = old_obj['size'] != new_obj['size']
                         size_details = f" (size {old_size_str} -> {new_size_str})" if size_changed else ""
-
-                        if not changed_parts:
-                            details = f"transformed{size_details}"
-                        else:
-                            details = f"changed { ' and '.join(changed_parts) }{size_details}"
+                        details = f"transformed{size_details}" if not changed_parts else f"changed { ' and '.join(changed_parts) }{size_details}"
 
                     changes.append(f"- {event_type}: Object {old_obj['id'].replace('obj_', 'id_')} at {old_obj['position']} {details}, now at {new_obj['position']}.")
 
@@ -2362,7 +2387,6 @@ class ObmlAgi3Agent(Agent):
 
         if assign_new_ids:
             unmatched_new = []
-            # Step 1: Check for perfect matches (REAPPEARED) first.
             for obj in new_unexplained:
                 stable_id = self._get_stable_id(obj)
                 if stable_id in self.removed_objects_memory:
@@ -2373,20 +2397,17 @@ class ObmlAgi3Agent(Agent):
                         if candidate_id not in used_persistent_ids:
                             found_id = candidate_id
                             break
-                    
                     if found_id:
                         obj['id'] = found_id
                         used_persistent_ids.add(found_id)
                         changes.append(f"- REAPPEARED: Object {found_id.replace('obj_', 'id_')} (ID {stable_id}) reappeared at {obj['position']}.")
                     else:
                         unmatched_new.append(obj)
-
                     if not id_deque:
                         del self.removed_objects_memory[stable_id]
                 else:
                     unmatched_new.append(obj)
             
-            # Step 2: For the remainder, check for fuzzy matches (TRANSFORMED).
             still_unmatched = []
             for obj in unmatched_new:
                 old_match_id, changed_properties = self._find_single_property_change_match(obj)
@@ -2398,7 +2419,6 @@ class ObmlAgi3Agent(Agent):
                         if candidate_id not in used_persistent_ids:
                             found_id = candidate_id
                             break
-                    
                     if found_id:
                         obj['id'] = found_id
                         used_persistent_ids.add(found_id)
@@ -2406,13 +2426,11 @@ class ObmlAgi3Agent(Agent):
                         changes.append(f"- REAPPEARED & TRANSFORMED: Object {found_id.replace('obj_', 'id_')} reappeared, changing {prop_name} from {old_val} to {new_val}, now at {obj['position']}.")
                     else:
                         still_unmatched.append(obj)
-
                     if not id_deque:
                         del self.removed_objects_memory[old_match_id]
                 else:
                     still_unmatched.append(obj)
 
-            # Step 3: Anything left is truly NEW.
             for obj in still_unmatched:
                 self.object_id_counter += 1
                 new_id = f'obj_{self.object_id_counter}'
@@ -2420,7 +2438,6 @@ class ObmlAgi3Agent(Agent):
                 stable_id = self._get_stable_id(obj)
                 changes.append(f"- NEW: Object {new_id.replace('obj_', 'id_')} (ID {stable_id}) appeared at {obj['position']}.")
 
-        # --- Final Counter Synchronization ---
         max_current_id = 0
         for obj in new_summary:
             try:
@@ -2429,7 +2446,6 @@ class ObmlAgi3Agent(Agent):
                     max_current_id = id_num
             except (ValueError, AttributeError):
                 continue
-        
         if self.object_id_counter < max_current_id:
             self.object_id_counter = max_current_id
 
@@ -2824,10 +2840,46 @@ class ObmlAgi3Agent(Agent):
                         until_sig = ('MOVED', obj_id, ('Until', cond))
                         transitions_to_analyze.append({'event': event, 'start': start_state, 'end': until_sig, 
                                                        'is_move_hyp': True, 'hyp_type': 'Until', 'hyp_val': cond})
+
+                # --- NEW: Growth Branching (Treating Growth as Movement) ---
+                elif event['type'] == 'GROWTH':
+                    # 1. Relative Hypothesis (Always grow +N pixels)
+                    rel_sig = ('GROWTH', obj_id, ('Relative', event['pixel_delta']))
+                    transitions_to_analyze.append({'event': event, 'start': start_state, 'end': rel_sig, 
+                                                   'is_move_hyp': True, 'hyp_type': 'Vector', 'hyp_val': event['pixel_delta']})
+                    
+                    # 2. Absolute Hypothesis (Always grow to Size WxH)
+                    abs_sig = ('GROWTH', obj_id, ('Absolute', event['to_size']))
+                    transitions_to_analyze.append({'event': event, 'start': start_state, 'end': abs_sig, 
+                                                   'is_move_hyp': True, 'hyp_type': 'Absolute', 'hyp_val': event['to_size']})
+                    
+                    # 3. Until Hypothesis (Grow until Wall/Object)
+                    shadow_start, shadow_end = self._calculate_growth_shadow(prev_obj, event)
+                    if shadow_start and shadow_end:
+                        stop_conds = self._analyze_stop_condition(shadow_start, shadow_end, self.last_object_summary)
+                        for cond in stop_conds:
+                            until_sig = ('GROWTH', obj_id, ('Until', cond))
+                            # Note: We reuse 'is_move_hyp' so it enters the Battle of Hypotheses logic
+                            transitions_to_analyze.append({'event': event, 'start': start_state, 'end': until_sig, 
+                                                           'is_move_hyp': True, 'hyp_type': 'Until', 'hyp_val': cond})
+
+                    # 4. Fallback (Phenomenal - "Variable Growth")
+                    # Included so we don't lose the event if strict rules fail
+                    phenom_sig = self._get_phenomenal_signature(event)
+                    transitions_to_analyze.append({
+                        'event': event, 'start': start_state, 'end': rel_sig, 
+                        'phenomenal_end': phenom_sig, 'is_move_hyp': False
+                    })
+
                 else:
-                    # Standard Handling
+                    # Standard Handling for other events (Recolor, etc)
                     end_state_sig = self._get_concrete_signature(event)
-                    transitions_to_analyze.append({'event': event, 'start': start_state, 'end': end_state_sig, 'is_move_hyp': False})
+                    # Add Phenomenal Fallback here too for general robustness
+                    phenom_sig = self._get_phenomenal_signature(event)
+                    transitions_to_analyze.append({
+                        'event': event, 'start': start_state, 'end': end_state_sig, 
+                        'phenomenal_end': phenom_sig, 'is_move_hyp': False
+                    })
 
         # --- B. Implicit Events (No Change) ---
         if target_id_from_action and target_id_from_action not in changed_obj_ids:
@@ -3559,3 +3611,39 @@ class ObmlAgi3Agent(Agent):
                     return reasons
                     
         return []
+
+    def _calculate_growth_shadow(self, prev_obj: dict, event: dict) -> tuple:
+        """
+        Determines the direction of growth by comparing old and new boundaries.
+        Returns a (Start, End) tuple representing the 'Expansion Vector' of the edge.
+        Used to feed _analyze_stop_condition.
+        """
+        old_r, old_c = prev_obj['position']
+        old_h, old_w = prev_obj['size']
+        
+        new_pos = event.get('end_position', prev_obj['position'])
+        new_size = event.get('to_size', prev_obj['size'])
+        
+        new_r, new_c = new_pos
+        new_h, new_w = new_size
+        
+        # Detect Horizontal Growth
+        if new_w > old_w:
+            if new_c < old_c: # Grew Left
+                # Edge moved from old_c to new_c.
+                # Vector is (0, -1). 
+                return (old_r, old_c), (old_r, old_c - 1)
+            else: # Grew Right
+                # Edge moved from (old_c + old_w - 1) to right.
+                right_edge = old_c + old_w - 1
+                return (old_r, right_edge), (old_r, right_edge + 1)
+
+        # Detect Vertical Growth
+        if new_h > old_h:
+            if new_r < old_r: # Grew Up
+                return (old_r, old_c), (old_r - 1, old_c)
+            else: # Grew Down
+                bottom_edge = old_r + old_h - 1
+                return (bottom_edge, old_c), (bottom_edge + 1, old_c)
+                
+        return None, None
