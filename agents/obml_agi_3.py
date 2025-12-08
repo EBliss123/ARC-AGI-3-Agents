@@ -2953,20 +2953,19 @@ class ObmlAgi3Agent(Agent):
             # Logic Synthesis: Prioritize Direct Causality if Global is disproven
             if control_group_found:
                 if found_diff_outcome:
-                    # Case: Variable results across actions.
+                    # Case: Variable results across actions (A->X, B->Y).
                     # This proves it is NOT a Global Law (universally true).
                     is_specific_global = False
                     
-                    # Since it is NOT Global, but it IS Consistent for this action (checked in Step 2),
-                    # it must be a Direct Law for this action.
-                    # (Even if other actions also cause it, A->X is a valid rule).
-                    is_direct = True
+                    # --- CRITICAL FIX ---
+                    # Only promote to Direct if it was internally consistent for THIS action.
+                    # Previous logic blindly set is_direct=True, which promoted random noise
+                    # just because it differed from the control group.
+                    is_direct = is_consistent_outcome 
                 else:
                     # Case: Consistent results across ALL observed actions.
                     # This suggests a Global Law.
                     is_specific_global = True
-                    
-                    # We prefer the Global label over Direct if possible.
                     is_direct = False
 
             # --- D. Branching Logic ---
@@ -3063,7 +3062,20 @@ class ObmlAgi3Agent(Agent):
                 else: ambiguous_events.append({'event': event, 'reason': "Abstract Global Hypothesis (N=1)", 'fix': "Needs replication."})
                 continue
 
-            # Case E: Ambiguous Overlap
+            # Case E: Ambiguous Overlap / Contradiction
+            # BEFORE giving up, check if a known Relational Law explains the "inconsistency".
+            rel_class = self._get_relational_classification(action_family, event.get('id'))
+            
+            if rel_class == 'DIRECT':
+                 # It looked inconsistent (e.g. diff colors), but Relational Memory knows why.
+                 direct_events.append(event)
+                 continue
+            elif rel_class == 'GLOBAL':
+                 # It happens everywhere (e.g. Gravity/Falling).
+                 event['_abstract_global'] = True
+                 global_events.append(event)
+                 continue
+
             ambiguous_events.append({'event': event, 'reason': "Ambiguous Overlap", 'fix': "Data supports conflicting hypotheses."})
 
         # --- E. Resolve The Movement Battle (Provisional Laws) ---
@@ -3080,17 +3092,27 @@ class ObmlAgi3Agent(Agent):
             alternatives_note = ""
 
             if len(survivors) > 1:
-                # Tie-Breaker: Certainty > Priority
+                # Tie-Breaker: Certainty > Specificity > Priority
                 def get_sort_key(s):
                     certainty = 0
-                    if s['classification'] in ['DIRECT', 'GLOBAL']: certainty = 1
+                    if s['classification'] in ['DIRECT', 'GLOBAL']: certainty = 2
+                    
+                    # NEW: Specificity Score
+                    # We prefer "Until Object 5" (Specific) over "Until Obstruction" (Generic)
+                    specificity = 0
+                    val_str = str(s['val'])
+                    if "UNTIL_OBJ_" in val_str: specificity = 4      # Most specific (ID)
+                    elif "UNTIL_COLOR_" in val_str: specificity = 3  # Property
+                    elif "UNTIL_SHAPE_" in val_str: specificity = 3  # Property
+                    elif "UNTIL_OBSTRUCTION_" in val_str: specificity = 2 # Directional
+                    elif "UNTIL_OBSTRUCTION" in val_str: specificity = 1  # Generic
                     
                     priority = 1
                     t = s['type']
                     if t == 'Until': priority = 3
                     elif t == 'Absolute': priority = 2
                     
-                    return (certainty, priority)
+                    return (certainty, specificity, priority)
                 
                 survivors.sort(key=get_sort_key, reverse=True)
                 winner = survivors[0]
