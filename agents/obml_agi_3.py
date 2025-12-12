@@ -149,6 +149,53 @@ class ObmlAgi3Agent(Agent):
             return GameAction.RESET
         
         if latest_frame.state == GameState.GAME_OVER:
+            # --- NEW: Scientific Death Analysis ---
+            # Instead of just resetting, we treat this as a "Terminal Event" for the previous action.
+            if self.last_action_context and self.last_object_summary:
+                learning_key = self.last_action_context
+                
+                # Reconstruct the context of the world *before* we died
+                prev_context = {
+                    'summary': self.last_object_summary,
+                    'rels': self.last_relationships,
+                    'adj': self.last_adjacencies,
+                    'diag_adj': self.last_diag_adjacencies,
+                    'align': self.last_alignments,
+                    'diag_align': self.last_diag_alignments,
+                    'match': self.last_match_groups
+                }
+                
+                # Broadcast the "Death" event to every object in memory.
+                # The Survivor System will filter out which object's state actually *correlated* with the death.
+                terminal_events = []
+                for obj in self.last_object_summary:
+                    terminal_events.append({'type': 'TERMINAL', 'outcome': 'LOSS', 'id': obj['id']})
+                
+                if self.debug_channels['FAILURE']:
+                    print(f"\n--- GAME OVER DETECTED ---")
+                    print(f"Injecting TERMINAL events for analysis on action {learning_key}...")
+
+                # Run the standard classification pipeline
+                direct, global_ev, ambiguous = self._classify_event_stream(terminal_events, learning_key, prev_context)
+                
+                # Learn from the classified results
+                # A. Direct (Action-Specific Death)
+                obj_events_map = {obj['id']: [] for obj in self.last_object_summary}
+                for event in direct:
+                    if 'id' in event and event['id'] in obj_events_map:
+                        obj_events_map[event['id']].append(event)
+                
+                for obj in self.last_object_summary:
+                    hypothesis_key = (learning_key, obj['id'])
+                    self._analyze_result(hypothesis_key, obj_events_map[obj['id']], prev_context)
+
+                # B. Global (State-Specific Death)
+                for event in global_ev:
+                    abst_sig = self._get_abstract_signature(event)
+                    global_key = ('GLOBAL', str(abst_sig)) 
+                    self._analyze_result(global_key, [event], prev_context)
+            # --------------------------------------
+
             self._reset_level_state()
             self.forcing_wait = False
             return GameAction.RESET
@@ -672,18 +719,30 @@ class ObmlAgi3Agent(Agent):
                     profile['failures'] += 1
                 else:
                     # Success: We matched a "Change" consistency rule.
-                    hashable_events = [tuple(sorted(e.items())) for e in predicted_events]
-                    fp = tuple(sorted(hashable_events))
-                    predicted_fingerprints_for_this_move.add(fp)
-                    all_predicted_events_for_move.extend(predicted_events)
+                    # --- NEW: Check for Terminality (The "Safety Layer") ---
+                    is_lethal = False
+                    for e in predicted_events:
+                        if e['type'] == 'TERMINAL' and e.get('outcome') == 'LOSS':
+                            is_lethal = True
+                            break
                     
-                    if fp in self.seen_outcomes and confidence >= 2:
-                        profile['boring'] += 1
+                    if is_lethal:
+                        # Treat as a catastrophic failure (high cost to sort to bottom)
+                        profile['failures'] += 1000 
+                    # -------------------------------------------------------
                     else:
-                        profile['discoveries'] += 1
+                        hashable_events = [tuple(sorted(e.items())) for e in predicted_events]
+                        fp = tuple(sorted(hashable_events))
+                        predicted_fingerprints_for_this_move.add(fp)
+                        all_predicted_events_for_move.extend(predicted_events)
+                        
+                        if fp in self.seen_outcomes and confidence >= 2:
+                            profile['boring'] += 1
+                        else:
+                            profile['discoveries'] += 1
             move_profiles.append((move, profile, predicted_fingerprints_for_this_move, all_predicted_events_for_move))
 
-# --- Failsafe: 2-Stage Ban Filtering ---
+    # --- Failsafe: 2-Stage Ban Filtering ---
         
         # --- Stage 1: Temporary "banned_action_keys" (cleared on success) ---
         if self.banned_action_keys and len(move_profiles) > 1:
@@ -1148,7 +1207,7 @@ class ObmlAgi3Agent(Agent):
             val = event.get('pixel_delta')
         elif e_type == 'TRANSFORM':
             val = event.get('to_fingerprint')
-        elif e_type == 'SHAPE_CHANGED':  # <--- WAS MISSING
+        elif e_type == 'SHAPE_CHANGED':
             val = event.get('to_fingerprint')
         elif e_type == 'NEW':
             # For NEW, the "ID" is the location/appearance, not the assigned string
@@ -1156,6 +1215,8 @@ class ObmlAgi3Agent(Agent):
             val = (event.get('color'), event.get('size'))
         elif e_type == 'REMOVED':
             val = 'removed'
+        elif e_type == 'TERMINAL': # <--- NEW: Handle Terminal Events
+            val = event.get('outcome')
 
         # Fallback for unknown types to prevent 'None' values from merging distinct events
         if val is None and e_type not in ['REMOVED', 'NEW']:
@@ -1200,6 +1261,8 @@ class ObmlAgi3Agent(Agent):
             val = (event.get('color'), event.get('size'))
         elif e_type == 'REMOVED':
             val = 'removed'
+        elif e_type == 'TERMINAL': # <--- NEW: Handle Terminal Events
+            val = event.get('outcome')
 
         if val is None: 
             val = 'unknown'
