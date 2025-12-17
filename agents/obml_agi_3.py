@@ -429,6 +429,20 @@ class ObmlAgi3Agent(Agent):
                     obj_id = obj['id']
                     specific_events = obj_events_map[obj_id]
                     hypothesis_key = (learning_key, obj_id)
+                    
+                    # --- NEW: Run Physics Check Before Learning ---
+                    for event in specific_events:
+                        if event['type'] == 'SHAPE_CHANGED':
+                            physics_note = self._check_interaction_physics(
+                                event['id'], 
+                                events,           # All events (to find movers)
+                                prev_context,     # Old state
+                                current_summary   # New state
+                            )
+                            if physics_note:
+                                event['_physics_note'] = physics_note
+                    # ----------------------------------------------
+
                     self._analyze_result(hypothesis_key, specific_events, prev_context)
                 
                 # B. Learn Global Rules (Environment -> Result)
@@ -563,6 +577,12 @@ class ObmlAgi3Agent(Agent):
                                     prefix = f"[EXCEPTION FOUND] {e['condition']} => "
 
                                 print(f"     * {e['type']} on {e.get('id', 'Unknown')}")
+                                
+                                # --- NEW: Print Physics Note ---
+                                if '_physics_note' in e:
+                                    print(f"       [Physics]     {e['_physics_note']}")
+                                # -------------------------------
+                                
                                 print(f"       [Explanation] Direct Causality: Action consistently causes '{_fmt_val(e)}'")
                                 print(f"       [Prediction]  {prefix}{rule_str}")
 
@@ -3732,3 +3752,65 @@ class ObmlAgi3Agent(Agent):
                 return (bottom_edge, old_c), (bottom_edge + 1, old_c)
                 
         return None, None
+
+    def _check_interaction_physics(self, target_id: str, changes: list[dict], prev_context: dict, curr_summary: list[dict]) -> str | None:
+        """
+        Verifies if a 'Mass-Conserving' Shape Change correlates with the footprint 
+        of moving objects (Start or End positions).
+        """
+        # 1. Get Target Data
+        prev_target = next((o for o in prev_context['summary'] if o['id'] == target_id), None)
+        curr_target = next((o for o in curr_summary if o['id'] == target_id), None)
+        
+        if not prev_target or not curr_target: return None
+        
+        old_pixels = set(prev_target['pixel_coords'])
+        new_pixels = set(curr_target['pixel_coords'])
+
+        # --- GATEKEEPER: Strict Mass Conservation ---
+        # We only apply this logic if the pixel count is constant.
+        if len(old_pixels) != len(new_pixels):
+            return None 
+
+        # 2. Build the "Combined Footprint" of all Agitators
+        # We collect the Start AND End positions of every object that moved.
+        total_footprint = set()
+        agitator_ids = []
+
+        for event in changes:
+            if event['type'] == 'MOVED' and event.get('id') != target_id:
+                mover_id = event['id']
+                prev_mover = next((o for o in prev_context['summary'] if o['id'] == mover_id), None)
+                curr_mover = next((o for o in curr_summary if o['id'] == mover_id), None)
+                
+                if prev_mover and curr_mover:
+                    total_footprint.update(prev_mover['pixel_coords']) # Departure footprint
+                    total_footprint.update(curr_mover['pixel_coords']) # Arrival footprint
+                    agitator_ids.append(mover_id)
+
+        if not total_footprint:
+            return None
+
+        # 3. Calculate the Target's "Disturbance"
+        # The set of pixels that are different between the old and new shape.
+        changed_pixels = old_pixels.symmetric_difference(new_pixels)
+        
+        if not changed_pixels:
+            return None # No actual shape change (just metadata?)
+
+        # 4. The Correlation Test
+        # Does the disturbance fall entirely within the Agitator Footprint?
+        # We allow a small margin of error (e.g., 90% coverage) for edge cases.
+        intersection = changed_pixels.intersection(total_footprint)
+        
+        if not intersection:
+            return None
+            
+        coverage = len(intersection) / len(changed_pixels)
+        
+        if coverage > 0.9:
+            mover_str = ", ".join(agitator_ids[:3]) # List first 3 for brevity
+            if len(agitator_ids) > 3: mover_str += "..."
+            return f"CORRELATION: Change matches footprint of {mover_str}"
+
+        return None
