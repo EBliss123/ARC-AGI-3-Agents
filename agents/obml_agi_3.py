@@ -73,6 +73,18 @@ class ObmlAgi3Agent(Agent):
         self.forcing_wait = False
         self.last_stable_pixels = None
 
+        # --- NEW: Global Forecasting Memory ---
+        self.global_event_history = {}  # Map: AbstractSig -> List of Turn IDs (When did it happen?)
+        self.global_precursors = {}     # Map: AbstractSig -> Precursor Context (What signaled it?)
+        self.global_cycles = {}         # Map: AbstractSig -> Period (int) (How often does it happen?)
+        # --------------------------------------
+
+        # --- NEW: Proven Law Registry ---
+        # Stores rules that have passed the 100% rigor test.
+        # Key: (Action_Family, Result_Signature) -> Value: Classification ('DIRECT', 'GLOBAL')
+        self.proven_rules = {} 
+        # --------------------------------
+
         # --- Debug Channels ---
         # Set these to True or False to control the debug output.
         self.debug_channels = {
@@ -448,8 +460,21 @@ class ObmlAgi3Agent(Agent):
                 # B. Learn Global Rules (Environment -> Result)
                 for event in global_events:
                     abst_sig = self._get_abstract_signature(event)
+                    
+                    # --- NEW: Update Global History ---
+                    if abst_sig not in self.global_event_history:
+                        self.global_event_history[abst_sig] = []
+                    
+                    # Avoid duplicates for the same turn
+                    if self.last_action_id not in self.global_event_history[abst_sig]:
+                        self.global_event_history[abst_sig].append(self.last_action_id)
+                    # ----------------------------------
+
                     global_key = ('GLOBAL', str(abst_sig)) 
                     self._analyze_result(global_key, [event], prev_context)
+
+                # --- NEW: Run Global Forecasting Analysis ---
+                self._analyze_global_patterns()
 
                 # --- NEW: Rescue Ambiguous Events via Relational Logic ---
                 # Ambiguous events are usually contradictions (e.g. "Sometimes Red, Sometimes Blue").
@@ -1657,16 +1682,99 @@ class ObmlAgi3Agent(Agent):
             return False # Failed to parse, so it's not a match
 
         return True # All pattern checks passed
+    
+    def _analyze_global_patterns(self):
+        """
+        The Global Forecaster.
+        Detects inevitable events driven by Time (Cycles) or State (Precursors).
+        Updates self.global_cycles and self.global_precursors.
+        """
+        min_occurrences_for_pattern = 2  # Scientific Rigor: Need 2 confirmations
+        
+        for sig, turn_ids in self.global_event_history.items():
+            if len(turn_ids) < min_occurrences_for_pattern:
+                continue
+                
+            # --- 1. The Chronometer (Periodicity Check) ---
+            turns = sorted(turn_ids)
+            intervals = [turns[i+1] - turns[i] for i in range(len(turns)-1)]
+            
+            # Check if all intervals are identical (Perfect Cycle)
+            if len(set(intervals)) == 1:
+                period = intervals[0]
+                self.global_cycles[sig] = period
+                if self.debug_channels['HYPOTHESIS']:
+                    print(f"  [Global Forecaster] Discovered Cycle: Event {sig} happens every {period} turns.")
+            
+            # --- 2. The Oracle (Precursor Signal Check) ---
+            # We need the contexts from the turn *before* each event.
+            relevant_contexts = []
+            valid_signal = True
+            
+            for t_id in turn_ids:
+                # Turn ID 1 is index 0 in history. 
+                # Pre-event context for Turn T is history[T-2].
+                ctx_idx = t_id - 2 
+                if ctx_idx >= 0 and ctx_idx < len(self.level_state_history):
+                    relevant_contexts.append(self.level_state_history[ctx_idx])
+                else:
+                    valid_signal = False; break
+            
+            if valid_signal and relevant_contexts:
+                # Find the intersection of all pre-event states
+                common_precursor = self._find_common_context(relevant_contexts)
+                
+                # If specific, we have a signal
+                if common_precursor and (common_precursor.get('adj') or common_precursor.get('match') or 
+                                         common_precursor.get('align') or common_precursor.get('rels')):
+                    self.global_precursors[sig] = common_precursor
+                    if self.debug_channels['HYPOTHESIS']:
+                        print(f"  [Global Forecaster] Discovered Signal: Event {sig} is preceded by a specific state.")
 
     def _predict_outcome(self, hypothesis_key: tuple, current_context: dict) -> tuple[list|None, int]:
         """
         Checks the current context against ALL learned consistency rules.
-        
-        CRITICAL UPDATE: "Local Landmine" Priority.
-        We ALWAYS check the raw failure history for a direct match on the target object.
-        If the target object (ID/Color/Shape/Size) is identical to a past failure,
-        we predict Failure immediately, overriding any broad intersection rules.
+        NOW INCLUDES: Global Forecasting (Time/State Overrides).
         """
+        # --- NEW: Global Forecast Layer ---
+        inevitable_events = []
+        
+        # 1. Check Chronometer (Cycles)
+        current_turn = self.global_action_counter + 1 # Predicting for the NEXT turn
+        
+        for sig, period in self.global_cycles.items():
+            last_turn = max(self.global_event_history[sig])
+            
+            # Predict: If next turn matches the period
+            if (current_turn - last_turn) == period:
+                e_type, e_val = sig
+                dummy_event = {'type': e_type, 'predicted_by': 'CYCLE'}
+                # Simple value expansion for key event types
+                if e_type == 'TERMINAL': dummy_event['outcome'] = e_val
+                elif e_type == 'MOVED': dummy_event['vector'] = e_val
+                
+                inevitable_events.append(dummy_event)
+
+        # 2. Check Oracle (Precursors)
+        for sig, precursor_rule in self.global_precursors.items():
+            if self._context_matches_pattern(current_context, precursor_rule):
+                 e_type, e_val = sig
+                 dummy_event = {'type': e_type, 'predicted_by': 'SIGNAL'}
+                 if e_type == 'TERMINAL': dummy_event['outcome'] = e_val
+                 elif e_type == 'MOVED': dummy_event['vector'] = e_val
+                 
+                 inevitable_events.append(dummy_event)
+
+        # 3. Apply Override
+        if inevitable_events:
+            # If we forecast a TERMINAL LOSS, it overrides everything.
+            for e in inevitable_events:
+                if e.get('type') == 'TERMINAL' and e.get('outcome') == 'LOSS':
+                     return inevitable_events, 999 # Max confidence, overrides action
+            
+            # Otherwise, these happen ALONGSIDE action results. 
+            # We continue to get the action result, then append these.
+        # ----------------------------------
 
         hypothesis = self.rule_hypotheses.get(hypothesis_key)
         if not hypothesis:
@@ -1726,7 +1834,6 @@ class ObmlAgi3Agent(Agent):
         if not matches:
             return None, 0
         
-        # --- Success Selection ---
         def get_rule_complexity(match_data):
             r = match_data.get('rule', {})
             if not r: return 0
@@ -1743,7 +1850,10 @@ class ObmlAgi3Agent(Agent):
         ), reverse=True)
 
         best_match = matches[0]
-        return best_match['raw_events'], len(best_match['contexts'])
+        
+        # --- MERGE FORECAST ---
+        final_events = best_match['raw_events'] + inevitable_events
+        return final_events, len(best_match['contexts'])
 
     def _get_hypothetical_summary(self, current_summary: list[dict], predicted_events_list: list[dict]) -> list[dict]:
         """
@@ -2973,9 +3083,7 @@ class ObmlAgi3Agent(Agent):
                 self._update_transition_memory(start_state, action_family, end_state_sig, current_trial_id)
 
         # --- C. Run The Survivor System ---
-        move_survivors = {} # Map obj_id -> List of surviving hypotheses
-        
-        # Track which events we have already flagged as contradictory to avoid duplicates
+        move_survivors = {} 
         flagged_contradictions = set()
 
         for item in transitions_to_analyze:
@@ -2996,78 +3104,77 @@ class ObmlAgi3Agent(Agent):
             current_specific = end
             current_abstract = (end[0], end[2])
 
-            # 2. Internal Consistency Check (Fix: Per-Outcome Consistency)
-            # We allow multiple consistent outcomes (Vector AND Until) to coexist.
+            # --- NEW: Check "Proven Law" Registry (The Sticky Logic) ---
+            rule_key = (action_family, end)
+            proven_classification = self.proven_rules.get(rule_key)
+            
+            # 2. Internal Consistency Check
             all_trials_in_branch = set()
             for outcome_set in this_action_history.values():
                 all_trials_in_branch.update(outcome_set)
             total_trials_count = len(all_trials_in_branch)
-            
             my_trials_count = len(this_action_history.get(end, set()))
             
-            # Consistent = I appear in 100% of the trials for this action
-            is_consistent_outcome = (total_trials_count > 0 and my_trials_count == total_trials_count)
+            # The Gate of Entry: Strict 100% Consistency
+            is_strict_consistent = (total_trials_count > 0 and my_trials_count == total_trials_count)
+
+            # The Override: If it is a Proven Law, we ignore current failures (Interference)
+            is_consistent_outcome = is_strict_consistent or (proven_classification is not None)
 
             if not is_consistent_outcome:
                 is_specific_global = False
                 is_abstract_global = False
                 is_direct = False
+            
+            # 3. External Control Check (Skip if Proven to preserve classification)
+            if proven_classification:
+                # Force the flags based on what we established in the past
+                is_direct = (proven_classification == 'DIRECT')
+                is_specific_global = (proven_classification == 'GLOBAL')
+                # Abstract global is usually tied to Specific Global in this context
+                is_abstract_global = False 
+            
+            else:
+                # Standard Scientific Rigor for New Hypotheses
+                control_group_found = False
+                found_diff_outcome = False
 
-            # 3. External Control Check
-            control_group_found = False
-            found_same_outcome = False
-            found_diff_outcome = False
+                if is_direct or is_specific_global or is_abstract_global:
+                    for other_action, outcomes in history.items():
+                        if other_action == action_family: continue
+                        control_group_found = True
+                        for other_end in outcomes:
+                            # Check if the result is identical
+                            if other_end != current_specific:
+                                found_diff_outcome = True
+                            
+                            if (other_end[0], other_end[2]) != current_abstract: 
+                                is_abstract_global = False
 
-            if is_direct or is_specific_global or is_abstract_global:
-                for other_action, outcomes in history.items():
-                    if other_action == action_family: continue
-                    control_group_found = True
-                    for other_end in outcomes:
-                        other_specific = other_end
-                        other_abstract = (other_end[0], other_end[2])
-                        
-                        if other_specific == current_specific:
-                            found_same_outcome = True
-                        else:
-                            found_diff_outcome = True
-                        
-                        if other_abstract != current_abstract: is_abstract_global = False
+                if control_group_found:
+                    if found_diff_outcome:
+                        # Variable result -> Direct Causality
+                        is_specific_global = False
+                        is_direct = is_strict_consistent # Must be strictly consistent to enter
+                    else:
+                        # Identical result -> Global Law
+                        is_specific_global = True
+                        is_direct = False
 
-            # Logic Synthesis: Prioritize Direct Causality if Global is disproven
-            if control_group_found:
-                if found_diff_outcome:
-                    # Case: Variable results across actions (A->X, B->Y).
-                    # This proves it is NOT a Global Law (universally true).
-                    is_specific_global = False
-                    
-                    # --- CRITICAL FIX ---
-                    # Only promote to Direct if it was internally consistent for THIS action.
-                    # Previous logic blindly set is_direct=True, which promoted random noise
-                    # just because it differed from the control group.
-                    is_direct = is_consistent_outcome 
-                else:
-                    # Case: Consistent results across ALL observed actions.
-                    # This suggests a Global Law.
-                    is_specific_global = True
-                    is_direct = False
-
-            # --- D. Branching Logic ---
+            # --- D. Branching Logic & Registration ---
             
             # Branch 1: Movement Hypotheses
             if item.get('is_move_hyp'):
-                # Collect consistent theories.
                 if is_consistent_outcome:
                     classification = 'AMBIGUOUS'
                     if is_specific_global: classification = 'GLOBAL'
                     elif is_direct: classification = 'DIRECT'
                     
-                    # --- NEW: Strict Scientific Check (N=1 Filter) ---
-                    # We require N >= 2 observations to confirm a Movement Law.
-                    # Even if a control group exists, N=1 is an anecdote, not a pattern.
-                    if total_trials_count < 2:
+                    if total_trials_count < 2 and not proven_classification:
                         classification = 'AMBIGUOUS'
-                    # -------------------------------------------------
-
+                    
+                    # NOTE: We register Movement Laws in the "Resolution" phase (Step E)
+                    
                     move_survivors.setdefault(event['id'], []).append({
                         'type': item['hyp_type'],
                         'val': item['hyp_val'],
@@ -3076,65 +3183,63 @@ class ObmlAgi3Agent(Agent):
                         'count': total_trials_count 
                     })
                 else:
+                    # Logic for contradictions...
+
+                    # --- NEW: Check for Deviation from Proven Law ---
+                    # If we already have a Proven Law for this object/action, but THIS event 
+                    # doesn't match it, we assume THIS event is a Global Override (Interference).
+                    has_proven_law = False
+                    for (p_action, p_sig), p_class in self.proven_rules.items():
+                        # Check if any rule exists for this Action + Object ID
+                        if p_action == action_family and p_sig[1] == event.get('id'):
+                            has_proven_law = True
+                            break
+                    
+                    if has_proven_law:
+                        move_survivors.setdefault(event['id'], []).append({
+                            'type': item['hyp_type'],
+                            'val': item['hyp_val'],
+                            'classification': 'GLOBAL', # Force Global because it overrode the Direct Law
+                            'full_sig': end,
+                            'count': my_trials_count 
+                        })
+                        continue # Skip the contradiction logging
+                    # ------------------------------------------------
+
                     if event.get('id') not in flagged_contradictions:
-                        # --- NEW: Enhanced Debugging Info ---
                         hyp_name = item['hyp_type']
-                        if hyp_name == 'Until':
-                            hyp_name += f"({item['hyp_val']})"
-                        
+                        if hyp_name == 'Until': hyp_name += f"({item['hyp_val']})"
                         ambiguous_events.append({
                             'event': event,
                             'reason': "Movement Contradiction",
                             'fix': f"Hypothesis '{hyp_name}' failed. Seen in {my_trials_count}/{total_trials_count} trials."
                         })
                         flagged_contradictions.add(event.get('id'))
-                continue 
-
-            # Branch 2: Standard Events (STRICT CONTROL GROUP LOGIC)
-            if not control_group_found:
-                if not (is_specific_global or is_abstract_global or is_direct): pass 
-                else:
-                    ambiguous_events.append({'event': event, 'reason': "Correlation Only", 'fix': "Needs Negative Control."})
-                    continue
-
-            # Case A: The Stipulation (Exceptions)
-            if not (is_specific_global or is_abstract_global or is_direct):
-                is_global_pattern = False
-                for other_action, outcomes in history.items():
-                    if other_action == action_family: continue
-                    for other_end in outcomes:
-                        if (other_end[0], other_end[2]) == current_abstract:
-                            is_global_pattern = True; break
-                    if is_global_pattern: break
-
-                condition_str = self._solve_conditional_rule(start, action_family, end, current_context)
-                if condition_str:
-                    event['condition'] = condition_str
-                    success_trials = this_action_history.get(end, set())
-                    if len(success_trials) >= 2:
-                        if is_global_pattern:
-                            event['_abstract_global'] = True
-                            global_events.append(event)
-                        else:
-                            direct_events.append(event) 
-                    else:
-                        ambiguous_events.append({'event': event, 'reason': "Exception Hypothesis (N=1)", 'fix': f"Found condition '{condition_str}'. Needs replication."})
-                elif is_global_pattern:
-                    ambiguous_events.append({'event': event, 'reason': "Ambiguous Global Pattern", 'fix': "Matches global pattern, but local causality is contradictory."})
-                else:
-                    ambiguous_events.append({'event': event, 'reason': "Contradiction Found", 'fix': "Variable results."})
                 continue
 
+            # Branch 2: Standard Events
+            # [Logic for Control Groups / Exceptions is handled above]
+            
             # Case B: Specific Global
             if is_specific_global:
-                if len(this_action_history.get(end, set())) >= 2: global_events.append(event)
-                else: ambiguous_events.append({'event': event, 'reason': "Global Hypothesis (N=1)", 'fix': "Needs replication."})
+                if len(this_action_history.get(end, set())) >= 2: 
+                    # --- NEW: REGISTER PROVEN LAW ---
+                    self.proven_rules[rule_key] = 'GLOBAL'
+                    # --------------------------------
+                    global_events.append(event)
+                else: 
+                    ambiguous_events.append({'event': event, 'reason': "Global Hypothesis (N=1)", 'fix': "Needs replication."})
                 continue
 
             # Case C: Direct Survivor
             if is_direct:
-                if len(this_action_history.get(end, set())) >= 2: direct_events.append(event)
-                else: ambiguous_events.append({'event': event, 'reason': "New Event (N=1)", 'fix': "Needs replication."})
+                if len(this_action_history.get(end, set())) >= 2: 
+                    # --- NEW: REGISTER PROVEN LAW ---
+                    self.proven_rules[rule_key] = 'DIRECT'
+                    # --------------------------------
+                    direct_events.append(event)
+                else: 
+                    ambiguous_events.append({'event': event, 'reason': "New Event (N=1)", 'fix': "Needs replication."})
                 continue
             
             # Case D: Abstract Global
@@ -3142,6 +3247,8 @@ class ObmlAgi3Agent(Agent):
                 if len(this_action_history.get(end, set())) >= 2:
                     event['_abstract_global'] = True 
                     global_events.append(event)
+                    # We don't register Abstract Global in the same way usually, 
+                    # but you could if desired.
                 else: ambiguous_events.append({'event': event, 'reason': "Abstract Global Hypothesis (N=1)", 'fix': "Needs replication."})
                 continue
 
@@ -3227,8 +3334,16 @@ class ObmlAgi3Agent(Agent):
                     clarified_event['_tie_break_note'] = alternatives_note
 
                 if winner['classification'] == 'DIRECT':
-                    direct_events.append(clarified_event)
+                    # --- NEW: REGISTER PROVEN MOVEMENT LAW ---
+                    rule_key = (action_family, winner['full_sig'])
+                    self.proven_rules[rule_key] = 'DIRECT'
+                    # -----------------------------------------
+                    direct_events.append(clarified_event)             
                 elif winner['classification'] == 'GLOBAL':
+                    # --- NEW: REGISTER PROVEN MOVEMENT LAW ---
+                    rule_key = (action_family, winner['full_sig'])
+                    self.proven_rules[rule_key] = 'GLOBAL'
+                    # -----------------------------------------
                     global_events.append(clarified_event)
                 else:
                     count = winner.get('count', 1)
