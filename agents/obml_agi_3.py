@@ -3096,70 +3096,93 @@ class ObmlAgi3Agent(Agent):
             history = self.transition_counts.get(start, {})
             this_action_history = history.get(action_family, {})
             
-            # 1. Initialize Status
-            is_specific_global = True
-            is_abstract_global = True
-            is_direct = True
+            # 1. Initialize Status (The "Null Hypothesis")
+            # We assume NOTHING. Both must be proven by data.
+            is_specific_global = False 
+            is_abstract_global = False
+            is_direct = False 
             
             current_specific = end
             current_abstract = (end[0], end[2])
 
-            # --- NEW: Check "Proven Law" Registry (The Sticky Logic) ---
+            # --- Check "Proven Law" Registry ---
+            # If we proved it in the past (passed rigor), we carry that forward.
             rule_key = (action_family, end)
             proven_classification = self.proven_rules.get(rule_key)
             
-            # 2. Internal Consistency Check
+            # 2. Internal Consistency Check (Evidence for DIRECT Candidate)
             all_trials_in_branch = set()
             for outcome_set in this_action_history.values():
                 all_trials_in_branch.update(outcome_set)
             total_trials_count = len(all_trials_in_branch)
             my_trials_count = len(this_action_history.get(end, set()))
             
-            # The Gate of Entry: Strict 100% Consistency
+            # Evidence A: Is this action consistent?
             is_strict_consistent = (total_trials_count > 0 and my_trials_count == total_trials_count)
 
-            # The Override: If it is a Proven Law, we ignore current failures (Interference)
+            # Apply "Sticky" Proven Status
             is_consistent_outcome = is_strict_consistent or (proven_classification is not None)
 
-            if not is_consistent_outcome:
-                is_specific_global = False
-                is_abstract_global = False
-                is_direct = False
+            # Note: We do NOT set is_direct = True yet. Consistency is just the prerequisite.
             
-            # 3. External Control Check (Skip if Proven to preserve classification)
+            # 3. External Control Check (The Categorization Test)
             if proven_classification:
-                # Force the flags based on what we established in the past
+                # Use established science (skip re-testing if already proven)
                 is_direct = (proven_classification == 'DIRECT')
                 is_specific_global = (proven_classification == 'GLOBAL')
-                # Abstract global is usually tied to Specific Global in this context
                 is_abstract_global = False 
             
             else:
-                # Standard Scientific Rigor for New Hypotheses
+                # Look for Control Groups to differentiate Direct vs Global
                 control_group_found = False
                 found_diff_outcome = False
+                found_same_outcome = False
+                
+                potential_abstract_global = False 
 
-                if is_direct or is_specific_global or is_abstract_global:
+                # Only run control check if we have a consistent candidate to test
+                if is_consistent_outcome: 
                     for other_action, outcomes in history.items():
                         if other_action == action_family: continue
                         control_group_found = True
+                        
+                        group_matches_abstract = True 
+
                         for other_end in outcomes:
-                            # Check if the result is identical
-                            if other_end != current_specific:
+                            # Evidence B: Does a control group produce the SAME specific result?
+                            if other_end == current_specific:
+                                found_same_outcome = True
+                            else:
                                 found_diff_outcome = True
                             
+                            # Evidence C: Does a control group produce the SAME abstract result?
                             if (other_end[0], other_end[2]) != current_abstract: 
-                                is_abstract_global = False
+                                group_matches_abstract = False
+                        
+                        if group_matches_abstract:
+                            potential_abstract_global = True
 
+                # --- The Scientific Verdict ---
                 if control_group_found:
-                    if found_diff_outcome:
-                        # Variable result -> Direct Causality
-                        is_specific_global = False
-                        is_direct = is_strict_consistent # Must be strictly consistent to enter
-                    else:
-                        # Identical result -> Global Law
+                    if found_same_outcome and not found_diff_outcome:
+                        # Control Group has Identical Result -> It is GLOBAL.
+                        # (Universality disproves exclusive Direct agency)
                         is_specific_global = True
                         is_direct = False
+                    
+                    elif found_diff_outcome:
+                        # Control Group has Different Result -> It is DIRECT.
+                        # (Exclusivity confirmed + Internal Consistency confirmed)
+                        is_specific_global = False
+                        is_direct = True
+                    
+                    # If we found abstract matches but not specific ones
+                    if potential_abstract_global and not is_specific_global and not is_direct:
+                         is_abstract_global = True
+                
+                # IF NO CONTROL GROUP FOUND:
+                # is_direct remains False. is_specific_global remains False.
+                # Result: Ambiguous (Needs Control Group).
 
             # --- D. Branching Logic & Registration ---
             
@@ -3207,25 +3230,6 @@ class ObmlAgi3Agent(Agent):
                             })
                             continue # Successfully classified as Conditional Direct
                     # ----------------------------------------------------------------
-
-                    # --- Existing: Check for Deviation from Proven Law (Global Override) ---
-                    # If we can't find a condition, maybe it's a global force overriding a known law.
-                    has_proven_law = False
-                    for (p_action, p_sig), p_class in self.proven_rules.items():
-                        if p_action == action_family and p_sig[1] == event.get('id'):
-                            has_proven_law = True
-                            break
-                    
-                    if has_proven_law:
-                        move_survivors.setdefault(event['id'], []).append({
-                            'type': item['hyp_type'],
-                            'val': item['hyp_val'],
-                            'classification': 'GLOBAL', # Force Global because it overrode the Direct Law
-                            'full_sig': end,
-                            'count': my_trials_count 
-                        })
-                        continue 
-                    # ------------------------------------------------
 
                     if event.get('id') not in flagged_contradictions:
                         hyp_name = item['hyp_type']
