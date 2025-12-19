@@ -3206,29 +3206,30 @@ class ObmlAgi3Agent(Agent):
                         'count': total_trials_count 
                     })
                 else:
-                    # Logic for contradictions...
+                    # --- NEW: Scientific Condition Solver (The "Rigor" Fix) ---
+                    # We attempted to solve the contradiction by finding a differentiator.
+                    # RIGOR UPDATE: If we find a condition, we do NOT declare it a Law yet.
+                    # We classify it as AMBIGUOUS but attach the Hypothesis.
                     
-                    # --- NEW: Scientific Condition Solver (The "No Percent" Fix) ---
-                    # We do NOT use percentages. We accept conflicting results ONLY if they 
-                    # are governed by distinct, reproducible conditions.
-                    
-                    # We attempt to solve this if we have at least 2 total data points to compare.
                     if total_trials_count >= 2: 
-                        # Try to find a condition that separates THIS event from the conflicting history
                         exception_condition = self._solve_conditional_rule(start, action_family, end, current_context)
                         
                         if exception_condition:
-                            # We SOLVED the contradiction. It is a valid Conditional Law.
-                            # This applies to BOTH the 'Normal' (54) and 'Exception' (4) cases.
-                            move_survivors.setdefault(event['id'], []).append({
-                                'type': item['hyp_type'],
-                                'val': item['hyp_val'],
-                                'classification': 'DIRECT', 
-                                'full_sig': end,
-                                'count': my_trials_count,
-                                'condition': exception_condition # Store the differentiator
+                            # We found a correlation, but N=1 is not proof.
+                            # We log it as a HYPOTHESIS to be verified.
+                            
+                            hyp_name = item['hyp_type']
+                            if hyp_name == 'Until': hyp_name += f"({item['hyp_val']})"
+                            
+                            ambiguous_events.append({
+                                'event': event,
+                                'reason': "Conditional Hypothesis (N=1)",
+                                # We explicitly state the Coordinate/State trigger we found
+                                'fix': f"Potential Law: IF {exception_condition} THEN {hyp_name}..."
                             })
-                            continue # Successfully classified as Conditional Direct
+                            # We treat this as handled (don't flag as generic contradiction)
+                            flagged_contradictions.add(event.get('id')) 
+                            continue 
                     # ----------------------------------------------------------------
 
                     if event.get('id') not in flagged_contradictions:
