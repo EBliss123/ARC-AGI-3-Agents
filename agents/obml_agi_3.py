@@ -3775,8 +3775,10 @@ class ObmlAgi3Agent(Agent):
         """
         Determines if a relational rule is DIRECT (Action-Specific) or GLOBAL (Universal).
         Scientific Method:
-        1. Consistency: N >= 2 (proven via _update_relational_constraints intersection).
-        2. Exclusivity: Does this rule appear in Control Groups (other actions)?
+        1. Consistency: N >= 2.
+        2. Exclusivity: Does this rule appear in Control Groups?
+           - If YES -> GLOBAL.
+           - If NO -> DIRECT (but ONLY if a Control Group actually exists).
         """
         key = (action_name, target_id)
         if key not in self.relational_constraints:
@@ -3799,7 +3801,6 @@ class ObmlAgi3Agent(Agent):
             if other_id == target_id and other_action != action_name:
                 
                 # Check if the rules overlap (e.g. both found "Adjacency(0,1)")
-                # If they share a mechanism, the mechanism is likely Global.
                 common_rules = my_rules & other_data['rules']
                 if common_rules:
                     is_found_elsewhere = True
@@ -3808,7 +3809,17 @@ class ObmlAgi3Agent(Agent):
         if is_found_elsewhere:
             return "GLOBAL"
         else:
-            return "DIRECT"
+            # --- NEW: Zero-Assumption Check ---
+            # We can only claim DIRECT exclusivity if we have actually tried other actions.
+            # If we've only ever done ONE thing, we can't be sure it's not Global.
+            
+            # self.performed_action_types includes the current action, so we need > 1
+            if len(self.performed_action_types) > 1:
+                return "DIRECT"
+            else:
+                # We have consistency (N>=2) but no control group.
+                # It is likely Direct, but scientifically unproven.
+                return "HYPOTHESIS"
         
     def _analyze_stop_condition(self, start_pos: tuple, end_pos: tuple, last_summary: list[dict]) -> list[str]:
         """
