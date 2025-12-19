@@ -3184,13 +3184,34 @@ class ObmlAgi3Agent(Agent):
                     })
                 else:
                     # Logic for contradictions...
+                    
+                    # --- NEW: Scientific Condition Solver (The "No Percent" Fix) ---
+                    # We do NOT use percentages. We accept conflicting results ONLY if they 
+                    # are governed by distinct, reproducible conditions.
+                    
+                    # We attempt to solve this if we have at least 2 total data points to compare.
+                    if total_trials_count >= 2: 
+                        # Try to find a condition that separates THIS event from the conflicting history
+                        exception_condition = self._solve_conditional_rule(start, action_family, end, current_context)
+                        
+                        if exception_condition:
+                            # We SOLVED the contradiction. It is a valid Conditional Law.
+                            # This applies to BOTH the 'Normal' (54) and 'Exception' (4) cases.
+                            move_survivors.setdefault(event['id'], []).append({
+                                'type': item['hyp_type'],
+                                'val': item['hyp_val'],
+                                'classification': 'DIRECT', 
+                                'full_sig': end,
+                                'count': my_trials_count,
+                                'condition': exception_condition # Store the differentiator
+                            })
+                            continue # Successfully classified as Conditional Direct
+                    # ----------------------------------------------------------------
 
-                    # --- NEW: Check for Deviation from Proven Law ---
-                    # If we already have a Proven Law for this object/action, but THIS event 
-                    # doesn't match it, we assume THIS event is a Global Override (Interference).
+                    # --- Existing: Check for Deviation from Proven Law (Global Override) ---
+                    # If we can't find a condition, maybe it's a global force overriding a known law.
                     has_proven_law = False
                     for (p_action, p_sig), p_class in self.proven_rules.items():
-                        # Check if any rule exists for this Action + Object ID
                         if p_action == action_family and p_sig[1] == event.get('id'):
                             has_proven_law = True
                             break
@@ -3203,7 +3224,7 @@ class ObmlAgi3Agent(Agent):
                             'full_sig': end,
                             'count': my_trials_count 
                         })
-                        continue # Skip the contradiction logging
+                        continue 
                     # ------------------------------------------------
 
                     if event.get('id') not in flagged_contradictions:
