@@ -49,10 +49,21 @@ class ObmlAgi3Agent(Agent):
         self.global_action_counter = 0  # Tracks the passing of time/trials
         self.last_action_id = 0         # ID of the action that caused the current state
 
-        # --- NEW: TRANSITION MEMORY (Scientific Standard) ---
-        # Structure: self.transition_counts[start_state][action_family][end_state] = count
-        # Start/End State Signature: (Color, Fingerprint, Size)
-        self.transition_counts = {}
+        # --- NEW: DETERMINISTIC SCIENTIFIC MEMORY ---
+        # 1. The Truth Table: Stores raw results of experiments.
+        # Structure: self.truth_table[Scientific_State][Action_Key] = {Result_Sig: [Turn_ID_List]}
+        self.truth_table = {}
+
+        # 2. Certified Laws: Rules that passed Positive & Negative control tests.
+        # Key: (Scientific_State, Action_Key) -> Value: {'type': 'DIRECT'|'GLOBAL', 'result': Result}
+        self.certified_laws = {}
+
+        # 3. State Refinements (The Splitter): Tracks how we define "State".
+        # Key: Base_Intrinsic_Sig -> Value: List of Context Keys (e.g. ['adj_top', 'match_Color'])
+        self.state_refinements = {}
+
+        # 4. Global Invariants: Rules that apply to EVERYTHING (e.g. Gravity).
+        self.global_invariants = {}
 
         self.global_action_counter = 0
         self.last_action_id = 0
@@ -130,7 +141,14 @@ class ObmlAgi3Agent(Agent):
         self.action_consistency_counts = {} 
         self.performed_action_types = set()
 
-        # Also reset the level state
+        self.truth_table = {}
+        self.certified_laws = {}
+        self.state_refinements = {}
+        self.global_invariants = {}
+        self.level_state_history = []
+        self.global_action_counter = 0
+        
+        # Reset per-level state
         self._reset_level_state()
 
     def _reset_level_state(self):
@@ -477,32 +495,8 @@ class ObmlAgi3Agent(Agent):
                 self._analyze_global_patterns()
 
                 # --- NEW: Rescue Ambiguous Events via Relational Logic ---
-                # Ambiguous events are usually contradictions (e.g. "Sometimes Red, Sometimes Blue").
-                # We check if a Relational Law (e.g. "Always Match Neighbor") resolves the contradiction.
-                rescued_events = []
-                remaining_ambiguous = []
-                
-                for wrapper in ambiguous_events:
-                    e = wrapper['event']
-                    if 'id' in e:
-                        # 1. Update memory manually
-                        check_key = (learning_key, e['id'])
-                        self._update_relational_constraints(check_key, [e], prev_context)
-                        
-                        # 2. Check Classification
-                        rel_class = self._get_relational_classification(learning_key, e['id'])
-                        
-                        # We only rescue if it is definitively DIRECT or GLOBAL (Consistency Proven)
-                        # If it's Global, we rescue it (it's predictable), but it will be printed as Global.
-                        if rel_class in ["DIRECT", "GLOBAL"]:
-                            rescued_events.append(e)
-                            continue
-                            
-                    remaining_ambiguous.append(wrapper)
-                
-                ambiguous_events = remaining_ambiguous
-                # Add rescued events to direct_events so they are printed in the Success block
-                direct_events.extend(rescued_events) 
+                # UPDATED: Disabled. We do not rescue ambiguous events with hypotheses.
+                # We strictly wait for the Truth Table to certify them.
                 # ---------------------------------------------------------
 
                 # --- DETAILED PRINTING (Now uses updated brain) ---
@@ -537,23 +531,6 @@ class ObmlAgi3Agent(Agent):
                         for e in global_events:
                             obj_id = e.get('id')
                             
-                            # --- NEW: Check Rigorous Relational Classification ---
-                            # We check the learning key used for this event
-                            # Note: Global events usually come from "passive" observations, 
-                            # so we check if the relation holds across the board.
-                            
-                            # Check if this object has a GLOBAL classification from the current action
-                            rel_class = self._get_relational_classification(learning_key, obj_id)
-                            
-                            if rel_class == "GLOBAL":
-                                data = self.relational_constraints[(learning_key, obj_id)]
-                                sources = list(data['rules'])
-                                source_str = " OR ".join(sources)
-                                print(f"     * {e['type']} on {obj_id}")
-                                print(f"       [Explanation] Global Relational Law: Inevitably matches '{source_str}'.")
-                                continue 
-                            # --------------------------------------------------------
-
                             abst_sig = self._get_abstract_signature(e)
                             global_key = ('GLOBAL', str(abst_sig))
                             rule_str = self._format_rule_description(global_key)
@@ -568,48 +545,19 @@ class ObmlAgi3Agent(Agent):
                             obj_id = e.get('id')
                             direct_key = (learning_key, obj_id)
                             
-                            # --- NEW: Check Rigorous Relational Classification ---
-                            rel_class = self._get_relational_classification(learning_key, obj_id)
+                            # --- Fallback to Standard Learner ---
+                            rule_str = self._format_rule_description(direct_key)
+                            prefix = ""
+                            if 'condition' in e:
+                                prefix = f"[EXCEPTION FOUND] {e['condition']} => "
+
+                            print(f"     * {e['type']} on {e.get('id', 'Unknown')}")
                             
-                            if rel_class:
-                                data = self.relational_constraints[direct_key]
-                                sources = list(data['rules'])
-                                source_str = " OR ".join(sources)
-                                
-                                if rel_class == "DIRECT":
-                                    print(f"     * {e['type']} on {obj_id}")
-                                    print(f"       [Explanation] Direct Relational Law: Action CAUSES match with '{source_str}'.")
-                                    continue # Handled
-                                    
-                                elif rel_class == "GLOBAL":
-                                    # If it's Global, it shouldn't really be in Direct list, 
-                                    # but if it ended up here, label it correctly.
-                                    print(f"     * {e['type']} on {obj_id}")
-                                    print(f"       [Explanation] Global Relational Law: Matches '{source_str}' (Non-Unique).")
-                                    continue
-                                    
-                                elif rel_class == "HYPOTHESIS":
-                                    print(f"     * {e['type']} on {obj_id}")
-                                    print(f"       [Explanation] Relational Hypothesis (N=1): Matches '{source_str}'?")
-                                    continue
-                            # -----------------------------------------------------
-
-                            else:
-                                # --- Fallback to Standard Learner ---
-                                rule_str = self._format_rule_description(direct_key)
-                                prefix = ""
-                                if 'condition' in e:
-                                    prefix = f"[EXCEPTION FOUND] {e['condition']} => "
-
-                                print(f"     * {e['type']} on {e.get('id', 'Unknown')}")
-                                
-                                # --- NEW: Print Physics Note ---
-                                if '_physics_note' in e:
-                                    print(f"       [Physics]     {e['_physics_note']}")
-                                # -------------------------------
-                                
-                                print(f"       [Explanation] Direct Causality: Action consistently causes '{_fmt_val(e)}'")
-                                print(f"       [Prediction]  {prefix}{rule_str}")
+                            if '_physics_note' in e:
+                                print(f"       [Physics]     {e['_physics_note']}")
+                            
+                            print(f"       [Explanation] Direct Causality: Action consistently causes '{_fmt_val(e)}'")
+                            print(f"       [Prediction]  {prefix}{rule_str}")
 
                     if ambiguous_events:
                         print(f"  -> Ignored {len(ambiguous_events)} Ambiguous events:")
@@ -618,19 +566,9 @@ class ObmlAgi3Agent(Agent):
                             reason = wrapper['reason']
                             fix = wrapper['fix']
                             
-                            # Check for Hypothesis
-                            rel_class = self._get_relational_classification(learning_key, e.get('id'))
-                            extra_note = ""
-                            
-                            if rel_class == "HYPOTHESIS":
-                                data = self.relational_constraints[(learning_key, e.get('id'))]
-                                sources = list(data['rules'])
-                                extra_note = f"\n       [Hypothesis] Potential Relation: {sources}"
-                            elif rel_class == "GLOBAL":
-                                extra_note = "\n       [Note] Confirmed Global Relation (happens elsewhere)."
-
+                            # Removed Relational Hypothesis Printing
                             print(f"     * {e['type']} on {e.get('id', 'Unknown')}")
-                            print(f"       [Status] {reason}{extra_note}")
+                            print(f"       [Status] {reason}")
                             print(f"       [Needs]  {fix}")
                             
                 # --- Failsafe: Track banned actions ---
@@ -1733,127 +1671,56 @@ class ObmlAgi3Agent(Agent):
 
     def _predict_outcome(self, hypothesis_key: tuple, current_context: dict) -> tuple[list|None, int]:
         """
-        Checks the current context against ALL learned consistency rules.
-        NOW INCLUDES: Global Forecasting (Time/State Overrides).
+        Scientific Prediction. Only predicts if a Certified Law exists.
         """
-        # --- NEW: Global Forecast Layer ---
-        inevitable_events = []
+        action_name, target_id = hypothesis_key
         
-        # 1. Check Chronometer (Cycles)
-        current_turn = self.global_action_counter + 1 # Predicting for the NEXT turn
-        
-        for sig, period in self.global_cycles.items():
-            last_turn = max(self.global_event_history[sig])
-            
-            # Predict: If next turn matches the period
-            if (current_turn - last_turn) == period:
-                e_type, e_val = sig
-                dummy_event = {'type': e_type, 'predicted_by': 'CYCLE'}
-                # Simple value expansion for key event types
-                if e_type == 'TERMINAL': dummy_event['outcome'] = e_val
-                elif e_type == 'MOVED': dummy_event['vector'] = e_val
-                
-                inevitable_events.append(dummy_event)
-
-        # 2. Check Oracle (Precursors)
-        for sig, precursor_rule in self.global_precursors.items():
-            if self._context_matches_pattern(current_context, precursor_rule):
-                 e_type, e_val = sig
-                 dummy_event = {'type': e_type, 'predicted_by': 'SIGNAL'}
-                 if e_type == 'TERMINAL': dummy_event['outcome'] = e_val
-                 elif e_type == 'MOVED': dummy_event['vector'] = e_val
-                 
-                 inevitable_events.append(dummy_event)
-
-        # 3. Apply Override
-        if inevitable_events:
-            # If we forecast a TERMINAL LOSS, it overrides everything.
-            for e in inevitable_events:
-                if e.get('type') == 'TERMINAL' and e.get('outcome') == 'LOSS':
-                     return inevitable_events, 999 # Max confidence, overrides action
-            
-            # Otherwise, these happen ALONGSIDE action results. 
-            # We continue to get the action result, then append these.
-        # ----------------------------------
-
-        hypothesis = self.rule_hypotheses.get(hypothesis_key)
-        if not hypothesis:
-            return None, 0
-        
-        matches = []
-        
-        # Extract the target object from the current context for local comparison.
-        target_id = hypothesis_key[1]
-        current_target_obj = None
+        # 1. Identify the Object and its Scientific State
+        target_obj = None
         if target_id:
-            for obj in current_context['summary']:
-                if obj['id'] == target_id:
-                    current_target_obj = obj
-                    break
-
-        for fingerprint, data in hypothesis.items():
-            rule = data['rule']
-            
-            # --- 1. Local Landmine Check (High Priority) ---
-            is_local_landmine = False
-
-            # --- MODIFIED: Only run this check for ACTION6 (clicks) ---
-            action_name_str = hypothesis_key[0]
-            if action_name_str.startswith('ACTION6') and current_target_obj and not data['raw_events']: # Only check if this is a Failure outcome
-                 for past_ctx in data['contexts']:
-                    past_target_obj = None
-                    
-            if current_target_obj and not data['raw_events']: # Only check if this is a Failure outcome
-                 for past_ctx in data['contexts']:
-                    past_target_obj = None
-                    # Optimization: We assume past_ctx structure holds the summary
-                    for obj in past_ctx['summary']:
-                        if obj['id'] == target_id:
-                            past_target_obj = obj
-                            break
-                    
-                    if past_target_obj:
-                        # Strict check: If intrinsic properties are identical, it's the same "Dead Object"
-                        if (current_target_obj['color'] == past_target_obj['color'] and
-                            current_target_obj['fingerprint'] == past_target_obj['fingerprint'] and
-                            current_target_obj['size'] == past_target_obj['size']):
-                            
-                            is_local_landmine = True
-                            break
-            
-            if is_local_landmine:
-                matches.append(data)
-                continue # We found a match, move to next hypothesis item
-
-            # --- 2. Standard Rule Match ---
-            # If it wasn't a direct landmine hit, check the learned rule (if any)
-            if rule is not None:
-                if self._context_matches_pattern(current_context, rule):
-                    matches.append(data)
-
-        if not matches:
+            target_obj = next((o for o in current_context['summary'] if o['id'] == target_id), None)
+        
+        if not target_obj:
+            # Handle Global Action prediction (not targeted at specific ID)
+            # For simplicity in this chunk, we skip broad global prediction here 
+            # or loop through all objects if needed.
             return None, 0
         
-        def get_rule_complexity(match_data):
-            r = match_data.get('rule', {})
-            if not r: return 0
-            score = 0
-            for k in ['adj', 'diag_adj']: score += len(r.get(k, {}))
-            for k in ['rels', 'align', 'match']:
-                for t, groups in r.get(k, {}).items(): score += len(groups)
-            score += len(r.get('diag_align', {}))
-            return score
-
-        matches.sort(key=lambda m: (
-            get_rule_complexity(m), 
-            len(m['contexts'])
-        ), reverse=True)
-
-        best_match = matches[0]
+        state_sig = self._get_scientific_state(target_obj, current_context)
         
-        # --- MERGE FORECAST ---
-        final_events = best_match['raw_events'] + inevitable_events
-        return final_events, len(best_match['contexts'])
+        # 2. Check for Certified Laws
+        
+        # A. Check Specific Direct Law (Highest Priority)
+        # "When I do X to this State, Y happens."
+        law = self.certified_laws.get((state_sig, action_name))
+        
+        # B. Check Global Law (Medium Priority)
+        # "This State always does Y, regardless of action."
+        if not law:
+            law = self.certified_laws.get((state_sig, 'ANY'))
+
+        # 3. Return Prediction
+        if law:
+            result_sig = law['result']
+            return self._expand_result(result_sig, target_obj), 100
+            
+        # 4. Unknown (No certified law)
+        return None, 0
+
+    def _expand_result(self, result_sig, target_obj):
+        """Converts signature back to event list."""
+        r_type, r_id, r_val = result_sig
+        
+        if r_type == 'NO_CHANGE': return []
+        
+        event = {'id': target_obj['id'], 'type': r_type}
+        if r_type == 'MOVED': event['vector'] = r_val
+        elif r_type == 'RECOLORED': event['to_color'] = r_val
+        elif r_type in ['GROWTH', 'SHRINK']: event['pixel_delta'] = r_val
+        elif r_type in ['TRANSFORM', 'SHAPE_CHANGED']: event['to_fingerprint'] = r_val
+        elif r_type == 'TERMINAL': event['outcome'] = r_val
+        
+        return [event]
 
     def _get_hypothetical_summary(self, current_summary: list[dict], predicted_events_list: list[dict]) -> list[dict]:
         """
@@ -2980,406 +2847,122 @@ class ObmlAgi3Agent(Agent):
             
         return (e_type, obj_id)
 
-    def _classify_event_stream(self, current_events: list[dict], current_action_key: str, current_context: dict) -> tuple[list[dict], list[dict], list[dict]]:
+    def _classify_event_stream(self, current_events: list[dict], action_key: str, prev_context: dict) -> tuple[list[dict], list[dict], list[dict]]:
         """
-        Classifies events using the 'Survivor System'. 
-        - Strict 'Control Group' requirement for general rules.
-        - 'Provisional Belief' for ambiguous movement mechanics (Vector vs Until).
+        The Scientific Method Loop.
+        1. Record Observation.
+        2. Record Negative Data.
+        3. Certify Laws (Direct vs Global).
+        4. Return Classified Events.
         """
         direct_events = []
         global_events = []
-        ambiguous_events = [] 
-        
-        action_family = current_action_key 
-        target_id_from_action = None
-        if 'ACTION6_' in current_action_key:
-            target_id_from_action = current_action_key.replace('ACTION6_', '')
+        ambiguous_events = []
 
-        self.performed_action_types.add(action_family)
-        if current_events:
-            self.productive_action_types.add(action_family)
-            
-        current_trial_id = self.last_action_id
-        
-        # --- A. Build Transitions (With Movement Hypotheses) ---
-        transitions_to_analyze = []
-        changed_obj_ids = {e['id']: e for e in current_events if 'id' in e}
-        
+        # Map IDs to previous objects
+        prev_obj_map = {o['id']: o for o in prev_context['summary']}
+        processed_ids = set()
+
+        # --- Step 1: Ingest Positive Data ---
         for event in current_events:
-            if 'id' not in event: continue
-            obj_id = event['id']
-            prev_obj = next((o for o in self.last_object_summary if o['id'] == obj_id), None)
+            obj_id = event.get('id')
+            if not obj_id or obj_id not in prev_obj_map: continue
             
-            if prev_obj:
-                start_state = self._get_object_state(prev_obj)
+            processed_ids.add(obj_id)
+            prev_obj = prev_obj_map[obj_id]
+            
+            state_sig = self._get_scientific_state(prev_obj, prev_context)
+            result_sig = self._get_concrete_signature(event)
+            
+            self._update_truth_table(state_sig, action_key, result_sig)
+
+        # --- Step 2: Ingest Negative Data ---
+        for obj in prev_context['summary']:
+            if obj['id'] not in processed_ids:
+                state_sig = self._get_scientific_state(obj, prev_context)
+                result_sig = ('NO_CHANGE', None, None) 
                 
-                # --- Movement Branching ---
-                if event['type'] == 'MOVED':
-                    # 1. Vector Hypothesis
-                    vec_sig = ('MOVED', obj_id, ('Vector', event['vector']))
-                    transitions_to_analyze.append({'event': event, 'start': start_state, 'end': vec_sig, 
-                                                   'is_move_hyp': True, 'hyp_type': 'Vector', 'hyp_val': event['vector']})
-                    
-                    # 2. Absolute Hypothesis
-                    end_r = prev_obj['position'][0] + event['vector'][0]
-                    end_c = prev_obj['position'][1] + event['vector'][1]
-                    abs_sig = ('MOVED', obj_id, ('Absolute', (end_r, end_c)))
-                    transitions_to_analyze.append({'event': event, 'start': start_state, 'end': abs_sig, 
-                                                   'is_move_hyp': True, 'hyp_type': 'Absolute', 'hyp_val': (end_r, end_c)})
-                    
-                    # 3. Until Hypotheses
-                    stop_conds = self._analyze_stop_condition(prev_obj['position'], (end_r, end_c), self.last_object_summary)
-                    for cond in stop_conds:
-                        until_sig = ('MOVED', obj_id, ('Until', cond))
-                        transitions_to_analyze.append({'event': event, 'start': start_state, 'end': until_sig, 
-                                                       'is_move_hyp': True, 'hyp_type': 'Until', 'hyp_val': cond})
+                self._update_truth_table(state_sig, action_key, result_sig)
 
-                # --- NEW: Growth Branching (Treating Growth as Movement) ---
-                elif event['type'] == 'GROWTH':
-                    # 1. Relative Hypothesis (Always grow +N pixels)
-                    rel_sig = ('GROWTH', obj_id, ('Relative', event['pixel_delta']))
-                    transitions_to_analyze.append({'event': event, 'start': start_state, 'end': rel_sig, 
-                                                   'is_move_hyp': True, 'hyp_type': 'Vector', 'hyp_val': event['pixel_delta']})
-                    
-                    # 2. Absolute Hypothesis (Always grow to Size WxH)
-                    abs_sig = ('GROWTH', obj_id, ('Absolute', event['to_size']))
-                    transitions_to_analyze.append({'event': event, 'start': start_state, 'end': abs_sig, 
-                                                   'is_move_hyp': True, 'hyp_type': 'Absolute', 'hyp_val': event['to_size']})
-                    
-                    # 3. Until Hypothesis (Grow until Wall/Object)
-                    shadow_start, shadow_end = self._calculate_growth_shadow(prev_obj, event)
-                    if shadow_start and shadow_end:
-                        stop_conds = self._analyze_stop_condition(shadow_start, shadow_end, self.last_object_summary)
-                        for cond in stop_conds:
-                            until_sig = ('GROWTH', obj_id, ('Until', cond))
-                            # Note: We reuse 'is_move_hyp' so it enters the Battle of Hypotheses logic
-                            transitions_to_analyze.append({'event': event, 'start': start_state, 'end': until_sig, 
-                                                           'is_move_hyp': True, 'hyp_type': 'Until', 'hyp_val': cond})
+        # --- Step 3: Certification & Splitting ---
+        affected_states = {self._get_scientific_state(prev_obj_map[id], prev_context) for id in processed_ids}
+        for obj in prev_context['summary']:
+            affected_states.add(self._get_scientific_state(obj, prev_context))
 
-                    # 4. Fallback (Phenomenal - "Variable Growth")
-                    # Included so we don't lose the event if strict rules fail
-                    phenom_sig = self._get_phenomenal_signature(event)
-                    transitions_to_analyze.append({
-                        'event': event, 'start': start_state, 'end': rel_sig, 
-                        'phenomenal_end': phenom_sig, 'is_move_hyp': False
-                    })
+        for state_sig in affected_states:
+            self._verify_and_certify(state_sig)
 
-                else:
-                    # Standard Handling for other events (Recolor, etc)
-                    end_state_sig = self._get_concrete_signature(event)
-                    # Add Phenomenal Fallback here too for general robustness
-                    phenom_sig = self._get_phenomenal_signature(event)
-                    transitions_to_analyze.append({
-                        'event': event, 'start': start_state, 'end': end_state_sig, 
-                        'phenomenal_end': phenom_sig, 'is_move_hyp': False
-                    })
+        # --- Step 4: Classify for Output ---
+        for event in current_events:
+            obj_id = event.get('id')
+            if not obj_id or obj_id not in prev_obj_map: 
+                continue
 
-        # --- B. Implicit Events (No Change) ---
-        if target_id_from_action and target_id_from_action not in changed_obj_ids:
-            prev_obj = next((o for o in self.last_object_summary if o['id'] == target_id_from_action), None)
-            if prev_obj:
-                start_state = self._get_object_state(prev_obj)
-                end_state_sig = ('NO_CHANGE', target_id_from_action, None)
-                self._update_transition_memory(start_state, action_family, end_state_sig, current_trial_id)
-
-        # --- C. Run The Survivor System ---
-        move_survivors = {} 
-        flagged_contradictions = set()
-
-        for item in transitions_to_analyze:
-            start = item['start']
-            end = item['end']
-            event = item['event']
+            prev_obj = prev_obj_map[obj_id]
+            state_sig = self._get_scientific_state(prev_obj, prev_context)
             
-            self._update_transition_memory(start, action_family, end, current_trial_id)
+            # Check the Science Book
+            direct_rule = self.certified_laws.get((state_sig, action_key))
+            global_rule = self.certified_laws.get((state_sig, 'ANY'))
             
-            history = self.transition_counts.get(start, {})
-            this_action_history = history.get(action_family, {})
-            
-            # 1. Initialize Status (The "Null Hypothesis")
-            # We assume NOTHING. Both must be proven by data.
-            is_specific_global = False 
-            is_abstract_global = False
-            is_direct = False 
-            
-            current_specific = end
-            current_abstract = (end[0], end[2])
-
-            # --- Check "Proven Law" Registry ---
-            # If we proved it in the past (passed rigor), we carry that forward.
-            rule_key = (action_family, end)
-            proven_classification = self.proven_rules.get(rule_key)
-            
-            # 2. Internal Consistency Check (Evidence for DIRECT Candidate)
-            all_trials_in_branch = set()
-            for outcome_set in this_action_history.values():
-                all_trials_in_branch.update(outcome_set)
-            total_trials_count = len(all_trials_in_branch)
-            my_trials_count = len(this_action_history.get(end, set()))
-            
-            # Evidence A: Is this action consistent?
-            is_strict_consistent = (total_trials_count > 0 and my_trials_count == total_trials_count)
-
-            # Apply "Sticky" Proven Status
-            is_consistent_outcome = is_strict_consistent or (proven_classification is not None)
-
-            # Note: We do NOT set is_direct = True yet. Consistency is just the prerequisite.
-            
-            # 3. External Control Check (The Categorization Test)
-            if proven_classification:
-                # Use established science (skip re-testing if already proven)
-                is_direct = (proven_classification == 'DIRECT')
-                is_specific_global = (proven_classification == 'GLOBAL')
-                is_abstract_global = False 
-            
+            if global_rule and global_rule['type'] == 'GLOBAL':
+                global_events.append(event)
+            elif direct_rule and direct_rule['type'] == 'DIRECT':
+                direct_events.append(event)
             else:
-                # Look for Control Groups to differentiate Direct vs Global
-                control_group_found = False
-                found_diff_outcome = False
-                found_same_outcome = False
+                # If uncertified, determine specific reason
+                reason = "Insufficient Controls"
+                fix = "Gathering experimental data."
                 
-                potential_abstract_global = False 
-
-                # Only run control check if we have a consistent candidate to test
-                if is_consistent_outcome: 
-                    for other_action, outcomes in history.items():
-                        if other_action == action_family: continue
-                        control_group_found = True
+                if state_sig in self.truth_table:
+                    results = self.truth_table[state_sig].get(action_key, {})
+                    
+                    # Check for Contradiction first
+                    change_sigs = [k for k in results.keys() if k[0] != 'NO_CHANGE']
+                    no_change_ids = set()
+                    if ('NO_CHANGE', None, None) in results:
+                        no_change_ids = set(results[('NO_CHANGE', None, None)])
                         
-                        group_matches_abstract = True 
-
-                        for other_end in outcomes:
-                            # Evidence B: Does a control group produce the SAME specific result?
-                            if other_end == current_specific:
-                                found_same_outcome = True
-                            else:
-                                found_diff_outcome = True
-                            
-                            # Evidence C: Does a control group produce the SAME abstract result?
-                            if (other_end[0], other_end[2]) != current_abstract: 
-                                group_matches_abstract = False
-                        
-                        if group_matches_abstract:
-                            potential_abstract_global = True
-
-                # --- The Scientific Verdict ---
-                if control_group_found:
-                    if found_same_outcome and not found_diff_outcome:
-                        # Control Group has Identical Result -> It is GLOBAL.
-                        # (Universality disproves exclusive Direct agency)
-                        is_specific_global = True
-                        is_direct = False
+                    if len(change_sigs) > 1:
+                        reason = "Contradiction (Splitting State)"
+                        fix = "Wait for Splitter to refine state."
+                    elif len(change_sigs) == 1:
+                        change_ids = set(results[change_sigs[0]])
+                        historical_failure = no_change_ids - change_ids
+                        if historical_failure:
+                             reason = "Contradiction (History Mismatch)"
+                             fix = "Wait for Splitter to refine state."
+                        else:
+                             # It is Consistent, but not yet Certified. Check N.
+                             # FIX: Count UNIQUE turns
+                             all_turn_ids = set()
+                             for ids in results.values():
+                                 all_turn_ids.update(ids)
+                             total_instances = len(all_turn_ids)
+                             
+                             if total_instances < 2:
+                                 reason = "First Observation (Need Repeatability)"
+                                 fix = "Repeat action to confirm."
+                             else:
+                                 reason = "Need Negative Control (Try different action)"
+                                 fix = "Try a different action to prove causality."
                     
-                    elif found_diff_outcome:
-                        # Control Group has Different Result -> It is DIRECT.
-                        # (Exclusivity confirmed + Internal Consistency confirmed)
-                        is_specific_global = False
-                        is_direct = True
-                    
-                    # If we found abstract matches but not specific ones
-                    if potential_abstract_global and not is_specific_global and not is_direct:
-                         is_abstract_global = True
-                
-                # IF NO CONTROL GROUP FOUND:
-                # is_direct remains False. is_specific_global remains False.
-                # Result: Ambiguous (Needs Control Group).
-
-            # --- D. Branching Logic & Registration ---
-            
-            # Branch 1: Movement Hypotheses
-            if item.get('is_move_hyp'):
-                if is_consistent_outcome:
-                    classification = 'AMBIGUOUS'
-                    if is_specific_global: classification = 'GLOBAL'
-                    elif is_direct: classification = 'DIRECT'
-                    
-                    if total_trials_count < 2 and not proven_classification:
-                        classification = 'AMBIGUOUS'
-                    
-                    # NOTE: We register Movement Laws in the "Resolution" phase (Step E)
-                    
-                    move_survivors.setdefault(event['id'], []).append({
-                        'type': item['hyp_type'],
-                        'val': item['hyp_val'],
-                        'classification': classification,
-                        'full_sig': end,
-                        'count': total_trials_count 
-                    })
-                else:
-                    # --- NEW: Scientific Condition Solver (The "Rigor" Fix) ---
-                    # We attempted to solve the contradiction by finding a differentiator.
-                    # RIGOR UPDATE: If we find a condition, we do NOT declare it a Law yet.
-                    # We classify it as AMBIGUOUS but attach the Hypothesis.
-                    
-                    if total_trials_count >= 2: 
-                        exception_condition = self._solve_conditional_rule(start, action_family, end, current_context)
-                        
-                        if exception_condition:
-                            # We found a correlation, but N=1 is not proof.
-                            # We log it as a HYPOTHESIS to be verified.
-                            
-                            hyp_name = item['hyp_type']
-                            if hyp_name == 'Until': hyp_name += f"({item['hyp_val']})"
-                            
-                            ambiguous_events.append({
-                                'event': event,
-                                'reason': "Conditional Hypothesis (N=1)",
-                                # We explicitly state the Coordinate/State trigger we found
-                                'fix': f"Potential Law: IF {exception_condition} THEN {hyp_name}..."
-                            })
-                            # We treat this as handled (don't flag as generic contradiction)
-                            flagged_contradictions.add(event.get('id')) 
-                            continue 
-                    # ----------------------------------------------------------------
-
-                    if event.get('id') not in flagged_contradictions:
-                        hyp_name = item['hyp_type']
-                        if hyp_name == 'Until': hyp_name += f"({item['hyp_val']})"
-                        ambiguous_events.append({
-                            'event': event,
-                            'reason': "Movement Contradiction",
-                            'fix': f"Hypothesis '{hyp_name}' failed. Seen in {my_trials_count}/{total_trials_count} trials."
-                        })
-                        flagged_contradictions.add(event.get('id'))
-                continue
-
-            # Branch 2: Standard Events
-            # [Logic for Control Groups / Exceptions is handled above]
-            
-            # Case B: Specific Global
-            if is_specific_global:
-                if len(this_action_history.get(end, set())) >= 2: 
-                    # --- NEW: REGISTER PROVEN LAW ---
-                    self.proven_rules[rule_key] = 'GLOBAL'
-                    # --------------------------------
-                    global_events.append(event)
-                else: 
-                    ambiguous_events.append({'event': event, 'reason': "Global Hypothesis (N=1)", 'fix': "Needs replication."})
-                continue
-
-            # Case C: Direct Survivor
-            if is_direct:
-                if len(this_action_history.get(end, set())) >= 2: 
-                    # --- NEW: REGISTER PROVEN LAW ---
-                    self.proven_rules[rule_key] = 'DIRECT'
-                    # --------------------------------
-                    direct_events.append(event)
-                else: 
-                    ambiguous_events.append({'event': event, 'reason': "New Event (N=1)", 'fix': "Needs replication."})
-                continue
-            
-            # Case D: Abstract Global
-            if is_abstract_global:
-                if len(this_action_history.get(end, set())) >= 2:
-                    event['_abstract_global'] = True 
-                    global_events.append(event)
-                    # We don't register Abstract Global in the same way usually, 
-                    # but you could if desired.
-                else: ambiguous_events.append({'event': event, 'reason': "Abstract Global Hypothesis (N=1)", 'fix': "Needs replication."})
-                continue
-
-            # Case E: Ambiguous Overlap / Contradiction
-            # BEFORE giving up, check if a known Relational Law explains the "inconsistency".
-            rel_class = self._get_relational_classification(action_family, event.get('id'))
-            
-            if rel_class == 'DIRECT':
-                 # It looked inconsistent (e.g. diff colors), but Relational Memory knows why.
-                 direct_events.append(event)
-                 continue
-            elif rel_class == 'GLOBAL':
-                 # It happens everywhere (e.g. Gravity/Falling).
-                 event['_abstract_global'] = True
-                 global_events.append(event)
-                 continue
-
-            ambiguous_events.append({'event': event, 'reason': "Ambiguous Overlap", 'fix': "Data supports conflicting hypotheses."})
-
-        # --- E. Resolve The Movement Battle (Provisional Laws) ---
-        for obj_id, survivors in move_survivors.items():
-            original_event = next((e for e in current_events if e.get('id') == obj_id), None)
-            if not original_event: continue
-            
-            # Remove from flagged contradictions if it turned out to have at least one valid theory
-            if obj_id in flagged_contradictions:
-                 # Remove the "Contradiction" entry from ambiguous_events since we found a Survivor
-                 ambiguous_events = [w for w in ambiguous_events if w['event'].get('id') != obj_id]
-            
-            winner = None
-            alternatives_note = ""
-
-            if len(survivors) > 1:
-                # Tie-Breaker: Certainty > Specificity > Priority
-                def get_sort_key(s):
-                    certainty = 0
-                    if s['classification'] in ['DIRECT', 'GLOBAL']: certainty = 2
-                    
-                    # NEW: Specificity Score
-                    # We prefer "Until Object 5" (Specific) over "Until Obstruction" (Generic)
-                    specificity = 0
-                    val_str = str(s['val'])
-                    if "UNTIL_OBJ_" in val_str: specificity = 4      # Most specific (ID)
-                    elif "UNTIL_COLOR_" in val_str: specificity = 3  # Property
-                    elif "UNTIL_SHAPE_" in val_str: specificity = 3  # Property
-                    elif "UNTIL_OBSTRUCTION_" in val_str: specificity = 2 # Directional
-                    elif "UNTIL_OBSTRUCTION" in val_str: specificity = 1  # Generic
-                    
-                    priority = 1
-                    t = s['type']
-                    if t == 'Until': priority = 3
-                    elif t == 'Absolute': priority = 2
-                    
-                    return (certainty, specificity, priority)
-                
-                survivors.sort(key=get_sort_key, reverse=True)
-                winner = survivors[0]
-                
-                others = [s['type'] for s in survivors] 
-                alternatives_note = f"Mechanisms: {others}"
-            
-            elif len(survivors) == 1:
-                winner = survivors[0]
-            
-            else:
-                # This should be handled by the 'else' block in the loop above,
-                # but as a failsafe:
-                ambiguous_events.append({'event': original_event, 'reason': "Movement Contradiction", 'fix': "Movement is inconsistent."})
-                continue
-
-            # Process the Winner
-            if winner:
-                clarified_event = copy.deepcopy(original_event)
-                
-                if winner['type'] == 'Absolute':
-                    clarified_event['is_absolute'] = True
-                    clarified_event['abs_coords'] = winner['val']
-                elif winner['type'] == 'Until':
-                    clarified_event['is_until'] = True
-                    clarified_event['until_cond'] = winner['val']
-                
-                if alternatives_note:
-                    clarified_event['_tie_break_note'] = alternatives_note
-
-                if winner['classification'] == 'DIRECT':
-                    # --- NEW: REGISTER PROVEN MOVEMENT LAW ---
-                    rule_key = (action_family, winner['full_sig'])
-                    self.proven_rules[rule_key] = 'DIRECT'
-                    # -----------------------------------------
-                    direct_events.append(clarified_event)             
-                elif winner['classification'] == 'GLOBAL':
-                    # --- NEW: REGISTER PROVEN MOVEMENT LAW ---
-                    rule_key = (action_family, winner['full_sig'])
-                    self.proven_rules[rule_key] = 'GLOBAL'
-                    # -----------------------------------------
-                    global_events.append(clarified_event)
-                else:
-                    count = winner.get('count', 1)
-                    ambiguous_events.append({
-                        'event': original_event, 
-                        'reason': f"Movement Hypothesis (N={count})", 
-                        'fix': "Theory works so far, needs replication."
-                    })
+                ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix})
 
         return direct_events, global_events, ambiguous_events
+
+    def _update_truth_table(self, state_sig, action_key, result_sig):
+        """Helper to write to the Truth Table."""
+        if state_sig not in self.truth_table: self.truth_table[state_sig] = {}
+        if action_key not in self.truth_table[state_sig]: self.truth_table[state_sig][action_key] = {}
+        
+        turn_id = self.global_action_counter
+        if result_sig not in self.truth_table[state_sig][action_key]:
+            self.truth_table[state_sig][action_key][result_sig] = []
+        
+        # Avoid duplicate entries for the same turn
+        if turn_id not in self.truth_table[state_sig][action_key][result_sig]:
+            self.truth_table[state_sig][action_key][result_sig].append(turn_id)
 
     def _update_transition_memory(self, start, action, end, trial_id):
         """
@@ -3403,54 +2986,9 @@ class ObmlAgi3Agent(Agent):
                                   current_adj: dict, prev_adj: dict, learning_key: str):
         """
         The Resolution Phase.
-        Analyzes Ambiguous events to checks for REACTIVE triggers (State-Dependent).
+        STRICT MODE: Disabled heuristic promotion. 
         """
-        promoted_direct_events = []
-        
-        if not ambiguous_wrappers:
-            return promoted_direct_events
-
-        # Identify "Agitators" (Objects that moved this turn)
-        mover_ids = {e['id'] for e in current_events if e['type'] == 'MOVED'}
-        movers = [obj for obj in current_summary if obj['id'] in mover_ids]
-
-        for wrapper in ambiguous_wrappers:
-            event = wrapper['event'] # Extract raw event from the wrapper
-            victim_id = event.get('id')
-            if not victim_id: continue
-            
-            # --- TEST 1: REACTIVE CHECK (The "State" Test) ---
-            
-            # Case A: Overlap (Bulldozer)
-            if event['type'] == 'REMOVED':
-                for mover in movers:
-                    overlapped_ids = self._detect_pixel_overlaps(mover, prev_summary)
-                    if victim_id in overlapped_ids:
-                        if self.debug_channels['HYPOTHESIS']:
-                            print(f"  [Resolution] EXPLAINED REACTIVE: {victim_id} was REMOVED because {mover['id']} overlapped it.")
-                        break
-
-            # Case B: Overlap (Self-Move)
-            elif victim_id in mover_ids:
-                actor = next((obj for obj in current_summary if obj['id'] == victim_id), None)
-                if actor:
-                    overlapped_ids = self._detect_pixel_overlaps(actor, prev_summary)
-                    if overlapped_ids:
-                        if self.debug_channels['HYPOTHESIS']:
-                            trigger_obj = overlapped_ids[0] 
-                            print(f"  [Resolution] EXPLAINED REACTIVE: {victim_id} {event['type']} because it overlapped {trigger_obj}.")
-
-            # Case C: Adjacency (Electric Fence)
-            else:
-                curr_contacts = set(current_adj.get(victim_id, [])); curr_contacts.discard('na')
-                prev_contacts = set(prev_adj.get(victim_id, [])); prev_contacts.discard('na')
-                new_contacts = curr_contacts - prev_contacts
-                if new_contacts:
-                    trigger_obj = list(new_contacts)[0]
-                    if self.debug_channels['HYPOTHESIS']:
-                        print(f"  [Resolution] EXPLAINED REACTIVE: {victim_id} {event['type']} because it touched {trigger_obj}.")
-
-        return promoted_direct_events
+        return []
     
     def _format_rule_description(self, hypothesis_key: tuple) -> str:
         """
@@ -3725,58 +3263,17 @@ class ObmlAgi3Agent(Agent):
     def _update_relational_constraints(self, action_key: tuple, events: list[dict], full_context: dict):
         """
         Identifies if a color change was caused by a specific neighbor or relation.
-        Populates self.relational_constraints with 'Laws' found.
-        NOW TRACKS CONFIDENCE: Only becomes a Law if count >= 2.
-        """
-        if not events: return
         
-        for event in events:
-            # We only care about events that define a Color (RECOLORED or NEW)
-            target_color = None
-            if event['type'] == 'RECOLORED':
-                target_color = event['to_color']
-            elif event['type'] == 'NEW' and 'color' in event:
-                target_color = event['color']
-            
-            if target_color is not None:
-                obj_id = event.get('id')
-                if not obj_id: continue
-
-                # Find potential sources in the PREVIOUS state (full_context)
-                detected_sources = self._find_color_source(obj_id, target_color, full_context)
-                
-                # Key format: (ActionName, TargetID)
-                dict_key = (action_key[0], obj_id) 
-                
-                if dict_key not in self.relational_constraints:
-                    if detected_sources:
-                        # First observation: It is a HYPOTHESIS (Count = 1)
-                        self.relational_constraints[dict_key] = {'rules': detected_sources, 'count': 1}
-                else:
-                    # Subsequent observation: INTERSECT and INCREMENT
-                    existing = self.relational_constraints[dict_key]
-                    
-                    if detected_sources:
-                        # Scientific Method: Intersect.
-                        # If I was Red because of "Alignment(x)" last time, and "Alignment(x)" this time...
-                        surviving_rules = existing['rules'] & detected_sources
-                        
-                        if surviving_rules:
-                            existing['rules'] = surviving_rules
-                            existing['count'] += 1 # validated!
-                        else:
-                            # Falsified: The rule I thought I had didn't hold up.
-                            del self.relational_constraints[dict_key]
-                    else:
-                        # Falsified: No relational explanation found this time.
-                        del self.relational_constraints[dict_key]
+        UPDATED: Disabled "for now" as requested.
+        """
+        return
 
     def _get_relational_classification(self, action_name: str, target_id: str) -> str:
         """
         Determines if a relational rule is DIRECT (Action-Specific) or GLOBAL (Universal).
         Scientific Method:
-        1. Consistency: N >= 2.
-        2. Exclusivity: Does this rule appear in Control Groups?
+        1. Consistency: N >= 2 (proven via _update_relational_constraints intersection).
+        2. Exclusivity: Does this rule appear in Control Groups (other actions)?
            - If YES -> GLOBAL.
            - If NO -> DIRECT (but ONLY if a Control Group actually exists).
         """
@@ -3801,6 +3298,7 @@ class ObmlAgi3Agent(Agent):
             if other_id == target_id and other_action != action_name:
                 
                 # Check if the rules overlap (e.g. both found "Adjacency(0,1)")
+                # If they share a mechanism, the mechanism is likely Global.
                 common_rules = my_rules & other_data['rules']
                 if common_rules:
                     is_found_elsewhere = True
@@ -3966,3 +3464,261 @@ class ObmlAgi3Agent(Agent):
             return f"CORRELATION: Change matches footprint of {mover_str}"
 
         return None
+    
+    def _get_scientific_state(self, obj: dict, context: dict) -> tuple:
+        """
+        Constructs the State Signature. Starts with Intrinsic properties.
+        If the Splitter has activated for this object type, it appends specific Context features.
+        """
+        # 1. Intrinsic Properties (The Base)
+        base_sig = (obj['color'], obj['fingerprint'], obj['size'])
+        
+        # 2. Check for Refinements (Context)
+        # Does this object type require checking specific attributes?
+        required_context_keys = self.state_refinements.get(base_sig, [])
+        
+        context_features = []
+        for key in required_context_keys:
+            # key format examples: 'adj_top', 'align_center_x', 'match_Color'
+            val = None
+            
+            if key.startswith('adj_'):
+                # Adjacency check
+                direction = key.split('_')[1] # top, right, etc.
+                d_idx = {'top':0, 'right':1, 'bottom':2, 'left':3}.get(direction)
+                adj_list = context.get('adj', {}).get(obj['id'], ['na']*4)
+                if d_idx is not None:
+                    # We store if a neighbor exists (True) or is empty (False)
+                    # For higher rigor, we could store the neighbor's color, but we start binary.
+                    val = (adj_list[d_idx] != 'na')
+
+            elif key.startswith('align_'):
+                # Alignment check
+                align_type = key.replace('align_', '')
+                groups = context.get('align', {}).get(align_type, {})
+                val = False
+                for coord, ids in groups.items():
+                    if obj['id'] in ids:
+                        val = True
+                        break
+            
+            elif key.startswith('match_'):
+                # Match Group check
+                m_type = key.replace('match_', '')
+                groups = context.get('match', {}).get(m_type, {})
+                val = False
+                for props, ids in groups.items():
+                    if obj['id'] in ids:
+                        val = True
+                        break
+
+            context_features.append((key, val))
+
+        # Return (Base, Context_Tuple)
+        return (base_sig, tuple(sorted(context_features)))
+    
+    def _verify_and_certify(self, state_sig):
+        """
+        Runs the logic: Is this Consistent? Is it Direct or Global?
+        
+        UPDATED: Fixed 'total_instances' calculation to count UNIQUE turns.
+        Prevents single-turn 'Twin' scenarios (Change + NoChange) from counting as N=2.
+        """
+        if state_sig not in self.truth_table: return
+        
+        actions_data = self.truth_table[state_sig]
+        
+        # 1. Internal Consistency Check (Per Action)
+        for action, results in actions_data.items():
+            
+            # Separate results into "Changes" and "No Changes"
+            change_results = {}
+            no_change_turn_ids = set()
+            
+            for r_sig, turn_ids in results.items():
+                if r_sig[0] == 'NO_CHANGE':
+                    no_change_turn_ids.update(turn_ids)
+                else:
+                    change_results[r_sig] = set(turn_ids)
+
+            # Case A: Contradiction (Multiple types of changes)
+            if len(change_results) > 1:
+                self._trigger_splitter(state_sig, action, results)
+                return 
+
+            # Case B: Change vs No Change
+            if change_results:
+                single_change_sig = list(change_results.keys())[0]
+                change_turn_ids = change_results[single_change_sig]
+                
+                # Check for History Mismatch
+                historical_failure = no_change_turn_ids - change_turn_ids
+                
+                if historical_failure:
+                    self._trigger_splitter(state_sig, action, results)
+                    return 
+                    
+                effective_results = {single_change_sig: list(change_turn_ids)}
+
+            else:
+                effective_results = results
+
+            # 2. Cross-Action Certification (Negative Control)
+            if len(actions_data) < 2:
+                return # Insufficient controls.
+
+            # Pick a reference result
+            ref_result = list(effective_results.keys())[0]
+            
+            is_invariant = True
+            for other_action, other_results in actions_data.items():
+                if other_action == action: continue
+                
+                other_res_keys = list(other_results.keys())
+                other_primary = next((k for k in other_res_keys if k[0] != 'NO_CHANGE'), other_res_keys[0])
+                
+                if other_primary != ref_result:
+                    is_invariant = False
+                    break
+            
+            # 3. Verdict
+            if is_invariant:
+                self.certified_laws[(state_sig, 'ANY')] = {'type': 'GLOBAL', 'result': ref_result}
+                for act in actions_data:
+                    if (state_sig, act) in self.certified_laws:
+                        del self.certified_laws[(state_sig, act)]
+            else:
+                # DIRECT: Result implies specific action causality.
+                # STRICT CONSTRAINT: Repeatability (N >= 2)
+                
+                # FIX: Count UNIQUE turns, not total entries.
+                all_turn_ids = set()
+                for ids in results.values():
+                    all_turn_ids.update(ids)
+                
+                total_instances = len(all_turn_ids)
+                
+                if total_instances >= 2:
+                    self.certified_laws[(state_sig, action)] = {'type': 'DIRECT', 'result': ref_result}
+
+    def _trigger_splitter(self, state_sig, action, conflicting_results: dict):
+        """
+        The Generic Splitter.
+        Scans ALL attributes (Adj, Align, Match) in history to find a difference.
+        """
+        base_sig = state_sig[0] # (Color, Fingerprint, Size)
+        
+        # Gather contexts for the conflicting results
+        contexts_by_result = {}
+        for res, turn_ids in conflicting_results.items():
+            contexts = []
+            for tid in turn_ids:
+                # Map turn_id back to history index (approximate)
+                if 0 <= tid - 1 < len(self.level_state_history):
+                    contexts.append(self.level_state_history[tid-1])
+            contexts_by_result[res] = contexts
+
+        res_keys = list(contexts_by_result.keys())
+        if len(res_keys) < 2: return
+        
+        ctx_group_A = contexts_by_result[res_keys[0]]
+        ctx_group_B = contexts_by_result[res_keys[1]]
+        
+        candidate_split_key = None
+        
+        # --- SCANNER: Check all feature types ---
+        
+        # 1. Check Adjacencies (adj_top, adj_right, etc.)
+        dirs = ['top', 'right', 'bottom', 'left']
+        for d in dirs:
+            key = f"adj_{d}"
+            # Check if Group A has neighbor X and Group B does not (or vice versa)
+            val_A = self._check_feature_presence(ctx_group_A, base_sig, 'adj', d)
+            val_B = self._check_feature_presence(ctx_group_B, base_sig, 'adj', d)
+            
+            if val_A != val_B:
+                candidate_split_key = key
+                break
+        
+        # 2. Check Alignments (align_center_x, etc.)
+        if not candidate_split_key:
+            align_types = ['center_x', 'center_y', 'top_y', 'left_x']
+            for a_t in align_types:
+                key = f"align_{a_t}"
+                val_A = self._check_feature_presence(ctx_group_A, base_sig, 'align', a_t)
+                val_B = self._check_feature_presence(ctx_group_B, base_sig, 'align', a_t)
+                
+                if val_A != val_B:
+                    candidate_split_key = key
+                    break
+
+        # 3. Check Match Groups (match_Color, match_Size)
+        if not candidate_split_key:
+             match_types = ['Exact', 'Color', 'Shape', 'Size']
+             for m_t in match_types:
+                key = f"match_{m_t}"
+                val_A = self._check_feature_presence(ctx_group_A, base_sig, 'match', m_t)
+                val_B = self._check_feature_presence(ctx_group_B, base_sig, 'match', m_t)
+                
+                if val_A != val_B:
+                    candidate_split_key = key
+                    break
+
+        # --- Apply Split ---
+        if candidate_split_key:
+            if base_sig not in self.state_refinements:
+                self.state_refinements[base_sig] = []
+            
+            # Avoid duplicate splits
+            if candidate_split_key not in self.state_refinements[base_sig]:
+                self.state_refinements[base_sig].append(candidate_split_key)
+                
+                # RESET Truth Table for this State Signature
+                # We force the agent to re-learn this object type using the new, precise definition.
+                del self.truth_table[state_sig]
+
+    def _check_feature_presence(self, contexts, base_sig, feature_type, sub_key):
+        """
+        Helper: Returns True ONLY if the feature is present in ALL contexts (100%).
+        Scientific Rigor: We don't guess based on majority. A single mismatch disqualifies the feature.
+        """
+        count = 0
+        total = 0
+        
+        for ctx in contexts:
+            # Find the object matching base_sig in this historical context
+            target_obj = None
+            for obj in ctx['summary']:
+                if (obj['color'], obj['fingerprint'], obj['size']) == base_sig:
+                    target_obj = obj
+                    break
+            
+            if not target_obj: continue
+            total += 1
+            
+            has_feature = False
+            
+            if feature_type == 'adj':
+                # sub_key is direction (e.g. 'top')
+                d_idx = {'top':0, 'right':1, 'bottom':2, 'left':3}.get(sub_key)
+                adj_list = ctx.get('adj', {}).get(target_obj['id'], ['na']*4)
+                if adj_list[d_idx] != 'na': has_feature = True
+                
+            elif feature_type == 'align':
+                # sub_key is type (e.g. 'center_x')
+                groups = ctx.get('align', {}).get(sub_key, {})
+                for coord, ids in groups.items():
+                    if target_obj['id'] in ids: has_feature = True; break
+            
+            elif feature_type == 'match':
+                 # sub_key is type (e.g. 'Color')
+                 groups = ctx.get('match', {}).get(sub_key, {})
+                 for props, ids in groups.items():
+                    if target_obj['id'] in ids: has_feature = True; break
+
+            if has_feature: count += 1
+            
+        if total == 0: return False
+        
+        # STRICT 100% CHECK
+        return count == total
