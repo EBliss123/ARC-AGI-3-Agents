@@ -1709,7 +1709,14 @@ class ObmlAgi3Agent(Agent):
 
     def _expand_result(self, result_sig, target_obj):
         """Converts signature back to event list."""
-        r_type, r_id, r_val = result_sig
+        
+        # Handle Abstract Signature (Type, Val) - Used for Global Laws
+        if len(result_sig) == 2:
+             r_type, r_val = result_sig
+             r_id = target_obj['id'] # Global laws apply to the object in question
+        else:
+             # Handle Concrete Signature (Type, ID, Val) - Used for Direct Laws
+             r_type, r_id, r_val = result_sig
         
         if r_type == 'NO_CHANGE': return []
         
@@ -3521,85 +3528,116 @@ class ObmlAgi3Agent(Agent):
         """
         Runs the logic: Is this Consistent? Is it Direct or Global?
         
-        UPDATED: Fixed 'total_instances' calculation to count UNIQUE turns.
-        Prevents single-turn 'Twin' scenarios (Change + NoChange) from counting as N=2.
+        UPDATED: 
+        1. Uses Abstract Signatures to allow Multi-Object changes (fixing false Contradictions).
+        2. Removed 'Target Correlation' logic. 
+        3. Enforces strict N>=2 repeatability for Direct laws.
         """
         if state_sig not in self.truth_table: return
         
         actions_data = self.truth_table[state_sig]
         
         # 1. Internal Consistency Check (Per Action)
+        # We group results by ABSTRACT signature (ignoring ID).
+        # This allows 10 different blocks to turn Red without it being a "Contradiction".
+        
+        effective_abstract_results = {} # Map Action -> AbstractResult
+
         for action, results in actions_data.items():
             
-            # Separate results into "Changes" and "No Changes"
-            change_results = {}
-            no_change_turn_ids = set()
-            
+            # Group by Abstract Sig (Type, Value)
+            abstract_groups = {}
             for r_sig, turn_ids in results.items():
-                if r_sig[0] == 'NO_CHANGE':
-                    no_change_turn_ids.update(turn_ids)
-                else:
-                    change_results[r_sig] = set(turn_ids)
+                # r_sig is (Type, ID, Val). Abstract is (Type, Val).
+                # We normalize the result to check for consistency of EFFECT.
+                abs_sig = (r_sig[0], r_sig[2]) 
+                
+                if abs_sig[0] == 'NO_CHANGE':
+                    continue
+                
+                if abs_sig not in abstract_groups:
+                    abstract_groups[abs_sig] = set()
+                abstract_groups[abs_sig].update(turn_ids)
 
-            # Case A: Contradiction (Multiple types of changes)
-            if len(change_results) > 1:
+            # Case A: Contradiction (Multiple types of CHANGES)
+            # e.g. One blue block moved Left, another moved Right (in the same turn or historically)
+            if len(abstract_groups) > 1:
                 self._trigger_splitter(state_sig, action, results)
                 return 
 
-            # Case B: Change vs No Change
-            if change_results:
-                single_change_sig = list(change_results.keys())[0]
-                change_turn_ids = change_results[single_change_sig]
+            # Case B: Change vs No Change (The Twin Problem)
+            if abstract_groups:
+                single_abs_sig = list(abstract_groups.keys())[0]
                 
-                # Check for History Mismatch
+                # Check history: Did we ever see ONLY "No Change" for this action?
+                # (We ignore "No Change" if it happened alongside a Change, assuming it's just a non-target peer)
+                
+                # Get all turn IDs where Change happened
+                change_turn_ids = abstract_groups[single_abs_sig]
+                
+                # Get all turn IDs where No Change happened
+                no_change_turn_ids = set()
+                if ('NO_CHANGE', None, None) in results:
+                     no_change_turn_ids.update(results[('NO_CHANGE', None, None)])
+                
+                # If there is a turn where NO change happened and NO change happened...
+                # That is a History Mismatch.
                 historical_failure = no_change_turn_ids - change_turn_ids
-                
                 if historical_failure:
                     self._trigger_splitter(state_sig, action, results)
-                    return 
-                    
-                effective_results = {single_change_sig: list(change_turn_ids)}
+                    return
 
+                effective_abstract_results[action] = single_abs_sig
             else:
-                effective_results = results
+                # Only No Change
+                effective_abstract_results[action] = ('NO_CHANGE', None)
 
-            # 2. Cross-Action Certification (Negative Control)
-            if len(actions_data) < 2:
-                return # Insufficient controls.
+        # 2. Cross-Action Certification
+        if len(actions_data) < 2:
+            return # Insufficient controls.
 
-            # Pick a reference result
-            ref_result = list(effective_results.keys())[0]
+        # Pick a reference result
+        ref_action = list(effective_abstract_results.keys())[0]
+        ref_result = effective_abstract_results[ref_action]
+        
+        # Check Invariance (Do all actions produce the same ABSTRACT result?)
+        is_invariant = True
+        for action, result in effective_abstract_results.items():
+            if result != ref_result:
+                is_invariant = False
+                break
+        
+        # 3. Verdict
+        if is_invariant:
+            # Result is Abstractly Invariant (e.g. "It Moves (-1, 0)" for both actions).
+            # VERDICT: GLOBAL
+            self.certified_laws[(state_sig, 'ANY')] = {'type': 'GLOBAL', 'result': ref_result}
             
-            is_invariant = True
-            for other_action, other_results in actions_data.items():
-                if other_action == action: continue
+            # Clean up specific laws
+            for act in actions_data:
+                if (state_sig, act) in self.certified_laws:
+                    del self.certified_laws[(state_sig, act)]
+        else:
+            # Result CHANGES when action changes.
+            # VERDICT: DIRECT
+            for action, result in effective_abstract_results.items():
+                if result[0] == 'NO_CHANGE': continue
+
+                # Retrieve Concrete Result for storage
+                # We just grab the first concrete result that matches the abstract one
+                concrete = None
+                for r_sig in actions_data[action]:
+                    if (r_sig[0], r_sig[2]) == result:
+                        concrete = r_sig
+                        break
                 
-                other_res_keys = list(other_results.keys())
-                other_primary = next((k for k in other_res_keys if k[0] != 'NO_CHANGE'), other_res_keys[0])
-                
-                if other_primary != ref_result:
-                    is_invariant = False
-                    break
-            
-            # 3. Verdict
-            if is_invariant:
-                self.certified_laws[(state_sig, 'ANY')] = {'type': 'GLOBAL', 'result': ref_result}
-                for act in actions_data:
-                    if (state_sig, act) in self.certified_laws:
-                        del self.certified_laws[(state_sig, act)]
-            else:
-                # DIRECT: Result implies specific action causality.
-                # STRICT CONSTRAINT: Repeatability (N >= 2)
-                
-                # FIX: Count UNIQUE turns, not total entries.
+                # Check N >= 2 (Repeatability)
                 all_turn_ids = set()
-                for ids in results.values():
-                    all_turn_ids.update(ids)
+                for ids in actions_data[action].values(): all_turn_ids.update(ids)
                 
-                total_instances = len(all_turn_ids)
-                
-                if total_instances >= 2:
-                    self.certified_laws[(state_sig, action)] = {'type': 'DIRECT', 'result': ref_result}
+                # We count UNIQUE turns to ensure we have seen this instance twice
+                if len(all_turn_ids) >= 2:
+                    self.certified_laws[(state_sig, action)] = {'type': 'DIRECT', 'result': concrete}
 
     def _trigger_splitter(self, state_sig, action, conflicting_results: dict):
         """
