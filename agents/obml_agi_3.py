@@ -109,11 +109,48 @@ class ObmlAgi3Agent(Agent):
             'CONTEXT_DETAILS': False # Keep or remove large prints
         }
 
+        # --- NEW: Log File Setup ---
+        self.log_file_path = "game_debug.log"
+        
+        # Overwrite the file at the start of each run
+        try:
+            with open(self.log_file_path, "w") as f:
+                f.write("--- NEW RUN STARTED ---\n")
+        except Exception as e:
+            print(f"Warning: Could not create log file: {e}")
+
+    def _log_to_file(self, message: str):
+        """Appends a message to the debug log file."""
+        try:
+            with open(self.log_file_path, "a") as f:
+                f.write(message + "\n")
+        except Exception:
+            pass # Fail silently to not crash the agent
+
+    def _print_and_log(self, message: str):
+        """Prints to console AND appends to the debug log file."""
+        print(message) # Show you
+        try:
+            with open(self.log_file_path, "a") as f:
+                f.write(message + "\n") # Show me
+        except Exception:
+            pass
+
     def _reset_agent_memory(self):
         """
         Resets all agent learning and memory to a clean state.
         This is called at the start of a new game.
         """
+
+        # --- NEW: Log File Reset ---
+        # Ensure the log is wiped clean at the beginning of every run/seed.
+        if hasattr(self, 'log_file_path'):
+            try:
+                with open(self.log_file_path, "w") as f:
+                    f.write("--- NEW RUN STARTED ---\n")
+            except Exception:
+                pass
+
         # Reset the "brain" (long-term learning)
         self.success_contexts = {}
         self.failure_contexts = {}
@@ -403,9 +440,9 @@ class ObmlAgi3Agent(Agent):
 
             # --- Log all changes found ---
             if changes and self.debug_channels['CHANGES']:
-                print("--- Change Log ---")
+                self._print_and_log("--- Change Log ---")
                 for change in changes:
-                    print(change)
+                    self._print_and_log(change)
 
             self._log_relationship_changes(self.last_relationships, current_relationships)
             self._log_adjacency_changes(self.last_adjacencies, current_adjacencies)
@@ -527,7 +564,7 @@ class ObmlAgi3Agent(Agent):
                         return e['type']
 
                     if global_events: 
-                        print(f"  -> Filtered {len(global_events)} Global events:")
+                        self._print_and_log(f"  -> Filtered {len(global_events)} Global events:")
                         for e in global_events:
                             obj_id = e.get('id')
                             
@@ -535,12 +572,12 @@ class ObmlAgi3Agent(Agent):
                             global_key = ('GLOBAL', str(abst_sig))
                             rule_str = self._format_rule_description(global_key)
                             
-                            print(f"     * {e['type']} on {e.get('id', 'Unknown')}")
-                            print(f"       [Explanation] Global Rule: Inevitable '{_fmt_val(e)}'.")
-                            print(f"       [Prediction]  {rule_str}")
+                            self._print_and_log(f"     * [GLOBAL] {e['type']} on {e.get('id', 'Unknown')}")
+                            self._print_and_log(f"       [Explanation] Global Rule: Inevitable '{_fmt_val(e)}'.")
+                            self._print_and_log(f"       [Prediction]  {rule_str}")
 
                     if direct_events: 
-                        print(f"  -> Processing {len(direct_events)} Direct events:")
+                        self._print_and_log(f"  -> Processing {len(direct_events)} Direct events:")
                         for e in direct_events:
                             obj_id = e.get('id')
                             direct_key = (learning_key, obj_id)
@@ -551,25 +588,23 @@ class ObmlAgi3Agent(Agent):
                             if 'condition' in e:
                                 prefix = f"[EXCEPTION FOUND] {e['condition']} => "
 
-                            print(f"     * {e['type']} on {e.get('id', 'Unknown')}")
-                            
+                            self._print_and_log(f"     * [DIRECT] {e['type']} on {e.get('id', 'Unknown')}")
                             if '_physics_note' in e:
-                                print(f"       [Physics]     {e['_physics_note']}")
-                            
-                            print(f"       [Explanation] Direct Causality: Action consistently causes '{_fmt_val(e)}'")
-                            print(f"       [Prediction]  {prefix}{rule_str}")
+                                self._print_and_log(f"       [Physics]     {e['_physics_note']}")
+                            self._print_and_log(f"       [Explanation] Direct Causality: Action consistently causes '{_fmt_val(e)}'")
+                            self._print_and_log(f"       [Prediction]  {rule_str}")
 
                     if ambiguous_events:
-                        print(f"  -> Ignored {len(ambiguous_events)} Ambiguous events:")
+                        self._print_and_log(f"  -> Ignored {len(ambiguous_events)} Ambiguous events:")
                         for wrapper in ambiguous_events:
                             e = wrapper['event']
                             reason = wrapper['reason']
                             fix = wrapper['fix']
                             
                             # Removed Relational Hypothesis Printing
-                            print(f"     * {e['type']} on {e.get('id', 'Unknown')}")
-                            print(f"       [Status] {reason}")
-                            print(f"       [Needs]  {fix}")
+                            self._print_and_log(f"     * [AMBIGUOUS] {e['type']} on {e.get('id', 'Unknown')}")
+                            self._print_and_log(f"       [Status] {reason}")
+                            self._print_and_log(f"       [Needs]  {fix}")
                             
                 # --- Failsafe: Track banned actions ---
                 # Note: We count success if there are DIRECT events or score increased.
@@ -783,9 +818,9 @@ class ObmlAgi3Agent(Agent):
 
         # --- NEW: Debug print of all move profiles ---
         if self.debug_channels['ACTION_SCORE']:
-            print("\n--- Full Profile List (Before Sort) ---")
+            self._print_and_log("\n--- Full Profile List (Before Sort) ---")
             if not move_profiles:
-                print("  (No moves to profile)")
+                self._print_and_log("  (No moves to profile)")
             
             # Sort for display purposes only
             sorted_for_print = sorted(move_profiles, key=lambda x: (
@@ -801,7 +836,7 @@ class ObmlAgi3Agent(Agent):
                 
                 prefix = "  -> " if i == 0 else "     " # Highlight the winner
                 
-                print(f"{prefix}{action_name}{target_name} -> "
+                self._print_and_log(f"{prefix}{action_name}{target_name} -> "
                         f"U:{profile['unknowns']} D:{profile['discoveries']} "
                         f"B:{profile['boring']} F:{profile['failures']}")
 
@@ -891,9 +926,9 @@ class ObmlAgi3Agent(Agent):
                 target_name = f" on {chosen_object_id.replace('obj_', 'id_')}"
             
             if self.debug_channels['ACTION_SCORE']:
-                print(f"\n--- Discovery Profiler ---")
-                print(f"Chose: {action_name}{target_name}")
-                print(f"Profile: U:{best_profile['unknowns']} D:{best_profile['discoveries']} B:{best_profile['boring']} F:{best_profile['failures']}")
+                self._print_and_log(f"\n--- Discovery Profiler ---")
+                self._print_and_log(f"Chose: {action_name}{target_name}")
+                self._print_and_log(f"Profile: U:{best_profile['unknowns']} D:{best_profile['discoveries']} B:{best_profile['boring']} F:{best_profile['failures']}")
         
         else:
             # Modified: If no moves found, just WAIT. Don't reset.
@@ -2640,10 +2675,10 @@ class ObmlAgi3Agent(Agent):
 
         if output_lines:
             if self.debug_channels['CHANGES']:
-                print("\n--- Relationship Change Log ---")
+                self._print_and_log("\n--- Relationship Change Log ---")
                 for line in sorted(output_lines):
-                    print(line)
-                print()
+                    self._print_and_log(line)
+                self._print_and_log("")
 
     def _log_adjacency_changes(self, old_adj: dict, new_adj: dict):
         """Compares two simplified adjacency maps and logs the differences."""
@@ -2670,10 +2705,10 @@ class ObmlAgi3Agent(Agent):
         
         if output_lines:
             if self.debug_channels['CHANGES']:
-                print("\n--- Adjacency Change Log ---")
+                self._print_and_log("\n--- Adjacency Change Log ---")
                 for line in output_lines:
-                    print(line)
-                print()
+                    self._print_and_log(line)
+                self._print_and_log("")
 
     def _log_diag_adjacency_changes(self, old_adj: dict, new_adj: dict):
         """Compares two diagonal adjacency maps and logs the differences."""
@@ -2700,10 +2735,10 @@ class ObmlAgi3Agent(Agent):
         
         if output_lines:
             if self.debug_channels['CHANGES']:
-                print("\n--- Diagonal Adjacency Change Log ---")
+                self._print_and_log("\n--- Diagonal Adjacency Change Log ---")
                 for line in output_lines:
-                    print(line)
-                print()
+                    self._print_and_log(line)
+                self._print_and_log("")
 
     def _log_alignment_changes(self, old_aligns: dict, new_aligns: dict, is_diagonal: bool = False):
         """Compares two alignment dictionaries and logs the differences."""
@@ -2757,10 +2792,10 @@ class ObmlAgi3Agent(Agent):
         if output_lines:
             if self.debug_channels['CHANGES']:
                 title = "Diagonal Alignment Change Log" if is_diagonal else "Alignment Change Log"
-                print(f"\n--- {title} ---")
+                self._print_and_log(f"\n--- {title} ---")
                 for line in sorted(output_lines):
-                    print(line)
-                print()
+                    self._print_and_log(line)
+                self._print_and_log("")
 
     def _log_match_type_changes(self, old_matches: dict, new_matches: dict):
         """Compares two match group dictionaries and logs group-level changes."""
@@ -2827,10 +2862,10 @@ class ObmlAgi3Agent(Agent):
 
         if output_lines:
             if self.debug_channels['CHANGES']:
-                print("\n--- Match Type Change Log ---")
+                self._print_and_log("\n--- Match Type Change Log ---")
                 for line in sorted(output_lines):
-                    print(line)
-                print()
+                    self._print_and_log(line)
+                self._print_and_log("")
             
     def _get_phenomenal_signature(self, event: dict):
         """
