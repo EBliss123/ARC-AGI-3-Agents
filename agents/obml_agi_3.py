@@ -3528,39 +3528,41 @@ class ObmlAgi3Agent(Agent):
         """
         Runs the logic: Is this Consistent? Is it Direct or Global?
         
-        UPDATED: 
-        1. Uses Abstract Signatures to allow Multi-Object changes (fixing false Contradictions).
-        2. Removed 'Target Correlation' logic. 
-        3. Enforces strict N>=2 repeatability for Direct laws.
+        UPDATED: Enforces STRICT Scientific Rigor.
+        1. Consistency: No internal contradictions for the action.
+        2. Repeatability: An action is only eligible for Global voting if N >= 2.
+        3. Control: Global Laws require at least 2 ELIGIBLE actions to agree.
         """
         if state_sig not in self.truth_table: return
         
         actions_data = self.truth_table[state_sig]
         
-        # 1. Internal Consistency Check (Per Action)
-        # We group results by ABSTRACT signature (ignoring ID).
-        # This allows 10 different blocks to turn Red without it being a "Contradiction".
-        
         effective_abstract_results = {} # Map Action -> AbstractResult
+        eligible_actions_count = 0      # Track how many actions are "Mature" (N>=2)
 
         for action, results in actions_data.items():
             
-            # Group by Abstract Sig (Type, Value)
+            # --- 1. Calculate Repeatability (N) ---
+            # We count UNIQUE turn IDs to ensure we have seen this instance twice
+            all_turn_ids = set()
+            for ids in results.values(): 
+                all_turn_ids.update(ids)
+            
+            n_count = len(all_turn_ids)
+            
+            # --- 2. Check Internal Consistency ---
+            # Group by Abstract Sig (Type, Value) to allow Multi-Object changes
             abstract_groups = {}
             for r_sig, turn_ids in results.items():
-                # r_sig is (Type, ID, Val). Abstract is (Type, Val).
-                # We normalize the result to check for consistency of EFFECT.
+                if r_sig[0] == 'NO_CHANGE': continue
+                
+                # Abstract is (Type, Val)
                 abs_sig = (r_sig[0], r_sig[2]) 
-                
-                if abs_sig[0] == 'NO_CHANGE':
-                    continue
-                
                 if abs_sig not in abstract_groups:
                     abstract_groups[abs_sig] = set()
                 abstract_groups[abs_sig].update(turn_ids)
 
             # Case A: Contradiction (Multiple types of CHANGES)
-            # e.g. One blue block moved Left, another moved Right (in the same turn or historically)
             if len(abstract_groups) > 1:
                 self._trigger_splitter(state_sig, action, results)
                 return 
@@ -3568,75 +3570,90 @@ class ObmlAgi3Agent(Agent):
             # Case B: Change vs No Change (The Twin Problem)
             if abstract_groups:
                 single_abs_sig = list(abstract_groups.keys())[0]
-                
-                # Check history: Did we ever see ONLY "No Change" for this action?
-                # (We ignore "No Change" if it happened alongside a Change, assuming it's just a non-target peer)
-                
-                # Get all turn IDs where Change happened
                 change_turn_ids = abstract_groups[single_abs_sig]
                 
-                # Get all turn IDs where No Change happened
                 no_change_turn_ids = set()
                 if ('NO_CHANGE', None, None) in results:
                      no_change_turn_ids.update(results[('NO_CHANGE', None, None)])
                 
-                # If there is a turn where NO change happened and NO change happened...
-                # That is a History Mismatch.
                 historical_failure = no_change_turn_ids - change_turn_ids
                 if historical_failure:
                     self._trigger_splitter(state_sig, action, results)
                     return
 
-                effective_abstract_results[action] = single_abs_sig
+                # It is consistent. Now, is it Mature?
+                if n_count >= 2:
+                    effective_abstract_results[action] = single_abs_sig
+                    eligible_actions_count += 1
+                
             else:
-                # Only No Change
-                effective_abstract_results[action] = ('NO_CHANGE', None)
+                # Only No Change. Always consistent.
+                if n_count >= 2:
+                    effective_abstract_results[action] = ('NO_CHANGE', None)
+                    eligible_actions_count += 1
 
-        # 2. Cross-Action Certification
-        if len(actions_data) < 2:
-            return # Insufficient controls.
-
-        # Pick a reference result
-        ref_action = list(effective_abstract_results.keys())[0]
-        ref_result = effective_abstract_results[ref_action]
+        # --- 3. Cross-Action Certification ---
         
-        # Check Invariance (Do all actions produce the same ABSTRACT result?)
-        is_invariant = True
-        for action, result in effective_abstract_results.items():
-            if result != ref_result:
-                is_invariant = False
-                break
-        
-        # 3. Verdict
-        if is_invariant:
-            # Result is Abstractly Invariant (e.g. "It Moves (-1, 0)" for both actions).
-            # VERDICT: GLOBAL
-            self.certified_laws[(state_sig, 'ANY')] = {'type': 'GLOBAL', 'result': ref_result}
-            
-            # Clean up specific laws
-            for act in actions_data:
-                if (state_sig, act) in self.certified_laws:
-                    del self.certified_laws[(state_sig, act)]
+        # KEY FIX: We only attempt Global Certification if we have 
+        # at least 2 DIFFERENT actions that are BOTH mature (N>=2).
+        if eligible_actions_count < 2:
+            # We might still certify DIRECT laws for the individual mature actions.
+            pass 
         else:
-            # Result CHANGES when action changes.
-            # VERDICT: DIRECT
+            # Pick a reference result from one of our eligible actions
+            ref_action = list(effective_abstract_results.keys())[0]
+            ref_result = effective_abstract_results[ref_action]
+            
+            # Check Invariance
+            is_invariant = True
             for action, result in effective_abstract_results.items():
-                if result[0] == 'NO_CHANGE': continue
+                if result != ref_result:
+                    is_invariant = False
+                    break
+            
+            if is_invariant:
+                # VERDICT: GLOBAL
+                # All mature actions agree on the result.
+                self.certified_laws[(state_sig, 'ANY')] = {'type': 'GLOBAL', 'result': ref_result}
+                
+                # Clean up specific laws (they are subsumed by Global)
+                for act in actions_data:
+                    if (state_sig, act) in self.certified_laws:
+                        del self.certified_laws[(state_sig, act)]
+                
+                # We are done.
+                return
 
-                # Retrieve Concrete Result for storage
-                # We just grab the first concrete result that matches the abstract one
+        # --- 4. Direct Verdict (Fallback) ---
+        # If we didn't certify Global (either not invariant, or not enough mature actions),
+        # we check each action individually for Direct certification.
+        for action in actions_data:
+            # Skip if we already certified it as Global (shouldn't happen due to return above, but safety first)
+            if self.certified_laws.get((state_sig, 'ANY')): continue
+
+            # We need the action to be consistent and mature (N>=2)
+            # We can re-verify maturity here, or rely on logic above.
+            # Let's re-verify to be safe and simple.
+            
+            # Check Consistency (Simplified re-check)
+            # ... (We assume it passed the splitter check above) ...
+            
+            # Get N count
+            all_turn_ids = set()
+            for ids in actions_data[action].values(): all_turn_ids.update(ids)
+            
+            if len(all_turn_ids) >= 2:
+                # Retrieve the concrete result
+                # We prioritize the CHANGE result over No Change
                 concrete = None
+                has_change = False
                 for r_sig in actions_data[action]:
-                    if (r_sig[0], r_sig[2]) == result:
+                    if r_sig[0] != 'NO_CHANGE':
                         concrete = r_sig
+                        has_change = True
                         break
                 
-                # Check N >= 2 (Repeatability)
-                all_turn_ids = set()
-                for ids in actions_data[action].values(): all_turn_ids.update(ids)
-                
-                # We count UNIQUE turns to ensure we have seen this instance twice
-                if len(all_turn_ids) >= 2:
+                if has_change and concrete:
                     self.certified_laws[(state_sig, action)] = {'type': 'DIRECT', 'result': concrete}
 
     def _trigger_splitter(self, state_sig, action, conflicting_results: dict):
