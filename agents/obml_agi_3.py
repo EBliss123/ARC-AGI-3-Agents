@@ -3537,7 +3537,7 @@ class ObmlAgi3Agent(Agent):
         UPDATED: Enforces STRICT Scientific Rigor.
         1. Consistency: No internal contradictions.
         2. Repeatability: Action confirmed on N >= 2 turns (PREVENTS SINGLE-SHOT LEARNING).
-        3. Generalizability: Action confirmed on N >= 2 DISTINCT OBJECTS.
+        3. Generalizability: Result confirmed on N >= 2 DISTINCT OBJECTS (PREVENTS SAMPLE-SIZE-OF-ONE).
         """
         if state_sig not in self.truth_table: return
         
@@ -3548,19 +3548,7 @@ class ObmlAgi3Agent(Agent):
 
         for action, results in actions_data.items():
             
-            # --- 1. Calculate Statistics ---
-            all_turn_ids = set()
-            all_object_ids = set()
-            
-            for entry_list in results.values():
-                for (t_id, o_id) in entry_list:
-                    all_turn_ids.add(t_id)
-                    if o_id: all_object_ids.add(o_id)
-            
-            n_count = len(all_turn_ids)
-            obj_diversity_count = len(all_object_ids)
-            
-            # --- 2. Check Internal Consistency ---
+            # --- 1. Check Internal Consistency ---
             # Group by Abstract Sig (Type, Value)
             abstract_groups = {}
             for r_sig, entry_list in results.items():
@@ -3569,11 +3557,12 @@ class ObmlAgi3Agent(Agent):
                 # Abstract is (Type, Val)
                 abs_sig = (r_sig[0], r_sig[2]) 
                 if abs_sig not in abstract_groups:
-                    abstract_groups[abs_sig] = set()
+                    abstract_groups[abs_sig] = {'turns': set(), 'objs': set()}
                 
-                # Collect turns for this specific result
-                turns = {t for (t, o) in entry_list}
-                abstract_groups[abs_sig].update(turns)
+                # Collect turns and objects for this specific result
+                for (t, o) in entry_list:
+                    abstract_groups[abs_sig]['turns'].add(t)
+                    if o: abstract_groups[abs_sig]['objs'].add(o)
 
             # Case A: Contradiction (Multiple types of CHANGES)
             if len(abstract_groups) > 1:
@@ -3583,26 +3572,35 @@ class ObmlAgi3Agent(Agent):
             # Case B: Change vs No Change
             if abstract_groups:
                 single_abs_sig = list(abstract_groups.keys())[0]
-                change_turn_ids = abstract_groups[single_abs_sig]
+                change_data = abstract_groups[single_abs_sig]
                 
                 no_change_turn_ids = set()
                 if ('NO_CHANGE', None, None) in results:
                      no_change_turn_ids.update({t for (t, o) in results[('NO_CHANGE', None, None)]})
                 
-                historical_failure = no_change_turn_ids - change_turn_ids
+                historical_failure = no_change_turn_ids - change_data['turns']
                 if historical_failure:
                     self._trigger_splitter(state_sig, action, results)
                     return
 
                 # It is Consistent. Now, is it VALID?
-                # RIGOR CHECK: Must be seen on at least 2 different objects to be a Class Law.
-                if n_count >= 2 and obj_diversity_count >= 2:
+                # RIGOR CHECK: The *Result* must be seen on at least 2 different objects to be a Global Candidate.
+                if len(change_data['turns']) >= 2 and len(change_data['objs']) >= 2:
                     effective_abstract_results[action] = single_abs_sig
                     eligible_actions_count += 1
                 
             else:
                 # Only No Change.
-                if n_count >= 2 and obj_diversity_count >= 2:
+                # For "No Change" to be a law, we just need repeatability.
+                # (Diversity is less critical for "Nothing happens", but let's keep it for safety)
+                all_nc_turns = set()
+                all_nc_objs = set()
+                if ('NO_CHANGE', None, None) in results:
+                     for (t, o) in results[('NO_CHANGE', None, None)]:
+                         all_nc_turns.add(t)
+                         if o: all_nc_objs.add(o)
+                         
+                if len(all_nc_turns) >= 2 and len(all_nc_objs) >= 2:
                     effective_abstract_results[action] = ('NO_CHANGE', None)
                     eligible_actions_count += 1
 
@@ -3630,29 +3628,26 @@ class ObmlAgi3Agent(Agent):
         # --- 4. Direct Verdict (Fallback) ---
         for action in actions_data:
             if self.certified_laws.get((state_sig, 'ANY')): continue
-
-            # Re-check statistics for this specific action
-            all_turn_ids = set() # <--- CRITICAL FIX: Track Time
-            all_object_ids = set() # <--- Track Space
             
-            for entry_list in actions_data[action].values():
-                for (t_id, o_id) in entry_list:
-                    all_turn_ids.add(t_id)
-                    if o_id: all_object_ids.add(o_id)
+            # Find the Concrete Change (if any)
+            concrete_sig = None
+            concrete_turns = set()
+            concrete_objs = set()
             
-            # RIGOR CHECK: Direct Laws require Repeatability (N>=2 Turns) AND Population Diversity (Objs>=2)
-            # This 'len(all_turn_ids) >= 2' is what prevents the single-shot hallucination.
-            if len(all_turn_ids) >= 2 and len(all_object_ids) >= 2:
-                concrete = None
-                has_change = False
-                for r_sig in actions_data[action]:
-                    if r_sig[0] != 'NO_CHANGE':
-                        concrete = r_sig
-                        has_change = True
-                        break
-                
-                if has_change and concrete:
-                    self.certified_laws[(state_sig, action)] = {'type': 'DIRECT', 'result': concrete}
+            for r_sig, entry_list in actions_data[action].items():
+                if r_sig[0] != 'NO_CHANGE':
+                    concrete_sig = r_sig
+                    for (t, o) in entry_list:
+                        concrete_turns.add(t)
+                        if o: concrete_objs.add(o)
+                    break # We already verified consistency above
+            
+            if concrete_sig:
+                # RIGOR CHECK: Direct Laws require Repeatability (N>=2 Turns)
+                # AND Population Diversity (Objs>=2 for that SPECIFIC result).
+                # This prevents "Negative Data" (No Change) from inflating the object count.
+                if len(concrete_turns) >= 2 and len(concrete_objs) >= 2:
+                    self.certified_laws[(state_sig, action)] = {'type': 'DIRECT', 'result': concrete_sig}
 
     def _trigger_splitter(self, state_sig, action, conflicting_results: dict):
         """
