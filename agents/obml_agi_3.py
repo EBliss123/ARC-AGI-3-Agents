@@ -2861,6 +2861,10 @@ class ObmlAgi3Agent(Agent):
         2. Record Negative Data.
         3. Certify Laws (Direct vs Global).
         4. Return Classified Events.
+        
+        UPDATED: Step 4 now strictly enforces 'Instance Maturity' (N>=2) 
+        by checking the SPECIFIC RESULT signature. 
+        (Prevents "No Change" history from validating "Change" events).
         """
         direct_events = []
         global_events = []
@@ -2914,47 +2918,69 @@ class ObmlAgi3Agent(Agent):
             direct_rule = self.certified_laws.get((state_sig, action_key))
             global_rule = self.certified_laws.get((state_sig, 'ANY'))
             
-            if global_rule and global_rule['type'] == 'GLOBAL':
+            # --- NEW SAFETY CHECK: Strict Result Verification ---
+            # We ONLY classify THIS event as verified if we have seen 
+            # THIS SPECIFIC RESULT on THIS SPECIFIC OBJECT >= 2 times.
+            # (Fixes the issue where 'No Change' history allowed 'Recolor' to pass)
+            
+            is_instance_mature = False
+            
+            # 1. Get the signature of the CURRENT event (e.g. Recolor to 3)
+            current_result_sig = self._get_concrete_signature(event)
+            
+            if state_sig in self.truth_table and action_key in self.truth_table[state_sig]:
+                # 2. Look up ONLY this specific result in the truth table
+                # (Do NOT iterate over all values, which mixes results)
+                specific_history = self.truth_table[state_sig][action_key].get(current_result_sig, [])
+                
+                # 3. Count unique turns where THIS object produced THIS result
+                obj_specific_turns = set()
+                for (t_id, o_id) in specific_history:
+                    if o_id == obj_id: # Exact ID match required
+                        obj_specific_turns.add(t_id)
+                
+                if len(obj_specific_turns) >= 2:
+                    is_instance_mature = True
+
+            # Logic:
+            # 1. If Global Law exists AND we have N>=2 for this object -> Classify GLOBAL
+            # 2. If Direct Law exists AND we have N>=2 for this object -> Classify DIRECT
+            # 3. Otherwise -> Classify AMBIGUOUS (Hypothesis)
+            
+            if global_rule and global_rule['type'] == 'GLOBAL' and is_instance_mature:
                 global_events.append(event)
-            elif direct_rule and direct_rule['type'] == 'DIRECT':
+            elif direct_rule and direct_rule['type'] == 'DIRECT' and is_instance_mature:
                 direct_events.append(event)
             else:
-                # If uncertified, determine specific reason
+                # Determine specific reason for Ambiguity
                 reason = "Insufficient Controls"
                 fix = "Gathering experimental data."
                 
-                if state_sig in self.truth_table:
+                if not is_instance_mature:
+                     reason = "First Observation (Hypothesis Stage)"
+                     fix = "Repeat action to confirm law on this object."
+                
+                elif state_sig in self.truth_table:
                     results = self.truth_table[state_sig].get(action_key, {})
-                    
-                    # Check for Contradiction first
                     change_sigs = [k for k in results.keys() if k[0] != 'NO_CHANGE']
                     no_change_ids = set()
                     if ('NO_CHANGE', None, None) in results:
-                        no_change_ids = set(results[('NO_CHANGE', None, None)])
+                        no_change_ids = set(t for (t, o) in results[('NO_CHANGE', None, None)])
                         
                     if len(change_sigs) > 1:
                         reason = "Contradiction (Splitting State)"
                         fix = "Wait for Splitter to refine state."
                     elif len(change_sigs) == 1:
-                        change_ids = set(results[change_sigs[0]])
+                        # Check historical failures
+                        change_ids = set(t for (t, o) in results[change_sigs[0]])
                         historical_failure = no_change_ids - change_ids
                         if historical_failure:
                              reason = "Contradiction (History Mismatch)"
                              fix = "Wait for Splitter to refine state."
                         else:
-                             # It is Consistent, but not yet Certified. Check N.
-                             # FIX: Count UNIQUE turns
-                             all_turn_ids = set()
-                             for ids in results.values():
-                                 all_turn_ids.update(ids)
-                             total_instances = len(all_turn_ids)
-                             
-                             if total_instances < 2:
-                                 reason = "First Observation (Need Repeatability)"
-                                 fix = "Repeat action to confirm."
-                             else:
-                                 reason = "Need Negative Control (Try different action)"
-                                 fix = "Try a different action to prove causality."
+                             # Consistent, Mature, but maybe not Certified yet?
+                             reason = "Need Negative Control"
+                             fix = "Try different action to prove causality."
                     
                 ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix})
 
@@ -3534,85 +3560,72 @@ class ObmlAgi3Agent(Agent):
         """
         Runs the logic: Is this Consistent? Is it Direct or Global?
         
-        UPDATED: Enforces STRICT Scientific Rigor.
-        1. Consistency: No internal contradictions.
-        2. Repeatability: Action confirmed on N >= 2 turns (PREVENTS SINGLE-SHOT LEARNING).
-        3. Generalizability: Result confirmed on N >= 2 DISTINCT OBJECTS (PREVENTS SAMPLE-SIZE-OF-ONE).
+        UPDATED: Strict Replication Logic.
+        1. Action count (N) doesn't matter as much as RESULT count.
+        2. We only certify if we have seen the RESULT >= 2 times.
         """
         if state_sig not in self.truth_table: return
         
         actions_data = self.truth_table[state_sig]
         
-        effective_abstract_results = {} # Map Action -> AbstractResult
-        eligible_actions_count = 0      # Track how many actions are "Mature"
-
+        # Step 1: Filter for MATURE actions only
+        mature_results = {} # Map Action -> AbstractResult
+        
         for action, results in actions_data.items():
             
-            # --- 1. Check Internal Consistency ---
             # Group by Abstract Sig (Type, Value)
             abstract_groups = {}
             for r_sig, entry_list in results.items():
                 if r_sig[0] == 'NO_CHANGE': continue
-                
-                # Abstract is (Type, Val)
                 abs_sig = (r_sig[0], r_sig[2]) 
                 if abs_sig not in abstract_groups:
-                    abstract_groups[abs_sig] = {'turns': set(), 'objs': set()}
-                
-                # Collect turns and objects for this specific result
-                for (t, o) in entry_list:
-                    abstract_groups[abs_sig]['turns'].add(t)
-                    if o: abstract_groups[abs_sig]['objs'].add(o)
+                    abstract_groups[abs_sig] = set()
+                # Track unique turns where THIS result happened
+                turns = {t for (t, o) in entry_list}
+                abstract_groups[abs_sig].update(turns)
 
-            # Case A: Contradiction (Multiple types of CHANGES)
+            # Consistency Check A: Contradictions (Multiple different changes)
             if len(abstract_groups) > 1:
                 self._trigger_splitter(state_sig, action, results)
-                return 
+                continue 
 
-            # Case B: Change vs No Change
+            # Consistency Check B: Change vs No Change
             if abstract_groups:
                 single_abs_sig = list(abstract_groups.keys())[0]
-                change_data = abstract_groups[single_abs_sig]
+                change_turn_ids = abstract_groups[single_abs_sig]
                 
                 no_change_turn_ids = set()
                 if ('NO_CHANGE', None, None) in results:
                      no_change_turn_ids.update({t for (t, o) in results[('NO_CHANGE', None, None)]})
                 
-                historical_failure = no_change_turn_ids - change_data['turns']
+                historical_failure = no_change_turn_ids - change_turn_ids
                 if historical_failure:
                     self._trigger_splitter(state_sig, action, results)
-                    return
+                    continue
 
-                # It is Consistent. Now, is it VALID?
-                # RIGOR CHECK: The *Result* must be seen on at least 2 different objects to be a Global Candidate.
-                if len(change_data['turns']) >= 2 and len(change_data['objs']) >= 2:
-                    effective_abstract_results[action] = single_abs_sig
-                    eligible_actions_count += 1
-                
+                # --- THE FIX: STRICT REPLICATION CHECK ---
+                # Only consider this result "Mature" if the CHANGE has been replicated.
+                # If len(change_turn_ids) == 1, it means we saw this exact result ONCE.
+                # Even if similar objects did it, THIS action key has only done it once.
+                # We refuse to certify it.
+                if len(change_turn_ids) >= 2:
+                    mature_results[action] = single_abs_sig
             else:
-                # Only No Change.
-                # For "No Change" to be a law, we just need repeatability.
-                # (Diversity is less critical for "Nothing happens", but let's keep it for safety)
-                all_nc_turns = set()
-                all_nc_objs = set()
-                if ('NO_CHANGE', None, None) in results:
-                     for (t, o) in results[('NO_CHANGE', None, None)]:
-                         all_nc_turns.add(t)
-                         if o: all_nc_objs.add(o)
-                         
-                if len(all_nc_turns) >= 2 and len(all_nc_objs) >= 2:
-                    effective_abstract_results[action] = ('NO_CHANGE', None)
-                    eligible_actions_count += 1
+                # Consistent "No Change"
+                all_turn_ids = set()
+                for entry_list in results.values():
+                    for (t_id, o_id) in entry_list: all_turn_ids.add(t_id)
+                
+                if len(all_turn_ids) >= 2:
+                    mature_results[action] = ('NO_CHANGE', None)
 
-        # --- 3. Cross-Action Certification (Global) ---
-        if eligible_actions_count >= 2:
-            # Pick a reference result
-            ref_action = list(effective_abstract_results.keys())[0]
-            ref_result = effective_abstract_results[ref_action]
+        # Step 2: Global Certification (Requires >= 2 Mature Actions)
+        if len(mature_results) >= 2:
+            ref_action = list(mature_results.keys())[0]
+            ref_result = mature_results[ref_action]
             
-            # Check Invariance
             is_invariant = True
-            for action, result in effective_abstract_results.items():
+            for action, result in mature_results.items():
                 if result != ref_result:
                     is_invariant = False
                     break
@@ -3625,29 +3638,23 @@ class ObmlAgi3Agent(Agent):
                         del self.certified_laws[(state_sig, act)]
                 return
 
-        # --- 4. Direct Verdict (Fallback) ---
-        for action in actions_data:
+        # Step 3: Direct Certification (Fallback)
+        for action, abstract_result in mature_results.items():
             if self.certified_laws.get((state_sig, 'ANY')): continue
             
-            # Find the Concrete Change (if any)
-            concrete_sig = None
-            concrete_turns = set()
-            concrete_objs = set()
+            # We already checked (len(change_turn_ids) >= 2) above when populating mature_results.
             
-            for r_sig, entry_list in actions_data[action].items():
-                if r_sig[0] != 'NO_CHANGE':
+            concrete_sig = None
+            raw_results = actions_data[action]
+            
+            for r_sig in raw_results:
+                if r_sig[0] == 'NO_CHANGE': continue
+                if (r_sig[0], r_sig[2]) == abstract_result:
                     concrete_sig = r_sig
-                    for (t, o) in entry_list:
-                        concrete_turns.add(t)
-                        if o: concrete_objs.add(o)
-                    break # We already verified consistency above
+                    break
             
             if concrete_sig:
-                # RIGOR CHECK: Direct Laws require Repeatability (N>=2 Turns)
-                # AND Population Diversity (Objs>=2 for that SPECIFIC result).
-                # This prevents "Negative Data" (No Change) from inflating the object count.
-                if len(concrete_turns) >= 2 and len(concrete_objs) >= 2:
-                    self.certified_laws[(state_sig, action)] = {'type': 'DIRECT', 'result': concrete_sig}
+                self.certified_laws[(state_sig, action)] = {'type': 'DIRECT', 'result': concrete_sig}
 
     def _trigger_splitter(self, state_sig, action, conflicting_results: dict):
         """
@@ -3658,9 +3665,10 @@ class ObmlAgi3Agent(Agent):
         
         # Gather contexts for the conflicting results
         contexts_by_result = {}
-        for res, turn_ids in conflicting_results.items():
+        for res, entry_list in conflicting_results.items(): 
             contexts = []
-            for tid in turn_ids:
+            # --- CRITICAL FIX: Unpack the tuple (TurnID, ObjID) ---
+            for (tid, oid) in entry_list: 
                 # Map turn_id back to history index (approximate)
                 if 0 <= tid - 1 < len(self.level_state_history):
                     contexts.append(self.level_state_history[tid-1])
@@ -3722,7 +3730,6 @@ class ObmlAgi3Agent(Agent):
                 self.state_refinements[base_sig].append(candidate_split_key)
                 
                 # RESET Truth Table for this State Signature
-                # We force the agent to re-learn this object type using the new, precise definition.
                 del self.truth_table[state_sig]
 
     def _check_feature_presence(self, contexts, base_sig, feature_type, sub_key):
