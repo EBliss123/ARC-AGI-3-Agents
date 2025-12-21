@@ -919,6 +919,7 @@ class ObmlAgi3Agent(Agent):
             # --- Logging ---
             action_name = action_to_return.name
             target_name = ""
+            
             if chosen_object:
                 chosen_object_id = chosen_object['id']
                 pos = chosen_object['position']
@@ -927,7 +928,12 @@ class ObmlAgi3Agent(Agent):
             
             if self.debug_channels['ACTION_SCORE']:
                 self._print_and_log(f"\n--- Discovery Profiler ---")
-                self._print_and_log(f"Chose: {action_name}{target_name}")
+                
+                # UPDATED: Print the Global Step Count (1-based index)
+                # self.global_action_counter is 0-based and incremented below, so we add 1 here.
+                current_step = self.global_action_counter + 1
+                self._print_and_log(f"Chose: {action_name}{target_name} (Step {current_step})")
+                
                 self._print_and_log(f"Profile: U:{best_profile['unknowns']} D:{best_profile['discoveries']} B:{best_profile['boring']} F:{best_profile['failures']}")
         
         else:
@@ -943,7 +949,7 @@ class ObmlAgi3Agent(Agent):
         self.global_action_counter += 1
         self.last_action_id = self.global_action_counter
         # ---------------------------------
-        
+      
         # --- Store state for level history ---
         current_context = {
             'summary': current_summary,
