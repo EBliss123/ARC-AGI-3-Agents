@@ -2881,7 +2881,8 @@ class ObmlAgi3Agent(Agent):
             state_sig = self._get_scientific_state(prev_obj, prev_context)
             result_sig = self._get_concrete_signature(event)
             
-            self._update_truth_table(state_sig, action_key, result_sig)
+            # PASS THE ID HERE
+            self._update_truth_table(state_sig, action_key, result_sig, obj_id=obj_id)
 
         # --- Step 2: Ingest Negative Data ---
         for obj in prev_context['summary']:
@@ -2889,7 +2890,8 @@ class ObmlAgi3Agent(Agent):
                 state_sig = self._get_scientific_state(obj, prev_context)
                 result_sig = ('NO_CHANGE', None, None) 
                 
-                self._update_truth_table(state_sig, action_key, result_sig)
+                # PASS THE ID HERE
+                self._update_truth_table(state_sig, action_key, result_sig, obj_id=obj['id'])
 
         # --- Step 3: Certification & Splitting ---
         affected_states = {self._get_scientific_state(prev_obj_map[id], prev_context) for id in processed_ids}
@@ -2958,8 +2960,8 @@ class ObmlAgi3Agent(Agent):
 
         return direct_events, global_events, ambiguous_events
 
-    def _update_truth_table(self, state_sig, action_key, result_sig):
-        """Helper to write to the Truth Table."""
+    def _update_truth_table(self, state_sig, action_key, result_sig, obj_id=None):
+        """Helper to write to the Truth Table. Now tracks Object Identity."""
         if state_sig not in self.truth_table: self.truth_table[state_sig] = {}
         if action_key not in self.truth_table[state_sig]: self.truth_table[state_sig][action_key] = {}
         
@@ -2967,9 +2969,13 @@ class ObmlAgi3Agent(Agent):
         if result_sig not in self.truth_table[state_sig][action_key]:
             self.truth_table[state_sig][action_key][result_sig] = []
         
-        # Avoid duplicate entries for the same turn
-        if turn_id not in self.truth_table[state_sig][action_key][result_sig]:
-            self.truth_table[state_sig][action_key][result_sig].append(turn_id)
+        # Store (Turn_ID, Object_ID)
+        # We need to know WHO confirmed this result to avoid "Sample Size of One" generalization.
+        entry = (turn_id, obj_id)
+        
+        # Avoid duplicate entries for the same turn/object
+        if entry not in self.truth_table[state_sig][action_key][result_sig]:
+            self.truth_table[state_sig][action_key][result_sig].append(entry)
 
     def _update_transition_memory(self, start, action, end, trial_id):
         """
@@ -3529,78 +3535,80 @@ class ObmlAgi3Agent(Agent):
         Runs the logic: Is this Consistent? Is it Direct or Global?
         
         UPDATED: Enforces STRICT Scientific Rigor.
-        1. Consistency: No internal contradictions for the action.
-        2. Repeatability: An action is only eligible for Global voting if N >= 2.
-        3. Control: Global Laws require at least 2 ELIGIBLE actions to agree.
+        1. Consistency: No internal contradictions.
+        2. Repeatability: Action confirmed on N >= 2 turns (PREVENTS SINGLE-SHOT LEARNING).
+        3. Generalizability: Action confirmed on N >= 2 DISTINCT OBJECTS.
         """
         if state_sig not in self.truth_table: return
         
         actions_data = self.truth_table[state_sig]
         
         effective_abstract_results = {} # Map Action -> AbstractResult
-        eligible_actions_count = 0      # Track how many actions are "Mature" (N>=2)
+        eligible_actions_count = 0      # Track how many actions are "Mature"
 
         for action, results in actions_data.items():
             
-            # --- 1. Calculate Repeatability (N) ---
-            # We count UNIQUE turn IDs to ensure we have seen this instance twice
+            # --- 1. Calculate Statistics ---
             all_turn_ids = set()
-            for ids in results.values(): 
-                all_turn_ids.update(ids)
+            all_object_ids = set()
+            
+            for entry_list in results.values():
+                for (t_id, o_id) in entry_list:
+                    all_turn_ids.add(t_id)
+                    if o_id: all_object_ids.add(o_id)
             
             n_count = len(all_turn_ids)
+            obj_diversity_count = len(all_object_ids)
             
             # --- 2. Check Internal Consistency ---
-            # Group by Abstract Sig (Type, Value) to allow Multi-Object changes
+            # Group by Abstract Sig (Type, Value)
             abstract_groups = {}
-            for r_sig, turn_ids in results.items():
+            for r_sig, entry_list in results.items():
                 if r_sig[0] == 'NO_CHANGE': continue
                 
                 # Abstract is (Type, Val)
                 abs_sig = (r_sig[0], r_sig[2]) 
                 if abs_sig not in abstract_groups:
                     abstract_groups[abs_sig] = set()
-                abstract_groups[abs_sig].update(turn_ids)
+                
+                # Collect turns for this specific result
+                turns = {t for (t, o) in entry_list}
+                abstract_groups[abs_sig].update(turns)
 
             # Case A: Contradiction (Multiple types of CHANGES)
             if len(abstract_groups) > 1:
                 self._trigger_splitter(state_sig, action, results)
                 return 
 
-            # Case B: Change vs No Change (The Twin Problem)
+            # Case B: Change vs No Change
             if abstract_groups:
                 single_abs_sig = list(abstract_groups.keys())[0]
                 change_turn_ids = abstract_groups[single_abs_sig]
                 
                 no_change_turn_ids = set()
                 if ('NO_CHANGE', None, None) in results:
-                     no_change_turn_ids.update(results[('NO_CHANGE', None, None)])
+                     no_change_turn_ids.update({t for (t, o) in results[('NO_CHANGE', None, None)]})
                 
                 historical_failure = no_change_turn_ids - change_turn_ids
                 if historical_failure:
                     self._trigger_splitter(state_sig, action, results)
                     return
 
-                # It is consistent. Now, is it Mature?
-                if n_count >= 2:
+                # It is Consistent. Now, is it VALID?
+                # RIGOR CHECK: Must be seen on at least 2 different objects to be a Class Law.
+                if n_count >= 2 and obj_diversity_count >= 2:
                     effective_abstract_results[action] = single_abs_sig
                     eligible_actions_count += 1
                 
             else:
-                # Only No Change. Always consistent.
-                if n_count >= 2:
+                # Only No Change.
+                if n_count >= 2 and obj_diversity_count >= 2:
                     effective_abstract_results[action] = ('NO_CHANGE', None)
                     eligible_actions_count += 1
 
-        # --- 3. Cross-Action Certification ---
-        
-        # KEY FIX: We only attempt Global Certification if we have 
-        # at least 2 DIFFERENT actions that are BOTH mature (N>=2).
-        if eligible_actions_count < 2:
-            # We might still certify DIRECT laws for the individual mature actions.
-            pass 
-        else:
-            # Pick a reference result from one of our eligible actions
+        # --- 3. Cross-Action Certification (Global) ---
+        if eligible_actions_count >= 2:
+            # Pick a reference result
             ref_action = list(effective_abstract_results.keys())[0]
             ref_result = effective_abstract_results[ref_action]
             
@@ -3613,38 +3621,28 @@ class ObmlAgi3Agent(Agent):
             
             if is_invariant:
                 # VERDICT: GLOBAL
-                # All mature actions agree on the result.
                 self.certified_laws[(state_sig, 'ANY')] = {'type': 'GLOBAL', 'result': ref_result}
-                
-                # Clean up specific laws (they are subsumed by Global)
                 for act in actions_data:
                     if (state_sig, act) in self.certified_laws:
                         del self.certified_laws[(state_sig, act)]
-                
-                # We are done.
                 return
 
         # --- 4. Direct Verdict (Fallback) ---
-        # If we didn't certify Global (either not invariant, or not enough mature actions),
-        # we check each action individually for Direct certification.
         for action in actions_data:
-            # Skip if we already certified it as Global (shouldn't happen due to return above, but safety first)
             if self.certified_laws.get((state_sig, 'ANY')): continue
 
-            # We need the action to be consistent and mature (N>=2)
-            # We can re-verify maturity here, or rely on logic above.
-            # Let's re-verify to be safe and simple.
+            # Re-check statistics for this specific action
+            all_turn_ids = set() # <--- CRITICAL FIX: Track Time
+            all_object_ids = set() # <--- Track Space
             
-            # Check Consistency (Simplified re-check)
-            # ... (We assume it passed the splitter check above) ...
+            for entry_list in actions_data[action].values():
+                for (t_id, o_id) in entry_list:
+                    all_turn_ids.add(t_id)
+                    if o_id: all_object_ids.add(o_id)
             
-            # Get N count
-            all_turn_ids = set()
-            for ids in actions_data[action].values(): all_turn_ids.update(ids)
-            
-            if len(all_turn_ids) >= 2:
-                # Retrieve the concrete result
-                # We prioritize the CHANGE result over No Change
+            # RIGOR CHECK: Direct Laws require Repeatability (N>=2 Turns) AND Population Diversity (Objs>=2)
+            # This 'len(all_turn_ids) >= 2' is what prevents the single-shot hallucination.
+            if len(all_turn_ids) >= 2 and len(all_object_ids) >= 2:
                 concrete = None
                 has_change = False
                 for r_sig in actions_data[action]:
