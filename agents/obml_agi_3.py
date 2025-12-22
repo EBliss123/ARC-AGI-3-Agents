@@ -539,10 +539,11 @@ class ObmlAgi3Agent(Agent):
                 # --- DETAILED PRINTING (Now uses updated brain) ---
                 if self.debug_channels['CHANGES']:
                     
+                    # Define map for logging lookups
+                    prev_obj_map = {o['id']: o for o in prev_context['summary']}
+                    
                     def _fmt_val(e):
-                        # Prioritize Classification Tags over Raw Data
                         if e.get('is_until'):
-                            # Handle both Move vectors and Growth deltas
                             val = e.get('vector') if 'vector' in e else f"+{e.get('pixel_delta')}"
                             action_verb = "Move" if 'vector' in e else "Grow"
                             return f"{action_verb} {val} (Until {e['until_cond']})"
@@ -551,12 +552,9 @@ class ObmlAgi3Agent(Agent):
                             if 'vector' in e: return f"Move to {e['abs_coords']}"
                             if 'to_size' in e: return f"Grow to Size {e['abs_coords']}"
                         
-                        # --- NEW: Variable Outcome Tag ---
                         suffix = ""
-                        if e.get('_is_variable'):
-                            suffix = " (Variable Magnitude/Shape)"
+                        if e.get('_is_variable'): suffix = " (Variable Magnitude/Shape)"
                         
-                        # Fallback to Raw Data
                         if 'vector' in e: return f"Move {e['vector']}{suffix}"
                         if 'to_color' in e: return f"Recolor to {e['to_color']}{suffix}"
                         if 'pixel_delta' in e: return f"Size {'+' if e['pixel_delta']>0 else ''}{e['pixel_delta']}{suffix}"
@@ -567,32 +565,37 @@ class ObmlAgi3Agent(Agent):
                         self._print_and_log(f"  -> Filtered {len(global_events)} Global events:")
                         for e in global_events:
                             obj_id = e.get('id')
+                            if not obj_id or obj_id not in prev_obj_map: continue
                             
-                            abst_sig = self._get_abstract_signature(e)
-                            global_key = ('GLOBAL', str(abst_sig))
-                            rule_str = self._format_rule_description(global_key)
+                            prev_obj = prev_obj_map[obj_id]
+                            state_sig = self._get_scientific_state(prev_obj, prev_context)
+                            result_sig = self._get_concrete_signature(e)
+                            
+                            # FIX: Use 'learning_key' instead of 'action_key'
+                            rule_str = self._format_rule_description('GLOBAL', learning_key, state_sig, result_sig)
                             
                             self._print_and_log(f"     * [GLOBAL] {e['type']} on {e.get('id', 'Unknown')}")
                             self._print_and_log(f"       [Explanation] Global Rule: Inevitable '{_fmt_val(e)}'.")
-                            self._print_and_log(f"       [Prediction]  {rule_str}")
+                            self._print_and_log(f"       [Prediction]  IF {rule_str}")
 
                     if direct_events: 
                         self._print_and_log(f"  -> Processing {len(direct_events)} Direct events:")
                         for e in direct_events:
                             obj_id = e.get('id')
-                            direct_key = (learning_key, obj_id)
+                            if not obj_id or obj_id not in prev_obj_map: continue
                             
-                            # --- Fallback to Standard Learner ---
-                            rule_str = self._format_rule_description(direct_key)
-                            prefix = ""
-                            if 'condition' in e:
-                                prefix = f"[EXCEPTION FOUND] {e['condition']} => "
-
+                            prev_obj = prev_obj_map[obj_id]
+                            state_sig = self._get_scientific_state(prev_obj, prev_context)
+                            result_sig = self._get_concrete_signature(e)
+                            
+                            # FIX: Use 'learning_key' instead of 'action_key'
+                            rule_str = self._format_rule_description('DIRECT', learning_key, state_sig, result_sig)
+                            
                             self._print_and_log(f"     * [DIRECT] {e['type']} on {e.get('id', 'Unknown')}")
                             if '_physics_note' in e:
                                 self._print_and_log(f"       [Physics]     {e['_physics_note']}")
                             self._print_and_log(f"       [Explanation] Direct Causality: Action consistently causes '{_fmt_val(e)}'")
-                            self._print_and_log(f"       [Prediction]  {rule_str}")
+                            self._print_and_log(f"       [Prediction]  IF {rule_str}")
 
                     if ambiguous_events:
                         self._print_and_log(f"  -> Ignored {len(ambiguous_events)} Ambiguous events:")
@@ -601,11 +604,10 @@ class ObmlAgi3Agent(Agent):
                             reason = wrapper['reason']
                             fix = wrapper['fix']
                             
-                            # Removed Relational Hypothesis Printing
                             self._print_and_log(f"     * [AMBIGUOUS] {e['type']} on {e.get('id', 'Unknown')}")
                             self._print_and_log(f"       [Status] {reason}")
                             self._print_and_log(f"       [Needs]  {fix}")
-                            
+
                 # --- Failsafe: Track banned actions ---
                 # Note: We count success if there are DIRECT events or score increased.
                 # Ambiguous events are NOT considered success yet (conservative).
@@ -3069,78 +3071,136 @@ class ObmlAgi3Agent(Agent):
         STRICT MODE: Disabled heuristic promotion. 
         """
         return []
+
+    def _get_invariant_properties(self, state_sig, action_key, result_sig):
+        """
+        Scans the history of a specific Outcome to find properties that are 
+        CONSTANT across all instances. 
+        """
+        if state_sig not in self.truth_table: return []
+        if action_key not in self.truth_table[state_sig]: return []
+        
+        # Get history: List of (turn_id, obj_id)
+        history = self.truth_table[state_sig][action_key].get(result_sig, [])
+        if not history: return []
+
+        # --- FIX: Handle Nested State Signature ---
+        # state_sig might be ((Color, Fp, Size), RefinementKey) or just (Color, Fp, Size)
+        
+        if len(state_sig) == 2 and isinstance(state_sig[0], tuple):
+            # It is refined: ((C, F, S), 'adj_top')
+            base_sig = state_sig[0]
+        else:
+            # It is raw: (C, F, S)
+            base_sig = state_sig
+
+        # Now safely unpack the base signature
+        try:
+            color, fp, size = base_sig
+        except ValueError:
+            return ["Invalid State Signature"]
+
+        # 1. Base Properties are always invariant
+        conditions = [f"Color={color}", f"Size={size}"]
+        fp_str = str(fp)
+        short_fp = fp_str[:6] + ".." if len(fp_str) > 6 else fp_str
+        conditions.append(f"Shape={short_fp}")
+
+        # 2. Contextual Properties (Adj, Align) - Must be computed from History
+        # We need to find features present in EVERY context in the history.
+        
+        # Initialize invariants with the first entry's features
+        first_turn_id, first_obj_id = history[0]
+        # Retrieve context from history (approximate lookback)
+        if not (0 <= first_turn_id - 1 < len(self.level_state_history)):
+            return conditions # Cannot verify contexts, return base only
+            
+        first_ctx = self.level_state_history[first_turn_id - 1]
+        
+        # Helper to extract features for a specific object from a context
+        def extract_features(ctx, oid):
+            feats = {}
+            # Adjacency
+            if 'adj' in ctx and oid in ctx['adj']:
+                feats['adj'] = ctx['adj'][oid] # [top, right, bottom, left]
+            # Alignment
+            feats['align'] = set()
+            if 'align' in ctx:
+                for a_type, groups in ctx['align'].items():
+                    for coord, ids in groups.items():
+                        if oid in ids:
+                            feats['align'].add((a_type, coord))
+            return feats
+
+        common_features = extract_features(first_ctx, first_obj_id)
+        
+        # Iterate through the rest of the history and intersect
+        for i in range(1, len(history)):
+            tid, oid = history[i]
+            if not (0 <= tid - 1 < len(self.level_state_history)): continue
+            
+            ctx = self.level_state_history[tid - 1]
+            current_feats = extract_features(ctx, oid)
+            
+            # Intersect Adjacency
+            # For adjacency, we require exact match of the neighbor ID (or 'na')
+            if 'adj' in common_features:
+                if 'adj' not in current_feats:
+                    del common_features['adj']
+                else:
+                    new_adj = []
+                    for k in range(4):
+                        if common_features['adj'][k] == current_feats['adj'][k]:
+                            new_adj.append(common_features['adj'][k])
+                        else:
+                            new_adj.append(None) # Mismatch -> Variable -> Noise
+                    
+                    # If all became None, remove the key entirely
+                    if all(x is None for x in new_adj):
+                        del common_features['adj']
+                    else:
+                        common_features['adj'] = new_adj
+
+            # Intersect Alignments
+            if 'align' in common_features:
+                common_features['align'] = common_features['align'].intersection(current_feats['align'])
+
+        # 3. Format the Surviving Invariants
+        dirs = ['top', 'right', 'bottom', 'left']
+        if 'adj' in common_features:
+            for i, neighbor in enumerate(common_features['adj']):
+                if neighbor and neighbor != 'na':
+                    # Standardize 'obj_' to 'id_'
+                    n_clean = neighbor.replace('obj_', 'id_')
+                    conditions.append(f"Adj({dirs[i]}={n_clean})")
+        
+        if 'align' in common_features:
+            for (a_type, coord) in common_features['align']:
+                conditions.append(f"{a_type}={coord}")
+
+        return conditions
     
-    def _format_rule_description(self, hypothesis_key: tuple) -> str:
+    def _format_rule_description(self, rule_type, action_key, state_sig, result_sig):
         """
-        Returns a readable rule string using Background Subtraction.
-        Explicitly prints Object IDs for every condition to verify bindings.
+        Returns a scientific description of the rule.
+        Uses _get_invariant_properties to parse down to only features 
+        that are UNIQUE/COMMON to the outcome history.
         """
-        hypothesis = self.rule_hypotheses.get(hypothesis_key)
-        if not hypothesis: return "(No rule learned yet)"
+        # 1. Compute Invariants
+        conditions = self._get_invariant_properties(state_sig, action_key, result_sig)
+        
+        # 2. Add Splitter Refinements (if any exist for this state)
+        # These are features the Splitter explicitly marked as "Critical"
+        if state_sig in self.state_refinements:
+            for refine_key in self.state_refinements[state_sig]:
+                # Format visually (e.g., "adj_top" -> "Split(adj_top)")
+                conditions.append(f"**{refine_key}**")
+
+        # 3. Format Output
+        if not conditions:
+            return "Universal Rule (No constraints identified)"
             
-        best_outcome = None
-        max_seen = -1
-        for fingerprint, data in hypothesis.items():
-            if data['raw_events'] and len(data['contexts']) > max_seen:
-                max_seen = len(data['contexts'])
-                best_outcome = data
-        
-        if not best_outcome: return "(History: Consistently No Change)"
-        rule = best_outcome['rule']
-        if not rule: return "IF (Always/Unconditional)"
-
-        # --- Calculate Static Background (Intersection of ALL history) ---
-        static_context = None
-        if self.level_state_history:
-            # Sample start, middle, end
-            indices = {0, len(self.level_state_history)-1}
-            if len(self.level_state_history) > 5: indices.add(len(self.level_state_history)//2)
-            sample_history = [self.level_state_history[i] for i in indices]
-            
-            static_context = sample_history[0]
-            for ctx in sample_history[1:]:
-                static_context = self._intersect_contexts(static_context, ctx)
-
-        def is_static(key, sub_key, val):
-            if not static_context: return False
-            if key not in static_context: return False
-            if sub_key not in static_context[key]: return False
-            return static_context[key][sub_key] == val
-
-        conditions = []
-        
-        # Format Adjacencies (Subtracting Static)
-        for key in ['adj', 'diag_adj']:
-            if key in rule:
-                for obj, contacts in rule[key].items():
-                    if is_static(key, obj, contacts): continue
-                    specifics = [c for c in contacts if c != 'x' and c != 'na']
-                    if specifics: conditions.append(f"Adj({obj} to {specifics})")
-
-        # Format Relationships/Alignments (Subtracting Static)
-        for key in ['rels', 'align', 'match']:
-            if key in rule:
-                for type_name, groups in rule[key].items():
-                    for val, ids in groups.items():
-                        # Check if this exact group exists in background
-                        is_group_static = False
-                        if static_context and key in static_context:
-                            static_types = static_context[key]
-                            if type_name in static_types:
-                                if val in static_types[type_name] and static_types[type_name][val] == ids:
-                                    is_group_static = True
-                        if not is_group_static:
-                            # --- THE FIX: Print the IDs involved! ---
-                            # e.g. turns "Color=3" into "Color=3(['obj_34'])"
-                            id_list_str = str(list(ids))
-                            conditions.append(f"{type_name}={val}{id_list_str}")
-        
-        if 'diag_align' in rule:
-             for type_name in rule['diag_align']:
-                conditions.append(f"DiagAlign({type_name})")
-
-        if not conditions: return "IF (Generic/Background Context)"
-        return "IF " + " AND ".join(conditions)
+        return " AND ".join(conditions)
 
     def _solve_conditional_rule(self, start_state, action_family, current_end_sig, current_context) -> str | None:
         """
