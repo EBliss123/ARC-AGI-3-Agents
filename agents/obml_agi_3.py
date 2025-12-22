@@ -3697,80 +3697,160 @@ class ObmlAgi3Agent(Agent):
             if concrete_sig:
                 self.certified_laws[(state_sig, action)] = {'type': 'DIRECT', 'result': concrete_sig}
 
+    def _get_feature_status(self, contexts: list[dict], base_sig: tuple, feature_type: str, sub_key: str) -> str:
+        """
+        Analyzes a set of historical contexts to see if a feature is consistent.
+        Returns: 'ALL' (100% Present), 'NONE' (0% Present), or 'MIXED'.
+        """
+        count = 0
+        total = 0
+        
+        for ctx in contexts:
+            # Find the object matching base_sig in this historical context
+            # (Logic copied to ensure we are looking at the specific actor in the specific past)
+            target_obj = None
+            for obj in ctx['summary']:
+                if (obj['color'], obj['fingerprint'], obj['size']) == base_sig:
+                    target_obj = obj
+                    break
+            
+            if not target_obj: continue
+            total += 1
+            
+            has_feature = False
+            
+            if feature_type == 'adj':
+                # sub_key is direction (e.g. 'top')
+                d_idx = {'top':0, 'right':1, 'bottom':2, 'left':3}.get(sub_key)
+                adj_list = ctx.get('adj', {}).get(target_obj['id'], ['na']*4)
+                if adj_list[d_idx] != 'na': has_feature = True
+                
+            elif feature_type == 'align':
+                # sub_key is type (e.g. 'center_x')
+                groups = ctx.get('align', {}).get(sub_key, {})
+                for coord, ids in groups.items():
+                    if target_obj['id'] in ids: has_feature = True; break
+            
+            elif feature_type == 'match':
+                 # sub_key is type (e.g. 'Color')
+                 groups = ctx.get('match', {}).get(sub_key, {})
+                 for props, ids in groups.items():
+                    if target_obj['id'] in ids: has_feature = True; break
+
+            if has_feature: count += 1
+            
+        if total == 0: return 'NONE' # Should not happen if contexts are valid
+        
+        if count == total: return 'ALL'
+        if count == 0: return 'NONE'
+        return 'MIXED'
+
     def _trigger_splitter(self, state_sig, action, conflicting_results: dict):
         """
-        The Generic Splitter.
-        Scans ALL attributes (Adj, Align, Match) in history to find a difference.
+        The Scientific Splitter.
+        Refines the State definition only when two DIFFERENT, REPEATABLE outcomes
+        can be perfectly separated by a context feature.
+        
+        Logic:
+        1. Anomaly Filter: Ignore conflicting results until they are Mature (N >= 2).
+        2. Hypothesis Search: Find a feature that is 'ALL' in Outcome A and 'NONE' in Outcome B.
+        3. Splitting: Only split if a perfect separator is found.
         """
         base_sig = state_sig[0] # (Color, Fingerprint, Size)
         
-        # Gather contexts for the conflicting results
+        # --- 1. MATURITY CHECK (The "Anomaly" Filter) ---
+        # We only attempt to split if we have at least 2 distinct observations 
+        # for at least 2 different outcomes.
+        # This prevents splitting logic based on a single fluke (N=1).
+        
+        valid_result_keys = []
+        
+        for res_sig, entry_list in conflicting_results.items():
+            # Count unique turns for this result
+            unique_turns = {tid for (tid, oid) in entry_list}
+            if len(unique_turns) >= 2:
+                valid_result_keys.append(res_sig)
+        
+        # If we don't have at least 2 mature outcomes, we are not ready to do science.
+        # We just wait. The anomaly stays in the truth table as "noise" for now.
+        if len(valid_result_keys) < 2:
+            return
+
+        # Gather contexts only for the valid (mature) results
         contexts_by_result = {}
-        for res, entry_list in conflicting_results.items(): 
+        for res in valid_result_keys: 
+            entry_list = conflicting_results[res]
             contexts = []
-            # --- CRITICAL FIX: Unpack the tuple (TurnID, ObjID) ---
             for (tid, oid) in entry_list: 
-                # Map turn_id back to history index (approximate)
                 if 0 <= tid - 1 < len(self.level_state_history):
                     contexts.append(self.level_state_history[tid-1])
             contexts_by_result[res] = contexts
 
-        res_keys = list(contexts_by_result.keys())
-        if len(res_keys) < 2: return
+        # Select the first two mature outcomes to compare (Outcome A vs Outcome B)
+        # (In complex cases with 3+ outcomes, solving the first pair usually helps resolve the rest iteratively)
+        res_A = valid_result_keys[0]
+        res_B = valid_result_keys[1]
         
-        ctx_group_A = contexts_by_result[res_keys[0]]
-        ctx_group_B = contexts_by_result[res_keys[1]]
+        ctx_group_A = contexts_by_result[res_A]
+        ctx_group_B = contexts_by_result[res_B]
         
         candidate_split_key = None
         
-        # --- SCANNER: Check all feature types ---
+        # --- 2. HYPOTHESIS SEARCH (The Separator) ---
+        # We look for a feature that is 100% Present in A and 0% in B (or vice versa).
+        # We do NOT accept "Mixed" results.
         
-        # 1. Check Adjacencies (adj_top, adj_right, etc.)
+        # A. Check Adjacencies
         dirs = ['top', 'right', 'bottom', 'left']
         for d in dirs:
-            key = f"adj_{d}"
-            # Check if Group A has neighbor X and Group B does not (or vice versa)
-            val_A = self._check_feature_presence(ctx_group_A, base_sig, 'adj', d)
-            val_B = self._check_feature_presence(ctx_group_B, base_sig, 'adj', d)
+            status_A = self._get_feature_status(ctx_group_A, base_sig, 'adj', d)
+            status_B = self._get_feature_status(ctx_group_B, base_sig, 'adj', d)
             
-            if val_A != val_B:
-                candidate_split_key = key
+            # Valid Split: ALL vs NONE
+            if (status_A == 'ALL' and status_B == 'NONE') or \
+               (status_A == 'NONE' and status_B == 'ALL'):
+                candidate_split_key = f"adj_{d}"
                 break
         
-        # 2. Check Alignments (align_center_x, etc.)
+        # B. Check Alignments
         if not candidate_split_key:
             align_types = ['center_x', 'center_y', 'top_y', 'left_x']
             for a_t in align_types:
-                key = f"align_{a_t}"
-                val_A = self._check_feature_presence(ctx_group_A, base_sig, 'align', a_t)
-                val_B = self._check_feature_presence(ctx_group_B, base_sig, 'align', a_t)
+                status_A = self._get_feature_status(ctx_group_A, base_sig, 'align', a_t)
+                status_B = self._get_feature_status(ctx_group_B, base_sig, 'align', a_t)
                 
-                if val_A != val_B:
-                    candidate_split_key = key
+                if (status_A == 'ALL' and status_B == 'NONE') or \
+                   (status_A == 'NONE' and status_B == 'ALL'):
+                    candidate_split_key = f"align_{a_t}"
                     break
 
-        # 3. Check Match Groups (match_Color, match_Size)
+        # C. Check Match Groups
         if not candidate_split_key:
              match_types = ['Exact', 'Color', 'Shape', 'Size']
              for m_t in match_types:
-                key = f"match_{m_t}"
-                val_A = self._check_feature_presence(ctx_group_A, base_sig, 'match', m_t)
-                val_B = self._check_feature_presence(ctx_group_B, base_sig, 'match', m_t)
+                status_A = self._get_feature_status(ctx_group_A, base_sig, 'match', m_t)
+                status_B = self._get_feature_status(ctx_group_B, base_sig, 'match', m_t)
                 
-                if val_A != val_B:
-                    candidate_split_key = key
+                if (status_A == 'ALL' and status_B == 'NONE') or \
+                   (status_A == 'NONE' and status_B == 'ALL'):
+                    candidate_split_key = f"match_{m_t}"
                     break
 
-        # --- Apply Split ---
+        # --- 3. APPLY SPLIT ---
         if candidate_split_key:
             if base_sig not in self.state_refinements:
                 self.state_refinements[base_sig] = []
             
             # Avoid duplicate splits
             if candidate_split_key not in self.state_refinements[base_sig]:
+                if self.debug_channels['STATE_GRAPH']:
+                    print(f"  [Scientific Splitter] Refined State {base_sig} using '{candidate_split_key}' to separate conflicting outcomes.")
+                
                 self.state_refinements[base_sig].append(candidate_split_key)
                 
                 # RESET Truth Table for this State Signature
+                # This forces the agent to re-sort all history into the new, specific buckets
+                # (State + Feature) vs (State + No Feature).
                 del self.truth_table[state_sig]
 
     def _check_feature_presence(self, contexts, base_sig, feature_type, sub_key):
