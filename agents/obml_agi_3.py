@@ -469,6 +469,16 @@ class ObmlAgi3Agent(Agent):
                 # 1. Parse text changes back to structured event dicts
                 events = self._parse_change_logs_to_events(changes)
 
+                # --- NEW: Pre-calculate Physics for Classification ---
+                # We run this BEFORE classification so the notes are available 
+                # for the classifier and debug logs.
+                for e in events:
+                    if e['type'] == 'SHAPE_CHANGED':
+                        note = self._check_interaction_physics(e['id'], events, prev_context, current_summary)
+                        if note:
+                            e['_physics_note'] = note
+                # -----------------------------------------------------
+
                 # 2. Classify Events (Strict Logic + Exception Solving)
                 # FIX: Pass 'prev_context' so the solver can compare states
                 direct_events, global_events, ambiguous_events = self._classify_event_stream(events, learning_key, prev_context)
@@ -496,19 +506,7 @@ class ObmlAgi3Agent(Agent):
                     obj_id = obj['id']
                     specific_events = obj_events_map[obj_id]
                     hypothesis_key = (learning_key, obj_id)
-                    
-                    # --- NEW: Run Physics Check Before Learning ---
-                    for event in specific_events:
-                        if event['type'] == 'SHAPE_CHANGED':
-                            physics_note = self._check_interaction_physics(
-                                event['id'], 
-                                events,           # All events (to find movers)
-                                prev_context,     # Old state
-                                current_summary   # New state
-                            )
-                            if physics_note:
-                                event['_physics_note'] = physics_note
-                    # ----------------------------------------------
+                
 
                     self._analyze_result(hypothesis_key, specific_events, prev_context)
                 
@@ -3006,6 +3004,49 @@ class ObmlAgi3Agent(Agent):
                 global_events.append(event)
             elif direct_rule and direct_rule['type'] == 'DIRECT' and is_instance_mature:
                 direct_events.append(event)
+            # --- NEW: Physics Logic with Causality Check ---
+            elif event.get('_physics_note'):
+                # We have a physics explanation.
+                # BUT: Is the CAUSE (the movement) trusted?
+                # We check if the movers involved in this turn have a Certified Law.
+                
+                note = event['_physics_note']
+                cause_trusted = True
+                
+                if "caused by movement of" in note:
+                    movers_part = note.split("caused by movement of ")[1]
+                    # Handle "obj_1, obj_2..." formatting
+                    mover_ids = [m.strip().replace('...', '') for m in movers_part.split(",")]
+                    
+                    for m_id in mover_ids:
+                        if not m_id: continue
+                        # Look up the mover object
+                        m_obj = prev_obj_map.get(m_id)
+                        if m_obj:
+                            m_state = self._get_scientific_state(m_obj, prev_context)
+                            # Check if a law exists for them (Direct OR Global)
+                            has_direct = self.certified_laws.get((m_state, action_key))
+                            has_global = self.certified_laws.get((m_state, 'ANY'))
+                            
+                            if not has_direct and not has_global:
+                                cause_trusted = False
+                                break
+                        else:
+                            # If we can't find the mover (unlikely), mistrust it.
+                            cause_trusted = False
+                            break
+                
+                if cause_trusted:
+                    direct_events.append(event)
+                else:
+                    # The cause is unproven, so the effect is unproven.
+                    ambiguous_events.append({
+                        'event': event, 
+                        'reason': "Unverified Cause", 
+                        'fix': "Wait for mover behavior to be confirmed.",
+                        'detail': "Physics matches, but the movement itself is not yet a Law."
+                    })
+            # --------------------------
             else:
                 # Determine specific reason for Ambiguity
                 reason = "Insufficient Controls"
@@ -3630,8 +3671,8 @@ class ObmlAgi3Agent(Agent):
 
     def _check_interaction_physics(self, target_id: str, changes: list[dict], prev_context: dict, curr_summary: list[dict]) -> str | None:
         """
-        Verifies if a 'Mass-Conserving' Shape Change correlates with the footprint 
-        of moving objects (Start or End positions).
+        Verifies if a Shape Change is strictly caused by objects moving ONTO or OFF OF the target.
+        UPDATED: Includes 'Swept Path' to handle fast-moving objects.
         """
         # 1. Get Target Data
         prev_target = next((o for o in prev_context['summary'] if o['id'] == target_id), None)
@@ -3641,15 +3682,17 @@ class ObmlAgi3Agent(Agent):
         
         old_pixels = set(prev_target['pixel_coords'])
         new_pixels = set(curr_target['pixel_coords'])
-
-        # --- GATEKEEPER: Strict Mass Conservation ---
-        # We only apply this logic if the pixel count is constant.
-        if len(old_pixels) != len(new_pixels):
-            return None 
-
-        # 2. Build the "Combined Footprint" of all Agitators
-        # We collect the Start AND End positions of every object that moved.
-        total_footprint = set()
+        
+        # Calculate the delta
+        gained_pixels = new_pixels - old_pixels
+        lost_pixels = old_pixels - new_pixels
+        
+        if not gained_pixels and not lost_pixels:
+            return None # No change in pixels
+            
+        # 2. Build the "Mover Footprints" (Start, End, AND Path)
+        union_prev_movers = set() # Where they WERE (potential revealers)
+        union_curr_movers = set() # Where they ARE (potential occluders)
         agitator_ids = []
 
         for event in changes:
@@ -3659,36 +3702,55 @@ class ObmlAgi3Agent(Agent):
                 curr_mover = next((o for o in curr_summary if o['id'] == mover_id), None)
                 
                 if prev_mover and curr_mover:
-                    total_footprint.update(prev_mover['pixel_coords']) # Departure footprint
-                    total_footprint.update(curr_mover['pixel_coords']) # Arrival footprint
+                    # Add Start/End positions
+                    union_prev_movers.update(prev_mover['pixel_coords'])
+                    union_curr_movers.update(curr_mover['pixel_coords'])
                     agitator_ids.append(mover_id)
+                    
+                    # --- NEW: Fill the Path (Swept Area) ---
+                    # We assume rectangular objects for simplicity in path fill.
+                    # This covers gaps if the object moved > 1 step.
+                    r1, c1 = prev_mover['position']
+                    r2, c2 = curr_mover['position']
+                    h, w = prev_mover['size']
+                    
+                    min_r, max_r = min(r1, r2), max(r1, r2)
+                    min_c, max_c = min(c1, c2), max(c1, c2)
+                    
+                    # Add all pixels in the bounding box of the move
+                    for r in range(min_r, max_r + h):
+                        for c in range(min_c, max_c + w):
+                            # The path counts as "Previous" (was passed through) AND 
+                            # "Current" (effectively occupied during the turn).
+                            union_prev_movers.add((r, c))
+                            union_curr_movers.add((r, c))
 
-        if not total_footprint:
+        if not agitator_ids:
             return None
 
-        # 3. Calculate the Target's "Disturbance"
-        # The set of pixels that are different between the old and new shape.
-        changed_pixels = old_pixels.symmetric_difference(new_pixels)
+        # 3. Verify Exceptions
         
-        if not changed_pixels:
-            return None # No actual shape change (just metadata?)
+        # Exception 1: Gained pixels must be explained by a mover leaving that spot
+        if gained_pixels:
+            if not gained_pixels.issubset(union_prev_movers):
+                return None # Unexplained spontaneous growth
+                
+        # Exception 2: Lost pixels must be explained by a mover arriving at that spot
+        if lost_pixels:
+            if not lost_pixels.issubset(union_curr_movers):
+                return None # Unexplained spontaneous shrinking
 
-        # 4. The Correlation Test
-        # Does the disturbance fall entirely within the Agitator Footprint?
-        # We allow a small margin of error (e.g., 90% coverage) for edge cases.
-        intersection = changed_pixels.intersection(total_footprint)
+        # 4. Success - Attributable to movement
+        mover_str = ", ".join(agitator_ids[:3]) 
+        if len(agitator_ids) > 3: mover_str += "..."
         
-        if not intersection:
-            return None
-            
-        coverage = len(intersection) / len(changed_pixels)
+        explanation_parts = []
+        if gained_pixels: explanation_parts.append("Reveal")
+        if lost_pixels: explanation_parts.append("Occlusion")
         
-        if coverage > 0.9:
-            mover_str = ", ".join(agitator_ids[:3]) # List first 3 for brevity
-            if len(agitator_ids) > 3: mover_str += "..."
-            return f"CORRELATION: Change matches footprint of {mover_str}"
-
-        return None
+        type_str = " & ".join(explanation_parts)
+        
+        return f"CORRELATION: {type_str} caused by movement of {mover_str}"
     
     def _get_scientific_state(self, obj: dict, context: dict) -> tuple:
         """
