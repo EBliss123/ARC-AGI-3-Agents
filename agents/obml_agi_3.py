@@ -3075,108 +3075,176 @@ class ObmlAgi3Agent(Agent):
     def _get_invariant_properties(self, state_sig, action_key, result_sig):
         """
         Scans the history of a specific Outcome to find properties that are 
-        CONSTANT across all instances. 
+        CONSTANT across all instances.
+        
+        UPDATED: Contrastive Analysis.
+        Checks against 'NO_CHANGE' examples to identify 'Critical Triggers'.
         """
         if state_sig not in self.truth_table: return []
         if action_key not in self.truth_table[state_sig]: return []
         
-        # Get history: List of (turn_id, obj_id)
-        history = self.truth_table[state_sig][action_key].get(result_sig, [])
-        if not history: return []
-
-        # --- FIX: Handle Nested State Signature ---
-        # state_sig might be ((Color, Fp, Size), RefinementKey) or just (Color, Fp, Size)
-        
+        # 1. FIX: Robust State Signature Unpacking
+        # Handles both raw (C,F,S) and refined ((C,F,S), 'key') signatures
         if len(state_sig) == 2 and isinstance(state_sig[0], tuple):
-            # It is refined: ((C, F, S), 'adj_top')
             base_sig = state_sig[0]
         else:
-            # It is raw: (C, F, S)
             base_sig = state_sig
-
-        # Now safely unpack the base signature
+            
         try:
             color, fp, size = base_sig
         except ValueError:
-            return ["Invalid State Signature"]
+            return ["State Error"] # Fallback
 
-        # 1. Base Properties are always invariant
-        conditions = [f"Color={color}", f"Size={size}"]
+        # Get Positive History (Change)
+        pos_history = self.truth_table[state_sig][action_key].get(result_sig, [])
+        if not pos_history: return []
+        
+        # Get Negative History (No Change) for Contrast
+        # We look for objects with the SAME state_sig that did NOT produce this result
+        neg_history = []
+        if ('NO_CHANGE', None, None) in self.truth_table[state_sig][action_key]:
+            neg_history = self.truth_table[state_sig][action_key][('NO_CHANGE', None, None)]
+
+        # --- Base Invariants (Always True) ---
+        conditions = []
+        conditions.append(f"Color={color}")
+        conditions.append(f"Size={size}")
         fp_str = str(fp)
         short_fp = fp_str[:6] + ".." if len(fp_str) > 6 else fp_str
         conditions.append(f"Shape={short_fp}")
 
-        # 2. Contextual Properties (Adj, Align) - Must be computed from History
-        # We need to find features present in EVERY context in the history.
+        # --- Contextual Invariants (The "Why") ---
         
-        # Initialize invariants with the first entry's features
-        first_turn_id, first_obj_id = history[0]
-        # Retrieve context from history (approximate lookback)
-        if not (0 <= first_turn_id - 1 < len(self.level_state_history)):
-            return conditions # Cannot verify contexts, return base only
-            
-        first_ctx = self.level_state_history[first_turn_id - 1]
-        
-        # Helper to extract features for a specific object from a context
+        # Helper to extract ALL features for an object in a context
         def extract_features(ctx, oid):
             feats = {}
-            # Adjacency
+            # Adjacency (Standard)
             if 'adj' in ctx and oid in ctx['adj']:
-                feats['adj'] = ctx['adj'][oid] # [top, right, bottom, left]
+                feats['adj'] = ctx['adj'][oid] 
+            # Diagonal Adjacency
+            if 'diag_adj' in ctx and oid in ctx['diag_adj']:
+                feats['diag_adj'] = ctx['diag_adj'][oid]
             # Alignment
             feats['align'] = set()
             if 'align' in ctx:
                 for a_type, groups in ctx['align'].items():
                     for coord, ids in groups.items():
-                        if oid in ids:
-                            feats['align'].add((a_type, coord))
+                        if oid in ids: feats['align'].add((a_type, coord))
+            # Diagonal Alignment
+            feats['diag_align'] = set()
+            if 'diag_align' in ctx:
+                 for a_type, groups in ctx['diag_align'].items():
+                    for line_idx, ids in enumerate(groups):
+                        if oid in ids: feats['diag_align'].add((a_type, line_idx))
             return feats
 
-        common_features = extract_features(first_ctx, first_obj_id)
-        
-        # Iterate through the rest of the history and intersect
-        for i in range(1, len(history)):
-            tid, oid = history[i]
+        # 1. Compute Intersection of POSITIVES (Must be present in ALL changes)
+        if not (0 <= pos_history[0][0] - 1 < len(self.level_state_history)): return conditions
+        first_ctx = self.level_state_history[pos_history[0][0] - 1]
+        common_feats = extract_features(first_ctx, pos_history[0][1])
+
+        for i in range(1, len(pos_history)):
+            tid, oid = pos_history[i]
             if not (0 <= tid - 1 < len(self.level_state_history)): continue
-            
             ctx = self.level_state_history[tid - 1]
-            current_feats = extract_features(ctx, oid)
+            curr_feats = extract_features(ctx, oid)
             
-            # Intersect Adjacency
-            # For adjacency, we require exact match of the neighbor ID (or 'na')
-            if 'adj' in common_features:
-                if 'adj' not in current_feats:
-                    del common_features['adj']
+            # Intersect Adj
+            if 'adj' in common_feats:
+                if 'adj' not in curr_feats: del common_feats['adj']
                 else:
                     new_adj = []
                     for k in range(4):
-                        if common_features['adj'][k] == current_feats['adj'][k]:
-                            new_adj.append(common_features['adj'][k])
-                        else:
-                            new_adj.append(None) # Mismatch -> Variable -> Noise
-                    
-                    # If all became None, remove the key entirely
-                    if all(x is None for x in new_adj):
-                        del common_features['adj']
+                        if common_feats['adj'][k] == curr_feats['adj'][k]: new_adj.append(common_feats['adj'][k])
+                        else: new_adj.append(None)
+                    if all(x is None for x in new_adj): del common_feats['adj']
+                    else: common_feats['adj'] = new_adj
+
+            # Intersect Diag Adj
+            if 'diag_adj' in common_feats:
+                if 'diag_adj' not in curr_feats: del common_feats['diag_adj']
+                else:
+                    new_dadj = []
+                    for k in range(4):
+                        if common_feats['diag_adj'][k] == curr_feats['diag_adj'][k]: new_dadj.append(common_feats['diag_adj'][k])
+                        else: new_dadj.append(None)
+                    if all(x is None for x in new_dadj): del common_feats['diag_adj']
+                    else: common_feats['diag_adj'] = new_dadj
+            
+            # Intersect Sets
+            for key in ['align', 'diag_align']:
+                if key in common_feats:
+                    if key in curr_feats:
+                        common_feats[key] = common_feats[key].intersection(curr_feats[key])
                     else:
-                        common_features['adj'] = new_adj
+                        del common_feats[key]
 
-            # Intersect Alignments
-            if 'align' in common_features:
-                common_features['align'] = common_features['align'].intersection(current_feats['align'])
-
-        # 3. Format the Surviving Invariants
-        dirs = ['top', 'right', 'bottom', 'left']
-        if 'adj' in common_features:
-            for i, neighbor in enumerate(common_features['adj']):
-                if neighbor and neighbor != 'na':
-                    # Standardize 'obj_' to 'id_'
-                    n_clean = neighbor.replace('obj_', 'id_')
-                    conditions.append(f"Adj({dirs[i]}={n_clean})")
+        # 2. Check Contrast with NEGATIVES (Find the Discriminators)
+        # A feature is "Critical" if NO negative example has it.
         
-        if 'align' in common_features:
-            for (a_type, coord) in common_features['align']:
-                conditions.append(f"{a_type}={coord}")
+        # Build set of features found in negatives to compare against
+        neg_features_union = {'adj': set(), 'diag_adj': set(), 'align': set(), 'diag_align': set()}
+        
+        # Optimization: Only scan a sample of negatives if there are too many
+        for i in range(len(neg_history)):
+            tid, oid = neg_history[i]
+            if not (0 <= tid - 1 < len(self.level_state_history)): continue
+            ctx = self.level_state_history[tid - 1]
+            nf = extract_features(ctx, oid)
+            
+            # Add specific values to union
+            if 'adj' in nf:
+                for k in range(4): neg_features_union['adj'].add((k, nf['adj'][k]))
+            if 'diag_adj' in nf:
+                for k in range(4): neg_features_union['diag_adj'].add((k, nf['diag_adj'][k]))
+            if 'align' in nf:
+                neg_features_union['align'].update(nf['align'])
+            if 'diag_align' in nf:
+                neg_features_union['diag_align'].update(nf['diag_align'])
+
+        # 3. Format Output with Highlighted Differentiators
+        
+        # Adjacency
+        dirs = ['top', 'right', 'bottom', 'left']
+        if 'adj' in common_feats:
+            for i, neighbor in enumerate(common_feats['adj']):
+                if neighbor and neighbor != 'na':
+                    n_clean = neighbor.replace('obj_', 'id_')
+                    feat_str = f"Adj({dirs[i]}={n_clean})"
+                    
+                    # IS THIS A CRITICAL TRIGGER?
+                    # Check if any negative had this specific neighbor at this position
+                    if (i, neighbor) not in neg_features_union['adj']:
+                        feat_str = f"**{feat_str}**" # Highlight
+                    
+                    conditions.append(feat_str)
+                    
+        # Diagonal Adjacency
+        diag_dirs = ['top_right', 'bottom_right', 'bottom_left', 'top_left']
+        if 'diag_adj' in common_feats:
+            for i, neighbor in enumerate(common_feats['diag_adj']):
+                if neighbor and neighbor != 'na':
+                    n_clean = neighbor.replace('obj_', 'id_')
+                    feat_str = f"DiagAdj({diag_dirs[i]}={n_clean})"
+                    if (i, neighbor) not in neg_features_union['diag_adj']:
+                        feat_str = f"**{feat_str}**"
+                    conditions.append(feat_str)
+
+        # Alignments
+        if 'align' in common_feats:
+            for (a_type, coord) in common_feats['align']:
+                feat_str = f"{a_type}={coord}"
+                if (a_type, coord) not in neg_features_union['align']:
+                    feat_str = f"**{feat_str}**"
+                conditions.append(feat_str)
+                
+        # Diagonal Alignments
+        if 'diag_align' in common_feats:
+            for (a_type, line_idx) in common_feats['diag_align']:
+                feat_str = f"{a_type}(Line {line_idx})"
+                if (a_type, line_idx) not in neg_features_union['diag_align']:
+                    feat_str = f"**{feat_str}**"
+                conditions.append(feat_str)
 
         return conditions
     
@@ -3660,18 +3728,17 @@ class ObmlAgi3Agent(Agent):
     def _verify_and_certify(self, state_sig):
         """
         Runs the logic: Is this Consistent? Is it Direct or Global?
-        
-        UPDATED: Strict Replication Logic.
-        1. Action count (N) doesn't matter as much as RESULT count.
-        2. We only certify if we have seen the RESULT >= 2 times.
         """
         if state_sig not in self.truth_table: return
         
         actions_data = self.truth_table[state_sig]
-        
+
         # Step 1: Filter for MATURE actions only
         mature_results = {} # Map Action -> AbstractResult
         
+        global_ballots = {} 
+        mature_direct_candidates = {}
+
         for action, results in actions_data.items():
             
             # Group by Abstract Sig (Type, Value)
@@ -3681,16 +3748,13 @@ class ObmlAgi3Agent(Agent):
                 abs_sig = (r_sig[0], r_sig[2]) 
                 if abs_sig not in abstract_groups:
                     abstract_groups[abs_sig] = set()
-                # Track unique turns where THIS result happened
                 turns = {t for (t, o) in entry_list}
                 abstract_groups[abs_sig].update(turns)
 
-            # Consistency Check A: Contradictions (Multiple different changes)
             if len(abstract_groups) > 1:
                 self._trigger_splitter(state_sig, action, results)
                 continue 
 
-            # Consistency Check B: Change vs No Change
             if abstract_groups:
                 single_abs_sig = list(abstract_groups.keys())[0]
                 change_turn_ids = abstract_groups[single_abs_sig]
@@ -3704,50 +3768,26 @@ class ObmlAgi3Agent(Agent):
                     self._trigger_splitter(state_sig, action, results)
                     continue
 
-                # --- THE FIX: STRICT REPLICATION CHECK ---
-                # Only consider this result "Mature" if the CHANGE has been replicated.
-                # If len(change_turn_ids) == 1, it means we saw this exact result ONCE.
-                # Even if similar objects did it, THIS action key has only done it once.
-                # We refuse to certify it.
+                if single_abs_sig not in global_ballots:
+                    global_ballots[single_abs_sig] = set()
+                global_ballots[single_abs_sig].add(action)
+
                 if len(change_turn_ids) >= 2:
-                    mature_results[action] = single_abs_sig
-            else:
-                # Consistent "No Change"
-                all_turn_ids = set()
-                for entry_list in results.values():
-                    for (t_id, o_id) in entry_list: all_turn_ids.add(t_id)
-                
-                if len(all_turn_ids) >= 2:
-                    mature_results[action] = ('NO_CHANGE', None)
+                    mature_direct_candidates[action] = single_abs_sig
 
-        # Step 2: Global Certification (Requires >= 2 Mature Actions)
-        if len(mature_results) >= 2:
-            ref_action = list(mature_results.keys())[0]
-            ref_result = mature_results[ref_action]
-            
-            is_invariant = True
-            for action, result in mature_results.items():
-                if result != ref_result:
-                    is_invariant = False
-                    break
-            
-            if is_invariant:
-                # VERDICT: GLOBAL
-                self.certified_laws[(state_sig, 'ANY')] = {'type': 'GLOBAL', 'result': ref_result}
-                for act in actions_data:
-                    if (state_sig, act) in self.certified_laws:
-                        del self.certified_laws[(state_sig, act)]
-                return
+        # --- Step 2: Global Certification (Local Coalition) ---
+        # "Different ACTIONS, same State -> Global"
+        for abs_result, agreeing_actions in global_ballots.items():
+            if len(agreeing_actions) >= 2:
+                self.certified_laws[(state_sig, 'ANY')] = {'type': 'GLOBAL', 'result': abs_result}
+                # No return, we might still find Universal Laws below
 
-        # Step 3: Direct Certification (Fallback)
-        for action, abstract_result in mature_results.items():
+        # --- Step 3: Direct Certification ---
+        for action, abstract_result in mature_direct_candidates.items():
             if self.certified_laws.get((state_sig, 'ANY')): continue
-            
-            # We already checked (len(change_turn_ids) >= 2) above when populating mature_results.
             
             concrete_sig = None
             raw_results = actions_data[action]
-            
             for r_sig in raw_results:
                 if r_sig[0] == 'NO_CHANGE': continue
                 if (r_sig[0], r_sig[2]) == abstract_result:
@@ -3756,6 +3796,45 @@ class ObmlAgi3Agent(Agent):
             
             if concrete_sig:
                 self.certified_laws[(state_sig, action)] = {'type': 'DIRECT', 'result': concrete_sig}
+
+        # --- NEW: Step 4 - Universal Law Generalization ---
+        # "Different STATES, same Result -> Universal Global"
+        
+        # 1. Identify the candidate result for THIS state
+        candidate_result = None
+        if (state_sig, 'ANY') in self.certified_laws:
+            candidate_result = self.certified_laws[(state_sig, 'ANY')]['result']
+        elif mature_direct_candidates:
+             # If we don't have a Global law yet, check if our best Direct law 
+             # is actually a Universal Global law in disguise.
+             # We take the result of the most frequent action.
+             candidate_result = list(mature_direct_candidates.values())[0]
+             
+        if candidate_result:
+            # 2. Scan ALL other states in the Truth Table
+            supporting_states = 0
+            for other_sig in self.truth_table:
+                if other_sig == state_sig: continue
+                
+                # Does this other state ALSO produce this result?
+                other_actions = self.truth_table[other_sig]
+                found_match = False
+                for act, res_dict in other_actions.items():
+                    for r_sig in res_dict:
+                        if r_sig[0] == 'NO_CHANGE': continue
+                        if (r_sig[0], r_sig[2]) == candidate_result:
+                            found_match = True
+                            break
+                    if found_match: break
+                
+                if found_match:
+                    supporting_states += 1
+            
+            # 3. Promote if evidence is found across state boundaries
+            # If >= 2 OTHER distinct states produce this same result, 
+            # we assume the differences (Adjacency, etc.) are irrelevant.
+            if supporting_states >= 2:
+                self.certified_laws[(state_sig, 'ANY')] = {'type': 'GLOBAL', 'result': candidate_result}
 
     def _get_feature_status(self, contexts: list[dict], base_sig: tuple, feature_type: str, sub_key: str) -> str:
         """
