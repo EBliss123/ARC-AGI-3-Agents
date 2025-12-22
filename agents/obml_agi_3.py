@@ -603,11 +603,23 @@ class ObmlAgi3Agent(Agent):
                             e = wrapper['event']
                             reason = wrapper['reason']
                             fix = wrapper['fix']
+                            detail = wrapper.get('detail', '')
                             
-                            self._print_and_log(f"     * [AMBIGUOUS] {e['type']} on {e.get('id', 'Unknown')}")
-                            self._print_and_log(f"       [Status] {reason}")
-                            self._print_and_log(f"       [Needs]  {fix}")
+                            # 1. Get the Readable Value (e.g., "Move (0, -1)")
+                            val_str = _fmt_val(e)
 
+                            self._print_and_log(f"     * [AMBIGUOUS] {e['type']} on {e.get('id', 'Unknown')}")
+                            
+                            # 2. Print WHAT happened (The "New" observation)
+                            self._print_and_log(f"       [Observed] {val_str}")
+                            
+                            self._print_and_log(f"       [Status]   {reason}")
+                            if detail:
+                                self._print_and_log(f"       [Detail]   {detail}")
+                                
+                            # 3. REMOVED: [Context] dump (too verbose)
+                            
+                            self._print_and_log(f"       [Needs]    {fix}")
                 # --- Failsafe: Track banned actions ---
                 # Note: We count success if there are DIRECT events or score increased.
                 # Ambiguous events are NOT considered success yet (conservative).
@@ -2998,10 +3010,12 @@ class ObmlAgi3Agent(Agent):
                 # Determine specific reason for Ambiguity
                 reason = "Insufficient Controls"
                 fix = "Gathering experimental data."
+                detail = "" # New explanation field
                 
                 if not is_instance_mature:
                      reason = "First Observation (Hypothesis Stage)"
                      fix = "Repeat action to confirm law on this object."
+                     detail = f"This specific State Configuration has only been observed {len(obj_specific_turns)} time(s)."
                 
                 elif state_sig in self.truth_table:
                     results = self.truth_table[state_sig].get(action_key, {})
@@ -3013,19 +3027,22 @@ class ObmlAgi3Agent(Agent):
                     if len(change_sigs) > 1:
                         reason = "Contradiction (Splitting State)"
                         fix = "Wait for Splitter to refine state."
+                        detail = f"Conflicting outcomes observed: {len(change_sigs)} different changes recorded for this state."
+                        
                     elif len(change_sigs) == 1:
-                        # Check historical failures
                         change_ids = set(t for (t, o) in results[change_sigs[0]])
                         historical_failure = no_change_ids - change_ids
                         if historical_failure:
                              reason = "Contradiction (History Mismatch)"
                              fix = "Wait for Splitter to refine state."
+                             # Explain the mismatch count
+                             detail = f"Inconsistency: Observed Change {len(change_ids)} times, but NO CHANGE {len(historical_failure)} times."
                         else:
-                             # Consistent, Mature, but maybe not Certified yet?
                              reason = "Need Negative Control"
                              fix = "Try different action to prove causality."
+                             detail = "Outcome is consistent, but causality is unproven."
                     
-                ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix})
+                ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
 
         return direct_events, global_events, ambiguous_events
 
