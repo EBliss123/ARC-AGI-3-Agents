@@ -474,9 +474,12 @@ class ObmlAgi3Agent(Agent):
                 # for the classifier and debug logs.
                 for e in events:
                     if e['type'] == 'SHAPE_CHANGED':
-                        note = self._check_interaction_physics(e['id'], events, prev_context, current_summary)
-                        if note:
+                        # Unpack Tuple
+                        result = self._check_interaction_physics(e['id'], events, prev_context, current_summary)
+                        if result:
+                            note, agitators = result
                             e['_physics_note'] = note
+                            e['_physics_agitators'] = agitators
                 # -----------------------------------------------------
 
                 # 2. Classify Events (Strict Logic + Exception Solving)
@@ -1229,32 +1232,42 @@ class ObmlAgi3Agent(Agent):
     def _get_concrete_signature(self, event: dict):
         """
         Returns a tuple representing the exact event identity: (Type, ID, Value).
-        Used to check if the exact same thing happened under different circumstances.
+        
+        UPDATED: If a Shape Change is driven by a Physics Correlation (e.g., Occlusion),
+        we use the Correlation string as the 'Value'. This allows the Scientific Method 
+        to find consistency (N >= 2) in the *Mechanism*, even if the resulting 
+        Shape Fingerprint changes every time.
         """
         e_type = event['type']
         obj_id = event.get('id')
-        
         val = None
-        if e_type == 'MOVED':
+        
+        # --- Logic Fix: Prioritize Mechanism for Shape Changes ---
+        # If the Physics Engine identified a correlation (e.g. "Reveal & Occlusion"),
+        # that explanation IS the consistent result we want to track.
+        # We only override if it's a Shape/Transform event, as these are the ones
+        # prone to "infinite random variations" (fingerprints) that break Direct Laws.
+        if e_type in ['SHAPE_CHANGED', 'TRANSFORM'] and event.get('_physics_note'):
+             val = event['_physics_note']
+        
+        # --- Standard Value Extraction (Fallback) ---
+        elif e_type == 'MOVED':
             val = event.get('vector')
         elif e_type == 'RECOLORED':
             val = event.get('to_color')
         elif e_type in ['GROWTH', 'SHRINK']:
             val = event.get('pixel_delta')
-        elif e_type == 'TRANSFORM':
-            val = event.get('to_fingerprint')
-        elif e_type == 'SHAPE_CHANGED':
+        elif e_type in ['TRANSFORM', 'SHAPE_CHANGED']:
+            # Fallback: If no physics note, the Fingerprint IS the result that matters.
             val = event.get('to_fingerprint')
         elif e_type == 'NEW':
-            # For NEW, the "ID" is the location/appearance, not the assigned string
             obj_id = event.get('position') 
             val = (event.get('color'), event.get('size'))
         elif e_type == 'REMOVED':
             val = 'removed'
-        elif e_type == 'TERMINAL': # <--- NEW: Handle Terminal Events
+        elif e_type == 'TERMINAL': 
             val = event.get('outcome')
 
-        # Fallback for unknown types to prevent 'None' values from merging distinct events
         if val is None and e_type not in ['REMOVED', 'NEW']:
              val = 'unknown_change'
 
@@ -1321,7 +1334,20 @@ class ObmlAgi3Agent(Agent):
         hashable_events = []
         if events:
             for event in events:
-                stable_event_tuple = tuple(sorted(event.items()))
+                # --- FIX: Ensure all values are hashable ---
+                # The '_physics_agitators' field is a list, which breaks hashing.
+                # We must convert any list values to tuples.
+                safe_items = []
+                for k, v in event.items():
+                    if isinstance(v, list):
+                        safe_items.append((k, tuple(v)))
+                    elif isinstance(v, set):
+                        # Just in case we use sets later (though we usually use frozenset)
+                        safe_items.append((k, tuple(sorted(list(v)))))
+                    else:
+                        safe_items.append((k, v))
+                
+                stable_event_tuple = tuple(sorted(safe_items))
                 hashable_events.append(stable_event_tuple)
         outcome_fingerprint = tuple(sorted(hashable_events))
 
@@ -2909,25 +2935,22 @@ class ObmlAgi3Agent(Agent):
 
     def _classify_event_stream(self, current_events: list[dict], action_key: str, prev_context: dict) -> tuple[list[dict], list[dict], list[dict]]:
         """
-        The Scientific Method Loop.
-        1. Record Observation.
-        2. Record Negative Data.
-        3. Certify Laws (Direct vs Global).
-        4. Return Classified Events.
-        
-        UPDATED: Step 4 now strictly enforces 'Instance Maturity' (N>=2) 
-        by checking the SPECIFIC RESULT signature. 
-        (Prevents "No Change" history from validating "Change" events).
+        The Scientific Method Loop (2-Pass Inheritance).
+        Pass 1: Classify Cause events (Movement, etc.).
+        Pass 2: Classify Effect events (Physics) by inheriting the Cause's class.
         """
         direct_events = []
         global_events = []
         ambiguous_events = []
 
-        # Map IDs to previous objects
         prev_obj_map = {o['id']: o for o in prev_context['summary']}
         processed_ids = set()
+        
+        # Temp storage for Pass 2
+        deferred_physics_events = [] 
+        id_classification_map = {} # Maps obj_id -> 'DIRECT', 'GLOBAL', 'AMBIGUOUS'
 
-        # --- Step 1: Ingest Positive Data ---
+        # --- Step 1: Update Truth Table (All Events) ---
         for event in current_events:
             obj_id = event.get('id')
             if not obj_id or obj_id not in prev_obj_map: continue
@@ -2937,156 +2960,116 @@ class ObmlAgi3Agent(Agent):
             
             state_sig = self._get_scientific_state(prev_obj, prev_context)
             result_sig = self._get_concrete_signature(event)
-            
-            # PASS THE ID HERE
             self._update_truth_table(state_sig, action_key, result_sig, obj_id=obj_id)
 
-        # --- Step 2: Ingest Negative Data ---
+        # Ingest Negative Data
         for obj in prev_context['summary']:
             if obj['id'] not in processed_ids:
                 state_sig = self._get_scientific_state(obj, prev_context)
-                result_sig = ('NO_CHANGE', None, None) 
-                
-                # PASS THE ID HERE
-                self._update_truth_table(state_sig, action_key, result_sig, obj_id=obj['id'])
+                self._update_truth_table(state_sig, action_key, ('NO_CHANGE', None, None), obj_id=obj['id'])
 
-        # --- Step 3: Certification & Splitting ---
+        # Certify Laws
         affected_states = {self._get_scientific_state(prev_obj_map[id], prev_context) for id in processed_ids}
         for obj in prev_context['summary']:
             affected_states.add(self._get_scientific_state(obj, prev_context))
-
         for state_sig in affected_states:
             self._verify_and_certify(state_sig)
 
-        # --- Step 4: Classify for Output ---
+        # --- Step 4: Classification (Two-Pass) ---
+        
+        # PASS 1: Standard Events (Causes)
         for event in current_events:
-            obj_id = event.get('id')
-            if not obj_id or obj_id not in prev_obj_map: 
+            if event.get('_physics_note'):
+                deferred_physics_events.append(event)
                 continue
+                
+            classification = 'AMBIGUOUS'
+            obj_id = event.get('id')
+            if not obj_id or obj_id not in prev_obj_map: continue
 
             prev_obj = prev_obj_map[obj_id]
             state_sig = self._get_scientific_state(prev_obj, prev_context)
+            current_result_sig = self._get_concrete_signature(event)
             
-            # Check the Science Book
+            # Maturity Checks
+            obj_specific_turns = set()
+            obj_global_turns = set()
+            peer_instances = 0
+            
+            for s_sig, actions_map in self.truth_table.items():
+                for act_key, results_map in actions_map.items():
+                    matched_entries = results_map.get(current_result_sig, [])
+                    for (t_id, o_id) in matched_entries:
+                        if o_id == obj_id:
+                            obj_global_turns.add(t_id)
+                            if act_key == action_key:
+                                obj_specific_turns.add(t_id)
+                        elif s_sig == state_sig:
+                            peer_instances += 1
+
+            is_direct_mature = len(obj_specific_turns) >= 2
+            is_global_mature = len(obj_global_turns) >= 2
+            
             direct_rule = self.certified_laws.get((state_sig, action_key))
             global_rule = self.certified_laws.get((state_sig, 'ANY'))
             
-            # --- NEW SAFETY CHECK: Strict Result Verification ---
-            # We ONLY classify THIS event as verified if we have seen 
-            # THIS SPECIFIC RESULT on THIS SPECIFIC OBJECT >= 2 times.
-            # (Fixes the issue where 'No Change' history allowed 'Recolor' to pass)
-            
-            is_instance_mature = False
-            
-            # 1. Get the signature of the CURRENT event (e.g. Recolor to 3)
-            current_result_sig = self._get_concrete_signature(event)
-            
-            # FIX: Initialize variable here so it exists even if the Truth Table check fails
-            obj_specific_turns = set()
-                
-            if state_sig in self.truth_table and action_key in self.truth_table[state_sig]:
-                # 2. Look up ONLY this specific result in the truth table
-                # (Do NOT iterate over all values, which mixes results)
-                specific_history = self.truth_table[state_sig][action_key].get(current_result_sig, [])
-                
-                # 3. Count unique turns where THIS object produced THIS result
-                obj_specific_turns = set()
-                for (t_id, o_id) in specific_history:
-                    if o_id == obj_id: # Exact ID match required
-                        obj_specific_turns.add(t_id)
-                
-                if len(obj_specific_turns) >= 2:
-                    is_instance_mature = True
-
-            # Logic:
-            # 1. If Global Law exists AND we have N>=2 for this object -> Classify GLOBAL
-            # 2. If Direct Law exists AND we have N>=2 for this object -> Classify DIRECT
-            # 3. Otherwise -> Classify AMBIGUOUS (Hypothesis)
-            
-            if global_rule and global_rule['type'] == 'GLOBAL' and is_instance_mature:
+            # Decision Tree
+            if global_rule and global_rule['type'] == 'GLOBAL' and is_global_mature:
+                classification = 'GLOBAL'
                 global_events.append(event)
-            elif direct_rule and direct_rule['type'] == 'DIRECT' and is_instance_mature:
+            elif direct_rule and direct_rule['type'] == 'DIRECT' and is_direct_mature:
+                classification = 'DIRECT'
                 direct_events.append(event)
-            # --- NEW: Physics Logic with Causality Check ---
-            elif event.get('_physics_note'):
-                # We have a physics explanation.
-                # BUT: Is the CAUSE (the movement) trusted?
-                # We check if the movers involved in this turn have a Certified Law.
-                
-                note = event['_physics_note']
-                cause_trusted = True
-                
-                if "caused by movement of" in note:
-                    movers_part = note.split("caused by movement of ")[1]
-                    # Handle "obj_1, obj_2..." formatting
-                    mover_ids = [m.strip().replace('...', '') for m in movers_part.split(",")]
-                    
-                    for m_id in mover_ids:
-                        if not m_id: continue
-                        # Look up the mover object
-                        m_obj = prev_obj_map.get(m_id)
-                        if m_obj:
-                            m_state = self._get_scientific_state(m_obj, prev_context)
-                            # Check if a law exists for them (Direct OR Global)
-                            has_direct = self.certified_laws.get((m_state, action_key))
-                            has_global = self.certified_laws.get((m_state, 'ANY'))
-                            
-                            if not has_direct and not has_global:
-                                cause_trusted = False
-                                break
-                        else:
-                            # If we can't find the mover (unlikely), mistrust it.
-                            cause_trusted = False
-                            break
-                
-                if cause_trusted:
-                    direct_events.append(event)
-                else:
-                    # The cause is unproven, so the effect is unproven.
-                    ambiguous_events.append({
-                        'event': event, 
-                        'reason': "Unverified Cause", 
-                        'fix': "Wait for mover behavior to be confirmed.",
-                        'detail': "Physics matches, but the movement itself is not yet a Law."
-                    })
-            # --------------------------
             else:
-                # Determine specific reason for Ambiguity
-                reason = "Insufficient Controls"
-                fix = "Gathering experimental data."
-                detail = "" # New explanation field
-                
-                if not is_instance_mature:
-                     reason = "First Observation (Hypothesis Stage)"
-                     fix = "Repeat action to confirm law on this object."
-                     detail = f"This specific State Configuration has only been observed {len(obj_specific_turns)} time(s)."
-                
-                elif state_sig in self.truth_table:
-                    results = self.truth_table[state_sig].get(action_key, {})
-                    change_sigs = [k for k in results.keys() if k[0] != 'NO_CHANGE']
-                    no_change_ids = set()
-                    if ('NO_CHANGE', None, None) in results:
-                        no_change_ids = set(t for (t, o) in results[('NO_CHANGE', None, None)])
-                        
-                    if len(change_sigs) > 1:
-                        reason = "Contradiction (Splitting State)"
-                        fix = "Wait for Splitter to refine state."
-                        detail = f"Conflicting outcomes observed: {len(change_sigs)} different changes recorded for this state."
-                        
-                    elif len(change_sigs) == 1:
-                        change_ids = set(t for (t, o) in results[change_sigs[0]])
-                        historical_failure = no_change_ids - change_ids
-                        if historical_failure:
-                             reason = "Contradiction (History Mismatch)"
-                             fix = "Wait for Splitter to refine state."
-                             # Explain the mismatch count
-                             detail = f"Inconsistency: Observed Change {len(change_ids)} times, but NO CHANGE {len(historical_failure)} times."
-                        else:
-                             reason = "Need Negative Control"
-                             fix = "Try different action to prove causality."
-                             detail = "Outcome is consistent, but causality is unproven."
+                # Diagnostics for Ambiguous
+                reason = "Insufficient Data"
+                fix = "Repeat action to confirm law."
+                detail = ""
+                if global_rule:
+                    reason = "Unverified Global Tendency"
+                    detail = f"Observed {len(obj_global_turns)} time(s) on this object."
+                elif direct_rule:
+                    reason = "Unverified Direct Law"
+                    detail = f"Observed {len(obj_specific_turns)} time(s) on this object."
+                else:
+                    reason = "First Observation (Hypothesis Stage)"
+                    detail = f"Observed {len(obj_specific_turns)} time(s) on this object."
                     
                 ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
+            
+            id_classification_map[obj_id] = classification
+
+        # PASS 2: Physics Events (Effects) - Inherit Causality
+        for event in deferred_physics_events:
+            agitators = event.get('_physics_agitators', [])
+            
+            # Inheritance Logic:
+            # 1. If any agitator is DIRECT, specific causality exists -> DIRECT.
+            # 2. Else if any agitator is AMBIGUOUS, cause is unclear -> AMBIGUOUS.
+            # 3. Else (all are GLOBAL), the entire system is global -> GLOBAL.
+            
+            has_direct_cause = False
+            has_ambiguous_cause = False
+            
+            for ag_id in agitators:
+                ag_class = id_classification_map.get(ag_id, 'AMBIGUOUS')
+                if ag_class == 'DIRECT':
+                    has_direct_cause = True
+                elif ag_class == 'AMBIGUOUS':
+                    has_ambiguous_cause = True
+            
+            if has_direct_cause:
+                direct_events.append(event)
+            elif has_ambiguous_cause:
+                # Explain WHY it's ambiguous (blame the mover)
+                reason = "Ambiguous Causality"
+                fix = "Confirm movement rules of agitators."
+                detail = f"Change correlated with ambiguous movement of {agitators}."
+                ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
+            else:
+                # All causes were Global (or no agitators found, default to Global/Direct logic?)
+                # If valid agitators exist and are all Global, this is Global.
+                global_events.append(event)
 
         return direct_events, global_events, ambiguous_events
 
@@ -3672,10 +3655,10 @@ class ObmlAgi3Agent(Agent):
                 
         return None, None
 
-    def _check_interaction_physics(self, target_id: str, changes: list[dict], prev_context: dict, curr_summary: list[dict]) -> str | None:
+    def _check_interaction_physics(self, target_id: str, changes: list[dict], prev_context: dict, curr_summary: list[dict]) -> tuple[str, list[str]] | None:
         """
         Verifies if a Shape Change is strictly caused by objects moving ONTO or OFF OF the target.
-        UPDATED: Includes 'Swept Path' to handle fast-moving objects.
+        Returns: (Explanation_String, List_of_Agitator_IDs) or None.
         """
         # 1. Get Target Data
         prev_target = next((o for o in prev_context['summary'] if o['id'] == target_id), None)
@@ -3686,16 +3669,15 @@ class ObmlAgi3Agent(Agent):
         old_pixels = set(prev_target['pixel_coords'])
         new_pixels = set(curr_target['pixel_coords'])
         
-        # Calculate the delta
         gained_pixels = new_pixels - old_pixels
         lost_pixels = old_pixels - new_pixels
         
         if not gained_pixels and not lost_pixels:
-            return None # No change in pixels
+            return None 
             
-        # 2. Build the "Mover Footprints" (Start, End, AND Path)
-        union_prev_movers = set() # Where they WERE (potential revealers)
-        union_curr_movers = set() # Where they ARE (potential occluders)
+        # 2. Build the "Mover Footprints"
+        union_prev_movers = set()
+        union_curr_movers = set()
         agitator_ids = []
 
         for event in changes:
@@ -3705,26 +3687,18 @@ class ObmlAgi3Agent(Agent):
                 curr_mover = next((o for o in curr_summary if o['id'] == mover_id), None)
                 
                 if prev_mover and curr_mover:
-                    # Add Start/End positions
                     union_prev_movers.update(prev_mover['pixel_coords'])
                     union_curr_movers.update(curr_mover['pixel_coords'])
                     agitator_ids.append(mover_id)
                     
-                    # --- NEW: Fill the Path (Swept Area) ---
-                    # We assume rectangular objects for simplicity in path fill.
-                    # This covers gaps if the object moved > 1 step.
+                    # Fill the Path (Swept Area)
                     r1, c1 = prev_mover['position']
                     r2, c2 = curr_mover['position']
                     h, w = prev_mover['size']
-                    
                     min_r, max_r = min(r1, r2), max(r1, r2)
                     min_c, max_c = min(c1, c2), max(c1, c2)
-                    
-                    # Add all pixels in the bounding box of the move
                     for r in range(min_r, max_r + h):
                         for c in range(min_c, max_c + w):
-                            # The path counts as "Previous" (was passed through) AND 
-                            # "Current" (effectively occupied during the turn).
                             union_prev_movers.add((r, c))
                             union_curr_movers.add((r, c))
 
@@ -3732,16 +3706,10 @@ class ObmlAgi3Agent(Agent):
             return None
 
         # 3. Verify Exceptions
-        
-        # Exception 1: Gained pixels must be explained by a mover leaving that spot
-        if gained_pixels:
-            if not gained_pixels.issubset(union_prev_movers):
-                return None # Unexplained spontaneous growth
-                
-        # Exception 2: Lost pixels must be explained by a mover arriving at that spot
-        if lost_pixels:
-            if not lost_pixels.issubset(union_curr_movers):
-                return None # Unexplained spontaneous shrinking
+        if gained_pixels and not gained_pixels.issubset(union_prev_movers):
+            return None 
+        if lost_pixels and not lost_pixels.issubset(union_curr_movers):
+            return None 
 
         # 4. Success - Attributable to movement
         mover_str = ", ".join(agitator_ids[:3]) 
@@ -3753,7 +3721,7 @@ class ObmlAgi3Agent(Agent):
         
         type_str = " & ".join(explanation_parts)
         
-        return f"CORRELATION: {type_str} caused by movement of {mover_str}"
+        return (f"CORRELATION: {type_str} caused by movement of {mover_str}", agitator_ids)
     
     def _get_scientific_state(self, obj: dict, context: dict) -> tuple:
         """
@@ -3810,13 +3778,16 @@ class ObmlAgi3Agent(Agent):
     def _verify_and_certify(self, state_sig):
         """
         Runs the logic: Is this Consistent? Is it Direct or Global?
+        Generates 'Candidate Laws' stored in certified_laws.
+        Note: Classification strictly enforces ID checks before applying these laws.
         """
         if state_sig not in self.truth_table: return
         
         actions_data = self.truth_table[state_sig]
 
-        # Step 1: Filter for MATURE actions only
-        mature_results = {} # Map Action -> AbstractResult
+        # Step 1: Filter for MATURE actions only (At the State Level)
+        # We look for patterns that exist generally, even if specific objects aren't there yet.
+        mature_results = {} 
         
         global_ballots = {} 
         mature_direct_candidates = {}
@@ -3858,11 +3829,10 @@ class ObmlAgi3Agent(Agent):
                     mature_direct_candidates[action] = single_abs_sig
 
         # --- Step 2: Global Certification (Local Coalition) ---
-        # "Different ACTIONS, same State -> Global"
+        # "Different ACTIONS, same State -> Global Candidate"
         for abs_result, agreeing_actions in global_ballots.items():
             if len(agreeing_actions) >= 2:
                 self.certified_laws[(state_sig, 'ANY')] = {'type': 'GLOBAL', 'result': abs_result}
-                # No return, we might still find Universal Laws below
 
         # --- Step 3: Direct Certification ---
         for action, abstract_result in mature_direct_candidates.items():
@@ -3879,26 +3849,21 @@ class ObmlAgi3Agent(Agent):
             if concrete_sig:
                 self.certified_laws[(state_sig, action)] = {'type': 'DIRECT', 'result': concrete_sig}
 
-        # --- NEW: Step 4 - Universal Law Generalization ---
+        # --- Step 4: Universal Law Generalization ---
         # "Different STATES, same Result -> Universal Global"
+        # This is the only case where we might bypass the ID check in classification,
+        # but for now we keep it conservative.
         
-        # 1. Identify the candidate result for THIS state
         candidate_result = None
         if (state_sig, 'ANY') in self.certified_laws:
             candidate_result = self.certified_laws[(state_sig, 'ANY')]['result']
         elif mature_direct_candidates:
-             # If we don't have a Global law yet, check if our best Direct law 
-             # is actually a Universal Global law in disguise.
-             # We take the result of the most frequent action.
              candidate_result = list(mature_direct_candidates.values())[0]
              
         if candidate_result:
-            # 2. Scan ALL other states in the Truth Table
             supporting_states = 0
             for other_sig in self.truth_table:
                 if other_sig == state_sig: continue
-                
-                # Does this other state ALSO produce this result?
                 other_actions = self.truth_table[other_sig]
                 found_match = False
                 for act, res_dict in other_actions.items():
@@ -3912,9 +3877,6 @@ class ObmlAgi3Agent(Agent):
                 if found_match:
                     supporting_states += 1
             
-            # 3. Promote if evidence is found across state boundaries
-            # If >= 2 OTHER distinct states produce this same result, 
-            # we assume the differences (Adjacency, etc.) are irrelevant.
             if supporting_states >= 2:
                 self.certified_laws[(state_sig, 'ANY')] = {'type': 'GLOBAL', 'result': candidate_result}
 
