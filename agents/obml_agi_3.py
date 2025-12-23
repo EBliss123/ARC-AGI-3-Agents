@@ -2981,6 +2981,9 @@ class ObmlAgi3Agent(Agent):
             # 1. Get the signature of the CURRENT event (e.g. Recolor to 3)
             current_result_sig = self._get_concrete_signature(event)
             
+            # FIX: Initialize variable here so it exists even if the Truth Table check fails
+            obj_specific_turns = set()
+                
             if state_sig in self.truth_table and action_key in self.truth_table[state_sig]:
                 # 2. Look up ONLY this specific result in the truth table
                 # (Do NOT iterate over all values, which mixes results)
