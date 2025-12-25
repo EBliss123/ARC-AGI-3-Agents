@@ -1153,7 +1153,7 @@ class ObmlAgi3Agent(Agent):
                 change_type, details = log_str.replace('- ', '', 1).split(': ', 1)
                 event = {'type': change_type}
                 
-                # --- NEW: Extract object ID ---
+                # --- Extract object ID ---
                 obj_id_str = ""
                 if 'Object id_' in details:
                     if change_type in ['NEW', 'REMOVED']:
@@ -1165,25 +1165,43 @@ class ObmlAgi3Agent(Agent):
                 
                 if obj_id_str.isdigit():
                     event['id'] = f"obj_{obj_id_str}"
-                # --- End NEW ---
 
                 if change_type == 'MOVED':
                     parts = details.split(' moved from ')
-                    pos_parts = parts[1].replace('.', '').split(' to ')
+                    # --- NEW: Clean the coordinate string of overlap notes ---
+                    coord_part = parts[1]
+                    if ' (overlapping' in coord_part:
+                        coord_part = coord_part.split(' (overlapping')[0]
+                    # ---------------------------------------------------------
+                    pos_parts = coord_part.replace('.', '').split(' to ')
                     start_pos, end_pos = ast.literal_eval(pos_parts[0]), ast.literal_eval(pos_parts[1])
                     event.update({'vector': (end_pos[0] - start_pos[0], end_pos[1] - start_pos[1])})
                     events.append(event)
+
                 elif change_type == 'RECOLORED':
+                    # Parse "color from 15 to 3" OR "color from 15 to 3, now at..."
                     from_color_str = details.split(' from ')[1].split(' to ')[0]
-                    to_color_str = details.split(' to ')[1].replace('.', '')
+                    
+                    # --- FIX: robustly handle trailing position info ---
+                    to_part = details.split(' to ')[1]
+                    # Stop at comma (if "now at" exists) or period (if end of line)
+                    to_color_str = to_part.split(',')[0].replace('.', '')
+                    
                     event.update({'from_color': int(from_color_str), 'to_color': int(to_color_str)})
                     events.append(event)
+
                 elif change_type == 'SHAPE_CHANGED':
                     fp_part = details.split('fingerprint: ')[1]
-                    from_fp_str, to_fp_str = fp_part.replace(').','').split(' -> ')
+                    
+                    # --- FIX: Stop parsing at the closing parenthesis ---
+                    # Format is "... (fingerprint: A -> B) ..."
+                    fp_clean = fp_part.split(')')[0]
+                    from_fp_str, to_fp_str = fp_clean.split(' -> ')
+                    
                     event.update({'from_fingerprint': int(from_fp_str), 'to_fingerprint': int(to_fp_str)})
                     events.append(event)
                 elif change_type in ['GROWTH', 'SHRINK', 'TRANSFORM']:
+                    # ... (rest of logic)
                     start_pos_str = details.split(') ')[0] + ')'
                     start_pos = ast.literal_eval(start_pos_str.split(' at ')[1])
                     end_pos_str = details.split('now at ')[1].replace('.', '')
@@ -1193,10 +1211,7 @@ class ObmlAgi3Agent(Agent):
                     if '(from ' in details:
                         from_size_str = details.split('(from ')[1].split(' to ')[0]
                         to_size_str = details.split(' to ')[1].split(')')[0]
-                        
-                        # Fix for potential 'and shape' suffix disrupting the split
                         if ')' in to_size_str: to_size_str = to_size_str.split(')')[0]
-                            
                         pixel_diff = int(details.split(' by ')[1].split(' pixels')[0])
                         event.update({
                             'from_size': ast.literal_eval(from_size_str.replace('x', ',')),
@@ -1204,7 +1219,6 @@ class ObmlAgi3Agent(Agent):
                             'pixel_delta': pixel_diff if change_type == 'GROWTH' else -pixel_diff
                         })
                         
-                    # --- NEW: Capture Shape Data if present ---
                     if 'shape (' in details:
                         fp_part = details.split('shape (')[1].split(')')[0]
                         from_fp, to_fp = fp_part.split(' -> ')
@@ -1212,7 +1226,6 @@ class ObmlAgi3Agent(Agent):
                             'from_fingerprint': int(from_fp),
                             'to_fingerprint': int(to_fp)
                         })
-                    # ------------------------------------------
                     
                     events.append(event)
                 elif change_type in ['NEW', 'REMOVED']:
@@ -2388,6 +2401,28 @@ class ObmlAgi3Agent(Agent):
                     continue
                 
                 if old_obj['position'] == new_obj['position']:
+                    # --- NEW: Strict Overlap Veto ---
+                    # Logic: If the object at this position looks completely different (properties changed),
+                    # AND there exists a perfect match for this new look elsewhere in the old frame,
+                    # we assume the perfect match MOVED here (Overlap), rather than this object transforming.
+                    old_stable_id = self._get_stable_id(old_obj)
+                    new_stable_id = self._get_stable_id(new_obj)
+                    
+                    if old_stable_id != new_stable_id:
+                        perfect_match_exists_elsewhere = False
+                        for other_old in old_summary:
+                            if other_old['id'] == old_obj['id']: continue # Skip self
+                            # If we find someone else who matches the new blob perfectly...
+                            if self._get_stable_id(other_old) == new_stable_id:
+                                perfect_match_exists_elsewhere = True
+                                break
+                        
+                        if perfect_match_exists_elsewhere:
+                            # VETO: We found a better candidate (a mover). 
+                            # Skip this position match so Pass 2 (Move Detection) can claim it.
+                            continue 
+                    # --------------------------------
+
                     # Propagate the persistent ID
                     new_obj['id'] = old_obj['id']
                     
@@ -2396,12 +2431,11 @@ class ObmlAgi3Agent(Agent):
                                      old_obj['size'] != new_obj['size'] or
                                      old_obj['pixels'] != new_obj['pixels'])
                     
-                    # --- NEW: Explicit Growth/Shrink with Shape Tracking ---
+                    # --- Explicit Growth/Shrink with Shape Tracking ---
                     pixel_diff = new_obj['pixels'] - old_obj['pixels']
                     size_str_old = f"{old_obj['size'][0]}x{old_obj['size'][1]}"
                     size_str_new = f"{new_obj['size'][0]}x{new_obj['size'][1]}"
                     
-                    # We now append the shape fingerprint change to the log string
                     shape_str = f"shape ({old_obj['fingerprint']} -> {new_obj['fingerprint']})"
                     
                     if pixel_diff > 0:
@@ -2425,7 +2459,6 @@ class ObmlAgi3Agent(Agent):
                             changes.append(f"- RECOLORED: Object {old_obj['id'].replace('obj_', 'id_')} changed color from {old_obj['color']} to {new_obj['color']}.")
                         elif shape_changed:
                             changes.append(f"- SHAPE_CHANGED: Object {old_obj['id'].replace('obj_', 'id_')} changed shape (fingerprint: {old_obj['fingerprint']} -> {new_obj['fingerprint']}).")
-                    # ------------------------------------------------------------------
 
                     matches_to_remove.append((old_obj, new_obj))
                     processed_new_objs_in_pass1.add(id(new_obj))
@@ -2461,7 +2494,23 @@ class ObmlAgi3Agent(Agent):
                 new_inst = new_instances.pop()
                 new_inst['id'] = old_inst['id']
                 if old_inst['position'] != new_inst['position']:
-                    changes.append(f"- MOVED: Object {old_inst['id'].replace('obj_', 'id_')} moved from {old_inst['position']} to {new_inst['position']}.")
+                    # --- NEW: Detect Overlap in Move Log ---
+                    # If this move landed on a spot occupied by an 'old_unexplained' object 
+                    # (one that hasn't moved or matched), it is an overlap/occlusion.
+                    overlap_note = ""
+                    for incumbent in old_unexplained:
+                        # Don't check against self (though self should already be popped from instances, 
+                        # checking ID ensures safety if logic shifts)
+                        if incumbent['id'] == old_inst['id']: continue 
+
+                        if incumbent['position'] == new_inst['position']:
+                            overlap_note = f" (overlapping id_{incumbent['id'].replace('obj_', '')})"
+                            # We found the victim.
+                            break
+                    
+                    changes.append(f"- MOVED: Object {old_inst['id'].replace('obj_', 'id_')} moved from {old_inst['position']} to {new_inst['position']}{overlap_note}.")
+                    # ---------------------------------------
+
                 moves_to_remove.append((old_inst, new_inst))
         
         matched_old_in_pass2 = {id(o) for o, n in moves_to_remove}
@@ -2495,7 +2544,7 @@ class ObmlAgi3Agent(Agent):
                     elif old_pixels > new_pixels:
                         event_type = "SHRINK"
                     else:
-                        event_type = "TRANSFORM"
+                        event_type = "TRANSFORM" # Default
 
                     pixel_diff = abs(new_obj['pixels'] - old_obj['pixels'])
                     old_size_str = f"{old_obj['size'][0]}x{old_obj['size'][1]}"
@@ -2506,14 +2555,26 @@ class ObmlAgi3Agent(Agent):
                     elif event_type == "SHRINK":
                         details = f"shrank by {pixel_diff} pixels (from {old_size_str} to {new_size_str})"
                     else:
+                        # Mass conserved
                         changed_parts = []
                         if old_obj['fingerprint'] != new_obj['fingerprint']:
                             changed_parts.append("shape")
                         if old_obj['color'] != new_obj['color']:
                             changed_parts.append(f"color from {old_obj['color']} to {new_obj['color']}")
+                        
                         size_changed = old_obj['size'] != new_obj['size']
                         size_details = f" (size {old_size_str} -> {new_size_str})" if size_changed else ""
-                        details = f"transformed{size_details}" if not changed_parts else f"changed { ' and '.join(changed_parts) }{size_details}"
+                        
+                        # --- NEW: Specific Labels for Pass 3 ---
+                        if len(changed_parts) == 1 and "color" in changed_parts[0] and not size_changed:
+                             event_type = "RECOLORED"
+                             details = changed_parts[0] # "color from X to Y"
+                        elif len(changed_parts) == 1 and "shape" in changed_parts[0] and not size_changed:
+                             event_type = "SHAPE_CHANGED"
+                             details = f"shape (fingerprint: {old_obj['fingerprint']} -> {new_obj['fingerprint']})"
+                        else:
+                             details = f"transformed{size_details}" if not changed_parts else f"changed { ' and '.join(changed_parts) }{size_details}"
+                        # ---------------------------------------
 
                     changes.append(f"- {event_type}: Object {old_obj['id'].replace('obj_', 'id_')} at {old_obj['position']} {details}, now at {new_obj['position']}.")
 
