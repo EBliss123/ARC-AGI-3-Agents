@@ -473,7 +473,8 @@ class ObmlAgi3Agent(Agent):
                 # We run this BEFORE classification so the notes are available 
                 # for the classifier and debug logs.
                 for e in events:
-                    if e['type'] == 'SHAPE_CHANGED':
+                    # UPDATED: Allow Mass Changes (Growth/Shrink) to enter Physics
+                    if e['type'] in ['SHAPE_CHANGED', 'TRANSFORM', 'GROWTH', 'SHRINK']:
                         # Unpack Tuple
                         result = self._check_interaction_physics(e['id'], events, prev_context, current_summary)
                         if result:
@@ -481,7 +482,7 @@ class ObmlAgi3Agent(Agent):
                             e['_physics_note'] = note
                             e['_physics_agitators'] = agitators
                 # -----------------------------------------------------
-
+                
                 # 2. Classify Events (Strict Logic + Exception Solving)
                 # FIX: Pass 'prev_context' so the solver can compare states
                 direct_events, global_events, ambiguous_events = self._classify_event_stream(events, learning_key, prev_context)
@@ -1201,11 +1202,19 @@ class ObmlAgi3Agent(Agent):
                     event.update({'from_fingerprint': int(from_fp_str), 'to_fingerprint': int(to_fp_str)})
                     events.append(event)
                 elif change_type in ['GROWTH', 'SHRINK', 'TRANSFORM']:
-                    # ... (rest of logic)
+                    # Parse "Object id_X at (R, C)..."
                     start_pos_str = details.split(') ')[0] + ')'
                     start_pos = ast.literal_eval(start_pos_str.split(' at ')[1])
-                    end_pos_str = details.split('now at ')[1].replace('.', '')
-                    end_pos = ast.literal_eval(end_pos_str)
+                    
+                    # --- FIX: Handle optional 'now at' for stationary changes ---
+                    if 'now at ' in details:
+                        end_pos_str = details.split('now at ')[1].replace('.', '')
+                        end_pos = ast.literal_eval(end_pos_str)
+                    else:
+                        # If "now at" is missing, the object stayed in place (Pass 1 event)
+                        end_pos = start_pos
+                    # ------------------------------------------------------------
+                    
                     event.update({'start_position': start_pos, 'end_position': end_pos})
                     
                     if '(from ' in details:
@@ -1245,23 +1254,21 @@ class ObmlAgi3Agent(Agent):
     def _get_concrete_signature(self, event: dict):
         """
         Returns a tuple representing the exact event identity: (Type, ID, Value).
-        
-        UPDATED: If a Shape Change is driven by a Physics Correlation (e.g., Occlusion),
-        we use the Correlation string as the 'Value'. This allows the Scientific Method 
-        to find consistency (N >= 2) in the *Mechanism*, even if the resulting 
-        Shape Fingerprint changes every time.
         """
         e_type = event['type']
         obj_id = event.get('id')
         val = None
         
-        # --- Logic Fix: Prioritize Mechanism for Shape Changes ---
+        # --- Logic Fix: Prioritize Mechanism for Shape AND Mass Changes ---
         # If the Physics Engine identified a correlation (e.g. "Reveal & Occlusion"),
         # that explanation IS the consistent result we want to track.
-        # We only override if it's a Shape/Transform event, as these are the ones
-        # prone to "infinite random variations" (fingerprints) that break Direct Laws.
-        if e_type in ['SHAPE_CHANGED', 'TRANSFORM'] and event.get('_physics_note'):
+        # We override raw values for Shape, Transform, Growth, and Shrink.
+        if e_type in ['SHAPE_CHANGED', 'TRANSFORM', 'GROWTH', 'SHRINK'] and event.get('_physics_note'):
              val = event['_physics_note']
+             # --- NEW: Unify Mass Changes under 'SHAPE_CHANGED' ---
+             # To the scientific learner, a Reveal is a Reveal, whether it adds pixels (Growth)
+             # or just alters the border (Shape Change). We force the type to match.
+             e_type = 'SHAPE_CHANGED'
         
         # --- Standard Value Extraction (Fallback) ---
         elif e_type == 'MOVED':
@@ -3737,11 +3744,12 @@ class ObmlAgi3Agent(Agent):
             return None 
             
         # 2. Build the "Mover Footprints"
-        union_prev_movers = set()
-        union_curr_movers = set()
+        union_prev_movers = set() # Pixels VACATED by others (Causes Reveals)
+        union_curr_movers = set() # Pixels OCCUPIED by others (Causes Occlusions)
         agitator_ids = []
 
         for event in changes:
+            # Case A: Movement (The object moves from A to B)
             if event['type'] == 'MOVED' and event.get('id') != target_id:
                 mover_id = event['id']
                 prev_mover = next((o for o in prev_context['summary'] if o['id'] == mover_id), None)
@@ -3752,7 +3760,7 @@ class ObmlAgi3Agent(Agent):
                     union_curr_movers.update(curr_mover['pixel_coords'])
                     agitator_ids.append(mover_id)
                     
-                    # Fill the Path (Swept Area)
+                    # Fill the Path (Swept Area) to be safe
                     r1, c1 = prev_mover['position']
                     r2, c2 = curr_mover['position']
                     h, w = prev_mover['size']
@@ -3762,17 +3770,30 @@ class ObmlAgi3Agent(Agent):
                         for c in range(min_c, max_c + w):
                             union_prev_movers.add((r, c))
                             union_curr_movers.add((r, c))
+            
+            # Case B: Removal (The object disappears, freeing up space)
+            elif event['type'] == 'REMOVED' and event.get('id') != target_id:
+                mover_id = event['id']
+                prev_mover = next((o for o in prev_context['summary'] if o['id'] == mover_id), None)
+                
+                if prev_mover:
+                    # It vacated these pixels
+                    union_prev_movers.update(prev_mover['pixel_coords'])
+                    agitator_ids.append(mover_id)
 
         if not agitator_ids:
             return None
 
         # 3. Verify Exceptions
+        # If we gained pixels, EVERY gained pixel must be explained by someone leaving that spot.
         if gained_pixels and not gained_pixels.issubset(union_prev_movers):
             return None 
+            
+        # If we lost pixels, EVERY lost pixel must be explained by someone arriving at that spot.
         if lost_pixels and not lost_pixels.issubset(union_curr_movers):
             return None 
 
-        # 4. Success - Attributable to movement
+        # 4. Success - Attributable to movement/removal
         mover_str = ", ".join(agitator_ids[:3]) 
         if len(agitator_ids) > 3: mover_str += "..."
         
@@ -3782,7 +3803,7 @@ class ObmlAgi3Agent(Agent):
         
         type_str = " & ".join(explanation_parts)
         
-        return (f"CORRELATION: {type_str} caused by movement of {mover_str}", agitator_ids)
+        return (f"CORRELATION: {type_str} caused by movement/removal of {mover_str}", agitator_ids)
     
     def _get_scientific_state(self, obj: dict, context: dict) -> tuple:
         """
