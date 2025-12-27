@@ -2557,11 +2557,11 @@ class ObmlAgi3Agent(Agent):
                   
                   if ghost_candidate_id:
                        # Match Found! 
-                       # 1. Log the requested MERGED event (Narrative)
-                       changes.append(f"- MERGED: Object {mover['id'].replace('obj_', 'id_')} moved and merged with revealed Object {ghost_candidate_id.replace('obj_', 'id_')} to form {new_obj['id'].replace('obj_', 'id_')}.")
+                       # 1. Log the requested MERGED event (Narrative Only - No ID claim)
+                       # NEW: Stop after the ingredients.
+                       changes.append(f"- MERGED: Object {mover['id'].replace('obj_', 'id_')} moved and merged with revealed Object {ghost_candidate_id.replace('obj_', 'id_')}.")
                        
                        # 2. Log a MOVED event for the learner (Scientific)
-                       # This ensures the 'Move' law is reinforced even though the ID changed.
                        changes.append(f"- MOVED: Object {mover['id'].replace('obj_', 'id_')} moved from {mover['position']} to {new_obj['position']} (merged).")
                        
                        mergers_to_remove.append((mover, new_obj, ghost_stable_id))
