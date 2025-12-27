@@ -3072,8 +3072,6 @@ class ObmlAgi3Agent(Agent):
     def _classify_event_stream(self, current_events: list[dict], action_key: str, prev_context: dict) -> tuple[list[dict], list[dict], list[dict]]:
         """
         The Scientific Method Loop (2-Pass Inheritance).
-        Pass 1: Classify Cause events (Movement, etc.).
-        Pass 2: Classify Effect events (Physics) by inheriting the Cause's class.
         """
         direct_events = []
         global_events = []
@@ -3130,7 +3128,6 @@ class ObmlAgi3Agent(Agent):
             # Maturity Checks
             obj_specific_turns = set()
             obj_global_turns = set()
-            peer_instances = 0
             
             for s_sig, actions_map in self.truth_table.items():
                 for act_key, results_map in actions_map.items():
@@ -3140,8 +3137,6 @@ class ObmlAgi3Agent(Agent):
                             obj_global_turns.add(t_id)
                             if act_key == action_key:
                                 obj_specific_turns.add(t_id)
-                        elif s_sig == state_sig:
-                            peer_instances += 1
 
             is_direct_mature = len(obj_specific_turns) >= 2
             is_global_mature = len(obj_global_turns) >= 2
@@ -3157,55 +3152,72 @@ class ObmlAgi3Agent(Agent):
                 classification = 'DIRECT'
                 direct_events.append(event)
             else:
-                # Diagnostics for Ambiguous
                 reason = "Insufficient Data"
                 fix = "Repeat action to confirm law."
-                detail = ""
-                if global_rule:
-                    reason = "Unverified Global Tendency"
-                    detail = f"Observed {len(obj_global_turns)} time(s) on this object."
-                elif direct_rule:
-                    reason = "Unverified Direct Law"
-                    detail = f"Observed {len(obj_specific_turns)} time(s) on this object."
-                else:
-                    reason = "First Observation (Hypothesis Stage)"
-                    detail = f"Observed {len(obj_specific_turns)} time(s) on this object."
-                    
+                detail = f"Observed {len(obj_specific_turns)} time(s) on this object."
+                if global_rule: reason = "Unverified Global Tendency"
+                elif direct_rule: reason = "Unverified Direct Law"
+                elif len(obj_specific_turns) == 1: reason = "First Observation (Hypothesis Stage)"
+
                 ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
             
             id_classification_map[obj_id] = classification
 
         # PASS 2: Physics Events (Effects) - Inherit Causality
-        for event in deferred_physics_events:
+        # We allow a small loop to handle chains (A pushes B, B pushes C)
+        
+        pending_physics = list(deferred_physics_events)
+        MAX_PHYSICS_PASSES = 3
+        
+        for _ in range(MAX_PHYSICS_PASSES):
+            if not pending_physics: break
+            
+            next_pending = []
+            progress_made = False
+            
+            for event in pending_physics:
+                agitators = event.get('_physics_agitators', [])
+                
+                has_direct_cause = False
+                has_global_cause = False
+                has_ambiguous_cause = False
+                all_unknown = True
+                
+                for ag_id in agitators:
+                    ag_class = id_classification_map.get(ag_id)
+                    if ag_class: all_unknown = False
+                    
+                    if ag_class == 'DIRECT': has_direct_cause = True
+                    elif ag_class == 'GLOBAL': has_global_cause = True
+                    elif ag_class == 'AMBIGUOUS': has_ambiguous_cause = True
+                
+                # Classification Logic
+                if has_direct_cause:
+                    direct_events.append(event)
+                    id_classification_map[event['id']] = 'DIRECT'
+                    progress_made = True
+                elif has_ambiguous_cause:
+                    # If the cause is ambiguous, we can't be sure yet.
+                    # Wait for next pass, or fail at end.
+                    next_pending.append(event)
+                elif has_global_cause and not all_unknown:
+                    global_events.append(event)
+                    id_classification_map[event['id']] = 'GLOBAL'
+                    progress_made = True
+                else:
+                    # No known agitator status? Keep waiting.
+                    next_pending.append(event)
+            
+            pending_physics = next_pending
+            if not progress_made: break
+        
+        # Clean up remaining ambiguous physics
+        for event in pending_physics:
             agitators = event.get('_physics_agitators', [])
-            
-            # Inheritance Logic:
-            # 1. If any agitator is DIRECT, specific causality exists -> DIRECT.
-            # 2. Else if any agitator is AMBIGUOUS, cause is unclear -> AMBIGUOUS.
-            # 3. Else (all are GLOBAL), the entire system is global -> GLOBAL.
-            
-            has_direct_cause = False
-            has_ambiguous_cause = False
-            
-            for ag_id in agitators:
-                ag_class = id_classification_map.get(ag_id, 'AMBIGUOUS')
-                if ag_class == 'DIRECT':
-                    has_direct_cause = True
-                elif ag_class == 'AMBIGUOUS':
-                    has_ambiguous_cause = True
-            
-            if has_direct_cause:
-                direct_events.append(event)
-            elif has_ambiguous_cause:
-                # Explain WHY it's ambiguous (blame the mover)
-                reason = "Ambiguous Causality"
-                fix = "Confirm movement rules of agitators."
-                detail = f"Change correlated with ambiguous movement of {agitators}."
-                ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
-            else:
-                # All causes were Global (or no agitators found, default to Global/Direct logic?)
-                # If valid agitators exist and are all Global, this is Global.
-                global_events.append(event)
+            reason = "Ambiguous Causality"
+            fix = "Confirm movement rules of agitators."
+            detail = f"Change correlated with ambiguous movement of {agitators}."
+            ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
 
         return direct_events, global_events, ambiguous_events
 
@@ -3793,8 +3805,8 @@ class ObmlAgi3Agent(Agent):
 
     def _check_interaction_physics(self, target_id: str, changes: list[dict], prev_context: dict, curr_summary: list[dict]) -> tuple[str, list[str]] | None:
         """
-        Verifies if a Shape Change is strictly caused by objects moving ONTO or OFF OF the target.
-        Returns: (Explanation_String, List_of_Agitator_IDs) or None.
+        Verifies if a Shape/Size change matches an Interaction (Occlusion/Reveal).
+        Uses Strict Occupancy Logic: identifies exactly WHO is standing on the lost/gained pixels.
         """
         # 1. Get Target Data
         prev_target = next((o for o in prev_context['summary'] if o['id'] == target_id), None)
@@ -3810,68 +3822,57 @@ class ObmlAgi3Agent(Agent):
         
         if not gained_pixels and not lost_pixels:
             return None 
-            
-        # 2. Build the "Mover Footprints"
-        union_prev_movers = set() # Pixels VACATED by others (Causes Reveals)
-        union_curr_movers = set() # Pixels OCCUPIED by others (Causes Occlusions)
-        agitator_ids = []
 
+        agitator_ids = set()
+        
+        # 2. Identify Movers (The Suspects)
+        # Anyone who moved, appeared, or merged is a potential agitator
+        moved_ids = set()
         for event in changes:
-            # Case A: Movement (The object moves from A to B)
-            if event['type'] == 'MOVED' and event.get('id') != target_id:
-                mover_id = event['id']
-                prev_mover = next((o for o in prev_context['summary'] if o['id'] == mover_id), None)
-                curr_mover = next((o for o in curr_summary if o['id'] == mover_id), None)
+            # We explicitly include NEW and REAPPEARED to catch spawns causing occlusion
+            if event['type'] in ['MOVED', 'NEW', 'REAPPEARED', 'REAPPEARED & TRANSFORMED']:
+                if event.get('id'): moved_ids.add(event['id'])
+        
+        # 3. Check for OCCLUSION (Lost Pixels)
+        # Who is standing where I used to be?
+        if lost_pixels:
+            for obj in curr_summary:
+                if obj['id'] == target_id: continue
                 
-                if prev_mover and curr_mover:
-                    union_prev_movers.update(prev_mover['pixel_coords'])
-                    union_curr_movers.update(curr_mover['pixel_coords'])
-                    agitator_ids.append(mover_id)
-                    
-                    # Fill the Path (Swept Area) to be safe
-                    r1, c1 = prev_mover['position']
-                    r2, c2 = curr_mover['position']
-                    h, w = prev_mover['size']
-                    min_r, max_r = min(r1, r2), max(r1, r2)
-                    min_c, max_c = min(c1, c2), max(c1, c2)
-                    for r in range(min_r, max_r + h):
-                        for c in range(min_c, max_c + w):
-                            union_prev_movers.add((r, c))
-                            union_curr_movers.add((r, c))
-            
-            # Case B: Removal (The object disappears, freeing up space)
-            elif event['type'] == 'REMOVED' and event.get('id') != target_id:
-                mover_id = event['id']
-                prev_mover = next((o for o in prev_context['summary'] if o['id'] == mover_id), None)
+                # Check intersection with lost spots
+                overlap = lost_pixels.intersection(obj['pixel_coords'])
+                if overlap:
+                    # If the intruder Moved (or is New), they are the Cause.
+                    if obj['id'] in moved_ids:
+                        agitator_ids.add(obj['id'])
+
+        # 4. Check for REVEAL (Gained Pixels)
+        # Who used to stand where I am now?
+        if gained_pixels:
+            for obj in prev_context['summary']:
+                if obj['id'] == target_id: continue
                 
-                if prev_mover:
-                    # It vacated these pixels
-                    union_prev_movers.update(prev_mover['pixel_coords'])
-                    agitator_ids.append(mover_id)
+                overlap = gained_pixels.intersection(obj['pixel_coords'])
+                if overlap:
+                    # If the previous occupant moved away (is in moved_ids) or was Removed
+                    is_removed = any(e['type'] == 'REMOVED' and e.get('id') == obj['id'] for e in changes)
+                    if obj['id'] in moved_ids or is_removed:
+                        agitator_ids.add(obj['id'])
 
         if not agitator_ids:
             return None
 
-        # 3. Verify Exceptions
-        # If we gained pixels, EVERY gained pixel must be explained by someone leaving that spot.
-        if gained_pixels and not gained_pixels.issubset(union_prev_movers):
-            return None 
-            
-        # If we lost pixels, EVERY lost pixel must be explained by someone arriving at that spot.
-        if lost_pixels and not lost_pixels.issubset(union_curr_movers):
-            return None 
-
-        # 4. Success - Attributable to movement/removal
-        mover_str = ", ".join(agitator_ids[:3]) 
-        if len(agitator_ids) > 3: mover_str += "..."
+        # 5. Success
+        agitator_list = sorted(list(agitator_ids))
+        mover_str = ", ".join(agitator_list[:3]) 
+        if len(agitator_list) > 3: mover_str += "..."
         
         explanation_parts = []
         if gained_pixels: explanation_parts.append("Reveal")
         if lost_pixels: explanation_parts.append("Occlusion")
-        
         type_str = " & ".join(explanation_parts)
         
-        return (f"CORRELATION: {type_str} caused by movement/removal of {mover_str}", agitator_ids)
+        return (f"CORRELATION: {type_str} caused by movement/removal of {mover_str}", agitator_list)
     
     def _get_scientific_state(self, obj: dict, context: dict) -> tuple:
         """
