@@ -1157,7 +1157,8 @@ class ObmlAgi3Agent(Agent):
                 # --- Extract object ID ---
                 obj_id_str = ""
                 if 'Object id_' in details:
-                    if change_type in ['NEW', 'REMOVED']:
+                    # UPDATED: Added REAPPEARED to ID extraction
+                    if change_type in ['NEW', 'REMOVED', 'REAPPEARED']: 
                          # Format: "Object id_X (ID ...)"
                         obj_id_str = details.split(' ')[1].replace('id_', '')
                     else:
@@ -1169,7 +1170,7 @@ class ObmlAgi3Agent(Agent):
 
                 if change_type == 'MOVED':
                     parts = details.split(' moved from ')
-                    # --- NEW: Clean the coordinate string of overlap/merge notes ---
+                    # --- FIX: Clean the coordinate string of overlap/merge notes ---
                     coord_part = parts[1]
                     if ' (overlapping' in coord_part:
                         coord_part = coord_part.split(' (overlapping')[0]
@@ -1185,10 +1186,10 @@ class ObmlAgi3Agent(Agent):
                     # Parse "color from 15 to 3" OR "color from 15 to 3, now at..."
                     from_color_str = details.split(' from ')[1].split(' to ')[0]
                     
-                    # --- FIX: robustly handle trailing position info ---
+                    # --- FIX: Robustly handle trailing position info ---
                     to_part = details.split(' to ')[1]
-                    # Stop at comma (if "now at" exists) or period (if end of line)
                     to_color_str = to_part.split(',')[0].replace('.', '')
+                    # ---------------------------------------------------
                     
                     event.update({'from_color': int(from_color_str), 'to_color': int(to_color_str)})
                     events.append(event)
@@ -1197,12 +1198,13 @@ class ObmlAgi3Agent(Agent):
                     fp_part = details.split('fingerprint: ')[1]
                     
                     # --- FIX: Stop parsing at the closing parenthesis ---
-                    # Format is "... (fingerprint: A -> B) ..."
                     fp_clean = fp_part.split(')')[0]
                     from_fp_str, to_fp_str = fp_clean.split(' -> ')
+                    # ---------------------------------------------------
                     
                     event.update({'from_fingerprint': int(from_fp_str), 'to_fingerprint': int(to_fp_str)})
                     events.append(event)
+
                 elif change_type in ['GROWTH', 'SHRINK', 'TRANSFORM']:
                     # Parse "Object id_X at (R, C)..."
                     start_pos_str = details.split(') ')[0] + ')'
@@ -1213,7 +1215,6 @@ class ObmlAgi3Agent(Agent):
                         end_pos_str = details.split('now at ')[1].replace('.', '')
                         end_pos = ast.literal_eval(end_pos_str)
                     else:
-                        # If "now at" is missing, the object stayed in place (Pass 1 event)
                         end_pos = start_pos
                     # ------------------------------------------------------------
                     
@@ -1229,7 +1230,7 @@ class ObmlAgi3Agent(Agent):
                             'to_size': ast.literal_eval(to_size_str.replace('x', ',')),
                             'pixel_delta': pixel_diff if change_type == 'GROWTH' else -pixel_diff
                         })
-                        
+                    
                     if 'shape (' in details:
                         fp_part = details.split('shape (')[1].split(')')[0]
                         from_fp, to_fp = fp_part.split(' -> ')
@@ -1239,7 +1240,9 @@ class ObmlAgi3Agent(Agent):
                         })
                     
                     events.append(event)
-                elif change_type in ['NEW', 'REMOVED']:
+
+                # --- NEW: Handler for REAPPEARED (Same format as NEW/REMOVED) ---
+                elif change_type in ['NEW', 'REMOVED', 'REAPPEARED']:
                     id_str = details.split(') ')[0] + ')'
                     id_tuple = ast.literal_eval(id_str.split('ID ')[1])
                     pos_str = '(' + details.split('(')[-1].replace('.', '')
@@ -1249,6 +1252,15 @@ class ObmlAgi3Agent(Agent):
                         'color': id_tuple[1], 'size': id_tuple[2], 'pixels': id_tuple[3]
                     })
                     events.append(event)
+                
+                # --- NEW: Handler for REAPPEARED & TRANSFORMED ---
+                elif change_type == 'REAPPEARED & TRANSFORMED':
+                    # We just need the position for the physics engine
+                    end_pos_str = details.split('now at ')[1].replace('.', '')
+                    end_pos = ast.literal_eval(end_pos_str)
+                    event.update({'position': end_pos})
+                    events.append(event)
+
             except (ValueError, IndexError, SyntaxError, AttributeError):
                 continue
         return events
