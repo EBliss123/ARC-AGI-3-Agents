@@ -482,7 +482,7 @@ class ObmlAgi3Agent(Agent):
                             e['_physics_note'] = note
                             e['_physics_agitators'] = agitators
                 # -----------------------------------------------------
-                
+
                 # 2. Classify Events (Strict Logic + Exception Solving)
                 # FIX: Pass 'prev_context' so the solver can compare states
                 direct_events, global_events, ambiguous_events = self._classify_event_stream(events, learning_key, prev_context)
@@ -1169,11 +1169,13 @@ class ObmlAgi3Agent(Agent):
 
                 if change_type == 'MOVED':
                     parts = details.split(' moved from ')
-                    # --- NEW: Clean the coordinate string of overlap notes ---
+                    # --- NEW: Clean the coordinate string of overlap/merge notes ---
                     coord_part = parts[1]
                     if ' (overlapping' in coord_part:
                         coord_part = coord_part.split(' (overlapping')[0]
-                    # ---------------------------------------------------------
+                    elif ' (merged' in coord_part:
+                        coord_part = coord_part.split(' (merged')[0]
+                    # ---------------------------------------------------------------
                     pos_parts = coord_part.replace('.', '').split(' to ')
                     start_pos, end_pos = ast.literal_eval(pos_parts[0]), ast.literal_eval(pos_parts[1])
                     event.update({'vector': (end_pos[0] - start_pos[0], end_pos[1] - start_pos[1])})
@@ -2524,6 +2526,60 @@ class ObmlAgi3Agent(Agent):
         matched_new_in_pass2 = {id(n) for o, n in moves_to_remove}
         old_unexplained = [obj for obj in old_unexplained if id(obj) not in matched_old_in_pass2]
         new_unexplained = [obj for obj in new_unexplained if id(obj) not in matched_new_in_pass2]
+
+        # --- NEW: Merger Detection (Before Fuzzy Match) ---
+        # Detects if a "New" object is actually an Old object + a Revealed Ghost
+        # Case: obj_35 moves, reveals obj_32, and they fuse into obj_46.
+        mergers_to_remove = []
+        
+        for new_obj in new_unexplained:
+             # We are looking for: New = Old + Ghost
+             # Candidates must match color
+             potential_movers = [o for o in old_unexplained if o['color'] == new_obj['color']]
+             
+             match_found = False
+             for mover in potential_movers:
+                  mass_diff = new_obj['pixels'] - mover['pixels']
+                  if mass_diff <= 0: continue
+                  
+                  # Look for a ghost in memory that matches the missing mass/color
+                  ghost_candidate_id = None
+                  ghost_stable_id = None
+                  
+                  for stable_id in list(self.removed_objects_memory.keys()):
+                       # stable_id format: (fingerprint, color, size, pixels)
+                       # Check Color (idx 1) and Pixels (idx 3)
+                       if stable_id[1] == new_obj['color'] and stable_id[3] == mass_diff:
+                            ghost_stable_id = stable_id
+                            if self.removed_objects_memory[stable_id]:
+                                ghost_candidate_id = self.removed_objects_memory[stable_id][0] # Peek ID
+                            break
+                  
+                  if ghost_candidate_id:
+                       # Match Found! 
+                       # 1. Log the requested MERGED event (Narrative)
+                       changes.append(f"- MERGED: Object {mover['id'].replace('obj_', 'id_')} moved and merged with revealed Object {ghost_candidate_id.replace('obj_', 'id_')} to form {new_obj['id'].replace('obj_', 'id_')}.")
+                       
+                       # 2. Log a MOVED event for the learner (Scientific)
+                       # This ensures the 'Move' law is reinforced even though the ID changed.
+                       changes.append(f"- MOVED: Object {mover['id'].replace('obj_', 'id_')} moved from {mover['position']} to {new_obj['position']} (merged).")
+                       
+                       mergers_to_remove.append((mover, new_obj, ghost_stable_id))
+                       match_found = True
+                       break
+             
+             if match_found: continue
+             
+        # Cleanup merged objects so they don't trigger SHRINK/NEW in later passes
+        for m, n, g_sid in mergers_to_remove:
+             if m in old_unexplained: old_unexplained.remove(m)
+             if n in new_unexplained: new_unexplained.remove(n)
+             # Consume the ghost from memory
+             if g_sid in self.removed_objects_memory:
+                  self.removed_objects_memory[g_sid].popleft()
+                  if not self.removed_objects_memory[g_sid]:
+                       del self.removed_objects_memory[g_sid]
+        # --------------------------------------------------
 
         # --- Pass 3: Fuzzy Matching for GROWTH and SHRINK events (Moved Objects) ---
         if old_unexplained and new_unexplained:
