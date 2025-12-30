@@ -176,7 +176,7 @@ class ObmlAgi3Agent(Agent):
         self.concrete_event_counts = {}
         self.phenomenal_event_counts = {}
         self.action_consistency_counts = {} 
-        self.performed_action_types = set()
+        self.performed_action_types = {}
 
         self.truth_table = {}
         self.certified_laws = {}
@@ -191,7 +191,7 @@ class ObmlAgi3Agent(Agent):
     def _reset_level_state(self):
         """Resets only the memory for the current level."""
         self.object_id_counter = 0
-        self.performed_action_types = set()
+        self.performed_action_types = {}
         self.productive_action_types = set()
         self.removed_objects_memory = {}
         self.last_object_summary = []
@@ -873,20 +873,31 @@ class ObmlAgi3Agent(Agent):
 
         # --- Deterministic Priority-Based Sorting ---
         if move_profiles:
-            # Re-define helper locally if needed, or rely on the one above if scope allows. 
-            # Safer to redefine or use the lambda directly to ensure it runs correctly here.
             def is_untried(move_tuple):
                 move = move_tuple[0]
                 key = self._get_learning_key(move['template'].name, move['object']['id'] if move['object'] else None)
                 return 1 if key not in self.performed_action_types else 0
 
+            # --- NEW: Recency Score (Fair Rotation) ---
+            # If we must repeat an action, pick the one done LONGEST ago.
+            # performed_action_types stores {key: turn_id}.
+            # We want Smallest Turn ID (Oldest) to be Best.
+            # Sort is Reverse=True (Biggest is Best).
+            # So we return -TurnID. (-1 is better than -100).
+            def get_recency_score(move_tuple):
+                move = move_tuple[0]
+                key = self._get_learning_key(move['template'].name, move['object']['id'] if move['object'] else None)
+                last_turn = self.performed_action_types.get(key, float('inf'))
+                return -last_turn
+
             # 1. Primary Sort
             move_profiles.sort(key=lambda x: (
-                is_untried(x),        
-                x[1]['unknowns'],     
-                x[1]['discoveries'], 
-                -x[1]['failures'], 
-                x[1]['boring']
+                is_untried(x),        # 1. Always do new things first
+                x[1]['unknowns'],     # 2. Resolve confusion
+                x[1]['discoveries'],  # 3. Verify new discoveries
+                -x[1]['failures'],    # 4. Avoid failures
+                get_recency_score(x), # 5. NEW: Rotate through old actions (LRU)
+                x[1]['boring']        # 6. Tie-breaker
             ), reverse=True)
             
             # --- Updated: Recursive Lookahead Tie-Breaker ---
@@ -986,8 +997,8 @@ class ObmlAgi3Agent(Agent):
         # --- Store action for next turn's analysis ---
         if action_to_return:
             learning_key_for_storage = self._get_learning_key(action_to_return.name, chosen_object_id if chosen_object else None)
-            # --- NEW: Track Performed Actions ---
-            self.performed_action_types.add(learning_key_for_storage)
+            # --- UPDATED: Track Turn ID ---
+            self.performed_action_types[learning_key_for_storage] = self.global_action_counter
         else:
             learning_key_for_storage = None
         
