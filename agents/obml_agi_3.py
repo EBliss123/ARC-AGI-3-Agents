@@ -191,6 +191,8 @@ class ObmlAgi3Agent(Agent):
     def _reset_level_state(self):
         """Resets only the memory for the current level."""
         self.object_id_counter = 0
+        self.performed_action_types = set()
+        self.productive_action_types = set()
         self.removed_objects_memory = {}
         self.last_object_summary = []
         self.last_relationships = {}
@@ -622,10 +624,15 @@ class ObmlAgi3Agent(Agent):
                             # 3. REMOVED: [Context] dump (too verbose)
                             
                             self._print_and_log(f"       [Needs]    {fix}")
+                
                 # --- Failsafe: Track banned actions ---
-                # Note: We count success if there are DIRECT events or score increased.
-                # Ambiguous events are NOT considered success yet (conservative).
-                action_succeeded = bool(direct_events) or score_increased
+                # UPDATED: Success = Any change detected (events) OR score increase.
+                action_succeeded = bool(events) or score_increased
+                
+                # --- NEW: Track Productive Actions (ACTION6 Only) ---
+                if action_succeeded and self.last_action_context and self.last_action_context.startswith('ACTION6'):
+                    self.productive_action_types.add(self.last_action_context)
+                # -------------------------------------
 
                 if not action_succeeded and self.last_action_context: # Last action was a total failure
                     self.banned_action_keys.add(self.last_action_context)
@@ -838,13 +845,21 @@ class ObmlAgi3Agent(Agent):
             if not move_profiles:
                 self._print_and_log("  (No moves to profile)")
             
-            # Sort for display purposes only
-            sorted_for_print = sorted(move_profiles, key=lambda x: (
-                x[1]['unknowns'], 
-                x[1]['discoveries'], 
-                -x[1]['failures'], 
-                x[1]['boring']
-            ), reverse=True)
+            # Helper for sorting logic (Defined here to use in both display and actual sort)
+            def get_sort_key(move_tuple):
+                move = move_tuple[0]
+                key = self._get_learning_key(move['template'].name, move['object']['id'] if move['object'] else None)
+                is_untried_val = 1 if key not in self.performed_action_types else 0
+                return (
+                    is_untried_val,
+                    move_tuple[1]['unknowns'], 
+                    move_tuple[1]['discoveries'], 
+                    -move_tuple[1]['failures'], 
+                    move_tuple[1]['boring']
+                )
+
+            # Sort for display matches actual logic
+            sorted_for_print = sorted(move_profiles, key=get_sort_key, reverse=True)
 
             for i, (move, profile, _, _) in enumerate(sorted_for_print):
                 action_name = move['template'].name
@@ -858,52 +873,67 @@ class ObmlAgi3Agent(Agent):
 
         # --- Deterministic Priority-Based Sorting ---
         if move_profiles:
-            # Sort by:
-            # 1. Most Unknowns (desc)
-            # 2. Most Discoveries (desc)
-            # 3. Fewest Failures (asc)
-            # 4. Most Boring (desc) - (to break ties, prefer action over inaction)
+            # Re-define helper locally if needed, or rely on the one above if scope allows. 
+            # Safer to redefine or use the lambda directly to ensure it runs correctly here.
+            def is_untried(move_tuple):
+                move = move_tuple[0]
+                key = self._get_learning_key(move['template'].name, move['object']['id'] if move['object'] else None)
+                return 1 if key not in self.performed_action_types else 0
+
+            # 1. Primary Sort
             move_profiles.sort(key=lambda x: (
-                x[1]['unknowns'], 
+                is_untried(x),        
+                x[1]['unknowns'],     
                 x[1]['discoveries'], 
                 -x[1]['failures'], 
                 x[1]['boring']
             ), reverse=True)
             
             # --- Updated: Recursive Lookahead Tie-Breaker ---
-            
             chosen_move_tuple = None
             
-            # If we have multiple best moves, and they are "Boring" (U=0, D=0),
-            # we need to check which one sets up a better future.
-            top_score_is_boring = (move_profiles[0][1]['unknowns'] == 0 and 
-                                   move_profiles[0][1]['discoveries'] == 0 and
-                                   move_profiles[0][1]['failures'] == 0)
+            # Check if the winner is "Boring" (U=0, D=0)
+            top_profile = move_profiles[0][1]
+            top_score_is_boring = (top_profile['unknowns'] == 0 and 
+                                   top_profile['discoveries'] == 0 and
+                                   top_profile['failures'] == 0)
 
             if top_score_is_boring:
-                # Find all ties for first place
+                # Find all ties for first place.
+                # CRITICAL FIX: The tie definition MUST include 'is_untried'.
+                # Since the list is already sorted, we just check items until the sort key changes.
+                
                 tied_moves = []
-                top_score = (move_profiles[0][1]['unknowns'], move_profiles[0][1]['discoveries'], -move_profiles[0][1]['failures'])
+                best_sort_key = (
+                    is_untried(move_profiles[0]),
+                    top_profile['unknowns'],
+                    top_profile['discoveries'],
+                    -top_profile['failures']
+                )
                 
                 for mp in move_profiles:
-                    current_score = (mp[1]['unknowns'], mp[1]['discoveries'], -mp[1]['failures'])
-                    if current_score == top_score:
+                    current_key = (
+                        is_untried(mp),
+                        mp[1]['unknowns'],
+                        mp[1]['discoveries'],
+                        -mp[1]['failures']
+                    )
+                    
+                    if current_key == best_sort_key:
                         tied_moves.append(mp)
                     else:
-                        break # Sorted list, so we can stop
+                        # Since list is sorted, as soon as we mismatch, we are done.
+                        break
                 
                 if len(tied_moves) > 1:
                     if self.debug_channels['ACTION_SCORE']: 
                         print(f"\n--- Running Recursive Lookahead (Depth 3) for {len(tied_moves)} Boring Moves ---")
-
+                    
                     best_deep_score = (-999, -999, -999, -999)
                     best_move_idx = 0
                     
                     for i, move_tuple in enumerate(tied_moves):
                         move, _, _, _ = move_tuple
-                        
-                        # Call the recursive function
-                        # Returns (Unknowns, Discoveries, -Failures, -Distance)
                         deep_score = self._recursive_lookahead_score(current_summary, move['template'], move['object'], 0)
                         
                         if self.debug_channels['ACTION_SCORE']:
@@ -916,12 +946,9 @@ class ObmlAgi3Agent(Agent):
                     
                     chosen_move_tuple = tied_moves[best_move_idx]
                 else:
-                    chosen_move_tuple = tied_moves[0] # No ties
+                    chosen_move_tuple = tied_moves[0]
             else:
-                # If the best move is already an Unknown or Discovery, just take it!
                 chosen_move_tuple = move_profiles[0]
-            
-            # --- End Lookahead ---
 
             # Choose the best move
             chosen_move, best_profile, new_fingerprints_to_add, _best_events = chosen_move_tuple
@@ -957,7 +984,13 @@ class ObmlAgi3Agent(Agent):
             action_to_return = None
 
         # --- Store action for next turn's analysis ---
-        learning_key_for_storage = self._get_learning_key(action_to_return.name, chosen_object_id if chosen_object else None)
+        if action_to_return:
+            learning_key_for_storage = self._get_learning_key(action_to_return.name, chosen_object_id if chosen_object else None)
+            # --- NEW: Track Performed Actions ---
+            self.performed_action_types.add(learning_key_for_storage)
+        else:
+            learning_key_for_storage = None
+        
         self.last_action_context = learning_key_for_storage
         
         # --- NEW: Timestamp the Action ---
