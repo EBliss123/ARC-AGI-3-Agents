@@ -3688,44 +3688,69 @@ class ObmlAgi3Agent(Agent):
     def _format_rule_description(self, rule_type, action_key, state_sig, result_sig):
         """
         Returns a scientific description of the rule.
-        STRICTLY LIMITS context to what the Scientific Splitter has deemed necessary.
+        Refined Logic:
+        1. Always shows Color (Primary ID).
+        2. Hides Size/Shape unless they VARY across known laws for this action (Salience).
+        3. Hides Context (Neighbors) unless marked critical by the Splitter.
         """
         # 1. Get raw invariants (Color, Size, Shape, Neighbors, etc.)
         raw_conditions = self._get_invariant_properties(state_sig, action_key, result_sig)
         
-        # 2. Filter based on Splitter Refinements
+        # 2. Analyze Salience (Do Size/Shape matter?)
+        # We check all certified laws for this Action to see if Size/Shape ever change.
+        # If every object we click has the same Size, we assume Size is irrelevant (Occam's Razor).
+        # If we have rules for Size A and Size B, then Size is a discriminator -> Show it.
+        
+        variations = {'Size': set(), 'Shape': set()}
+        
+        # Scan all laws for this action
+        for (l_state, l_action), l_data in self.certified_laws.items():
+            if l_action == action_key:
+                # l_state is ((C, F, S), Context) or just (C, F, S)
+                base = l_state[0] if len(l_state) == 2 and isinstance(l_state[0], tuple) else l_state
+                try:
+                    # base is (Color, Fingerprint, Size)
+                    variations['Shape'].add(base[1])
+                    variations['Size'].add(base[2])
+                except IndexError:
+                    pass
+
+        show_size = len(variations['Size']) > 1
+        show_shape = len(variations['Shape']) > 1
+        
+        # 3. Filter Conditions
         refined_conditions = []
         
-        # Always include Intrinsic Properties (Color, Size, Shape) as they define the 'State'
-        # We identify them because _get_invariant_properties returns strings like "Color=5"
-        intrinsic_prefixes = ["Color=", "Size=", "Shape="]
-        
-        # Get the list of critical context keys for this state (e.g. ['adj_top'])
+        # Get the list of critical context keys for this state
         critical_keys = self.state_refinements.get(state_sig, [])
         
         for cond in raw_conditions:
-            is_intrinsic = any(cond.startswith(p) for p in intrinsic_prefixes)
+            # Handle Intrinsic Properties
+            if cond.startswith("Color="):
+                refined_conditions.append(cond) # Always show Color
             
-            if is_intrinsic:
-                refined_conditions.append(cond)
+            elif cond.startswith("Size="):
+                if show_size: refined_conditions.append(cond)
+                
+            elif cond.startswith("Shape="):
+                if show_shape: refined_conditions.append(cond)
+            
+            # Handle Context Properties (Adj, Align, etc.)
             else:
-                # It's context (Adj, Align, etc.). Only keep if critical.
-                # format of cond is like "**Adj(top=id_5)**" or "Adj(top=id_5)"
+                # clean formatting markers like '**'
                 clean_cond = cond.replace('*', '')
                 
                 keep = False
-                # Check simple mapping
+                # Check mapping to critical keys
                 if "Adj(top=" in clean_cond and "adj_top" in critical_keys: keep = True
                 elif "Adj(right=" in clean_cond and "adj_right" in critical_keys: keep = True
                 elif "Adj(bottom=" in clean_cond and "adj_bottom" in critical_keys: keep = True
                 elif "Adj(left=" in clean_cond and "adj_left" in critical_keys: keep = True
                 elif "Align" in clean_cond:
-                    # e.g. "center_x=10" -> check if "align_center_x" is in critical_keys
                     for k in critical_keys:
                         if k.startswith('align_') and k.replace('align_', '') in clean_cond:
-                            keep = True
-                            break
-                elif "Match" in clean_cond: # e.g. Match(Color=..)
+                            keep = True; break
+                elif "Match" in clean_cond:
                      for k in critical_keys:
                         if k.startswith('match_') and k.replace('match_', '') in clean_cond:
                             keep = True; break
@@ -3734,6 +3759,7 @@ class ObmlAgi3Agent(Agent):
                     refined_conditions.append(cond)
 
         if not refined_conditions:
+            # If we stripped everything (e.g. Color was somehow constant globally?), show something.
             return "Universal Rule"
             
         return " AND ".join(refined_conditions)
