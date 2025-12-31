@@ -1838,30 +1838,58 @@ class ObmlAgi3Agent(Agent):
             target_obj = next((o for o in current_context['summary'] if o['id'] == target_id), None)
         
         if not target_obj:
-            # Handle Global Action prediction (not targeted at specific ID)
-            # For simplicity in this chunk, we skip broad global prediction here 
-            # or loop through all objects if needed.
             return None, 0
         
         state_sig = self._get_scientific_state(target_obj, current_context)
         
         # 2. Check for Certified Laws
-        
-        # A. Check Specific Direct Law (Highest Priority)
-        # "When I do X to this State, Y happens."
-        law = self.certified_laws.get((state_sig, action_name))
-        
-        # B. Check Global Law (Medium Priority)
-        # "This State always does Y, regardless of action."
+        law = self.certified_laws.get((state_sig, action_name)) # Direct
         if not law:
-            law = self.certified_laws.get((state_sig, 'ANY'))
+            law = self.certified_laws.get((state_sig, 'ANY'))   # Global
 
         # 3. Return Prediction
         if law:
-            result_sig = law['result']
-            return self._expand_result(result_sig, target_obj), 100
+            # --- CASE A: Standard Global/Direct Law ---
+            if 'result' in law:
+                result_sig = law['result']
+                return self._expand_result(result_sig, target_obj), 100
             
-        # 4. Unknown (No certified law)
+            # --- CASE B: Sequential Global Law ---
+            elif law.get('type') == 'GLOBAL_SEQUENCE':
+                # We need to construct a 'result_sig' from the sequence prediction
+                # Format: (Type, ID, Value)
+                # Note: Sequence laws usually predict the VALUE, but apply to the CURRENT object
+                # if the sequence logic was based on values. 
+                # However, our sequence detector tracks TARGET IDs.
+                
+                # If the sequence predicts the next Target ID, we only act if THIS object is the target.
+                # But _predict_outcome is called FOR a specific object.
+                
+                # Actually, our sequence detector stored 'next_prediction' which is the Target ID.
+                next_target_id = law.get('next_prediction')
+                
+                # If this object is the one predicted to change:
+                if next_target_id is not None:
+                     # Check if the current object's ID matches the prediction
+                     # We stored numeric IDs in the sequence logic (e.g. 7).
+                     # target_obj['id'] is 'obj_7'.
+                     current_numeric_id = int(target_obj['id'].split('_')[-1])
+                     
+                     if current_numeric_id == next_target_id:
+                         # This object is CHOSEN.
+                         # Construct the result signature using the stored type/value
+                         r_type = law['result_type']
+                         r_val = law['result_value']
+                         
+                         # (Type, ID, Value)
+                         # We use the object's own ID because we are predicting FOR it.
+                         result_sig = (r_type, target_obj['id'], r_val)
+                         return self._expand_result(result_sig, target_obj), 100
+                     else:
+                         # This object is NOT the one in the sequence.
+                         # It should NOT change (regarding this law).
+                         return [], 100
+
         return None, 0
 
     def _expand_result(self, result_sig, target_obj):
@@ -3188,24 +3216,56 @@ class ObmlAgi3Agent(Agent):
             direct_rule = self.certified_laws.get((state_sig, action_key))
             global_rule = self.certified_laws.get((state_sig, 'ANY'))
             
-            # Decision Tree
-            if global_rule and global_rule['type'] == 'GLOBAL' and is_global_mature:
-                classification = 'GLOBAL'
-                global_events.append(event)
-            elif direct_rule and direct_rule['type'] == 'DIRECT' and is_direct_mature:
-                classification = 'DIRECT'
-                direct_events.append(event)
-            else:
-                reason = "Insufficient Data"
-                fix = "Repeat action to confirm law."
-                detail = f"Observed {len(obj_specific_turns)} time(s) on this object."
-                if global_rule: reason = "Unverified Global Tendency"
-                elif direct_rule: reason = "Unverified Direct Law"
-                elif len(obj_specific_turns) == 1: reason = "First Observation (Hypothesis Stage)"
-
-                ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
+            # --- DECISION TREE (Updated) ---
             
-            id_classification_map[obj_id] = classification
+            # 1. Check Global Laws (Sequence OR Standard)
+            if global_rule:
+                # A. Sequence Law (Cycle) - Trusts the pattern immediately
+                if global_rule['type'] == 'GLOBAL_SEQUENCE':
+                    # Rough check: does event type match the sequence domain?
+                    # (e.g. Sequence predicts RECOLOR, event is RECOLOR)
+                    event_abs = self._get_abstract_signature(event)
+                    if global_rule['result_type'] == event_abs[0]:
+                        classification = 'GLOBAL'
+                        global_events.append(event)
+                
+                # B. Standard Global Law - Requires local maturity
+                elif global_rule['type'] == 'GLOBAL':
+                    if is_global_mature:
+                        classification = 'GLOBAL'
+                        global_events.append(event)
+                    else:
+                        # Matches Law, but first time on THIS object
+                        reason = "Unverified Global Application"
+                        fix = "Test DIFFERENT actions to confirm Global Independence."
+                        detail = f"Matches Global Law, but observed only {len(obj_specific_turns)} times on this object."
+                        ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
+                        id_classification_map[obj_id] = 'AMBIGUOUS'
+                        continue
+
+            # 2. Check Direct Laws (if not already Global)
+            if classification == 'AMBIGUOUS' and direct_rule and direct_rule['type'] == 'DIRECT':
+                 if is_direct_mature:
+                    classification = 'DIRECT'
+                    direct_events.append(event)
+                 else:
+                    reason = "Unverified Direct Law"
+                    fix = "Repeat SAME action to confirm Direct Causality."
+                    detail = f"Matches Direct Law, but observed only {len(obj_specific_turns)} times."
+                    ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
+                    id_classification_map[obj_id] = 'AMBIGUOUS'
+                    continue
+
+            # 3. True Ambiguity (No Laws Yet)
+            if classification == 'AMBIGUOUS':
+                if not direct_rule and not global_rule:
+                     reason = "Hypothesis Created (N=1)"
+                     fix = "Repeat SAME action to test Direct Causality."
+                     detail = f"First observation. Causality is unknown."
+                     ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
+            
+            if classification != 'AMBIGUOUS':
+                id_classification_map[obj_id] = classification
 
         # PASS 2: Physics Events (Effects) - Inherit Causality
         # We allow a small loop to handle chains (A pushes B, B pushes C)
@@ -3970,6 +4030,76 @@ class ObmlAgi3Agent(Agent):
         # Return (Base, Context_Tuple)
         return (base_sig, tuple(sorted(context_features)))
     
+    def _detect_sequential_global_laws(self, state_sig, actions_data):
+        """
+        Detects if a specific event type (e.g. 'RECOLOR to 3') follows a global repeating
+        cycle of Target IDs (e.g. 7, 2, 19, 7...) regardless of the action taken.
+        """
+        # 1. Gather all events sorted by time
+        abstract_timelines = {} 
+
+        for action_name, results in actions_data.items():
+            for r_sig, entry_list in results.items():
+                if r_sig[0] == 'NO_CHANGE': continue
+                
+                # Abstract Signature: (Type, Value) - ignoring ID for grouping
+                abs_key = (r_sig[0], r_sig[2]) 
+                
+                if abs_key not in abstract_timelines:
+                    abstract_timelines[abs_key] = []
+                
+                for (turn, obj_id_str) in entry_list:
+                    try:
+                        if '_' in obj_id_str:
+                            numeric_id = int(obj_id_str.split('_')[-1])
+                            abstract_timelines[abs_key].append((turn, numeric_id, action_name))
+                    except ValueError:
+                        continue
+
+        # 2. Analyze timelines for CYCLE PATTERNS
+        for abs_key, timeline in abstract_timelines.items():
+            if len(timeline) < 3: continue 
+            
+            # Sort by turn to establish the sequence order
+            timeline.sort(key=lambda x: x[0])
+            
+            ids = [x[1] for x in timeline]
+            actions = [x[2] for x in timeline]
+            
+            # Scientific Rigor: The pattern must hold across DIFFERENT actions
+            # to prove it is Global and not just a direct effect of one button.
+            if len(set(actions)) < 2: continue 
+
+            # Check for Arbitrary Cycle (e.g., 7, 2, 19, 7, 2...)
+            n = len(ids)
+            found_cycle = None
+            
+            # Try periods 'p' from 1 up to n/2
+            for p in range(1, n // 2 + 1):
+                matches = True
+                # Verify the cycle holds for the entire history
+                for i in range(n - p):
+                    if ids[i] != ids[i+p]:
+                        matches = False
+                        break
+                if matches:
+                    found_cycle = ids[:p]
+                    break
+            
+            if found_cycle:
+                # Calculate the predicted next step based on where we are in the cycle
+                current_idx_in_cycle = (n - 1) % len(found_cycle)
+                next_val = found_cycle[(current_idx_in_cycle + 1) % len(found_cycle)]
+                
+                self.certified_laws[(state_sig, 'ANY')] = {
+                    'type': 'GLOBAL_SEQUENCE',
+                    'pattern': 'CYCLE',
+                    'sequence': found_cycle,
+                    'result_type': abs_key[0],
+                    'result_value': abs_key[1],
+                    'next_prediction': next_val
+                }
+
     def _verify_and_certify(self, state_sig):
         """
         Runs the logic: Is this Consistent? Is it Direct or Global?
@@ -3989,11 +4119,18 @@ class ObmlAgi3Agent(Agent):
 
         for action, results in actions_data.items():
             
-            # Group by Abstract Sig (Type, Value)
+            # Group by Concrete Sig (Type, ID, Value)
+            # FIX: We now include the ID (index 1) in the signature.
+            # "Recolor Obj 7" and "Recolor Obj 8" are DIFFERENT events and cannot
+            # combine to form a Global Law.
             abstract_groups = {}
             for r_sig, entry_list in results.items():
                 if r_sig[0] == 'NO_CHANGE': continue
-                abs_sig = (r_sig[0], r_sig[2]) 
+                
+                # OLD: abs_sig = (r_sig[0], r_sig[2]) 
+                # NEW: Full signature including ID
+                abs_sig = r_sig 
+                
                 if abs_sig not in abstract_groups:
                     abstract_groups[abs_sig] = set()
                 turns = {t for (t, o) in entry_list}
@@ -4029,6 +4166,9 @@ class ObmlAgi3Agent(Agent):
             if len(agreeing_actions) >= 2:
                 self.certified_laws[(state_sig, 'ANY')] = {'type': 'GLOBAL', 'result': abs_result}
 
+        # Step 2.5: Detect Round-Robin / Cycle Patterns
+        self._detect_sequential_global_laws(state_sig, actions_data)
+
         # --- Step 3: Direct Certification ---
         for action, abstract_result in mature_direct_candidates.items():
             if self.certified_laws.get((state_sig, 'ANY')): continue
@@ -4037,7 +4177,10 @@ class ObmlAgi3Agent(Agent):
             raw_results = actions_data[action]
             for r_sig in raw_results:
                 if r_sig[0] == 'NO_CHANGE': continue
-                if (r_sig[0], r_sig[2]) == abstract_result:
+                
+                # FIX: abstract_result is now the full tuple (Type, ID, Value)
+                # so we compare directly instead of constructing a subset tuple.
+                if r_sig == abstract_result:
                     concrete_sig = r_sig
                     break
             
@@ -4046,12 +4189,13 @@ class ObmlAgi3Agent(Agent):
 
         # --- Step 4: Universal Law Generalization ---
         # "Different STATES, same Result -> Universal Global"
-        # This is the only case where we might bypass the ID check in classification,
-        # but for now we keep it conservative.
         
         candidate_result = None
         if (state_sig, 'ANY') in self.certified_laws:
-            candidate_result = self.certified_laws[(state_sig, 'ANY')]['result']
+            # FIX: Check if 'result' exists (Sequence laws use different keys)
+            law = self.certified_laws[(state_sig, 'ANY')]
+            if 'result' in law:
+                candidate_result = law['result']
         elif mature_direct_candidates:
              candidate_result = list(mature_direct_candidates.values())[0]
              
@@ -4064,7 +4208,9 @@ class ObmlAgi3Agent(Agent):
                 for act, res_dict in other_actions.items():
                     for r_sig in res_dict:
                         if r_sig[0] == 'NO_CHANGE': continue
-                        if (r_sig[0], r_sig[2]) == candidate_result:
+                        
+                        # FIX: Compare full tuple here as well
+                        if r_sig == candidate_result:
                             found_match = True
                             break
                     if found_match: break
