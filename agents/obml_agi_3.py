@@ -573,14 +573,22 @@ class ObmlAgi3Agent(Agent):
                             
                             prev_obj = prev_obj_map[obj_id]
                             state_sig = self._get_scientific_state(prev_obj, prev_context)
-                            result_sig = self._get_concrete_signature(e)
                             
-                            # FIX: Use 'learning_key' instead of 'action_key'
-                            rule_str = self._format_rule_description('GLOBAL', learning_key, state_sig, result_sig)
+                            # Check for Global Sequence Law
+                            law = self.certified_laws.get((state_sig, 'ANY'))
                             
                             self._print_and_log(f"     * [GLOBAL] {e['type']} on {e.get('id', 'Unknown')}")
-                            self._print_and_log(f"       [Explanation] Global Rule: Inevitable '{_fmt_val(e)}'.")
-                            self._print_and_log(f"       [Prediction]  IF {rule_str}")
+
+                            if law and law.get('type') == 'GLOBAL_SEQUENCE':
+                                seq_str = " -> ".join(map(str, law['sequence']))
+                                self._print_and_log(f"       [Explanation] Global Cycle: Target ID Pattern {seq_str}")
+                                self._print_and_log(f"       [Prediction]  Next Target ID: {law.get('next_prediction', 'Unknown')}")
+                            else:
+                                result_sig = self._get_concrete_signature(e)
+                                # FIX: Use 'learning_key' instead of 'action_key'
+                                rule_str = self._format_rule_description('GLOBAL', learning_key, state_sig, result_sig)
+                                self._print_and_log(f"       [Explanation] Global Rule: Inevitable '{_fmt_val(e)}'.")
+                                self._print_and_log(f"       [Prediction]  IF {rule_str}")
 
                     if direct_events: 
                         self._print_and_log(f"  -> Processing {len(direct_events)} Direct events:")
@@ -590,16 +598,36 @@ class ObmlAgi3Agent(Agent):
                             
                             prev_obj = prev_obj_map[obj_id]
                             state_sig = self._get_scientific_state(prev_obj, prev_context)
-                            result_sig = self._get_concrete_signature(e)
-                            
-                            # FIX: Use 'learning_key' instead of 'action_key'
-                            rule_str = self._format_rule_description('DIRECT', learning_key, state_sig, result_sig)
+
+                            # Check for Direct Sequence Law
+                            law = self.certified_laws.get((state_sig, learning_key))
                             
                             self._print_and_log(f"     * [DIRECT] {e['type']} on {e.get('id', 'Unknown')}")
                             if '_physics_note' in e:
                                 self._print_and_log(f"       [Physics]     {e['_physics_note']}")
-                            self._print_and_log(f"       [Explanation] Direct Causality: Action consistently causes '{_fmt_val(e)}'")
-                            self._print_and_log(f"       [Prediction]  IF {rule_str}")
+                            
+                            if law and law.get('type') == 'DIRECT_SEQUENCE':
+                                seq_str = " -> ".join(map(str, law['sequence']))
+                                self._print_and_log(f"       [Explanation] Direct Cycle: Value Pattern {seq_str}")
+                                
+                                # Calculate next value for display (replicating prediction logic)
+                                current_val = None
+                                r_type = law['result_type']
+                                if r_type == 'RECOLORED': current_val = prev_obj['color']
+                                elif r_type in ['SHAPE_CHANGED', 'TRANSFORM']: current_val = prev_obj['fingerprint']
+                                elif r_type in ['GROWTH', 'SHRINK']: current_val = prev_obj['pixels']
+                                
+                                next_val = "Unknown"
+                                if current_val in law['sequence']:
+                                    idx = law['sequence'].index(current_val)
+                                    next_val = law['sequence'][(idx + 1) % len(law['sequence'])]
+                                
+                                self._print_and_log(f"       [Prediction]  Next Value: {next_val}")
+                            else:
+                                result_sig = self._get_concrete_signature(e)
+                                rule_str = self._format_rule_description('DIRECT', learning_key, state_sig, result_sig)
+                                self._print_and_log(f"       [Explanation] Direct Causality: Action consistently causes '{_fmt_val(e)}'")
+                                self._print_and_log(f"       [Prediction]  IF {rule_str}")
 
                     if ambiguous_events:
                         self._print_and_log(f"  -> Ignored {len(ambiguous_events)} Ambiguous events:")
@@ -1889,6 +1917,30 @@ class ObmlAgi3Agent(Agent):
                          # This object is NOT the one in the sequence.
                          # It should NOT change (regarding this law).
                          return [], 100
+            
+            # --- NEW CASE C: Sequential Direct Law (Value Cycles) ---
+            elif law.get('type') == 'DIRECT_SEQUENCE':
+                r_type = law['result_type']
+                seq = law['sequence']
+                
+                # 1. Determine current value based on the law type
+                current_val = None
+                if r_type == 'RECOLORED': current_val = target_obj['color']
+                elif r_type in ['SHAPE_CHANGED', 'TRANSFORM']: current_val = target_obj['fingerprint']
+                elif r_type in ['GROWTH', 'SHRINK']: current_val = target_obj['pixels'] # Or size, depending on tracking
+                
+                # 2. Find next step in cycle
+                if current_val in seq:
+                    idx = seq.index(current_val)
+                    next_val = seq[(idx + 1) % len(seq)]
+                    
+                    # Construct result signature
+                    result_sig = (r_type, target_obj['id'], next_val)
+                    return self._expand_result(result_sig, target_obj), 100
+                else:
+                    # Current value not in known cycle? Assume cycle break or start of cycle.
+                    # Default to first in sequence or fail. Let's return None (Unknown).
+                    return None, 0
 
         return None, 0
 
@@ -2926,7 +2978,7 @@ class ObmlAgi3Agent(Agent):
                         output_lines.append(f"- {rel_type} Group ({value_str}): {format_ids(left_ids).capitalize()} left.")
 
         if output_lines:
-            if self.debug_channels['CHANGES']:
+            if self.debug_channels['CONTEXT_DETAILS']:
                 self._print_and_log("\n--- Relationship Change Log ---")
                 for line in sorted(output_lines):
                     self._print_and_log(line)
@@ -2956,7 +3008,7 @@ class ObmlAgi3Agent(Agent):
                 output_lines.append(f"- Adjacency Change for Object {clean_id}: contacts changed from {old_str} to {new_str}.")
         
         if output_lines:
-            if self.debug_channels['CHANGES']:
+            if self.debug_channels['CONTEXT_DETAILS']:
                 self._print_and_log("\n--- Adjacency Change Log ---")
                 for line in output_lines:
                     self._print_and_log(line)
@@ -2986,7 +3038,7 @@ class ObmlAgi3Agent(Agent):
                 output_lines.append(f"- Diagonal Adjacency for Object {clean_id}: contacts changed from {old_str} to {new_str}.")
         
         if output_lines:
-            if self.debug_channels['CHANGES']:
+            if self.debug_channels['CONTEXT_DETAILS']:
                 self._print_and_log("\n--- Diagonal Adjacency Change Log ---")
                 for line in output_lines:
                     self._print_and_log(line)
@@ -3042,7 +3094,7 @@ class ObmlAgi3Agent(Agent):
                         output_lines.append(f"- {log_prefix}: {format_ids(left).capitalize()} left.")
 
         if output_lines:
-            if self.debug_channels['CHANGES']:
+            if self.debug_channels['CONTEXT_DETAILS']:
                 title = "Diagonal Alignment Change Log" if is_diagonal else "Alignment Change Log"
                 self._print_and_log(f"\n--- {title} ---")
                 for line in sorted(output_lines):
@@ -3113,7 +3165,7 @@ class ObmlAgi3Agent(Agent):
                     output_lines.append(f"- {label} Group {props_str}: {format_ids(left).capitalize()} left.")
 
         if output_lines:
-            if self.debug_channels['CHANGES']:
+            if self.debug_channels['CONTEXT_DETAILS']:
                 self._print_and_log("\n--- Match Type Change Log ---")
                 for line in sorted(output_lines):
                     self._print_and_log(line)
@@ -3228,6 +3280,9 @@ class ObmlAgi3Agent(Agent):
                     if global_rule['result_type'] == event_abs[0]:
                         classification = 'GLOBAL'
                         global_events.append(event)
+                    # FIX: If it DOESN'T match, we fall through.
+                    # We do NOT mark it 'AMBIGUOUS' here to avoid premature logging.
+                    # We let it try Direct, then fallback to Ambiguous/Deviation.
                 
                 # B. Standard Global Law - Requires local maturity
                 elif global_rule['type'] == 'GLOBAL':
@@ -3256,13 +3311,19 @@ class ObmlAgi3Agent(Agent):
                     id_classification_map[obj_id] = 'AMBIGUOUS'
                     continue
 
-            # 3. True Ambiguity (No Laws Yet)
+            # 3. True Ambiguity / Deviation (No Applicable Laws)
             if classification == 'AMBIGUOUS':
-                if not direct_rule and not global_rule:
-                     reason = "Hypothesis Created (N=1)"
-                     fix = "Repeat SAME action to test Direct Causality."
-                     detail = f"First observation. Causality is unknown."
-                     ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
+                reason = "Hypothesis Created (N=1)"
+                fix = "Repeat SAME action to test Direct Causality."
+                detail = "First observation. Causality is unknown."
+                
+                # Check if we are deviating from a known rule (that didn't match above)
+                if direct_rule or global_rule:
+                     reason = "Deviation from Law"
+                     detail = "Observed event differs from the certified law for this state."
+                     fix = "Analyze context for new Splitter variables."
+
+                ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
             
             if classification != 'AMBIGUOUS':
                 id_classification_map[obj_id] = classification
@@ -3547,24 +3608,55 @@ class ObmlAgi3Agent(Agent):
     def _format_rule_description(self, rule_type, action_key, state_sig, result_sig):
         """
         Returns a scientific description of the rule.
-        Uses _get_invariant_properties to parse down to only features 
-        that are UNIQUE/COMMON to the outcome history.
+        STRICTLY LIMITS context to what the Scientific Splitter has deemed necessary.
         """
-        # 1. Compute Invariants
-        conditions = self._get_invariant_properties(state_sig, action_key, result_sig)
+        # 1. Get raw invariants (Color, Size, Shape, Neighbors, etc.)
+        raw_conditions = self._get_invariant_properties(state_sig, action_key, result_sig)
         
-        # 2. Add Splitter Refinements (if any exist for this state)
-        # These are features the Splitter explicitly marked as "Critical"
-        if state_sig in self.state_refinements:
-            for refine_key in self.state_refinements[state_sig]:
-                # Format visually (e.g., "adj_top" -> "Split(adj_top)")
-                conditions.append(f"**{refine_key}**")
-
-        # 3. Format Output
-        if not conditions:
-            return "Universal Rule (No constraints identified)"
+        # 2. Filter based on Splitter Refinements
+        refined_conditions = []
+        
+        # Always include Intrinsic Properties (Color, Size, Shape) as they define the 'State'
+        # We identify them because _get_invariant_properties returns strings like "Color=5"
+        intrinsic_prefixes = ["Color=", "Size=", "Shape="]
+        
+        # Get the list of critical context keys for this state (e.g. ['adj_top'])
+        critical_keys = self.state_refinements.get(state_sig, [])
+        
+        for cond in raw_conditions:
+            is_intrinsic = any(cond.startswith(p) for p in intrinsic_prefixes)
             
-        return " AND ".join(conditions)
+            if is_intrinsic:
+                refined_conditions.append(cond)
+            else:
+                # It's context (Adj, Align, etc.). Only keep if critical.
+                # format of cond is like "**Adj(top=id_5)**" or "Adj(top=id_5)"
+                clean_cond = cond.replace('*', '')
+                
+                keep = False
+                # Check simple mapping
+                if "Adj(top=" in clean_cond and "adj_top" in critical_keys: keep = True
+                elif "Adj(right=" in clean_cond and "adj_right" in critical_keys: keep = True
+                elif "Adj(bottom=" in clean_cond and "adj_bottom" in critical_keys: keep = True
+                elif "Adj(left=" in clean_cond and "adj_left" in critical_keys: keep = True
+                elif "Align" in clean_cond:
+                    # e.g. "center_x=10" -> check if "align_center_x" is in critical_keys
+                    for k in critical_keys:
+                        if k.startswith('align_') and k.replace('align_', '') in clean_cond:
+                            keep = True
+                            break
+                elif "Match" in clean_cond: # e.g. Match(Color=..)
+                     for k in critical_keys:
+                        if k.startswith('match_') and k.replace('match_', '') in clean_cond:
+                            keep = True; break
+                
+                if keep:
+                    refined_conditions.append(cond)
+
+        if not refined_conditions:
+            return "Universal Rule"
+            
+        return " AND ".join(refined_conditions)
 
     def _solve_conditional_rule(self, start_state, action_family, current_end_sig, current_context) -> str | None:
         """
@@ -4034,6 +4126,7 @@ class ObmlAgi3Agent(Agent):
         """
         Detects if a specific event type (e.g. 'RECOLOR to 3') follows a global repeating
         cycle of Target IDs (e.g. 7, 2, 19, 7...) regardless of the action taken.
+        Requires observation of at least 2 full cycles.
         """
         # 1. Gather all events sorted by time
         abstract_timelines = {} 
@@ -4058,49 +4151,46 @@ class ObmlAgi3Agent(Agent):
 
         # 2. Analyze timelines for CYCLE PATTERNS
         for abs_key, timeline in abstract_timelines.items():
-            if len(timeline) < 3: continue 
-            
             # Sort by turn to establish the sequence order
             timeline.sort(key=lambda x: x[0])
             
             ids = [x[1] for x in timeline]
-            
+            n = len(ids)
+
             # --- Scientific Rigor: Decoupling Check ---
-            # We must ensure the sequence is not just a direct mapping of the actions taken.
-            # (e.g. Action_A always -> 5, Action_B always -> 9 is NOT a global sequence).
-            # To prove it is Global, at least one Action Key must be associated with 
-            # MULTIPLE distinct steps in the sequence (e.g. Action_A -> 5 AND Action_A -> 9).
-            
             action_outcomes = {}
             for _, obj_id, act_key in timeline:
                 if act_key not in action_outcomes: 
                     action_outcomes[act_key] = set()
                 action_outcomes[act_key].add(obj_id)
             
-            # If every action maps 1:1 to a specific result ID, we can't distinguish 
-            # this from Direct Causality. Reject Global until we see a divergence.
             if all(len(outcomes) == 1 for outcomes in action_outcomes.values()):
                 continue
             # ------------------------------------------
 
             # Check for Arbitrary Cycle (e.g., 7, 2, 19, 7, 2...)
-            n = len(ids)
             found_cycle = None
             
-            # Try periods 'p' from 1 up to n/2
+            # Try periods 'p' from 1 up to n // 2 (Strict: Must fit 2 full cycles)
+            # This implicitly handles the length check: if n < 2*p, the loop won't run for that p.
             for p in range(1, n // 2 + 1):
                 matches = True
-                # Verify the cycle holds for the entire history
+                
+                # Verify consistency for the entire history
                 for i in range(n - p):
                     if ids[i] != ids[i+p]:
                         matches = False
                         break
+                
                 if matches:
+                    # Found a valid period.
                     found_cycle = ids[:p]
-                    break
-            
+                    if len(set(found_cycle)) > 1:
+                        break
+                    else:
+                        found_cycle = None 
+
             if found_cycle:
-                # Calculate the predicted next step based on where we are in the cycle
                 current_idx_in_cycle = (n - 1) % len(found_cycle)
                 next_val = found_cycle[(current_idx_in_cycle + 1) % len(found_cycle)]
                 
@@ -4112,6 +4202,64 @@ class ObmlAgi3Agent(Agent):
                     'result_value': abs_key[1],
                     'next_prediction': next_val
                 }
+
+    def _detect_direct_sequential_laws(self, state_sig, action_key, results_map):
+        """
+        Detects if a specific Action causes a property (Value) to cycle 
+        (e.g. Color 9 -> 8 -> 3 -> 9...).
+        Requires observation of at least 2 full cycles.
+        """
+        # 1. Flatten history into a timeline: (turn, type, value)
+        timeline = []
+        for r_sig, entry_list in results_map.items():
+            if r_sig[0] == 'NO_CHANGE': continue
+            
+            # r_sig is (Type, ID, Value)
+            r_type = r_sig[0]
+            r_val = r_sig[2]
+            
+            for (turn, obj_id) in entry_list:
+                timeline.append((turn, r_type, r_val))
+        
+        # Minimum events for a 2-step cycle observed twice is 4 (A->B->A->B)
+        if len(timeline) < 4: return 
+        
+        # Sort by turn ID to get the chronological sequence
+        timeline.sort(key=lambda x: x[0])
+        
+        # 2. Verify Homogeneity (Must be the same TYPE of change, e.g. all RECOLORED)
+        primary_type = timeline[0][1]
+        if not all(t[1] == primary_type for t in timeline): return
+        
+        # 3. Extract the Sequence of Values
+        values = [t[2] for t in timeline]
+        
+        # 4. Cycle Detection
+        n = len(values)
+        found_cycle = None
+        
+        # Try periods from 2 up to n // 2 (Strict: Must fit 2 full cycles)
+        for p in range(2, n // 2 + 1):
+            matches = True
+            # Check consistency: v[i] must equal v[i+p]
+            for i in range(n - p):
+                if values[i] != values[i+p]:
+                    matches = False
+                    break
+            
+            # Additional Check: The cycle must actually CHANGE values.
+            cycle_candidate = values[:p]
+            if matches and len(set(cycle_candidate)) > 1:
+                found_cycle = cycle_candidate
+                break
+                
+        if found_cycle:
+             self.certified_laws[(state_sig, action_key)] = {
+                'type': 'DIRECT_SEQUENCE',
+                'pattern': 'CYCLE',
+                'sequence': found_cycle,
+                'result_type': primary_type
+            }
 
     def _verify_and_certify(self, state_sig):
         """
@@ -4132,6 +4280,10 @@ class ObmlAgi3Agent(Agent):
 
         for action, results in actions_data.items():
             
+            # --- NEW: Check for Direct Cycles (e.g. Toggle Switches / Color Cycles) ---
+            self._detect_direct_sequential_laws(state_sig, action, results)
+            # --------------------------------------------------------------------------
+
             # Group by Concrete Sig (Type, ID, Value)
             # FIX: We now include the ID (index 1) in the signature.
             # "Recolor Obj 7" and "Recolor Obj 8" are DIFFERENT events and cannot
@@ -4150,7 +4302,10 @@ class ObmlAgi3Agent(Agent):
                 abstract_groups[abs_sig].update(turns)
 
             if len(abstract_groups) > 1:
-                self._trigger_splitter(state_sig, action, results)
+                # If we detected a cycle earlier, don't treat this as a Splitter anomaly!
+                # Direct Sequence laws supersede static consistency checks.
+                if (state_sig, action) not in self.certified_laws:
+                    self._trigger_splitter(state_sig, action, results)
                 continue 
 
             if abstract_groups:
@@ -4163,7 +4318,9 @@ class ObmlAgi3Agent(Agent):
                 
                 historical_failure = no_change_turn_ids - change_turn_ids
                 if historical_failure:
-                    self._trigger_splitter(state_sig, action, results)
+                    # Similarly, ignore splitter trigger if cycle exists
+                    if (state_sig, action) not in self.certified_laws:
+                        self._trigger_splitter(state_sig, action, results)
                     continue
 
                 if single_abs_sig not in global_ballots:
@@ -4184,7 +4341,9 @@ class ObmlAgi3Agent(Agent):
 
         # --- Step 3: Direct Certification ---
         for action, abstract_result in mature_direct_candidates.items():
+            # If we already found a Sequence Law or Global Law, skip static Direct
             if self.certified_laws.get((state_sig, 'ANY')): continue
+            if self.certified_laws.get((state_sig, action)): continue
             
             concrete_sig = None
             raw_results = actions_data[action]
@@ -4219,6 +4378,10 @@ class ObmlAgi3Agent(Agent):
                 other_actions = self.truth_table[other_sig]
                 found_match = False
                 for act, res_dict in other_actions.items():
+                    # Skip if this action has a sequence law
+                    if (other_sig, act) in self.certified_laws and self.certified_laws[(other_sig, act)].get('type') == 'DIRECT_SEQUENCE':
+                        continue
+
                     for r_sig in res_dict:
                         if r_sig[0] == 'NO_CHANGE': continue
                         
