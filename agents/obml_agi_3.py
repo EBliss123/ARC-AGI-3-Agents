@@ -3249,75 +3249,151 @@ class ObmlAgi3Agent(Agent):
             state_sig = self._get_scientific_state(prev_obj, prev_context)
             current_result_sig = self._get_concrete_signature(event)
             
-            # Maturity Checks
-            obj_specific_turns = set()
-            obj_global_turns = set()
+            # --- Analysis: Count Observations ---
+            obj_result_turns = set()
+            obj_any_result_turns = set() 
             
-            for s_sig, actions_map in self.truth_table.items():
-                for act_key, results_map in actions_map.items():
-                    matched_entries = results_map.get(current_result_sig, [])
-                    for (t_id, o_id) in matched_entries:
+            # Check Truth Table for this specific State
+            if state_sig in self.truth_table and action_key in self.truth_table[state_sig]:
+                for r_sig, entry_list in self.truth_table[state_sig][action_key].items():
+                    for (t_id, o_id) in entry_list:
                         if o_id == obj_id:
-                            obj_global_turns.add(t_id)
-                            if act_key == action_key:
-                                obj_specific_turns.add(t_id)
+                            obj_any_result_turns.add(t_id)
+                            if r_sig == current_result_sig:
+                                obj_result_turns.add(t_id)
 
-            is_direct_mature = len(obj_specific_turns) >= 2
-            is_global_mature = len(obj_global_turns) >= 2
+            is_direct_mature = len(obj_result_turns) >= 2
             
             direct_rule = self.certified_laws.get((state_sig, action_key))
             global_rule = self.certified_laws.get((state_sig, 'ANY'))
             
-            # --- DECISION TREE (Updated) ---
+            # --- DECISION TREE ---
             
-            # 1. Check Global Laws (Sequence OR Standard)
+            # 1. Check Global Laws
             if global_rule:
-                # A. Sequence Law (Cycle) - Trusts the pattern immediately
                 if global_rule['type'] == 'GLOBAL_SEQUENCE':
-                    # Rough check: does event type match the sequence domain?
-                    # (e.g. Sequence predicts RECOLOR, event is RECOLOR)
                     event_abs = self._get_abstract_signature(event)
                     if global_rule['result_type'] == event_abs[0]:
                         classification = 'GLOBAL'
                         global_events.append(event)
-                    # FIX: If it DOESN'T match, we fall through.
-                    # We do NOT mark it 'AMBIGUOUS' here to avoid premature logging.
-                    # We let it try Direct, then fallback to Ambiguous/Deviation.
-                
-                # B. Standard Global Law - Requires local maturity
                 elif global_rule['type'] == 'GLOBAL':
-                    if is_global_mature:
+                    if is_direct_mature: 
                         classification = 'GLOBAL'
                         global_events.append(event)
                     else:
-                        # Matches Law, but first time on THIS object
                         reason = "Unverified Global Application"
                         fix = "Test DIFFERENT actions to confirm Global Independence."
-                        detail = f"Matches Global Law, but observed only {len(obj_specific_turns)} times on this object."
+                        detail = f"Matches Global Law, but observed only {len(obj_result_turns)} times on this object."
                         ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
                         id_classification_map[obj_id] = 'AMBIGUOUS'
                         continue
 
-            # 2. Check Direct Laws (if not already Global)
-            if classification == 'AMBIGUOUS' and direct_rule and direct_rule['type'] == 'DIRECT':
-                 if is_direct_mature:
-                    classification = 'DIRECT'
-                    direct_events.append(event)
-                 else:
-                    reason = "Unverified Direct Law"
-                    fix = "Repeat SAME action to confirm Direct Causality."
-                    detail = f"Matches Direct Law, but observed only {len(obj_specific_turns)} times."
-                    ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
-                    id_classification_map[obj_id] = 'AMBIGUOUS'
-                    continue
+            # 2. Check Direct Laws
+            if classification == 'AMBIGUOUS' and direct_rule:
+                 if direct_rule['type'] == 'DIRECT':
+                     if is_direct_mature:
+                        classification = 'DIRECT'
+                        direct_events.append(event)
+                     else:
+                        reason = "Unverified Direct Law"
+                        fix = "Repeat SAME action to confirm Direct Causality."
+                        detail = f"Matches Direct Law, but observed only {len(obj_result_turns)} times."
+                        ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
+                        id_classification_map[obj_id] = 'AMBIGUOUS'
+                        continue
+                 elif direct_rule['type'] == 'DIRECT_SEQUENCE':
+                     classification = 'DIRECT'
+                     direct_events.append(event)
 
-            # 3. True Ambiguity / Deviation (No Applicable Laws)
+            # 3. True Ambiguity / Deviation
             if classification == 'AMBIGUOUS':
-                reason = "Hypothesis Created (N=1)"
                 fix = "Repeat SAME action to test Direct Causality."
-                detail = "First observation. Causality is unknown."
                 
-                # Check if we are deviating from a known rule (that didn't match above)
+                # Intelligent Status Reporting
+                if len(obj_any_result_turns) > 1:
+                    if len(obj_result_turns) == 1:
+                         reason = "New Outcome Detected"
+                         detail = f"Action repeated {len(obj_any_result_turns)} times. Previous outcomes differed."
+                    else:
+                         # --- PENDING CYCLE CHECK (CROSS-STATE) ---
+                         # Reconstruct timeline for this Object ID across ALL states
+                         is_cyclic = False
+                         cycle_vals = []
+                         confidence = ""
+                         
+                         history_entries = []
+                         
+                         # Iterate entire Truth Table to find this object's history with this action
+                         for s_sig_iter, acts in self.truth_table.items():
+                             if action_key in acts:
+                                 for r_sig_iter, t_list in acts[action_key].items():
+                                     if r_sig_iter[0] == 'NO_CHANGE': continue
+                                     val = r_sig_iter[2]
+                                     for (t_id, o_id) in t_list:
+                                         if o_id == obj_id:
+                                             history_entries.append((t_id, val))
+                         
+                         history_entries.sort(key=lambda x: x[0])
+                         cycle_vals = [h[1] for h in history_entries]
+                         
+                         # Strong: A -> B -> A (min 3 items)
+                         if len(cycle_vals) >= 3:
+                             if cycle_vals[-1] == cycle_vals[-3] and cycle_vals[-1] != cycle_vals[-2]:
+                                 is_cyclic = True
+                                 confidence = "Strong"
+                         # Weak: A -> B (min 2 items)
+                         elif len(cycle_vals) == 2:
+                             if cycle_vals[0] != cycle_vals[1]:
+                                 is_cyclic = True
+                                 confidence = "Weak"
+                         
+                         if is_cyclic:
+                             reason = f"Potential Cycle Detected ({confidence})"
+                             val_seq = " -> ".join(map(str, cycle_vals[-3:]))
+                             detail = f"Alternating results ({val_seq}). Repeat to confirm cycle law."
+                         else:
+                             reason = "Conflicting Results"
+                             detail = "Outcomes vary too frequently to certify a law."
+                         # ---------------------------
+                else:
+                    total_history = 0
+                    for s_sig_iter, acts in self.truth_table.items():
+                        if action_key in acts:
+                             for res_map in acts[action_key].values():
+                                 for (_, o_id) in res_map:
+                                     if o_id == obj_id: total_history += 1
+                    
+                    if total_history > 1:
+                        reason = "New State Detected"
+                        detail = "First observation for this Object in this specific State."
+                        
+                        # --- NEW STATE CYCLE CHECK ---
+                        # Even if N=1 for *this* state, it might be the Nth step of a cycle (A->B->A)
+                        is_cyclic = False
+                        history_entries = []
+                        for s_sig_iter, acts in self.truth_table.items():
+                             if action_key in acts:
+                                 for r_sig_iter, t_list in acts[action_key].items():
+                                     if r_sig_iter[0] == 'NO_CHANGE': continue
+                                     val = r_sig_iter[2]
+                                     for (t_id, o_id) in t_list:
+                                         if o_id == obj_id:
+                                             history_entries.append((t_id, val))
+                        
+                        history_entries.sort(key=lambda x: x[0])
+                        cycle_vals = [h[1] for h in history_entries]
+
+                        if len(cycle_vals) >= 2 and cycle_vals[-1] != cycle_vals[-2]:
+                            is_cyclic = True
+                            confidence = "Strong" if len(cycle_vals) >= 3 and cycle_vals[-1] == cycle_vals[-3] else "Weak"
+                            reason = f"Potential Cycle Detected ({confidence})"
+                            val_seq = " -> ".join(map(str, cycle_vals[-3:]))
+                            detail = f"Alternating results ({val_seq}). Repeat to confirm cycle law."
+                        # -----------------------------
+                    else:
+                        reason = "Hypothesis Created (N=1)"
+                        detail = "First observation. Causality is unknown."
+
                 if direct_rule or global_rule:
                      reason = "Deviation from Law"
                      detail = "Observed event differs from the certified law for this state."
@@ -3328,61 +3404,44 @@ class ObmlAgi3Agent(Agent):
             if classification != 'AMBIGUOUS':
                 id_classification_map[obj_id] = classification
 
-        # PASS 2: Physics Events (Effects) - Inherit Causality
-        # We allow a small loop to handle chains (A pushes B, B pushes C)
-        
+        # PASS 2: Physics (Unchanged)
         pending_physics = list(deferred_physics_events)
         MAX_PHYSICS_PASSES = 3
-        
         for _ in range(MAX_PHYSICS_PASSES):
             if not pending_physics: break
-            
             next_pending = []
             progress_made = False
-            
             for event in pending_physics:
                 agitators = event.get('_physics_agitators', [])
-                
                 has_direct_cause = False
                 has_global_cause = False
                 has_ambiguous_cause = False
                 all_unknown = True
-                
                 for ag_id in agitators:
                     ag_class = id_classification_map.get(ag_id)
                     if ag_class: all_unknown = False
-                    
                     if ag_class == 'DIRECT': has_direct_cause = True
                     elif ag_class == 'GLOBAL': has_global_cause = True
                     elif ag_class == 'AMBIGUOUS': has_ambiguous_cause = True
                 
-                # Classification Logic
                 if has_direct_cause:
                     direct_events.append(event)
                     id_classification_map[event['id']] = 'DIRECT'
                     progress_made = True
                 elif has_ambiguous_cause:
-                    # If the cause is ambiguous, we can't be sure yet.
-                    # Wait for next pass, or fail at end.
                     next_pending.append(event)
                 elif has_global_cause and not all_unknown:
                     global_events.append(event)
                     id_classification_map[event['id']] = 'GLOBAL'
                     progress_made = True
                 else:
-                    # No known agitator status? Keep waiting.
                     next_pending.append(event)
-            
             pending_physics = next_pending
             if not progress_made: break
         
-        # Clean up remaining ambiguous physics
         for event in pending_physics:
             agitators = event.get('_physics_agitators', [])
-            reason = "Ambiguous Causality"
-            fix = "Confirm movement rules of agitators."
-            detail = f"Change correlated with ambiguous movement of {agitators}."
-            ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
+            ambiguous_events.append({'event': event, 'reason': "Ambiguous Causality", 'fix': "Confirm movement rules of agitators.", 'detail': f"Change correlated with ambiguous movement of {agitators}."})
 
         return direct_events, global_events, ambiguous_events
 
