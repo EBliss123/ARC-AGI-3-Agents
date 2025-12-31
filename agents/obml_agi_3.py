@@ -34,6 +34,7 @@ class ObmlAgi3Agent(Agent):
         self.level_state_history = []
         self.win_condition_hypotheses = []
         self.actions_printed = False
+        self.run_counter = 0
         self.last_score = 0
         self.banned_action_keys = set()
         self.permanent_banned_actions = set()
@@ -215,6 +216,7 @@ class ObmlAgi3Agent(Agent):
         # --- 1. Game Start / Game Over Logic ---
         if latest_frame.state == GameState.NOT_PLAYED:
             self._reset_agent_memory()
+            self.run_counter += 1 # New Run
             return GameAction.RESET
         
         if latest_frame.state == GameState.GAME_OVER:
@@ -267,6 +269,7 @@ class ObmlAgi3Agent(Agent):
 
             self._reset_level_state()
             self.forcing_wait = False
+            self.run_counter += 1 # New Run
             return GameAction.RESET
 
         # --- 2. Animation Guard: If server says busy, we wait ---
@@ -3196,6 +3199,7 @@ class ObmlAgi3Agent(Agent):
     def _classify_event_stream(self, current_events: list[dict], action_key: str, prev_context: dict) -> tuple[list[dict], list[dict], list[dict]]:
         """
         The Scientific Method Loop (2-Pass Inheritance).
+        Updated with RUN-AWARE Cycle Detection to handle Resets.
         """
         direct_events = []
         global_events = []
@@ -3206,9 +3210,9 @@ class ObmlAgi3Agent(Agent):
         
         # Temp storage for Pass 2
         deferred_physics_events = [] 
-        id_classification_map = {} # Maps obj_id -> 'DIRECT', 'GLOBAL', 'AMBIGUOUS'
+        id_classification_map = {} 
 
-        # --- Step 1: Update Truth Table (All Events) ---
+        # --- Step 1: Update Truth Table ---
         for event in current_events:
             obj_id = event.get('id')
             if not obj_id or obj_id not in prev_obj_map: continue
@@ -3233,9 +3237,9 @@ class ObmlAgi3Agent(Agent):
         for state_sig in affected_states:
             self._verify_and_certify(state_sig)
 
-        # --- Step 4: Classification (Two-Pass) ---
+        # --- Step 4: Classification ---
         
-        # PASS 1: Standard Events (Causes)
+        # PASS 1: Standard Events
         for event in current_events:
             if event.get('_physics_note'):
                 deferred_physics_events.append(event)
@@ -3253,14 +3257,22 @@ class ObmlAgi3Agent(Agent):
             obj_result_turns = set()
             obj_any_result_turns = set() 
             
-            # Check Truth Table for this specific State
             if state_sig in self.truth_table and action_key in self.truth_table[state_sig]:
                 for r_sig, entry_list in self.truth_table[state_sig][action_key].items():
-                    for (t_id, o_id) in entry_list:
+                    for entry in entry_list:
+                        # Entry can be (turn, oid) [Legacy] or (run, turn, oid) [New]
+                        # Normalize to (run, turn, oid)
+                        if len(entry) == 3:
+                            r_id, t_id, o_id = entry
+                        else:
+                            r_id, t_id, o_id = 0, entry[0], entry[1]
+
                         if o_id == obj_id:
-                            obj_any_result_turns.add(t_id)
+                            # Unique ID for counting is now (Run, Turn)
+                            uniq_key = (r_id, t_id)
+                            obj_any_result_turns.add(uniq_key)
                             if r_sig == current_result_sig:
-                                obj_result_turns.add(t_id)
+                                obj_result_turns.add(uniq_key)
 
             is_direct_mature = len(obj_result_turns) >= 2
             
@@ -3315,81 +3327,83 @@ class ObmlAgi3Agent(Agent):
                          reason = "New Outcome Detected"
                          detail = f"Action repeated {len(obj_any_result_turns)} times. Previous outcomes differed."
                     else:
-                         # --- PENDING CYCLE CHECK (CROSS-STATE) ---
-                         # Reconstruct timeline for this Object ID across ALL states
+                         # --- PENDING CYCLE CHECK (RUN-AWARE) ---
                          is_cyclic = False
                          cycle_vals = []
                          confidence = ""
                          
                          history_entries = []
                          
-                         # Iterate entire Truth Table to find this object's history with this action
+                         # Collect Cross-State History
                          for s_sig_iter, acts in self.truth_table.items():
                              if action_key in acts:
                                  for r_sig_iter, t_list in acts[action_key].items():
                                      if r_sig_iter[0] == 'NO_CHANGE': continue
                                      val = r_sig_iter[2]
-                                     for (t_id, o_id) in t_list:
+                                     for entry in t_list:
+                                         # Normalize Entry
+                                         if len(entry) == 3: r_id, t_id, o_id = entry
+                                         else: r_id, t_id, o_id = 0, entry[0], entry[1]
+
                                          if o_id == obj_id:
-                                             history_entries.append((t_id, val))
+                                             history_entries.append({'run': r_id, 'turn': t_id, 'val': val})
                          
-                         history_entries.sort(key=lambda x: x[0])
-                         cycle_vals = [h[1] for h in history_entries]
+                         # Sort by (Run, Turn)
+                         history_entries.sort(key=lambda x: (x['run'], x['turn']))
                          
-                         # Strong: A -> B -> A (min 3 items)
-                         if len(cycle_vals) >= 3:
-                             if cycle_vals[-1] == cycle_vals[-3] and cycle_vals[-1] != cycle_vals[-2]:
-                                 is_cyclic = True
-                                 confidence = "Strong"
-                         # Weak: A -> B (min 2 items)
-                         elif len(cycle_vals) == 2:
-                             if cycle_vals[0] != cycle_vals[1]:
-                                 is_cyclic = True
-                                 confidence = "Weak"
+                         # Check Cycle Consistency (Respecting Resets)
+                         consistent_flips = 0
+                         last_val = None
+                         last_run = None
+                         
+                         for entry in history_entries:
+                             curr_val = entry['val']
+                             curr_run = entry['run']
+                             
+                             if last_val is not None:
+                                 # Only check flip if we are in the SAME run
+                                 if curr_run == last_run:
+                                     if curr_val != last_val:
+                                         consistent_flips += 1
+                                     else:
+                                         # Same value in same run -> Breaks the "Simple Flip" hypothesis
+                                         # (Unless period > 2, but for ambiguity check we look for flips)
+                                         consistent_flips = -999 
+                                 else:
+                                     # Reset detected! We ignore the transition.
+                                     pass
+                             
+                             last_val = curr_val
+                             last_run = curr_run
+
+                         if consistent_flips >= 2: # At least A->B->A
+                             is_cyclic = True
+                             confidence = "Strong"
+                         elif consistent_flips == 1: # A->B
+                             is_cyclic = True
+                             confidence = "Weak"
                          
                          if is_cyclic:
                              reason = f"Potential Cycle Detected ({confidence})"
-                             val_seq = " -> ".join(map(str, cycle_vals[-3:]))
-                             detail = f"Alternating results ({val_seq}). Repeat to confirm cycle law."
+                             detail = "Outcomes alternate consistently within runs."
                          else:
                              reason = "Conflicting Results"
-                             detail = "Outcomes vary too frequently to certify a law."
+                             detail = "Outcomes vary within a single run without a clear pattern."
                          # ---------------------------
                 else:
+                    # N=1 Logic (Unchanged)
                     total_history = 0
                     for s_sig_iter, acts in self.truth_table.items():
                         if action_key in acts:
                              for res_map in acts[action_key].values():
-                                 for (_, o_id) in res_map:
-                                     if o_id == obj_id: total_history += 1
+                                 for entry in res_map: # Iterating list of tuples
+                                    # We don't need to parse tuple here, just find obj_id
+                                    o_id = entry[-1] # Obj ID is always last
+                                    if o_id == obj_id: total_history += 1
                     
                     if total_history > 1:
                         reason = "New State Detected"
                         detail = "First observation for this Object in this specific State."
-                        
-                        # --- NEW STATE CYCLE CHECK ---
-                        # Even if N=1 for *this* state, it might be the Nth step of a cycle (A->B->A)
-                        is_cyclic = False
-                        history_entries = []
-                        for s_sig_iter, acts in self.truth_table.items():
-                             if action_key in acts:
-                                 for r_sig_iter, t_list in acts[action_key].items():
-                                     if r_sig_iter[0] == 'NO_CHANGE': continue
-                                     val = r_sig_iter[2]
-                                     for (t_id, o_id) in t_list:
-                                         if o_id == obj_id:
-                                             history_entries.append((t_id, val))
-                        
-                        history_entries.sort(key=lambda x: x[0])
-                        cycle_vals = [h[1] for h in history_entries]
-
-                        if len(cycle_vals) >= 2 and cycle_vals[-1] != cycle_vals[-2]:
-                            is_cyclic = True
-                            confidence = "Strong" if len(cycle_vals) >= 3 and cycle_vals[-1] == cycle_vals[-3] else "Weak"
-                            reason = f"Potential Cycle Detected ({confidence})"
-                            val_seq = " -> ".join(map(str, cycle_vals[-3:]))
-                            detail = f"Alternating results ({val_seq}). Repeat to confirm cycle law."
-                        # -----------------------------
                     else:
                         reason = "Hypothesis Created (N=1)"
                         detail = "First observation. Causality is unknown."
@@ -3446,21 +3460,24 @@ class ObmlAgi3Agent(Agent):
         return direct_events, global_events, ambiguous_events
 
     def _update_truth_table(self, state_sig, action_key, result_sig, obj_id=None):
-        """Helper to write to the Truth Table. Now tracks Object Identity."""
-        if state_sig not in self.truth_table: self.truth_table[state_sig] = {}
-        if action_key not in self.truth_table[state_sig]: self.truth_table[state_sig][action_key] = {}
+        """
+        Records an observation in the Truth Table with Run ID + Turn ID.
+        """
+        if state_sig not in self.truth_table:
+            self.truth_table[state_sig] = {}
         
-        turn_id = self.global_action_counter
+        if action_key not in self.truth_table[state_sig]:
+            self.truth_table[state_sig][action_key] = {}
+            
         if result_sig not in self.truth_table[state_sig][action_key]:
             self.truth_table[state_sig][action_key][result_sig] = []
+            
+        # Store (RunID, TurnID, ObjID)
+        # We use getattr/default just in case frame number isn't set yet
+        turn_num = getattr(self, 'last_frame_number', 0)
+        entry = (self.run_counter, turn_num, obj_id)
         
-        # Store (Turn_ID, Object_ID)
-        # We need to know WHO confirmed this result to avoid "Sample Size of One" generalization.
-        entry = (turn_id, obj_id)
-        
-        # Avoid duplicate entries for the same turn/object
-        if entry not in self.truth_table[state_sig][action_key][result_sig]:
-            self.truth_table[state_sig][action_key][result_sig].append(entry)
+        self.truth_table[state_sig][action_key][result_sig].append(entry)
 
     def _update_transition_memory(self, start, action, end, trial_id):
         """
@@ -3493,14 +3510,13 @@ class ObmlAgi3Agent(Agent):
         Scans the history of a specific Outcome to find properties that are 
         CONSTANT across all instances.
         
-        UPDATED: Contrastive Analysis.
-        Checks against 'NO_CHANGE' examples to identify 'Critical Triggers'.
+        UPDATED: Contrastive Analysis + Run-Aware Unpacking.
+        Only analyzes context from the CURRENT RUN, as previous run contexts are discarded.
         """
         if state_sig not in self.truth_table: return []
         if action_key not in self.truth_table[state_sig]: return []
         
-        # 1. FIX: Robust State Signature Unpacking
-        # Handles both raw (C,F,S) and refined ((C,F,S), 'key') signatures
+        # 1. Robust State Signature Unpacking
         if len(state_sig) == 2 and isinstance(state_sig[0], tuple):
             base_sig = state_sig[0]
         else:
@@ -3509,17 +3525,37 @@ class ObmlAgi3Agent(Agent):
         try:
             color, fp, size = base_sig
         except ValueError:
-            return ["State Error"] # Fallback
+            return ["State Error"]
 
-        # Get Positive History (Change)
-        pos_history = self.truth_table[state_sig][action_key].get(result_sig, [])
-        if not pos_history: return []
+        # --- STEP 1: Fetch and Normalize History (Current Run Only) ---
+        # We effectively flatten the 3-tuple (run, turn, id) back to (turn, id)
+        # BUT only for the current run, so downstream logic works safely.
         
-        # Get Negative History (No Change) for Contrast
-        # We look for objects with the SAME state_sig that did NOT produce this result
+        raw_pos_history = self.truth_table[state_sig][action_key].get(result_sig, [])
+        pos_history = []
+        for entry in raw_pos_history:
+            if len(entry) == 3: run, turn, oid = entry
+            else: run, turn, oid = 0, entry[0], entry[1]
+            
+            if run == self.run_counter:
+                pos_history.append((turn, oid))
+        
+        # If we have no history in this run (e.g. just reset), return basic stats
+        if not pos_history: 
+            fp_str = str(fp)
+            short_fp = fp_str[:6] + ".." if len(fp_str) > 6 else fp_str
+            return [f"Color={color}", f"Size={size}", f"Shape={short_fp}"]
+        
+        # Get Negative History (No Change) for Contrast - Current Run Only
         neg_history = []
         if ('NO_CHANGE', None, None) in self.truth_table[state_sig][action_key]:
-            neg_history = self.truth_table[state_sig][action_key][('NO_CHANGE', None, None)]
+            raw_neg = self.truth_table[state_sig][action_key][('NO_CHANGE', None, None)]
+            for entry in raw_neg:
+                if len(entry) == 3: run, turn, oid = entry
+                else: run, turn, oid = 0, entry[0], entry[1]
+                
+                if run == self.run_counter:
+                    neg_history.append((turn, oid))
 
         # --- Base Invariants (Always True) ---
         conditions = []
@@ -3534,19 +3570,15 @@ class ObmlAgi3Agent(Agent):
         # Helper to extract ALL features for an object in a context
         def extract_features(ctx, oid):
             feats = {}
-            # Adjacency (Standard)
             if 'adj' in ctx and oid in ctx['adj']:
                 feats['adj'] = ctx['adj'][oid] 
-            # Diagonal Adjacency
             if 'diag_adj' in ctx and oid in ctx['diag_adj']:
                 feats['diag_adj'] = ctx['diag_adj'][oid]
-            # Alignment
             feats['align'] = set()
             if 'align' in ctx:
                 for a_type, groups in ctx['align'].items():
                     for coord, ids in groups.items():
                         if oid in ids: feats['align'].add((a_type, coord))
-            # Diagonal Alignment
             feats['diag_align'] = set()
             if 'diag_align' in ctx:
                  for a_type, groups in ctx['diag_align'].items():
@@ -3554,8 +3586,11 @@ class ObmlAgi3Agent(Agent):
                         if oid in ids: feats['diag_align'].add((a_type, line_idx))
             return feats
 
-        # 1. Compute Intersection of POSITIVES (Must be present in ALL changes)
-        if not (0 <= pos_history[0][0] - 1 < len(self.level_state_history)): return conditions
+        # 1. Compute Intersection of POSITIVES
+        # Validation: Check if history index exists
+        if not (0 <= pos_history[0][0] - 1 < len(self.level_state_history)): 
+            return conditions
+            
         first_ctx = self.level_state_history[pos_history[0][0] - 1]
         common_feats = extract_features(first_ctx, pos_history[0][1])
 
@@ -3595,20 +3630,15 @@ class ObmlAgi3Agent(Agent):
                     else:
                         del common_feats[key]
 
-        # 2. Check Contrast with NEGATIVES (Find the Discriminators)
-        # A feature is "Critical" if NO negative example has it.
-        
-        # Build set of features found in negatives to compare against
+        # 2. Check Contrast with NEGATIVES
         neg_features_union = {'adj': set(), 'diag_adj': set(), 'align': set(), 'diag_align': set()}
         
-        # Optimization: Only scan a sample of negatives if there are too many
         for i in range(len(neg_history)):
             tid, oid = neg_history[i]
             if not (0 <= tid - 1 < len(self.level_state_history)): continue
             ctx = self.level_state_history[tid - 1]
             nf = extract_features(ctx, oid)
             
-            # Add specific values to union
             if 'adj' in nf:
                 for k in range(4): neg_features_union['adj'].add((k, nf['adj'][k]))
             if 'diag_adj' in nf:
@@ -3618,24 +3648,17 @@ class ObmlAgi3Agent(Agent):
             if 'diag_align' in nf:
                 neg_features_union['diag_align'].update(nf['diag_align'])
 
-        # 3. Format Output with Highlighted Differentiators
-        
-        # Adjacency
+        # 3. Format Output
         dirs = ['top', 'right', 'bottom', 'left']
         if 'adj' in common_feats:
             for i, neighbor in enumerate(common_feats['adj']):
                 if neighbor and neighbor != 'na':
                     n_clean = neighbor.replace('obj_', 'id_')
                     feat_str = f"Adj({dirs[i]}={n_clean})"
-                    
-                    # IS THIS A CRITICAL TRIGGER?
-                    # Check if any negative had this specific neighbor at this position
                     if (i, neighbor) not in neg_features_union['adj']:
-                        feat_str = f"**{feat_str}**" # Highlight
-                    
+                        feat_str = f"**{feat_str}**"
                     conditions.append(feat_str)
                     
-        # Diagonal Adjacency
         diag_dirs = ['top_right', 'bottom_right', 'bottom_left', 'top_left']
         if 'diag_adj' in common_feats:
             for i, neighbor in enumerate(common_feats['diag_adj']):
@@ -3646,7 +3669,6 @@ class ObmlAgi3Agent(Agent):
                         feat_str = f"**{feat_str}**"
                     conditions.append(feat_str)
 
-        # Alignments
         if 'align' in common_feats:
             for (a_type, coord) in common_feats['align']:
                 feat_str = f"{a_type}={coord}"
@@ -3654,7 +3676,6 @@ class ObmlAgi3Agent(Agent):
                     feat_str = f"**{feat_str}**"
                 conditions.append(feat_str)
                 
-        # Diagonal Alignments
         if 'diag_align' in common_feats:
             for (a_type, line_idx) in common_feats['diag_align']:
                 feat_str = f"{a_type}(Line {line_idx})"
@@ -4185,7 +4206,6 @@ class ObmlAgi3Agent(Agent):
         """
         Detects if a specific event type (e.g. 'RECOLOR to 3') follows a global repeating
         cycle of Target IDs (e.g. 7, 2, 19, 7...) regardless of the action taken.
-        Requires observation of at least 2 full cycles.
         """
         # 1. Gather all events sorted by time
         abstract_timelines = {} 
@@ -4200,25 +4220,31 @@ class ObmlAgi3Agent(Agent):
                 if abs_key not in abstract_timelines:
                     abstract_timelines[abs_key] = []
                 
-                for (turn, obj_id_str) in entry_list:
+                for entry in entry_list:
+                    # Handle unpacking
+                    if len(entry) == 3:
+                        run, turn, obj_id_str = entry
+                    else:
+                        run, turn, obj_id_str = 0, entry[0], entry[1]
+
                     try:
-                        if '_' in obj_id_str:
+                        if isinstance(obj_id_str, str) and '_' in obj_id_str:
                             numeric_id = int(obj_id_str.split('_')[-1])
-                            abstract_timelines[abs_key].append((turn, numeric_id, action_name))
+                            abstract_timelines[abs_key].append((run, turn, numeric_id, action_name))
                     except ValueError:
                         continue
 
         # 2. Analyze timelines for CYCLE PATTERNS
         for abs_key, timeline in abstract_timelines.items():
-            # Sort by turn to establish the sequence order
-            timeline.sort(key=lambda x: x[0])
+            # Sort by RUN then TURN
+            timeline.sort(key=lambda x: (x[0], x[1]))
             
-            ids = [x[1] for x in timeline]
+            ids = [x[2] for x in timeline]
             n = len(ids)
 
             # --- Scientific Rigor: Decoupling Check ---
             action_outcomes = {}
-            for _, obj_id, act_key in timeline:
+            for _, _, obj_id, act_key in timeline:
                 if act_key not in action_outcomes: 
                     action_outcomes[act_key] = set()
                 action_outcomes[act_key].add(obj_id)
@@ -4230,8 +4256,6 @@ class ObmlAgi3Agent(Agent):
             # Check for Arbitrary Cycle (e.g., 7, 2, 19, 7, 2...)
             found_cycle = None
             
-            # Try periods 'p' from 1 up to n // 2 (Strict: Must fit 2 full cycles)
-            # This implicitly handles the length check: if n < 2*p, the loop won't run for that p.
             for p in range(1, n // 2 + 1):
                 matches = True
                 
@@ -4242,7 +4266,6 @@ class ObmlAgi3Agent(Agent):
                         break
                 
                 if matches:
-                    # Found a valid period.
                     found_cycle = ids[:p]
                     if len(set(found_cycle)) > 1:
                         break
@@ -4268,7 +4291,7 @@ class ObmlAgi3Agent(Agent):
         (e.g. Color 9 -> 8 -> 3 -> 9...).
         Requires observation of at least 2 full cycles.
         """
-        # 1. Flatten history into a timeline: (turn, type, value)
+        # 1. Flatten history into a timeline: (run, turn, type, value)
         timeline = []
         for r_sig, entry_list in results_map.items():
             if r_sig[0] == 'NO_CHANGE': continue
@@ -4277,27 +4300,33 @@ class ObmlAgi3Agent(Agent):
             r_type = r_sig[0]
             r_val = r_sig[2]
             
-            for (turn, obj_id) in entry_list:
-                timeline.append((turn, r_type, r_val))
+            for entry in entry_list:
+                # Handle legacy (turn, id) vs new (run, turn, id)
+                if len(entry) == 3:
+                    run, turn, obj_id = entry
+                else:
+                    run, turn, obj_id = 0, entry[0], entry[1]
+                
+                timeline.append((run, turn, r_type, r_val))
         
-        # Minimum events for a 2-step cycle observed twice is 4 (A->B->A->B)
-        if len(timeline) < 4: return 
+        if len(timeline) < 3: return 
         
-        # Sort by turn ID to get the chronological sequence
-        timeline.sort(key=lambda x: x[0])
+        # Sort by RUN then TURN to preserve chronological order across resets
+        timeline.sort(key=lambda x: (x[0], x[1]))
         
         # 2. Verify Homogeneity (Must be the same TYPE of change, e.g. all RECOLORED)
-        primary_type = timeline[0][1]
-        if not all(t[1] == primary_type for t in timeline): return
+        primary_type = timeline[0][2]
+        if not all(t[2] == primary_type for t in timeline): return
         
         # 3. Extract the Sequence of Values
-        values = [t[2] for t in timeline]
-        
-        # 4. Cycle Detection
+        # Note: We treat the timeline as continuous for cycle detection, 
+        # even if broken by resets, assuming the law holds globally.
+        values = [t[3] for t in timeline]
         n = len(values)
         found_cycle = None
         
-        # Try periods from 2 up to n // 2 (Strict: Must fit 2 full cycles)
+        # 4. Cycle Detection
+        # Try periods from 2 up to n // 2
         for p in range(2, n // 2 + 1):
             matches = True
             # Check consistency: v[i] must equal v[i+p]
@@ -4357,7 +4386,10 @@ class ObmlAgi3Agent(Agent):
                 
                 if abs_sig not in abstract_groups:
                     abstract_groups[abs_sig] = set()
-                turns = {t for (t, o) in entry_list}
+                turns = set()
+                for entry in entry_list:
+                    if len(entry) == 3: turns.add((entry[0], entry[1])) # (run, turn)
+                    else: turns.add((0, entry[0])) # Legacy fallback
                 abstract_groups[abs_sig].update(turns)
 
             if len(abstract_groups) > 1:
@@ -4373,7 +4405,9 @@ class ObmlAgi3Agent(Agent):
                 
                 no_change_turn_ids = set()
                 if ('NO_CHANGE', None, None) in results:
-                     no_change_turn_ids.update({t for (t, o) in results[('NO_CHANGE', None, None)]})
+                     for entry in results[('NO_CHANGE', None, None)]:
+                        if len(entry) == 3: no_change_turn_ids.add((entry[0], entry[1]))
+                        else: no_change_turn_ids.add((0, entry[0]))
                 
                 historical_failure = no_change_turn_ids - change_turn_ids
                 if historical_failure:
@@ -4525,8 +4559,12 @@ class ObmlAgi3Agent(Agent):
         valid_result_keys = []
         
         for res_sig, entry_list in conflicting_results.items():
-            # Count unique turns for this result
-            unique_turns = {tid for (tid, oid) in entry_list}
+            # Count unique turns for this result (Handling Run ID)
+            unique_turns = set()
+            for entry in entry_list:
+                if len(entry) == 3: unique_turns.add((entry[0], entry[1])) # (Run, Turn)
+                else: unique_turns.add((0, entry[0]))
+            
             if len(unique_turns) >= 2:
                 valid_result_keys.append(res_sig)
         
@@ -4540,7 +4578,13 @@ class ObmlAgi3Agent(Agent):
         for res in valid_result_keys: 
             entry_list = conflicting_results[res]
             contexts = []
-            for (tid, oid) in entry_list: 
+            for entry in entry_list:
+                # Unpack safely
+                if len(entry) == 3: run, tid, oid = entry
+                else: run, tid, oid = 0, entry[0], entry[1]
+
+                # Note: We only look up history if it matches the current run context
+                # (Assuming level_state_history is reset per run)
                 if 0 <= tid - 1 < len(self.level_state_history):
                     contexts.append(self.level_state_history[tid-1])
             contexts_by_result[res] = contexts
