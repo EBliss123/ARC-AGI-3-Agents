@@ -4064,11 +4064,24 @@ class ObmlAgi3Agent(Agent):
             timeline.sort(key=lambda x: x[0])
             
             ids = [x[1] for x in timeline]
-            actions = [x[2] for x in timeline]
             
-            # Scientific Rigor: The pattern must hold across DIFFERENT actions
-            # to prove it is Global and not just a direct effect of one button.
-            if len(set(actions)) < 2: continue 
+            # --- Scientific Rigor: Decoupling Check ---
+            # We must ensure the sequence is not just a direct mapping of the actions taken.
+            # (e.g. Action_A always -> 5, Action_B always -> 9 is NOT a global sequence).
+            # To prove it is Global, at least one Action Key must be associated with 
+            # MULTIPLE distinct steps in the sequence (e.g. Action_A -> 5 AND Action_A -> 9).
+            
+            action_outcomes = {}
+            for _, obj_id, act_key in timeline:
+                if act_key not in action_outcomes: 
+                    action_outcomes[act_key] = set()
+                action_outcomes[act_key].add(obj_id)
+            
+            # If every action maps 1:1 to a specific result ID, we can't distinguish 
+            # this from Direct Causality. Reject Global until we see a divergence.
+            if all(len(outcomes) == 1 for outcomes in action_outcomes.values()):
+                continue
+            # ------------------------------------------
 
             # Check for Arbitrary Cycle (e.g., 7, 2, 19, 7, 2...)
             n = len(ids)
