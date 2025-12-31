@@ -1887,39 +1887,33 @@ class ObmlAgi3Agent(Agent):
             
             # --- CASE B: Sequential Global Law ---
             elif law.get('type') == 'GLOBAL_SEQUENCE':
-                # We need to construct a 'result_sig' from the sequence prediction
-                # Format: (Type, ID, Value)
-                # Note: Sequence laws usually predict the VALUE, but apply to the CURRENT object
-                # if the sequence logic was based on values. 
-                # However, our sequence detector tracks TARGET IDs.
+                # Check if this object is in the predicted set of targets
+                next_targets = law.get('next_target_ids')
                 
-                # If the sequence predicts the next Target ID, we only act if THIS object is the target.
-                # But _predict_outcome is called FOR a specific object.
+                current_numeric_id = None
+                try:
+                    current_numeric_id = int(target_obj['id'].split('_')[-1])
+                except: pass
                 
-                # Actually, our sequence detector stored 'next_prediction' which is the Target ID.
-                next_target_id = law.get('next_prediction')
+                is_target = False
                 
-                # If this object is the one predicted to change:
-                if next_target_id is not None:
-                     # Check if the current object's ID matches the prediction
-                     # We stored numeric IDs in the sequence logic (e.g. 7).
-                     # target_obj['id'] is 'obj_7'.
-                     current_numeric_id = int(target_obj['id'].split('_')[-1])
-                     
-                     if current_numeric_id == next_target_id:
-                         # This object is CHOSEN.
-                         # Construct the result signature using the stored type/value
-                         r_type = law['result_type']
-                         r_val = law['result_value']
-                         
-                         # (Type, ID, Value)
-                         # We use the object's own ID because we are predicting FOR it.
-                         result_sig = (r_type, target_obj['id'], r_val)
-                         return self._expand_result(result_sig, target_obj), 100
-                     else:
-                         # This object is NOT the one in the sequence.
-                         # It should NOT change (regarding this law).
-                         return [], 100
+                if next_targets is not None:
+                    # New Set-based logic
+                    if current_numeric_id in next_targets:
+                        is_target = True
+                else:
+                    # Fallback (Safety)
+                    pred = law.get('next_prediction')
+                    if isinstance(pred, int) and pred == current_numeric_id:
+                        is_target = True
+                
+                if is_target:
+                     r_type = law['result_type']
+                     r_val = law['result_value']
+                     result_sig = (r_type, target_obj['id'], r_val)
+                     return self._expand_result(result_sig, target_obj), 100
+                else:
+                     return [], 100
             
             # --- NEW CASE C: Sequential Direct Law (Value Cycles) ---
             elif law.get('type') == 'DIRECT_SEQUENCE':
@@ -4230,85 +4224,75 @@ class ObmlAgi3Agent(Agent):
     
     def _detect_sequential_global_laws(self, state_sig, actions_data):
         """
-        Detects if a specific event type (e.g. 'RECOLOR to 3') follows a global repeating
-        cycle of Target IDs (e.g. 7, 2, 19, 7...) regardless of the action taken.
+        Detects Perfect Global Cycles.
+        1. Target ID Cycles: {2,4} -> {2,4} (Simultaneous).
         """
-        # 1. Gather all events sorted by time
-        abstract_timelines = {} 
+        # Map: (Type, Val) -> { (Run, Turn): {IDs} }
+        type_val_timeline = {}
 
         for action_name, results in actions_data.items():
             for r_sig, entry_list in results.items():
                 if r_sig[0] == 'NO_CHANGE': continue
                 
-                # Abstract Signature: (Type, Value) - ignoring ID for grouping
-                abs_key = (r_sig[0], r_sig[2]) 
-                
-                if abs_key not in abstract_timelines:
-                    abstract_timelines[abs_key] = []
+                # r_sig is (Type, ID, Value)
+                r_type = r_sig[0]
+                r_val = r_sig[2]
                 
                 for entry in entry_list:
-                    # Handle unpacking
-                    if len(entry) == 3:
-                        run, turn, obj_id_str = entry
-                    else:
-                        run, turn, obj_id_str = 0, entry[0], entry[1]
+                    # Unpack safely
+                    if len(entry) == 3: run, turn, oid = entry
+                    else: run, turn, oid = 0, entry[0], entry[1]
+                    
+                    numeric_id = oid
+                    if isinstance(oid, str) and '_' in oid:
+                        try: numeric_id = int(oid.split('_')[-1])
+                        except: pass
+                    
+                    # Key by (Type, Value) to find "Who does this happen to?"
+                    tv_key = (r_type, r_val)
+                    
+                    if tv_key not in type_val_timeline: type_val_timeline[tv_key] = {}
+                    if (run, turn) not in type_val_timeline[tv_key]: type_val_timeline[tv_key][(run, turn)] = set()
+                    
+                    type_val_timeline[tv_key][(run, turn)].add(numeric_id)
 
-                    try:
-                        if isinstance(obj_id_str, str) and '_' in obj_id_str:
-                            numeric_id = int(obj_id_str.split('_')[-1])
-                            abstract_timelines[abs_key].append((run, turn, numeric_id, action_name))
-                    except ValueError:
-                        continue
-
-        # 2. Analyze timelines for CYCLE PATTERNS
-        for abs_key, timeline in abstract_timelines.items():
-            # Sort by RUN then TURN
-            timeline.sort(key=lambda x: (x[0], x[1]))
+        # --- Analyze ID Cycles (Simultaneity aware) ---
+        for tv_key, turn_map in type_val_timeline.items():
+            sorted_turns = sorted(turn_map.keys())
+            if len(sorted_turns) < 3: continue
             
-            ids = [x[2] for x in timeline]
-            n = len(ids)
-
-            # --- Scientific Rigor: Decoupling Check ---
-            action_outcomes = {}
-            for _, _, obj_id, act_key in timeline:
-                if act_key not in action_outcomes: 
-                    action_outcomes[act_key] = set()
-                action_outcomes[act_key].add(obj_id)
+            # Extract SETS (Frozen for hashing)
+            id_sets = [frozenset(turn_map[t]) for t in sorted_turns]
             
-            if all(len(outcomes) == 1 for outcomes in action_outcomes.values()):
-                continue
-            # ------------------------------------------
-
-            # Check for Arbitrary Cycle (e.g., 7, 2, 19, 7, 2...)
+            # Detect Cycle
             found_cycle = None
-            
+            n = len(id_sets)
             for p in range(1, n // 2 + 1):
                 matches = True
-                
-                # Verify consistency for the entire history
                 for i in range(n - p):
-                    if ids[i] != ids[i+p]:
+                    if id_sets[i] != id_sets[i+p]:
                         matches = False
                         break
-                
                 if matches:
-                    found_cycle = ids[:p]
-                    if len(set(found_cycle)) > 1:
-                        break
-                    else:
-                        found_cycle = None 
-
+                    found_cycle = id_sets[:p]
+                    break
+            
             if found_cycle:
-                current_idx_in_cycle = (n - 1) % len(found_cycle)
-                next_val = found_cycle[(current_idx_in_cycle + 1) % len(found_cycle)]
+                current_idx = (n - 1) % len(found_cycle)
+                next_set = found_cycle[(current_idx + 1) % len(found_cycle)]
+                
+                # Format for display
+                next_str = ", ".join(map(str, sorted(list(next_set))))
+                if len(next_set) > 1: next_str = f"{{{next_str}}}"
                 
                 self.certified_laws[(state_sig, 'ANY')] = {
                     'type': 'GLOBAL_SEQUENCE',
-                    'pattern': 'CYCLE',
+                    'pattern': 'ID_CYCLE',
+                    'result_type': tv_key[0],
+                    'result_value': tv_key[1],
                     'sequence': found_cycle,
-                    'result_type': abs_key[0],
-                    'result_value': abs_key[1],
-                    'next_prediction': next_val
+                    'next_target_ids': next_set, # Store the actual set for logic
+                    'next_prediction': next_str  # String for display
                 }
 
     def _detect_direct_sequential_laws(self, state_sig, action_key, results_map):
