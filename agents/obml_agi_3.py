@@ -799,9 +799,8 @@ class ObmlAgi3Agent(Agent):
                             break
                     
                     if is_lethal:
-                        # Treat as a catastrophic failure (high cost to sort to bottom)
-                        profile['failures'] += 1000 
-                    # -------------------------------------------------------
+                        # Treat as a failure (Lethal) - Count strictly as 1 object
+                        profile['failures'] += 1 
                     else:
                         hashable_events = [tuple(sorted(e.items())) for e in predicted_events]
                         fp = tuple(sorted(hashable_events))
