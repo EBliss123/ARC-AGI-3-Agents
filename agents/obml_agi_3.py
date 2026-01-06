@@ -587,12 +587,33 @@ class ObmlAgi3Agent(Agent):
                             self._print_and_log(f"     * [GLOBAL] {e['type']} on {e.get('id', 'Unknown')}")
 
                             if law and law.get('type') == 'GLOBAL_SEQUENCE':
-                                seq_str = " -> ".join(map(str, law['sequence']))
-                                self._print_and_log(f"       [Explanation] Global Cycle: Target ID Pattern {seq_str}")
-                                self._print_and_log(f"       [Prediction]  Next Target ID: {law.get('next_prediction', 'Unknown')}")
+                                pattern = law.get('pattern')
+                                
+                                # --- FIX: Display Specific Rule Value ---
+                                if pattern == 'CHARACTER_RULE':
+                                    rule_map = law.get('rule_map', {})
+                                    
+                                    # Extract numeric ID safely
+                                    current_numeric_id = None
+                                    try: 
+                                        if isinstance(obj_id, str) and '_' in obj_id:
+                                            current_numeric_id = int(obj_id.split('_')[-1])
+                                        else:
+                                            current_numeric_id = int(obj_id)
+                                    except: pass
+                                    
+                                    val = rule_map.get(current_numeric_id, 'Unknown')
+                                    
+                                    self._print_and_log(f"       [Explanation] Character Rule: ID {obj_id} consistently behaves as '{val}'.")
+                                    self._print_and_log(f"       [Prediction]  Next: {val}")
+                                    
+                                elif pattern in ['ID_CYCLE', 'VALUE_CYCLE']:
+                                    seq = law.get('sequence', [])
+                                    seq_str = " -> ".join(map(str, seq))
+                                    self._print_and_log(f"       [Explanation] Global {pattern}: Pattern {seq_str}")
+                                    self._print_and_log(f"       [Prediction]  Next: {law.get('next_prediction', 'Unknown')}")
                             else:
                                 result_sig = self._get_concrete_signature(e)
-                                # FIX: Use 'learning_key' instead of 'action_key'
                                 rule_str = self._format_rule_description('GLOBAL', learning_key, state_sig, result_sig)
                                 self._print_and_log(f"       [Explanation] Global Rule: Inevitable '{_fmt_val(e)}'.")
                                 self._print_and_log(f"       [Prediction]  IF {rule_str}")
@@ -1862,86 +1883,86 @@ class ObmlAgi3Agent(Agent):
 
     def _predict_outcome(self, hypothesis_key: tuple, current_context: dict) -> tuple[list|None, int]:
         """
-        Scientific Prediction. Only predicts if a Certified Law exists.
+        Scientific Prediction. Handles CHARACTER_RULE and VALUE_CYCLE.
         """
         action_name, target_id = hypothesis_key
-        
-        # 1. Identify the Object and its Scientific State
-        target_obj = None
-        if target_id:
-            target_obj = next((o for o in current_context['summary'] if o['id'] == target_id), None)
-        
-        if not target_obj:
-            return None, 0
-        
+        target_obj = next((o for o in current_context['summary'] if o['id'] == target_id), None)
+        if not target_obj: return None, 0
         state_sig = self._get_scientific_state(target_obj, current_context)
         
-        # 2. Check for Certified Laws
         law = self.certified_laws.get((state_sig, action_name)) # Direct
-        if not law:
-            law = self.certified_laws.get((state_sig, 'ANY'))   # Global
+        if not law: law = self.certified_laws.get((state_sig, 'ANY'))   # Global
 
-        # 3. Return Prediction
         if law:
-            # --- CASE A: Standard Global/Direct Law ---
             if 'result' in law:
-                result_sig = law['result']
-                return self._expand_result(result_sig, target_obj), 100
+                return self._expand_result(law['result'], target_obj), 100
             
-            # --- CASE B: Sequential Global Law ---
+            # --- GLOBAL SEQUENCES ---
             elif law.get('type') == 'GLOBAL_SEQUENCE':
-                # Check if this object is in the predicted set of targets
-                next_targets = law.get('next_target_ids')
+                pattern = law.get('pattern')
                 
-                current_numeric_id = None
-                try:
-                    current_numeric_id = int(target_obj['id'].split('_')[-1])
-                except: pass
-                
-                is_target = False
-                
-                if next_targets is not None:
-                    # New Set-based logic
-                    if current_numeric_id in next_targets:
-                        is_target = True
-                else:
-                    # Fallback (Safety)
-                    pred = law.get('next_prediction')
-                    if isinstance(pred, int) and pred == current_numeric_id:
-                        is_target = True
-                
-                if is_target:
-                     r_type = law['result_type']
-                     r_val = law['result_value']
-                     result_sig = (r_type, target_obj['id'], r_val)
-                     return self._expand_result(result_sig, target_obj), 100
-                else:
-                     return [], 100
-            
-            # --- NEW CASE C: Sequential Direct Law (Value Cycles) ---
-            elif law.get('type') == 'DIRECT_SEQUENCE':
-                r_type = law['result_type']
-                seq = law['sequence']
-                
-                # 1. Determine current value based on the law type
-                current_val = None
-                if r_type == 'RECOLORED': current_val = target_obj['color']
-                elif r_type in ['SHAPE_CHANGED', 'TRANSFORM']: current_val = target_obj['fingerprint']
-                elif r_type in ['GROWTH', 'SHRINK']: current_val = target_obj['pixels'] # Or size, depending on tracking
-                
-                # 2. Find next step in cycle
-                if current_val in seq:
-                    idx = seq.index(current_val)
-                    next_val = seq[(idx + 1) % len(seq)]
-                    
-                    # Construct result signature
-                    result_sig = (r_type, target_obj['id'], next_val)
-                    return self._expand_result(result_sig, target_obj), 100
-                else:
-                    # Current value not in known cycle? Assume cycle break or start of cycle.
-                    # Default to first in sequence or fail. Let's return None (Unknown).
-                    return None, 0
+                # 1. CHARACTER RULE (ID -> Value)
+                if pattern == 'CHARACTER_RULE':
+                     rule_map = law.get('rule_map', {})
+                     current_numeric_id = None
+                     try: current_numeric_id = int(target_obj['id'].split('_')[-1])
+                     except: pass
+                     
+                     if current_numeric_id in rule_map:
+                         val = rule_map[current_numeric_id]
+                         r_type = law['result_type']
+                         result_sig = (r_type, target_obj['id'], val)
+                         return self._expand_result(result_sig, target_obj), 100
+                         
+                # 2. VALUE CYCLE (ID -> Next Value)
+                elif pattern == 'VALUE_CYCLE':
+                     # Check if this law applies to THIS object
+                     law_target = law.get('target_id') # Stored as numeric or string?
+                     # Let's handle both just in case
+                     current_numeric = None
+                     try: current_numeric = int(target_obj['id'].split('_')[-1])
+                     except: pass
+                     
+                     if law_target == current_numeric or law_target == target_obj['id']:
+                         val = law['next_value']
+                         r_type = law['result_type']
+                         result_sig = (r_type, target_obj['id'], val)
+                         return self._expand_result(result_sig, target_obj), 100
 
+                # 3. ID CYCLE (Sequence of Targets)
+                elif pattern == 'ID_CYCLE':
+                    next_targets = law.get('next_target_ids')
+                    current_numeric_id = None
+                    try: current_numeric_id = int(target_obj['id'].split('_')[-1])
+                    except: pass
+                    
+                    if next_targets and current_numeric_id in next_targets:
+                        r_type = law['result_type']
+                        r_val = law.get('result_value')
+                        # Only predict if we have a stable value
+                        if r_val is not None and r_val != "Variable":
+                            result_sig = (r_type, target_obj['id'], r_val)
+                            return self._expand_result(result_sig, target_obj), 100
+                        else:
+                             return [], 100 # We know it's the target, but value is unknown.
+                    else:
+                        return [], 100
+
+            # --- DIRECT SEQUENCES ---
+            elif law.get('type') == 'DIRECT_SEQUENCE':
+                 seq = law['sequence']
+                 r_type = law['result_type']
+                 current_val = None
+                 if r_type == 'RECOLORED': current_val = target_obj['color']
+                 elif r_type in ['SHAPE_CHANGED', 'TRANSFORM']: current_val = target_obj['fingerprint']
+                 elif r_type in ['GROWTH', 'SHRINK']: current_val = target_obj['pixels']
+                 
+                 if current_val in seq:
+                     idx = seq.index(current_val)
+                     next_val = seq[(idx + 1) % len(seq)]
+                     result_sig = (r_type, target_obj['id'], next_val)
+                     return self._expand_result(result_sig, target_obj), 100
+        
         return None, 0
 
     def _expand_result(self, result_sig, target_obj):
@@ -4227,75 +4248,199 @@ class ObmlAgi3Agent(Agent):
     
     def _detect_sequential_global_laws(self, state_sig, actions_data):
         """
-        Detects Perfect Global Cycles.
-        1. Target ID Cycles: {2,4} -> {2,4} (Simultaneous).
+        Detects Global Laws with Object-Centric Rigor.
+        
+        Priority 1: Character Rules (The "How")
+           - "Object 2 always grows by +3. Object 7 always grows by +4."
+           - VETO: Rejected if Action Key perfectly predicts Value (Direct Causality).
+           
+        Priority 2: Independent ID Cycles (The "Who")
+           - "The system targets {Obj 1, Obj 2}, then {Obj 3}."
+           - SIMULTANEITY: Events in same turn are treated as a Set, not a Sequence.
+           - VETO: Rejected if Action Input explains the target switch.
         """
-        # Map: (Type, Val) -> { (Run, Turn): {IDs} }
-        type_val_timeline = {}
+        # Data Structure: Type -> { ID: [History of (Run, Turn, Val, ActionKey)] }
+        object_profiles = {}
+        
+        # Data Structure: Type -> [(Run, Turn, TargetID, ActionKey)]
+        global_timeline = {}
 
         for action_name, results in actions_data.items():
             for r_sig, entry_list in results.items():
                 if r_sig[0] == 'NO_CHANGE': continue
                 
-                # r_sig is (Type, ID, Value)
-                r_type = r_sig[0]
-                r_val = r_sig[2]
+                r_type, r_id, r_val = r_sig
                 
+                # Normalize ID
+                real_num_id = r_id
+                if isinstance(r_id, str) and '_' in r_id:
+                    try: real_num_id = int(r_id.split('_')[-1])
+                    except: pass
+                
+                if r_type not in object_profiles: object_profiles[r_type] = {}
+                if real_num_id not in object_profiles[r_type]: object_profiles[r_type][real_num_id] = []
+                if r_type not in global_timeline: global_timeline[r_type] = []
+
                 for entry in entry_list:
                     # Unpack safely
                     if len(entry) == 3: run, turn, oid = entry
                     else: run, turn, oid = 0, entry[0], entry[1]
                     
-                    numeric_id = oid
-                    if isinstance(oid, str) and '_' in oid:
-                        try: numeric_id = int(oid.split('_')[-1])
-                        except: pass
-                    
-                    # Key by (Type, Value) to find "Who does this happen to?"
-                    tv_key = (r_type, r_val)
-                    
-                    if tv_key not in type_val_timeline: type_val_timeline[tv_key] = {}
-                    if (run, turn) not in type_val_timeline[tv_key]: type_val_timeline[tv_key][(run, turn)] = set()
-                    
-                    type_val_timeline[tv_key][(run, turn)].add(numeric_id)
+                    record = (run, turn, r_val, action_name)
+                    object_profiles[r_type][real_num_id].append(record)
+                    global_timeline[r_type].append((run, turn, real_num_id, action_name))
 
-        # --- Analyze ID Cycles (Simultaneity aware) ---
-        for tv_key, turn_map in type_val_timeline.items():
-            sorted_turns = sorted(turn_map.keys())
+        # --- PHASE 1: Analyze "The How" (Value Logic) ---
+        for r_type, profiles in object_profiles.items():
+            
+            # A. Check for Character-Specific Rules (ID -> Value)
+            consistent_characters = True
+            character_rules_map = {} # ID -> Value
+            
+            # For Veto: Track Action -> Value mapping
+            action_value_map = {}
+            action_is_perfect_predictor = True
+            
+            for obj_id, history in profiles.items():
+                values = [h[2] for h in history]
+                if not values: continue
+                
+                if len(set(values)) == 1:
+                    val = values[0]
+                    character_rules_map[obj_id] = val
+                    
+                    # --- VETO DATA COLLECTION ---
+                    for h in history:
+                        act_key = h[3]
+                        if act_key not in action_value_map:
+                            action_value_map[act_key] = val
+                        elif action_value_map[act_key] != val:
+                            action_is_perfect_predictor = False
+                    # ----------------------------
+                else:
+                    # Check for Value Cycle (e.g. 9 -> 8 -> 9)
+                    history.sort(key=lambda x: (x[0], x[1]))
+                    sorted_vals = [h[2] for h in history]
+                    
+                    found_cycle = None
+                    n = len(sorted_vals)
+                    if n >= 3:
+                        for p in range(2, n // 2 + 1):
+                            matches = True
+                            for i in range(n - p):
+                                if sorted_vals[i] != sorted_vals[i+p]:
+                                    matches = False; break
+                            if matches and len(set(sorted_vals[:p])) > 1:
+                                found_cycle = sorted_vals[:p]
+                                break
+                    
+                    if found_cycle:
+                        current_idx = (n - 1) % len(found_cycle)
+                        next_val = found_cycle[(current_idx + 1) % len(found_cycle)]
+                        seq_str = " -> ".join(map(str, found_cycle))
+                        
+                        self.certified_laws[(state_sig, 'ANY')] = {
+                            'type': 'GLOBAL_SEQUENCE',
+                            'pattern': 'VALUE_CYCLE',
+                            'target_id': obj_id,
+                            'result_type': r_type,
+                            'sequence': found_cycle,
+                            'next_value': next_val,
+                            'next_prediction': f"{next_val} (Cycle: {seq_str})"
+                        }
+                        consistent_characters = False
+                    else:
+                        consistent_characters = False
+            
+            if consistent_characters and len(character_rules_map) >= 2:
+                unique_results = set(character_rules_map.values())
+                if len(unique_results) > 1:
+                    # --- VETO CHECK: Is this just Direct Laws? ---
+                    # If Action Key perfectly predicts Value, we don't need a Character Rule.
+                    # This VETO prevents the redundancy you observed.
+                    if action_is_perfect_predictor:
+                         continue 
+
+                    self.certified_laws[(state_sig, 'ANY')] = {
+                        'type': 'GLOBAL_SEQUENCE',
+                        'pattern': 'CHARACTER_RULE',
+                        'result_type': r_type,
+                        'rule_map': character_rules_map, 
+                        'next_prediction': "Depends on ID" # Placeholder
+                    }
+
+        # --- PHASE 2: Analyze "The Who" (ID Cycles with Simultaneity) ---
+        for r_type, timeline in global_timeline.items():
+            if len(timeline) < 3: continue
+            
+            # 1. Bucket by Turn (The Fix for 2->4 issue)
+            # Group simultaneous events into Sets
+            turn_buckets = {} 
+            for entry in timeline:
+                run, turn, oid, act = entry
+                key = (run, turn)
+                if key not in turn_buckets: turn_buckets[key] = {'ids': set(), 'actions': set()}
+                turn_buckets[key]['ids'].add(oid)
+                turn_buckets[key]['actions'].add(act)
+            
+            sorted_turns = sorted(turn_buckets.keys())
             if len(sorted_turns) < 3: continue
+
+            # 2. Extract Sets
+            id_sets = [frozenset(turn_buckets[t]['ids']) for t in sorted_turns]
+            action_sets = [frozenset(turn_buckets[t]['actions']) for t in sorted_turns]
             
-            # Extract SETS (Frozen for hashing)
-            id_sets = [frozenset(turn_map[t]) for t in sorted_turns]
-            
-            # Detect Cycle
+            # 3. Detect Cycle
             found_cycle = None
             n = len(id_sets)
             for p in range(1, n // 2 + 1):
                 matches = True
                 for i in range(n - p):
                     if id_sets[i] != id_sets[i+p]:
-                        matches = False
-                        break
-                if matches:
+                        matches = False; break
+                # Cycle must actually involve DIFFERENT sets to be interesting
+                if matches and len(set(id_sets[:p])) > 1:
                     found_cycle = id_sets[:p]
                     break
             
             if found_cycle:
+                # --- THE ACTION VETO (Set-Based) ---
+                action_target_map = {}
+                
+                # Check mapping for all history
+                for i in range(n):
+                    act_set = action_sets[i]
+                    tgt_set = id_sets[i]
+                    
+                    if act_set in action_target_map:
+                        if action_target_map[act_set] != tgt_set:
+                            # Same action set -> Different target set.
+                            pass 
+                    else:
+                        action_target_map[act_set] = tgt_set
+                
+                # If unique actions > 1 and map is perfect, it's user-driven (Bad)
+                unique_act_sets = set(action_sets)
+                if len(unique_act_sets) > 1:
+                    is_perfect = True
+                    for i in range(n):
+                         if action_target_map[action_sets[i]] != id_sets[i]:
+                             is_perfect = False; break
+                    if is_perfect: continue
+
+                # Passed Veto
                 current_idx = (n - 1) % len(found_cycle)
                 next_set = found_cycle[(current_idx + 1) % len(found_cycle)]
                 
-                # Format for display
                 next_str = ", ".join(map(str, sorted(list(next_set))))
-                if len(next_set) > 1: next_str = f"{{{next_str}}}"
                 
                 self.certified_laws[(state_sig, 'ANY')] = {
                     'type': 'GLOBAL_SEQUENCE',
                     'pattern': 'ID_CYCLE',
-                    'result_type': tv_key[0],
-                    'result_value': tv_key[1],
+                    'result_type': r_type,
                     'sequence': found_cycle,
-                    'next_target_ids': next_set, # Store the actual set for logic
-                    'next_prediction': next_str  # String for display
+                    'next_target_ids': next_set,
+                    'next_prediction': f"Objs {{{next_str}}}"
                 }
 
     def _detect_direct_sequential_laws(self, state_sig, action_key, results_map):
