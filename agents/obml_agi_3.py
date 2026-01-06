@@ -4364,31 +4364,55 @@ class ObmlAgi3Agent(Agent):
 
     def _verify_and_certify(self, state_sig):
         """
-        Runs the logic: Is this Consistent? Is it Direct or Global?
-        Generates 'Candidate Laws' stored in certified_laws.
-        Note: Classification strictly enforces ID checks before applying these laws.
+        Strict Certification Logic.
+        1. Checks for Perfect Global Cycles first.
+        2. Identifies 'Global Suspects' (events happening in >1 action).
+        3. Blocks Direct Certification for Suspects (keeps them Ambiguous).
         """
         if state_sig not in self.truth_table: return
         
         actions_data = self.truth_table[state_sig]
 
-        # Step 1: Filter for MATURE actions only (At the State Level)
-        # We look for patterns that exist generally, even if specific objects aren't there yet.
-        mature_results = {} 
-        
-        global_ballots = {} 
+        # --- INSERTION: Identify "Global Suspects" (The Veto) ---
+        # If an Abstract Event (Type + ID) occurs in >= 2 different Actions,
+        # we suspect it is Global. We must NOT allow Direct certification for it
+        # until the Global Cycle is mathematically proven.
+        global_suspects = set() 
+        abstract_counts = {} 
+        for action, results in actions_data.items():
+            for r_sig, entry_list in results.items():
+                if r_sig[0] == 'NO_CHANGE': continue
+                abs_sig = (r_sig[0], r_sig[1]) # (Type, ID) - ignoring Value
+                if abs_sig not in abstract_counts: abstract_counts[abs_sig] = set()
+                abstract_counts[abs_sig].add(action)
+
+        for abs_sig, actions in abstract_counts.items():
+            if len(actions) >= 2: 
+                global_suspects.add(abs_sig)
+        # --------------------------------------------------------
+
         mature_direct_candidates = {}
+        global_ballots = {} 
 
         for action, results in actions_data.items():
             
-            # --- NEW: Check for Direct Cycles (e.g. Toggle Switches / Color Cycles) ---
-            self._detect_direct_sequential_laws(state_sig, action, results)
-            # --------------------------------------------------------------------------
+            # --- UPDATED: Direct Cycle Check (WITH VETO AND CONTROL) ---
+            # 1. Suspect Check: Is this event happening in other actions?
+            is_suspect_context = False
+            for r_sig in results:
+                 if (r_sig[0], r_sig[1]) in global_suspects:
+                     is_suspect_context = True
+            
+            # 2. Control Group Check: Have we tried at least one OTHER action?
+            other_actions_tried = [k for k in actions_data.keys() if k != action]
+            has_control_group = len(other_actions_tried) > 0
+
+            # Only run Direct Sequence Detection if we have a control group and it's not a suspect
+            if not is_suspect_context and has_control_group:
+                self._detect_direct_sequential_laws(state_sig, action, results)
+            # -----------------------------------------------------------
 
             # Group by Concrete Sig (Type, ID, Value)
-            # FIX: We now include the ID (index 1) in the signature.
-            # "Recolor Obj 7" and "Recolor Obj 8" are DIFFERENT events and cannot
-            # combine to form a Global Law.
             abstract_groups = {}
             for r_sig, entry_list in results.items():
                 if r_sig[0] == 'NO_CHANGE': continue
@@ -4450,6 +4474,28 @@ class ObmlAgi3Agent(Agent):
             # If we already found a Sequence Law or Global Law, skip static Direct
             if self.certified_laws.get((state_sig, 'ANY')): continue
             if self.certified_laws.get((state_sig, action)): continue
+            
+            # --- NEW: Negative Control & Exclusivity Check ---
+            # Requirement: At least one OTHER action must have been attempted (Control Group).
+            # And that other action must NOT produce the exact same result (Exclusivity).
+            
+            other_actions_tried = [k for k in actions_data.keys() if k != action]
+            if not other_actions_tried:
+                # We haven't tried a control group yet (N=0 for others).
+                # We cannot be scientifically sure this is Direct.
+                continue
+            
+            is_exclusive = True
+            for other_action in other_actions_tried:
+                # If the same result happened with another action (even once, N>=1),
+                # we cannot claim Direct Causality. It is a Global Suspect.
+                if abstract_result in actions_data[other_action]:
+                    is_exclusive = False
+                    break
+            
+            if not is_exclusive:
+                continue
+            # -------------------------------------------------
             
             concrete_sig = None
             raw_results = actions_data[action]
