@@ -217,6 +217,8 @@ class ObmlAgi3Agent(Agent):
         if latest_frame.state == GameState.NOT_PLAYED:
             self._reset_agent_memory()
             self.run_counter += 1 # New Run
+            self.global_action_counter += 1
+            self.last_action_id = self.global_action_counter
             return GameAction.RESET
         
         if latest_frame.state == GameState.GAME_OVER:
@@ -270,6 +272,8 @@ class ObmlAgi3Agent(Agent):
             self._reset_level_state()
             self.forcing_wait = False
             self.run_counter += 1 # New Run
+            self.global_action_counter += 1
+            self.last_action_id = self.global_action_counter
             return GameAction.RESET
 
         # --- 2. Animation Guard: If server says busy, we wait ---
