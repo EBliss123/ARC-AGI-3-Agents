@@ -4011,17 +4011,23 @@ class ObmlAgi3Agent(Agent):
         """
         Constructs the State Signature. Starts with Intrinsic properties.
         If the Splitter has activated for this object type, it appends specific Context features.
+        Supports Modes: BINARY, ID, COLOR.
         """
         # 1. Intrinsic Properties (The Base)
         base_sig = (obj['color'], obj['fingerprint'], obj['size'])
         
         # 2. Check for Refinements (Context)
-        # Does this object type require checking specific attributes?
-        required_context_keys = self.state_refinements.get(base_sig, [])
+        required_context_items = self.state_refinements.get(base_sig, [])
         
         context_features = []
-        for key in required_context_keys:
-            # key format examples: 'adj_top', 'align_center_x', 'match_Color'
+        for item in required_context_items:
+            # Handle legacy string-only keys (default to BINARY) just in case
+            if isinstance(item, str):
+                key = item
+                mode = 'BINARY'
+            else:
+                key, mode = item
+            
             val = None
             
             if key.startswith('adj_'):
@@ -4029,30 +4035,50 @@ class ObmlAgi3Agent(Agent):
                 direction = key.split('_')[1] # top, right, etc.
                 d_idx = {'top':0, 'right':1, 'bottom':2, 'left':3}.get(direction)
                 adj_list = context.get('adj', {}).get(obj['id'], ['na']*4)
+                
+                neighbor_id = 'na'
                 if d_idx is not None:
-                    # We store if a neighbor exists (True) or is empty (False)
-                    # For higher rigor, we could store the neighbor's color, but we start binary.
-                    val = (adj_list[d_idx] != 'na')
+                    neighbor_id = adj_list[d_idx]
+                
+                if mode == 'BINARY':
+                    val = (neighbor_id != 'na')
+                
+                elif mode == 'ID':
+                    val = neighbor_id # Returns 'obj_5' or 'na'
+                
+                elif mode == 'COLOR':
+                    if neighbor_id == 'na':
+                        val = 'na'
+                    else:
+                        # We need to look up the neighbor object to get its color
+                        # This is slightly expensive but necessary for Scientific Rigor
+                        neighbor_obj = next((o for o in context['summary'] if o['id'] == neighbor_id), None)
+                        val = neighbor_obj['color'] if neighbor_obj else 'unknown'
 
             elif key.startswith('align_'):
-                # Alignment check
+                # Alignment check (Usually Binary, but could be ID-based later)
                 align_type = key.replace('align_', '')
                 groups = context.get('align', {}).get(align_type, {})
-                val = False
+                
+                # Check membership
+                is_member = False
                 for coord, ids in groups.items():
                     if obj['id'] in ids:
-                        val = True
+                        is_member = True
                         break
+                val = is_member # Default to Binary for now until Splitter upgrades Alignment
             
             elif key.startswith('match_'):
                 # Match Group check
                 m_type = key.replace('match_', '')
                 groups = context.get('match', {}).get(m_type, {})
-                val = False
+                
+                is_member = False
                 for props, ids in groups.items():
                     if obj['id'] in ids:
-                        val = True
+                        is_member = True
                         break
+                val = is_member
 
             context_features.append((key, val))
 
@@ -4243,14 +4269,12 @@ class ObmlAgi3Agent(Agent):
         Finds constants (ID, Color, Size) for each result and refines the State Signature.
         """
         # 1. Gather Contexts for each Result Type
-        # map: Result_Sig -> List of Contexts (Full snapshots)
         contexts_by_result = {}
         
         for r_sig, locs in conflicting_results.items():
             contexts_by_result[r_sig] = []
             for run, turn in locs:
                 if 0 <= turn < len(self.level_state_history):
-                    # We store the full snapshot + the specific object ID to look at
                     contexts_by_result[r_sig].append({
                         'snapshot': self.level_state_history[turn],
                         'target_id': obj_id
@@ -4258,9 +4282,6 @@ class ObmlAgi3Agent(Agent):
 
         if len(contexts_by_result) < 2: return # Need at least 2 to split
 
-        # 2. Independent Profiling
-        # We look for what is CONSTANT in Result A vs Result B
-        
         # Helper to extract neighbor properties
         def get_neighbor_prop(ctx_entry, direction, prop_type):
             snap = ctx_entry['snapshot']
@@ -4295,8 +4316,6 @@ class ObmlAgi3Agent(Agent):
                 id_profiles[r_sig] = seen
             
             # Is ID consistent for any result?
-            # And does that consistent ID distinguish it from others?
-            # Simplified: If Result A always has Neighbor ID_5, and Result B never does.
             candidate_found = False
             for r_sig, ids in id_profiles.items():
                 if len(ids) == 1: # Constant!
@@ -4340,8 +4359,7 @@ class ObmlAgi3Agent(Agent):
         if best_refinement:
             feature_key, mode = best_refinement
             
-            # We need to find the Base Signature to store this refinement
-            # We take the first available object state as the representative Base Sig
+            # Find the Base Signature
             first_ctx = list(contexts_by_result.values())[0][0]
             t_obj = next((o for o in first_ctx['snapshot']['summary'] if o['id'] == obj_id), None)
             
@@ -4351,14 +4369,10 @@ class ObmlAgi3Agent(Agent):
                 if base_sig not in self.state_refinements:
                     self.state_refinements[base_sig] = []
                 
-                # Store as tuple (Key, Mode) if not present
-                # Note: Existing code in _get_scientific_state expects strings in list
-                # We update it to handle the mode if we change _get_scientific_state
-                # For now, let's just append the key string, and _get_scientific_state 
-                # will default to existence check, but we need to upgrade it later for ID/Color.
-                # To keep it simple per your request:
-                if feature_key not in self.state_refinements[base_sig]:
-                    self.state_refinements[base_sig].append(feature_key)
+                # FIX: Store the FULL TUPLE (Key, Mode)
+                # Check if we already have this refinement
+                if best_refinement not in self.state_refinements[base_sig]:
+                    self.state_refinements[base_sig].append(best_refinement)
                     
             if self.debug_channels['HYPOTHESIS']:
                 print(f"  [Splitter] Refined State for {obj_id}: Added {feature_key} ({mode})")
