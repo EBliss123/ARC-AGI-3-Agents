@@ -492,8 +492,28 @@ class ObmlAgi3Agent(Agent):
                             e['_physics_agitators'] = agitators
                 # -----------------------------------------------------
 
-                # 2. Classify Events (Strict Logic + Exception Solving)
-                # FIX: Pass 'prev_context' so the solver can compare states
+                # [INSERTION POINT] 1.5. Record Raw Data into Scientific Memory
+                # We must record the events BEFORE we classify them, so the classifier
+                # can see the "N=1" count immediately for new phenomena.
+                for event in events:
+                    obj_id = event.get('id')
+                    if obj_id:
+                        # We need the state from the PREVIOUS context (Cause)
+                        # to associate with this Result.
+                        prev_obj = next((o for o in prev_summary if o['id'] == obj_id), None)
+                        
+                        if prev_obj:
+                            # 1. Get Scientific State (Color/Shape/Size + Context)
+                            state_sig = self._get_scientific_state(prev_obj, prev_context)
+                            
+                            # 2. Get Concrete Result (The "What happened")
+                            result_sig = self._get_concrete_signature(event)
+                            
+                            # 3. Log to Truth Table
+                            # learning_key is the Action (e.g., 'ACTION6_obj_5')
+                            self._update_truth_table(state_sig, learning_key, result_sig, obj_id=obj_id)
+
+                # 2. Classify Events (Now reads from the populated Truth Table)
                 direct_events, global_events, ambiguous_events = self._classify_event_stream(events, learning_key, prev_context)
                 
                 # 3. Resolve Ambiguity (The Pipeline)
@@ -512,7 +532,10 @@ class ObmlAgi3Agent(Agent):
                     if 'id' in event and event['id'] in obj_events_map:
                         obj_events_map[event['id']].append(event)
 
-                # 5. Unified Learning Loop (RUN BEFORE PRINTING)
+                # [INSERTION POINT] 5. Run The Scientific Judge
+                # After we have processed all learning, we ask the Judge to review the
+                # updated Truth Table and certify any new laws.
+                self._verify_and_certify()
                 
                 # A. Learn Direct Rules (Action -> Result)
                 for obj in self.last_object_summary:
