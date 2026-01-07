@@ -587,33 +587,12 @@ class ObmlAgi3Agent(Agent):
                             self._print_and_log(f"     * [GLOBAL] {e['type']} on {e.get('id', 'Unknown')}")
 
                             if law and law.get('type') == 'GLOBAL_SEQUENCE':
-                                pattern = law.get('pattern')
-                                
-                                # --- FIX: Display Specific Rule Value ---
-                                if pattern == 'CHARACTER_RULE':
-                                    rule_map = law.get('rule_map', {})
-                                    
-                                    # Extract numeric ID safely
-                                    current_numeric_id = None
-                                    try: 
-                                        if isinstance(obj_id, str) and '_' in obj_id:
-                                            current_numeric_id = int(obj_id.split('_')[-1])
-                                        else:
-                                            current_numeric_id = int(obj_id)
-                                    except: pass
-                                    
-                                    val = rule_map.get(current_numeric_id, 'Unknown')
-                                    
-                                    self._print_and_log(f"       [Explanation] Character Rule: ID {obj_id} consistently behaves as '{val}'.")
-                                    self._print_and_log(f"       [Prediction]  Next: {val}")
-                                    
-                                elif pattern in ['ID_CYCLE', 'VALUE_CYCLE']:
-                                    seq = law.get('sequence', [])
-                                    seq_str = " -> ".join(map(str, seq))
-                                    self._print_and_log(f"       [Explanation] Global {pattern}: Pattern {seq_str}")
-                                    self._print_and_log(f"       [Prediction]  Next: {law.get('next_prediction', 'Unknown')}")
+                                seq_str = " -> ".join(map(str, law['sequence']))
+                                self._print_and_log(f"       [Explanation] Global Cycle: Target ID Pattern {seq_str}")
+                                self._print_and_log(f"       [Prediction]  Next Target ID: {law.get('next_prediction', 'Unknown')}")
                             else:
                                 result_sig = self._get_concrete_signature(e)
+                                # FIX: Use 'learning_key' instead of 'action_key'
                                 rule_str = self._format_rule_description('GLOBAL', learning_key, state_sig, result_sig)
                                 self._print_and_log(f"       [Explanation] Global Rule: Inevitable '{_fmt_val(e)}'.")
                                 self._print_and_log(f"       [Prediction]  IF {rule_str}")
@@ -1883,86 +1862,86 @@ class ObmlAgi3Agent(Agent):
 
     def _predict_outcome(self, hypothesis_key: tuple, current_context: dict) -> tuple[list|None, int]:
         """
-        Scientific Prediction. Handles CHARACTER_RULE and VALUE_CYCLE.
+        Scientific Prediction. Only predicts if a Certified Law exists.
         """
         action_name, target_id = hypothesis_key
-        target_obj = next((o for o in current_context['summary'] if o['id'] == target_id), None)
-        if not target_obj: return None, 0
+        
+        # 1. Identify the Object and its Scientific State
+        target_obj = None
+        if target_id:
+            target_obj = next((o for o in current_context['summary'] if o['id'] == target_id), None)
+        
+        if not target_obj:
+            return None, 0
+        
         state_sig = self._get_scientific_state(target_obj, current_context)
         
+        # 2. Check for Certified Laws
         law = self.certified_laws.get((state_sig, action_name)) # Direct
-        if not law: law = self.certified_laws.get((state_sig, 'ANY'))   # Global
+        if not law:
+            law = self.certified_laws.get((state_sig, 'ANY'))   # Global
 
+        # 3. Return Prediction
         if law:
+            # --- CASE A: Standard Global/Direct Law ---
             if 'result' in law:
-                return self._expand_result(law['result'], target_obj), 100
+                result_sig = law['result']
+                return self._expand_result(result_sig, target_obj), 100
             
-            # --- GLOBAL SEQUENCES ---
+            # --- CASE B: Sequential Global Law ---
             elif law.get('type') == 'GLOBAL_SEQUENCE':
-                pattern = law.get('pattern')
+                # Check if this object is in the predicted set of targets
+                next_targets = law.get('next_target_ids')
                 
-                # 1. CHARACTER RULE (ID -> Value)
-                if pattern == 'CHARACTER_RULE':
-                     rule_map = law.get('rule_map', {})
-                     current_numeric_id = None
-                     try: current_numeric_id = int(target_obj['id'].split('_')[-1])
-                     except: pass
-                     
-                     if current_numeric_id in rule_map:
-                         val = rule_map[current_numeric_id]
-                         r_type = law['result_type']
-                         result_sig = (r_type, target_obj['id'], val)
-                         return self._expand_result(result_sig, target_obj), 100
-                         
-                # 2. VALUE CYCLE (ID -> Next Value)
-                elif pattern == 'VALUE_CYCLE':
-                     # Check if this law applies to THIS object
-                     law_target = law.get('target_id') # Stored as numeric or string?
-                     # Let's handle both just in case
-                     current_numeric = None
-                     try: current_numeric = int(target_obj['id'].split('_')[-1])
-                     except: pass
-                     
-                     if law_target == current_numeric or law_target == target_obj['id']:
-                         val = law['next_value']
-                         r_type = law['result_type']
-                         result_sig = (r_type, target_obj['id'], val)
-                         return self._expand_result(result_sig, target_obj), 100
-
-                # 3. ID CYCLE (Sequence of Targets)
-                elif pattern == 'ID_CYCLE':
-                    next_targets = law.get('next_target_ids')
-                    current_numeric_id = None
-                    try: current_numeric_id = int(target_obj['id'].split('_')[-1])
-                    except: pass
-                    
-                    if next_targets and current_numeric_id in next_targets:
-                        r_type = law['result_type']
-                        r_val = law.get('result_value')
-                        # Only predict if we have a stable value
-                        if r_val is not None and r_val != "Variable":
-                            result_sig = (r_type, target_obj['id'], r_val)
-                            return self._expand_result(result_sig, target_obj), 100
-                        else:
-                             return [], 100 # We know it's the target, but value is unknown.
-                    else:
-                        return [], 100
-
-            # --- DIRECT SEQUENCES ---
-            elif law.get('type') == 'DIRECT_SEQUENCE':
-                 seq = law['sequence']
-                 r_type = law['result_type']
-                 current_val = None
-                 if r_type == 'RECOLORED': current_val = target_obj['color']
-                 elif r_type in ['SHAPE_CHANGED', 'TRANSFORM']: current_val = target_obj['fingerprint']
-                 elif r_type in ['GROWTH', 'SHRINK']: current_val = target_obj['pixels']
-                 
-                 if current_val in seq:
-                     idx = seq.index(current_val)
-                     next_val = seq[(idx + 1) % len(seq)]
-                     result_sig = (r_type, target_obj['id'], next_val)
+                current_numeric_id = None
+                try:
+                    current_numeric_id = int(target_obj['id'].split('_')[-1])
+                except: pass
+                
+                is_target = False
+                
+                if next_targets is not None:
+                    # New Set-based logic
+                    if current_numeric_id in next_targets:
+                        is_target = True
+                else:
+                    # Fallback (Safety)
+                    pred = law.get('next_prediction')
+                    if isinstance(pred, int) and pred == current_numeric_id:
+                        is_target = True
+                
+                if is_target:
+                     r_type = law['result_type']
+                     r_val = law['result_value']
+                     result_sig = (r_type, target_obj['id'], r_val)
                      return self._expand_result(result_sig, target_obj), 100
-        
+                else:
+                     return [], 100
+            
+            # --- NEW CASE C: Sequential Direct Law (Value Cycles) ---
+            elif law.get('type') == 'DIRECT_SEQUENCE':
+                r_type = law['result_type']
+                seq = law['sequence']
+                
+                # 1. Determine current value based on the law type
+                current_val = None
+                if r_type == 'RECOLORED': current_val = target_obj['color']
+                elif r_type in ['SHAPE_CHANGED', 'TRANSFORM']: current_val = target_obj['fingerprint']
+                elif r_type in ['GROWTH', 'SHRINK']: current_val = target_obj['pixels'] # Or size, depending on tracking
+                
+                # 2. Find next step in cycle
+                if current_val in seq:
+                    idx = seq.index(current_val)
+                    next_val = seq[(idx + 1) % len(seq)]
+                    
+                    # Construct result signature
+                    result_sig = (r_type, target_obj['id'], next_val)
+                    return self._expand_result(result_sig, target_obj), 100
+                else:
+                    # Current value not in known cycle? Assume cycle break or start of cycle.
+                    # Default to first in sequence or fail. Let's return None (Unknown).
+                    return None, 0
+
         return None, 0
 
     def _expand_result(self, result_sig, target_obj):
@@ -3216,286 +3195,33 @@ class ObmlAgi3Agent(Agent):
 
     def _classify_event_stream(self, current_events: list[dict], action_key: str, prev_context: dict) -> tuple[list[dict], list[dict], list[dict]]:
         """
-        The Scientific Method Loop (2-Pass Inheritance).
-        Updated with RUN-AWARE Cycle Detection to handle Resets.
+        [PLACEHOLDER] HIGH PRIORITY: THE GATEKEEPER
+        
+        New Logic Requirements:
+        1. Input: Stream of raw events (Result R on Object O).
+        2. Check certified_laws for Object O's State.
+        3. IF Certified GLOBAL: Return as Global.
+        4. IF Certified DIRECT (and matches Action A): Return as Direct.
+        5. ELSE: Force classification as AMBIGUOUS.
+           - Do not guess.
+           - If N=1, Fix = "Repeat Action".
+           - If N>1 but no Negative Control, Fix = "Try Different Action".
         """
-        direct_events = []
-        global_events = []
-        ambiguous_events = []
-
-        prev_obj_map = {o['id']: o for o in prev_context['summary']}
-        processed_ids = set()
-        
-        # Temp storage for Pass 2
-        deferred_physics_events = [] 
-        id_classification_map = {} 
-
-        # --- Step 1: Update Truth Table ---
-        for event in current_events:
-            obj_id = event.get('id')
-            if not obj_id or obj_id not in prev_obj_map: continue
-            
-            processed_ids.add(obj_id)
-            prev_obj = prev_obj_map[obj_id]
-            
-            state_sig = self._get_scientific_state(prev_obj, prev_context)
-            result_sig = self._get_concrete_signature(event)
-            self._update_truth_table(state_sig, action_key, result_sig, obj_id=obj_id)
-
-        # Ingest Negative Data
-        for obj in prev_context['summary']:
-            if obj['id'] not in processed_ids:
-                state_sig = self._get_scientific_state(obj, prev_context)
-                self._update_truth_table(state_sig, action_key, ('NO_CHANGE', None, None), obj_id=obj['id'])
-
-        # Certify Laws
-        affected_states = {self._get_scientific_state(prev_obj_map[id], prev_context) for id in processed_ids}
-        for obj in prev_context['summary']:
-            affected_states.add(self._get_scientific_state(obj, prev_context))
-        for state_sig in affected_states:
-            self._verify_and_certify(state_sig)
-
-        # --- Step 4: Classification ---
-        
-        # PASS 1: Standard Events
-        for event in current_events:
-            if event.get('_physics_note'):
-                deferred_physics_events.append(event)
-                continue
-                
-            classification = 'AMBIGUOUS'
-            obj_id = event.get('id')
-            if not obj_id or obj_id not in prev_obj_map: continue
-
-            prev_obj = prev_obj_map[obj_id]
-            state_sig = self._get_scientific_state(prev_obj, prev_context)
-            current_result_sig = self._get_concrete_signature(event)
-            
-            # --- Analysis: Count Observations ---
-            obj_result_turns = set()
-            obj_any_result_turns = set() 
-            
-            if state_sig in self.truth_table and action_key in self.truth_table[state_sig]:
-                for r_sig, entry_list in self.truth_table[state_sig][action_key].items():
-                    for entry in entry_list:
-                        # Entry can be (turn, oid) [Legacy] or (run, turn, oid) [New]
-                        # Normalize to (run, turn, oid)
-                        if len(entry) == 3:
-                            r_id, t_id, o_id = entry
-                        else:
-                            r_id, t_id, o_id = 0, entry[0], entry[1]
-
-                        if o_id == obj_id:
-                            # Unique ID for counting is now (Run, Turn)
-                            uniq_key = (r_id, t_id)
-                            obj_any_result_turns.add(uniq_key)
-                            if r_sig == current_result_sig:
-                                obj_result_turns.add(uniq_key)
-
-            is_direct_mature = len(obj_result_turns) >= 2
-            
-            direct_rule = self.certified_laws.get((state_sig, action_key))
-            global_rule = self.certified_laws.get((state_sig, 'ANY'))
-            
-            # --- DECISION TREE ---
-            
-            # 1. Check Global Laws
-            if global_rule:
-                if global_rule['type'] == 'GLOBAL_SEQUENCE':
-                    event_abs = self._get_abstract_signature(event)
-                    if global_rule['result_type'] == event_abs[0]:
-                        classification = 'GLOBAL'
-                        global_events.append(event)
-                elif global_rule['type'] == 'GLOBAL':
-                    if is_direct_mature: 
-                        classification = 'GLOBAL'
-                        global_events.append(event)
-                    else:
-                        reason = "Unverified Global Application"
-                        fix = "Test DIFFERENT actions to confirm Global Independence."
-                        detail = f"Matches Global Law, but observed only {len(obj_result_turns)} times on this object."
-                        ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
-                        id_classification_map[obj_id] = 'AMBIGUOUS'
-                        continue
-
-            # 2. Check Direct Laws
-            if classification == 'AMBIGUOUS' and direct_rule:
-                 if direct_rule['type'] == 'DIRECT':
-                     if is_direct_mature:
-                        classification = 'DIRECT'
-                        direct_events.append(event)
-                     else:
-                        reason = "Unverified Direct Law"
-                        fix = "Repeat SAME action to confirm Direct Causality."
-                        detail = f"Matches Direct Law, but observed only {len(obj_result_turns)} times."
-                        ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
-                        id_classification_map[obj_id] = 'AMBIGUOUS'
-                        continue
-                 elif direct_rule['type'] == 'DIRECT_SEQUENCE':
-                     classification = 'DIRECT'
-                     direct_events.append(event)
-
-            # 3. True Ambiguity / Deviation
-            if classification == 'AMBIGUOUS':
-                fix = "Repeat SAME action to test Direct Causality."
-                
-                # Intelligent Status Reporting
-                if len(obj_any_result_turns) > 1:
-                    if len(obj_result_turns) == 1:
-                         reason = "New Outcome Detected"
-                         detail = f"Action repeated {len(obj_any_result_turns)} times. Previous outcomes differed."
-                    else:
-                         # --- PENDING CYCLE CHECK (RUN-AWARE) ---
-                         is_cyclic = False
-                         cycle_vals = []
-                         confidence = ""
-                         
-                         history_entries = []
-                         
-                         # Collect Cross-State History
-                         for s_sig_iter, acts in self.truth_table.items():
-                             if action_key in acts:
-                                 for r_sig_iter, t_list in acts[action_key].items():
-                                     if r_sig_iter[0] == 'NO_CHANGE': continue
-                                     val = r_sig_iter[2]
-                                     for entry in t_list:
-                                         # Normalize Entry
-                                         if len(entry) == 3: r_id, t_id, o_id = entry
-                                         else: r_id, t_id, o_id = 0, entry[0], entry[1]
-
-                                         if o_id == obj_id:
-                                             history_entries.append({'run': r_id, 'turn': t_id, 'val': val})
-                         
-                         # Sort by (Run, Turn)
-                         history_entries.sort(key=lambda x: (x['run'], x['turn']))
-                         
-                         # Check Cycle Consistency (Respecting Resets)
-                         consistent_flips = 0
-                         last_val = None
-                         last_run = None
-                         
-                         for entry in history_entries:
-                             curr_val = entry['val']
-                             curr_run = entry['run']
-                             
-                             if last_val is not None:
-                                 # Only check flip if we are in the SAME run
-                                 if curr_run == last_run:
-                                     if curr_val != last_val:
-                                         consistent_flips += 1
-                                     else:
-                                         # Same value in same run -> Breaks the "Simple Flip" hypothesis
-                                         # (Unless period > 2, but for ambiguity check we look for flips)
-                                         consistent_flips = -999 
-                                 else:
-                                     # Reset detected! We ignore the transition.
-                                     pass
-                             
-                             last_val = curr_val
-                             last_run = curr_run
-
-                         if consistent_flips >= 2: # At least A->B->A
-                             is_cyclic = True
-                             confidence = "Strong"
-                         elif consistent_flips == 1: # A->B
-                             is_cyclic = True
-                             confidence = "Weak"
-                         
-                         if is_cyclic:
-                             reason = f"Potential Cycle Detected ({confidence})"
-                             detail = "Outcomes alternate consistently within runs."
-                         else:
-                             reason = "Conflicting Results"
-                             detail = "Outcomes vary within a single run without a clear pattern."
-                         # ---------------------------
-                else:
-                    # N=1 Logic (Unchanged)
-                    total_history = 0
-                    for s_sig_iter, acts in self.truth_table.items():
-                        if action_key in acts:
-                             for res_map in acts[action_key].values():
-                                 for entry in res_map: # Iterating list of tuples
-                                    # We don't need to parse tuple here, just find obj_id
-                                    o_id = entry[-1] # Obj ID is always last
-                                    if o_id == obj_id: total_history += 1
-                    
-                    if total_history > 1:
-                        reason = "New State Detected"
-                        detail = "First observation for this Object in this specific State."
-                    else:
-                        reason = "Hypothesis Created (N=1)"
-                        detail = "First observation. Causality is unknown."
-
-                if direct_rule or global_rule:
-                     reason = "Deviation from Law"
-                     detail = "Observed event differs from the certified law for this state."
-                     fix = "Analyze context for new Splitter variables."
-
-                ambiguous_events.append({'event': event, 'reason': reason, 'fix': fix, 'detail': detail})
-            
-            if classification != 'AMBIGUOUS':
-                id_classification_map[obj_id] = classification
-
-        # PASS 2: Physics (Unchanged)
-        pending_physics = list(deferred_physics_events)
-        MAX_PHYSICS_PASSES = 3
-        for _ in range(MAX_PHYSICS_PASSES):
-            if not pending_physics: break
-            next_pending = []
-            progress_made = False
-            for event in pending_physics:
-                agitators = event.get('_physics_agitators', [])
-                has_direct_cause = False
-                has_global_cause = False
-                has_ambiguous_cause = False
-                all_unknown = True
-                for ag_id in agitators:
-                    ag_class = id_classification_map.get(ag_id)
-                    if ag_class: all_unknown = False
-                    if ag_class == 'DIRECT': has_direct_cause = True
-                    elif ag_class == 'GLOBAL': has_global_cause = True
-                    elif ag_class == 'AMBIGUOUS': has_ambiguous_cause = True
-                
-                if has_direct_cause:
-                    direct_events.append(event)
-                    id_classification_map[event['id']] = 'DIRECT'
-                    progress_made = True
-                elif has_ambiguous_cause:
-                    next_pending.append(event)
-                elif has_global_cause and not all_unknown:
-                    global_events.append(event)
-                    id_classification_map[event['id']] = 'GLOBAL'
-                    progress_made = True
-                else:
-                    next_pending.append(event)
-            pending_physics = next_pending
-            if not progress_made: break
-        
-        for event in pending_physics:
-            agitators = event.get('_physics_agitators', [])
-            ambiguous_events.append({'event': event, 'reason': "Ambiguous Causality", 'fix': "Confirm movement rules of agitators.", 'detail': f"Change correlated with ambiguous movement of {agitators}."})
-
-        return direct_events, global_events, ambiguous_events
+        # Return empty lists for now to prevent crashes while logic is missing
+        return [], [], []
 
     def _update_truth_table(self, state_sig, action_key, result_sig, obj_id=None):
         """
-        Records an observation in the Truth Table with Run ID + Turn ID.
+        [PLACEHOLDER] HIGH PRIORITY: SCIENTIFIC DATA ENTRY
+        
+        New Logic Requirements:
+        1. Must index strictly by Scientific State -> Action Key -> Result Sig.
+        2. CRITICAL: The entry value must be a tuple of (Run_ID, Turn_ID, Object_ID).
+        3. This enables the 'Subject Consistency' check (did THIS object do it before?).
+        4. Must explicitly BLOCK 'Wait' actions from entering this table (Wait is ignored).
         """
-        if state_sig not in self.truth_table:
-            self.truth_table[state_sig] = {}
-        
-        if action_key not in self.truth_table[state_sig]:
-            self.truth_table[state_sig][action_key] = {}
-            
-        if result_sig not in self.truth_table[state_sig][action_key]:
-            self.truth_table[state_sig][action_key][result_sig] = []
-            
-        # Store (RunID, TurnID, ObjID)
-        # We use getattr/default just in case frame number isn't set yet
-        turn_num = getattr(self, 'last_frame_number', 0)
-        entry = (self.run_counter, turn_num, obj_id)
-        
-        self.truth_table[state_sig][action_key][result_sig].append(entry)
+        # TODO: Implement strict ID-based logging here.
+        pass
 
     def _update_transition_memory(self, start, action, end, trial_id):
         """
@@ -4248,451 +3974,43 @@ class ObmlAgi3Agent(Agent):
     
     def _detect_sequential_global_laws(self, state_sig, actions_data):
         """
-        Detects Global Laws with Object-Centric Rigor.
+        [PLACEHOLDER] ID-BASED GLOBAL CYCLES
         
-        Priority 1: Character Rules (The "How")
-           - "Object 2 always grows by +3. Object 7 always grows by +4."
-           - VETO: Rejected if Action Key perfectly predicts Value (Direct Causality).
-           
-        Priority 2: Independent ID Cycles (The "Who")
-           - "The system targets {Obj 1, Obj 2}, then {Obj 3}."
-           - SIMULTANEITY: Events in same turn are treated as a Set, not a Sequence.
-           - VETO: Rejected if Action Input explains the target switch.
+        New Logic:
+        - Track (Run, Turn) history for specific IDs.
+        - Detect if Object ID X cycles (A -> B -> C) regardless of action.
         """
-        # Data Structure: Type -> { ID: [History of (Run, Turn, Val, ActionKey)] }
-        object_profiles = {}
-        
-        # Data Structure: Type -> [(Run, Turn, TargetID, ActionKey)]
-        global_timeline = {}
-
-        for action_name, results in actions_data.items():
-            for r_sig, entry_list in results.items():
-                if r_sig[0] == 'NO_CHANGE': continue
-                
-                r_type, r_id, r_val = r_sig
-                
-                # Normalize ID
-                real_num_id = r_id
-                if isinstance(r_id, str) and '_' in r_id:
-                    try: real_num_id = int(r_id.split('_')[-1])
-                    except: pass
-                
-                if r_type not in object_profiles: object_profiles[r_type] = {}
-                if real_num_id not in object_profiles[r_type]: object_profiles[r_type][real_num_id] = []
-                if r_type not in global_timeline: global_timeline[r_type] = []
-
-                for entry in entry_list:
-                    # Unpack safely
-                    if len(entry) == 3: run, turn, oid = entry
-                    else: run, turn, oid = 0, entry[0], entry[1]
-                    
-                    record = (run, turn, r_val, action_name)
-                    object_profiles[r_type][real_num_id].append(record)
-                    global_timeline[r_type].append((run, turn, real_num_id, action_name))
-
-        # --- PHASE 1: Analyze "The How" (Value Logic) ---
-        for r_type, profiles in object_profiles.items():
-            
-            # A. Check for Character-Specific Rules (ID -> Value)
-            consistent_characters = True
-            character_rules_map = {} # ID -> Value
-            
-            # For Veto: Track Action -> Value mapping
-            action_value_map = {}
-            action_is_perfect_predictor = True
-            
-            for obj_id, history in profiles.items():
-                values = [h[2] for h in history]
-                if not values: continue
-                
-                if len(set(values)) == 1:
-                    val = values[0]
-                    character_rules_map[obj_id] = val
-                    
-                    # --- VETO DATA COLLECTION ---
-                    for h in history:
-                        act_key = h[3]
-                        if act_key not in action_value_map:
-                            action_value_map[act_key] = val
-                        elif action_value_map[act_key] != val:
-                            action_is_perfect_predictor = False
-                    # ----------------------------
-                else:
-                    # Check for Value Cycle (e.g. 9 -> 8 -> 9)
-                    history.sort(key=lambda x: (x[0], x[1]))
-                    sorted_vals = [h[2] for h in history]
-                    
-                    found_cycle = None
-                    n = len(sorted_vals)
-                    if n >= 3:
-                        for p in range(2, n // 2 + 1):
-                            matches = True
-                            for i in range(n - p):
-                                if sorted_vals[i] != sorted_vals[i+p]:
-                                    matches = False; break
-                            if matches and len(set(sorted_vals[:p])) > 1:
-                                found_cycle = sorted_vals[:p]
-                                break
-                    
-                    if found_cycle:
-                        current_idx = (n - 1) % len(found_cycle)
-                        next_val = found_cycle[(current_idx + 1) % len(found_cycle)]
-                        seq_str = " -> ".join(map(str, found_cycle))
-                        
-                        self.certified_laws[(state_sig, 'ANY')] = {
-                            'type': 'GLOBAL_SEQUENCE',
-                            'pattern': 'VALUE_CYCLE',
-                            'target_id': obj_id,
-                            'result_type': r_type,
-                            'sequence': found_cycle,
-                            'next_value': next_val,
-                            'next_prediction': f"{next_val} (Cycle: {seq_str})"
-                        }
-                        consistent_characters = False
-                    else:
-                        consistent_characters = False
-            
-            if consistent_characters and len(character_rules_map) >= 2:
-                unique_results = set(character_rules_map.values())
-                if len(unique_results) > 1:
-                    # --- VETO CHECK: Is this just Direct Laws? ---
-                    # If Action Key perfectly predicts Value, we don't need a Character Rule.
-                    # This VETO prevents the redundancy you observed.
-                    if action_is_perfect_predictor:
-                         continue 
-
-                    self.certified_laws[(state_sig, 'ANY')] = {
-                        'type': 'GLOBAL_SEQUENCE',
-                        'pattern': 'CHARACTER_RULE',
-                        'result_type': r_type,
-                        'rule_map': character_rules_map, 
-                        'next_prediction': "Depends on ID" # Placeholder
-                    }
-
-        # --- PHASE 2: Analyze "The Who" (ID Cycles with Simultaneity) ---
-        for r_type, timeline in global_timeline.items():
-            if len(timeline) < 3: continue
-            
-            # 1. Bucket by Turn (The Fix for 2->4 issue)
-            # Group simultaneous events into Sets
-            turn_buckets = {} 
-            for entry in timeline:
-                run, turn, oid, act = entry
-                key = (run, turn)
-                if key not in turn_buckets: turn_buckets[key] = {'ids': set(), 'actions': set()}
-                turn_buckets[key]['ids'].add(oid)
-                turn_buckets[key]['actions'].add(act)
-            
-            sorted_turns = sorted(turn_buckets.keys())
-            if len(sorted_turns) < 3: continue
-
-            # 2. Extract Sets
-            id_sets = [frozenset(turn_buckets[t]['ids']) for t in sorted_turns]
-            action_sets = [frozenset(turn_buckets[t]['actions']) for t in sorted_turns]
-            
-            # 3. Detect Cycle
-            found_cycle = None
-            n = len(id_sets)
-            for p in range(1, n // 2 + 1):
-                matches = True
-                for i in range(n - p):
-                    if id_sets[i] != id_sets[i+p]:
-                        matches = False; break
-                # Cycle must actually involve DIFFERENT sets to be interesting
-                if matches and len(set(id_sets[:p])) > 1:
-                    found_cycle = id_sets[:p]
-                    break
-            
-            if found_cycle:
-                # --- THE ACTION VETO (Set-Based) ---
-                action_target_map = {}
-                
-                # Check mapping for all history
-                for i in range(n):
-                    act_set = action_sets[i]
-                    tgt_set = id_sets[i]
-                    
-                    if act_set in action_target_map:
-                        if action_target_map[act_set] != tgt_set:
-                            # Same action set -> Different target set.
-                            pass 
-                    else:
-                        action_target_map[act_set] = tgt_set
-                
-                # If unique actions > 1 and map is perfect, it's user-driven (Bad)
-                unique_act_sets = set(action_sets)
-                if len(unique_act_sets) > 1:
-                    is_perfect = True
-                    for i in range(n):
-                         if action_target_map[action_sets[i]] != id_sets[i]:
-                             is_perfect = False; break
-                    if is_perfect: continue
-
-                # Passed Veto
-                current_idx = (n - 1) % len(found_cycle)
-                next_set = found_cycle[(current_idx + 1) % len(found_cycle)]
-                
-                next_str = ", ".join(map(str, sorted(list(next_set))))
-                
-                self.certified_laws[(state_sig, 'ANY')] = {
-                    'type': 'GLOBAL_SEQUENCE',
-                    'pattern': 'ID_CYCLE',
-                    'result_type': r_type,
-                    'sequence': found_cycle,
-                    'next_target_ids': next_set,
-                    'next_prediction': f"Objs {{{next_str}}}"
-                }
+        pass
 
     def _detect_direct_sequential_laws(self, state_sig, action_key, results_map):
         """
-        Detects if a specific Action causes a property (Value) to cycle 
-        (e.g. Color 9 -> 8 -> 3 -> 9...).
-        Requires observation of at least 2 full cycles.
+        [PLACEHOLDER] ID-BASED DIRECT CYCLES
+        
+        New Logic:
+        - Track (Run, Turn) history for specific IDs.
+        - Detect if Object ID X cycles (A -> B -> C) ONLY when Action A is applied.
         """
-        # 1. Flatten history into a timeline: (run, turn, type, value)
-        timeline = []
-        for r_sig, entry_list in results_map.items():
-            if r_sig[0] == 'NO_CHANGE': continue
-            
-            # r_sig is (Type, ID, Value)
-            r_type = r_sig[0]
-            r_val = r_sig[2]
-            
-            for entry in entry_list:
-                # Handle legacy (turn, id) vs new (run, turn, id)
-                if len(entry) == 3:
-                    run, turn, obj_id = entry
-                else:
-                    run, turn, obj_id = 0, entry[0], entry[1]
-                
-                timeline.append((run, turn, r_type, r_val))
-        
-        if len(timeline) < 3: return 
-        
-        # Sort by RUN then TURN to preserve chronological order across resets
-        timeline.sort(key=lambda x: (x[0], x[1]))
-        
-        # 2. Verify Homogeneity (Must be the same TYPE of change, e.g. all RECOLORED)
-        primary_type = timeline[0][2]
-        if not all(t[2] == primary_type for t in timeline): return
-        
-        # 3. Extract the Sequence of Values
-        # Note: We treat the timeline as continuous for cycle detection, 
-        # even if broken by resets, assuming the law holds globally.
-        values = [t[3] for t in timeline]
-        n = len(values)
-        found_cycle = None
-        
-        # 4. Cycle Detection
-        # Try periods from 2 up to n // 2
-        for p in range(2, n // 2 + 1):
-            matches = True
-            # Check consistency: v[i] must equal v[i+p]
-            for i in range(n - p):
-                if values[i] != values[i+p]:
-                    matches = False
-                    break
-            
-            # Additional Check: The cycle must actually CHANGE values.
-            cycle_candidate = values[:p]
-            if matches and len(set(cycle_candidate)) > 1:
-                found_cycle = cycle_candidate
-                break
-                
-        if found_cycle:
-             self.certified_laws[(state_sig, action_key)] = {
-                'type': 'DIRECT_SEQUENCE',
-                'pattern': 'CYCLE',
-                'sequence': found_cycle,
-                'result_type': primary_type
-            }
+        pass
 
     def _verify_and_certify(self, state_sig):
         """
-        Strict Certification Logic.
-        1. Checks for Perfect Global Cycles first.
-        2. Identifies 'Global Suspects' (events happening in >1 action).
-        3. Blocks Direct Certification for Suspects (keeps them Ambiguous).
+        [PLACEHOLDER] HIGH PRIORITY: THE SCIENTIFIC FORK
+        
+        New Logic Requirements:
+        1. Iterate through every Action A in the truth table for this State.
+        2. PHASE 1 (Consistency):
+           - Check history of specific Object IDs. 
+           - Is N >= 2 for (Action A + Object ID)?
+           - If Mixed Results for same ID -> Trigger Splitter.
+           
+        3. PHASE 2 (Distinction / Negative Control):
+           - Look for ANY different Action B performed on the SAME Object ID.
+           - PATH 1 (Global): Action B -> Same Result. Certify GLOBAL.
+           - PATH 2 (Direct): Action B -> Diff Result (or None). Certify DIRECT.
+           - PATH 3 (Ambiguous): No Action B found. Remain AMBIGUOUS.
         """
-        if state_sig not in self.truth_table: return
-        
-        actions_data = self.truth_table[state_sig]
-
-        # --- INSERTION: Identify "Global Suspects" (The Veto) ---
-        # If an Abstract Event (Type + ID) occurs in >= 2 different Actions,
-        # we suspect it is Global. We must NOT allow Direct certification for it
-        # until the Global Cycle is mathematically proven.
-        global_suspects = set() 
-        abstract_counts = {} 
-        for action, results in actions_data.items():
-            for r_sig, entry_list in results.items():
-                if r_sig[0] == 'NO_CHANGE': continue
-                abs_sig = (r_sig[0], r_sig[1]) # (Type, ID) - ignoring Value
-                if abs_sig not in abstract_counts: abstract_counts[abs_sig] = set()
-                abstract_counts[abs_sig].add(action)
-
-        for abs_sig, actions in abstract_counts.items():
-            if len(actions) >= 2: 
-                global_suspects.add(abs_sig)
-        # --------------------------------------------------------
-
-        mature_direct_candidates = {}
-        global_ballots = {} 
-
-        for action, results in actions_data.items():
-            
-            # --- UPDATED: Direct Cycle Check (WITH VETO AND CONTROL) ---
-            # 1. Suspect Check: Is this event happening in other actions?
-            is_suspect_context = False
-            for r_sig in results:
-                 if (r_sig[0], r_sig[1]) in global_suspects:
-                     is_suspect_context = True
-            
-            # 2. Control Group Check: Have we tried at least one OTHER action?
-            other_actions_tried = [k for k in actions_data.keys() if k != action]
-            has_control_group = len(other_actions_tried) > 0
-
-            # Only run Direct Sequence Detection if we have a control group and it's not a suspect
-            if not is_suspect_context and has_control_group:
-                self._detect_direct_sequential_laws(state_sig, action, results)
-            # -----------------------------------------------------------
-
-            # Group by Concrete Sig (Type, ID, Value)
-            abstract_groups = {}
-            for r_sig, entry_list in results.items():
-                if r_sig[0] == 'NO_CHANGE': continue
-                
-                # OLD: abs_sig = (r_sig[0], r_sig[2]) 
-                # NEW: Full signature including ID
-                abs_sig = r_sig 
-                
-                if abs_sig not in abstract_groups:
-                    abstract_groups[abs_sig] = set()
-                turns = set()
-                for entry in entry_list:
-                    if len(entry) == 3: turns.add((entry[0], entry[1])) # (run, turn)
-                    else: turns.add((0, entry[0])) # Legacy fallback
-                abstract_groups[abs_sig].update(turns)
-
-            if len(abstract_groups) > 1:
-                # If we detected a cycle earlier, don't treat this as a Splitter anomaly!
-                # Direct Sequence laws supersede static consistency checks.
-                if (state_sig, action) not in self.certified_laws:
-                    self._trigger_splitter(state_sig, action, results)
-                continue 
-
-            if abstract_groups:
-                single_abs_sig = list(abstract_groups.keys())[0]
-                change_turn_ids = abstract_groups[single_abs_sig]
-                
-                no_change_turn_ids = set()
-                if ('NO_CHANGE', None, None) in results:
-                     for entry in results[('NO_CHANGE', None, None)]:
-                        if len(entry) == 3: no_change_turn_ids.add((entry[0], entry[1]))
-                        else: no_change_turn_ids.add((0, entry[0]))
-                
-                historical_failure = no_change_turn_ids - change_turn_ids
-                if historical_failure:
-                    # Similarly, ignore splitter trigger if cycle exists
-                    if (state_sig, action) not in self.certified_laws:
-                        self._trigger_splitter(state_sig, action, results)
-                    continue
-
-                if single_abs_sig not in global_ballots:
-                    global_ballots[single_abs_sig] = set()
-                global_ballots[single_abs_sig].add(action)
-
-                if len(change_turn_ids) >= 2:
-                    mature_direct_candidates[action] = single_abs_sig
-
-        # --- Step 2: Global Certification (Local Coalition) ---
-        # "Different ACTIONS, same State -> Global Candidate"
-        for abs_result, agreeing_actions in global_ballots.items():
-            if len(agreeing_actions) >= 2:
-                self.certified_laws[(state_sig, 'ANY')] = {'type': 'GLOBAL', 'result': abs_result}
-
-        # Step 2.5: Detect Round-Robin / Cycle Patterns
-        self._detect_sequential_global_laws(state_sig, actions_data)
-
-        # --- Step 3: Direct Certification ---
-        for action, abstract_result in mature_direct_candidates.items():
-            # If we already found a Sequence Law or Global Law, skip static Direct
-            if self.certified_laws.get((state_sig, 'ANY')): continue
-            if self.certified_laws.get((state_sig, action)): continue
-            
-            # --- NEW: Negative Control & Exclusivity Check ---
-            # Requirement: At least one OTHER action must have been attempted (Control Group).
-            # And that other action must NOT produce the exact same result (Exclusivity).
-            
-            other_actions_tried = [k for k in actions_data.keys() if k != action]
-            if not other_actions_tried:
-                # We haven't tried a control group yet (N=0 for others).
-                # We cannot be scientifically sure this is Direct.
-                continue
-            
-            is_exclusive = True
-            for other_action in other_actions_tried:
-                # If the same result happened with another action (even once, N>=1),
-                # we cannot claim Direct Causality. It is a Global Suspect.
-                if abstract_result in actions_data[other_action]:
-                    is_exclusive = False
-                    break
-            
-            if not is_exclusive:
-                continue
-            # -------------------------------------------------
-            
-            concrete_sig = None
-            raw_results = actions_data[action]
-            for r_sig in raw_results:
-                if r_sig[0] == 'NO_CHANGE': continue
-                
-                # FIX: abstract_result is now the full tuple (Type, ID, Value)
-                # so we compare directly instead of constructing a subset tuple.
-                if r_sig == abstract_result:
-                    concrete_sig = r_sig
-                    break
-            
-            if concrete_sig:
-                self.certified_laws[(state_sig, action)] = {'type': 'DIRECT', 'result': concrete_sig}
-
-        # --- Step 4: Universal Law Generalization ---
-        # "Different STATES, same Result -> Universal Global"
-        
-        candidate_result = None
-        if (state_sig, 'ANY') in self.certified_laws:
-            # FIX: Check if 'result' exists (Sequence laws use different keys)
-            law = self.certified_laws[(state_sig, 'ANY')]
-            if 'result' in law:
-                candidate_result = law['result']
-        elif mature_direct_candidates:
-             candidate_result = list(mature_direct_candidates.values())[0]
-             
-        if candidate_result:
-            supporting_states = 0
-            for other_sig in self.truth_table:
-                if other_sig == state_sig: continue
-                other_actions = self.truth_table[other_sig]
-                found_match = False
-                for act, res_dict in other_actions.items():
-                    # Skip if this action has a sequence law
-                    if (other_sig, act) in self.certified_laws and self.certified_laws[(other_sig, act)].get('type') == 'DIRECT_SEQUENCE':
-                        continue
-
-                    for r_sig in res_dict:
-                        if r_sig[0] == 'NO_CHANGE': continue
-                        
-                        # FIX: Compare full tuple here as well
-                        if r_sig == candidate_result:
-                            found_match = True
-                            break
-                    if found_match: break
-                
-                if found_match:
-                    supporting_states += 1
-            
-            if supporting_states >= 2:
-                self.certified_laws[(state_sig, 'ANY')] = {'type': 'GLOBAL', 'result': candidate_result}
+        # TODO: Implement the Fork logic.
+        pass
 
     def _get_feature_status(self, contexts: list[dict], base_sig: tuple, feature_type: str, sub_key: str) -> str:
         """
@@ -4744,121 +4062,17 @@ class ObmlAgi3Agent(Agent):
 
     def _trigger_splitter(self, state_sig, action, conflicting_results: dict):
         """
-        The Scientific Splitter.
-        Refines the State definition only when two DIFFERENT, REPEATABLE outcomes
-        can be perfectly separated by a context feature.
+        [PLACEHOLDER] HIGH PRIORITY: INDIVIDUAL ANOMALY DETECTOR
         
-        Logic:
-        1. Anomaly Filter: Ignore conflicting results until they are Mature (N >= 2).
-        2. Hypothesis Search: Find a feature that is 'ALL' in Outcome A and 'NONE' in Outcome B.
-        3. Splitting: Only split if a perfect separator is found.
+        New Logic Requirements:
+        1. Trigger ONLY when a specific Object ID has N >= 2 conflicting results.
+           - Example: Obj_5 Clicked -> Red (Run 1), Obj_5 Clicked -> Blue (Run 2).
+        2. Scan Context (Neighbors, Alignments) for the variables present in Run 1 vs Run 2.
+        3. Find the variable that is 100% correlated with the difference.
+        4. Refine State Signature.
         """
-        base_sig = state_sig[0] # (Color, Fingerprint, Size)
-        
-        # --- 1. MATURITY CHECK (The "Anomaly" Filter) ---
-        # We only attempt to split if we have at least 2 distinct observations 
-        # for at least 2 different outcomes.
-        # This prevents splitting logic based on a single fluke (N=1).
-        
-        valid_result_keys = []
-        
-        for res_sig, entry_list in conflicting_results.items():
-            # Count unique turns for this result (Handling Run ID)
-            unique_turns = set()
-            for entry in entry_list:
-                if len(entry) == 3: unique_turns.add((entry[0], entry[1])) # (Run, Turn)
-                else: unique_turns.add((0, entry[0]))
-            
-            if len(unique_turns) >= 2:
-                valid_result_keys.append(res_sig)
-        
-        # If we don't have at least 2 mature outcomes, we are not ready to do science.
-        # We just wait. The anomaly stays in the truth table as "noise" for now.
-        if len(valid_result_keys) < 2:
-            return
-
-        # Gather contexts only for the valid (mature) results
-        contexts_by_result = {}
-        for res in valid_result_keys: 
-            entry_list = conflicting_results[res]
-            contexts = []
-            for entry in entry_list:
-                # Unpack safely
-                if len(entry) == 3: run, tid, oid = entry
-                else: run, tid, oid = 0, entry[0], entry[1]
-
-                # Note: We only look up history if it matches the current run context
-                # (Assuming level_state_history is reset per run)
-                if 0 <= tid - 1 < len(self.level_state_history):
-                    contexts.append(self.level_state_history[tid-1])
-            contexts_by_result[res] = contexts
-
-        # Select the first two mature outcomes to compare (Outcome A vs Outcome B)
-        # (In complex cases with 3+ outcomes, solving the first pair usually helps resolve the rest iteratively)
-        res_A = valid_result_keys[0]
-        res_B = valid_result_keys[1]
-        
-        ctx_group_A = contexts_by_result[res_A]
-        ctx_group_B = contexts_by_result[res_B]
-        
-        candidate_split_key = None
-        
-        # --- 2. HYPOTHESIS SEARCH (The Separator) ---
-        # We look for a feature that is 100% Present in A and 0% in B (or vice versa).
-        # We do NOT accept "Mixed" results.
-        
-        # A. Check Adjacencies
-        dirs = ['top', 'right', 'bottom', 'left']
-        for d in dirs:
-            status_A = self._get_feature_status(ctx_group_A, base_sig, 'adj', d)
-            status_B = self._get_feature_status(ctx_group_B, base_sig, 'adj', d)
-            
-            # Valid Split: ALL vs NONE
-            if (status_A == 'ALL' and status_B == 'NONE') or \
-               (status_A == 'NONE' and status_B == 'ALL'):
-                candidate_split_key = f"adj_{d}"
-                break
-        
-        # B. Check Alignments
-        if not candidate_split_key:
-            align_types = ['center_x', 'center_y', 'top_y', 'left_x']
-            for a_t in align_types:
-                status_A = self._get_feature_status(ctx_group_A, base_sig, 'align', a_t)
-                status_B = self._get_feature_status(ctx_group_B, base_sig, 'align', a_t)
-                
-                if (status_A == 'ALL' and status_B == 'NONE') or \
-                   (status_A == 'NONE' and status_B == 'ALL'):
-                    candidate_split_key = f"align_{a_t}"
-                    break
-
-        # C. Check Match Groups
-        if not candidate_split_key:
-             match_types = ['Exact', 'Color', 'Shape', 'Size']
-             for m_t in match_types:
-                status_A = self._get_feature_status(ctx_group_A, base_sig, 'match', m_t)
-                status_B = self._get_feature_status(ctx_group_B, base_sig, 'match', m_t)
-                
-                if (status_A == 'ALL' and status_B == 'NONE') or \
-                   (status_A == 'NONE' and status_B == 'ALL'):
-                    candidate_split_key = f"match_{m_t}"
-                    break
-
-        # --- 3. APPLY SPLIT ---
-        if candidate_split_key:
-            if base_sig not in self.state_refinements:
-                self.state_refinements[base_sig] = []
-            
-            # Avoid duplicate splits
-            if candidate_split_key not in self.state_refinements[base_sig]:
-                if self.debug_channels['STATE_GRAPH']:
-                    print(f"  [Scientific Splitter] Refined State {base_sig} using '{candidate_split_key}' to separate conflicting outcomes.")
-                
-                self.state_refinements[base_sig].append(candidate_split_key)
-                
-                # RESET Truth Table for this State Signature
-                # This forces the agent to re-sort all history into the new, specific buckets
-                # (State + Feature) vs (State + No Feature).
-                del self.truth_table[state_sig]
+        # TODO: Implement individual-based context splitting.
+        pass
 
     def _check_feature_presence(self, contexts, base_sig, feature_type, sub_key):
         """
