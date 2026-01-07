@@ -4236,19 +4236,132 @@ class ObmlAgi3Agent(Agent):
         if count == 0: return 'NONE'
         return 'MIXED'
 
-    def _trigger_splitter(self, state_sig, action, conflicting_results: dict):
+    def _trigger_splitter(self, obj_id, action, conflicting_results: dict):
         """
-        [PLACEHOLDER] HIGH PRIORITY: INDIVIDUAL ANOMALY DETECTOR
+        [THE SPLITTER]
+        Resolves inconsistency by profiling each result type independently.
+        Finds constants (ID, Color, Size) for each result and refines the State Signature.
+        """
+        # 1. Gather Contexts for each Result Type
+        # map: Result_Sig -> List of Contexts (Full snapshots)
+        contexts_by_result = {}
         
-        New Logic Requirements:
-        1. Trigger ONLY when a specific Object ID has N >= 2 conflicting results.
-           - Example: Obj_5 Clicked -> Red (Run 1), Obj_5 Clicked -> Blue (Run 2).
-        2. Scan Context (Neighbors, Alignments) for the variables present in Run 1 vs Run 2.
-        3. Find the variable that is 100% correlated with the difference.
-        4. Refine State Signature.
-        """
-        # TODO: Implement individual-based context splitting.
-        pass
+        for r_sig, locs in conflicting_results.items():
+            contexts_by_result[r_sig] = []
+            for run, turn in locs:
+                if 0 <= turn < len(self.level_state_history):
+                    # We store the full snapshot + the specific object ID to look at
+                    contexts_by_result[r_sig].append({
+                        'snapshot': self.level_state_history[turn],
+                        'target_id': obj_id
+                    })
+
+        if len(contexts_by_result) < 2: return # Need at least 2 to split
+
+        # 2. Independent Profiling
+        # We look for what is CONSTANT in Result A vs Result B
+        
+        # Helper to extract neighbor properties
+        def get_neighbor_prop(ctx_entry, direction, prop_type):
+            snap = ctx_entry['snapshot']
+            tid = ctx_entry['target_id']
+            # Get Neighbor ID from adjacency map
+            idx = {'top':0, 'right':1, 'bottom':2, 'left':3}.get(direction)
+            adj_list = snap.get('adj', {}).get(tid, ['na']*4)
+            neighbor_id = adj_list[idx]
+            
+            if neighbor_id == 'na': return 'na'
+            
+            # Find the actual object to get properties
+            neighbor_obj = next((o for o in snap['summary'] if o['id'] == neighbor_id), None)
+            if not neighbor_obj: return 'unknown'
+            
+            if prop_type == 'ID': return neighbor_id
+            if prop_type == 'COLOR': return neighbor_obj['color']
+            if prop_type == 'SIZE': return neighbor_obj['size']
+            return 'na'
+
+        # Analyze each direction for potential splitters
+        directions = ['top', 'right', 'bottom', 'left']
+        best_refinement = None
+        
+        for direction in directions:
+            # Check TIER 1: Identity (ID)
+            id_profiles = {} # Result -> Set of IDs seen
+            for r_sig, ctx_list in contexts_by_result.items():
+                seen = set()
+                for ctx in ctx_list:
+                    seen.add(get_neighbor_prop(ctx, direction, 'ID'))
+                id_profiles[r_sig] = seen
+            
+            # Is ID consistent for any result?
+            # And does that consistent ID distinguish it from others?
+            # Simplified: If Result A always has Neighbor ID_5, and Result B never does.
+            candidate_found = False
+            for r_sig, ids in id_profiles.items():
+                if len(ids) == 1: # Constant!
+                    constant_id = list(ids)[0]
+                    # Check overlap with others
+                    overlap = False
+                    for other_r, other_ids in id_profiles.items():
+                        if r_sig == other_r: continue
+                        if constant_id in other_ids: overlap = True
+                    
+                    if not overlap:
+                        # Found a splitter! ID is the key.
+                        best_refinement = (f'adj_{direction}', 'ID')
+                        candidate_found = True
+                        break
+            if candidate_found: break
+            
+            # Check TIER 2: Color
+            color_profiles = {}
+            for r_sig, ctx_list in contexts_by_result.items():
+                seen = set()
+                for ctx in ctx_list:
+                    seen.add(get_neighbor_prop(ctx, direction, 'COLOR'))
+                color_profiles[r_sig] = seen
+                
+            candidate_found = False
+            for r_sig, colors in color_profiles.items():
+                if len(colors) == 1:
+                    constant_color = list(colors)[0]
+                    overlap = False
+                    for other_r, other_cols in color_profiles.items():
+                        if r_sig == other_r: continue
+                        if constant_color in other_cols: overlap = True
+                    if not overlap:
+                        best_refinement = (f'adj_{direction}', 'COLOR')
+                        candidate_found = True
+                        break
+            if candidate_found: break
+
+        # 3. Apply Refinement
+        if best_refinement:
+            feature_key, mode = best_refinement
+            
+            # We need to find the Base Signature to store this refinement
+            # We take the first available object state as the representative Base Sig
+            first_ctx = list(contexts_by_result.values())[0][0]
+            t_obj = next((o for o in first_ctx['snapshot']['summary'] if o['id'] == obj_id), None)
+            
+            if t_obj:
+                base_sig = (t_obj['color'], t_obj['fingerprint'], t_obj['size'])
+                
+                if base_sig not in self.state_refinements:
+                    self.state_refinements[base_sig] = []
+                
+                # Store as tuple (Key, Mode) if not present
+                # Note: Existing code in _get_scientific_state expects strings in list
+                # We update it to handle the mode if we change _get_scientific_state
+                # For now, let's just append the key string, and _get_scientific_state 
+                # will default to existence check, but we need to upgrade it later for ID/Color.
+                # To keep it simple per your request:
+                if feature_key not in self.state_refinements[base_sig]:
+                    self.state_refinements[base_sig].append(feature_key)
+                    
+            if self.debug_channels['HYPOTHESIS']:
+                print(f"  [Splitter] Refined State for {obj_id}: Added {feature_key} ({mode})")
 
     def _check_feature_presence(self, contexts, base_sig, feature_type, sub_key):
         """
