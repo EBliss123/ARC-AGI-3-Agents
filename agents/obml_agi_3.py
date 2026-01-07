@@ -3195,20 +3195,87 @@ class ObmlAgi3Agent(Agent):
 
     def _classify_event_stream(self, current_events: list[dict], action_key: str, prev_context: dict) -> tuple[list[dict], list[dict], list[dict]]:
         """
-        [PLACEHOLDER] HIGH PRIORITY: THE GATEKEEPER
-        
-        New Logic Requirements:
-        1. Input: Stream of raw events (Result R on Object O).
-        2. Check certified_laws for Object O's State.
-        3. IF Certified GLOBAL: Return as Global.
-        4. IF Certified DIRECT (and matches Action A): Return as Direct.
-        5. ELSE: Force classification as AMBIGUOUS.
-           - Do not guess.
-           - If N=1, Fix = "Repeat Action".
-           - If N>1 but no Negative Control, Fix = "Try Different Action".
+        [THE GATEKEEPER]
+        Sorts raw events into DIRECT, GLOBAL, or AMBIGUOUS based strictly on Certified Laws.
+        Diagnoses Ambiguous events to give the Profiler a 'Fix' (Next Step).
         """
-        # Return empty lists for now to prevent crashes while logic is missing
-        return [], [], []
+        direct_events = []
+        global_events = []
+        ambiguous_events = []
+
+        for event in current_events:
+            obj_id = event.get('id')
+            
+            # 1. Valid ID Check
+            # If we don't know WHO it happened to, we can't classify it scientifically.
+            if not obj_id:
+                ambiguous_events.append({
+                    'event': event,
+                    'reason': "No Object ID",
+                    'fix': "IGNORE",
+                    'detail': "Event has no target ID."
+                })
+                continue
+
+            # 2. Construct the Signature
+            # We need to look up exactly what happened in the Law Book.
+            result_sig = self._get_concrete_signature(event)
+            
+            # 3. Check the Law Book (Certified Laws)
+            # We check specific laws for THIS object ID.
+            laws = self.certified_laws.get(obj_id, {})
+            
+            # A. Check for GLOBAL Law (Action-Independent)
+            # Key 'ANY' stores global laws.
+            global_law = laws.get('ANY')
+            if global_law and global_law['result'] == result_sig:
+                global_events.append(event)
+                continue
+            
+            # B. Check for DIRECT Law (Action-Specific)
+            # Key is the specific action we just took.
+            direct_law = laws.get(action_key)
+            if direct_law and direct_law['result'] == result_sig:
+                direct_events.append(event)
+                continue
+                
+            # 4. If we are here, it is AMBIGUOUS (Unproven).
+            # We must diagnose WHY to tell the Profiler what to do.
+            
+            diagnosis = "Unknown"
+            fix = "EXPLORE"
+            detail = ""
+            
+            # Look up the raw data in the Truth Table
+            if obj_id in self.truth_table and action_key in self.truth_table[obj_id]:
+                history = self.truth_table[obj_id][action_key].get(result_sig, [])
+                n_count = len(history)
+                
+                if n_count <= 1:
+                    # Case 1: Unverified Hypothesis
+                    diagnosis = "Unverified (N=1)"
+                    fix = "REPEAT_ACTION"
+                    detail = "Need N >= 2 to prove consistency."
+                else:
+                    # Case 2: Lack of Distinction
+                    # We have N >= 2 (Consistent), but it wasn't in Certified Laws.
+                    # This implies we failed the Negative Control check (Phase 2).
+                    diagnosis = "Lack of Distinction"
+                    fix = "TRY_DIFFERENT_ACTION"
+                    detail = "Proven consistent, but need Negative Control (different action) to prove Directness."
+            else:
+                # Case 3: First sighting (should match N=1 logic usually, but safety catch)
+                diagnosis = "New Phenomenon"
+                fix = "REPEAT_ACTION"
+            
+            ambiguous_events.append({
+                'event': event,
+                'reason': diagnosis,
+                'fix': fix,
+                'detail': detail
+            })
+
+        return direct_events, global_events, ambiguous_events
 
     def _update_truth_table(self, state_sig, action_key, result_sig, obj_id=None):
         """
