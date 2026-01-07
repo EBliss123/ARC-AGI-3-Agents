@@ -327,3 +327,68 @@ class TestObmlAgi3NewBehaviors:
         ctxB = {"diag_align": {"tl_br": [{"obj_1", "obj_2"}, {"obj_5", "obj_6"}]}}
         inter = agent._intersect_contexts(ctxA, ctxB)
         assert inter["diag_align"]["tl_br"] == [{"obj_1", "obj_2"}]
+
+
+@pytest.mark.unit
+class TestObmlAgi3StabilityAndParsing:
+    def _stub_minimal(self, agent, objects):
+        agent._perceive_objects = lambda latest_frame: objects
+        agent._analyze_relationships = lambda summary: ({}, {}, {}, {}, {}, {}, {})
+        agent._log_changes = lambda prev_summary, curr_summary: ([], curr_summary)
+
+    def test_returns_none_when_no_available_actions(self):
+        agent = make_agent()
+        frame = make_frame(state=GameState.NOT_FINISHED, actions=[])
+        # Early guard: if no available actions, agent should wait
+        assert agent.choose_action([frame], frame) is None
+
+    def test_forcing_wait_after_action_causes_single_wait(self):
+        agent = make_agent()
+        frame = make_frame(state=GameState.NOT_FINISHED, actions=[GameAction.ACTION6, GameAction.ACTION1])
+        # Provide a constant pixel grid to satisfy stability logic
+        frame.frame = [[[0, 0], [0, 0]]]
+        objects = [{"position": (0, 0), "id": "obj_1", "color": 1, "size": (1, 1), "fingerprint": 1, "pixels": 1, "pixel_coords": frozenset()}]
+        self._stub_minimal(agent, objects)
+
+        # First call: baseline stability -> wait
+        assert agent.choose_action([frame], frame) is None
+        # Second call: stable -> act and set forcing_wait
+        action = agent.choose_action([frame], frame)
+        assert isinstance(action, GameAction)
+        # Third call: forcing_wait triggers a single wait and resets
+        assert agent.choose_action([frame], frame) is None
+        # Fourth call: stable again -> can act again
+        action2 = agent.choose_action([frame], frame)
+        assert isinstance(action2, GameAction)
+
+    def test_performed_action_types_tracks_turn_and_counters_increment(self):
+        agent = make_agent()
+        frame = make_frame(state=GameState.NOT_FINISHED, actions=[GameAction.ACTION6, GameAction.ACTION1])
+        frame.frame = [[[1]]]
+        objects = [{"position": (0, 0), "id": "obj_1", "color": 2, "size": (1, 1), "fingerprint": 9, "pixels": 1, "pixel_coords": frozenset()}]
+        self._stub_minimal(agent, objects)
+
+        # Prime stability then act
+        assert agent.choose_action([frame], frame) is None
+        action = agent.choose_action([frame], frame)
+        assert isinstance(action, GameAction)
+
+        # Should track last_action_context with the turn recorded before post-increment
+        assert agent.last_action_context in agent.performed_action_types
+        stored_turn = agent.performed_action_types[agent.last_action_context]
+        assert isinstance(stored_turn, int)
+        assert stored_turn == agent.global_action_counter - 1
+        assert agent.last_action_id == agent.global_action_counter
+
+    def test_get_abstract_signature_new_ignores_position(self):
+        agent = make_agent()
+        e = {"type": "NEW", "color": 7, "size": (2, 2), "position": (5, 5)}
+        assert agent._get_abstract_signature(e) == ("NEW", (7, (2, 2)))
+
+    def test_parse_change_logs_recolored_with_trailing_position(self):
+        agent = make_agent()
+        logs = ["- RECOLORED: Object id_1 color from 15 to 3, now at (0, 0)."]
+        events = agent._parse_change_logs_to_events(logs)
+        assert len(events) == 1
+        assert events[0]["type"] == "RECOLORED"
+        assert events[0]["to_color"] == 3
