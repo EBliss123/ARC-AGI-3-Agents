@@ -4012,25 +4012,114 @@ class ObmlAgi3Agent(Agent):
         """
         pass
 
-    def _verify_and_certify(self, state_sig):
+    def _verify_and_certify(self, state_sig=None):
         """
-        [PLACEHOLDER] HIGH PRIORITY: THE SCIENTIFIC FORK
+        [SCIENTIFIC METHOD: ID-BASED VERIFICATION]
+        Iterates through the Truth Table (organized by Object ID).
+        Certifies laws ONLY if they pass:
+        1. Consistency (Run vs Run)
+        2. Distinction (Action vs Action)
+        """
+        # We ignore the passed state_sig because we iterate ALL objects in the table.
+        # This ensures we catch updates for any ID that had activity.
         
-        New Logic Requirements:
-        1. Iterate through every Action A in the truth table for this State.
-        2. PHASE 1 (Consistency):
-           - Check history of specific Object IDs. 
-           - Is N >= 2 for (Action A + Object ID)?
-           - If Mixed Results for same ID -> Trigger Splitter.
-           
-        3. PHASE 2 (Distinction / Negative Control):
-           - Look for ANY different Action B performed on the SAME Object ID.
-           - PATH 1 (Global): Action B -> Same Result. Certify GLOBAL.
-           - PATH 2 (Direct): Action B -> Diff Result (or None). Certify DIRECT.
-           - PATH 3 (Ambiguous): No Action B found. Remain AMBIGUOUS.
-        """
-        # TODO: Implement the Fork logic.
-        pass
+        for obj_id, actions_data in self.truth_table.items():
+            
+            # --- PRE-ANALYSIS: Gather all consistent results for this object ---
+            # Map: Action_Key -> Result_Sig (if consistent)
+            consistent_results = {}
+            
+            for action_key, results_map in actions_data.items():
+                # results_map is { Result_Sig: [(Run, Turn), ...] }
+                
+                # 1. Filter out empty/vestigial entries
+                valid_results = {r: locs for r, locs in results_map.items() if locs}
+                
+                if not valid_results:
+                    continue
+                    
+                # 2. Check Phase 1: Consistency (Per Action)
+                # Does this action *always* cause the same result?
+                if len(valid_results) > 1:
+                    # CONFLICT! Action A caused Result X AND Result Y.
+                    # This object is behaving inconsistently.
+                    # ACTION: Trigger Splitter to find the context difference.
+                    if self.debug_channels['HYPOTHESIS']:
+                        print(f"  [Science] Inconsistency detected for {obj_id} + {action_key}: {list(valid_results.keys())}")
+                    
+                    self._trigger_splitter(obj_id, action_key, valid_results)
+                    continue # Cannot certify this action yet
+                
+                # If only 1 result type exists, check N count
+                result_sig, locs = list(valid_results.items())[0]
+                
+                # Rigor: We need N >= 2 to prove it's not a fluke?
+                # For 'Single Action' levels, N=1 might be all we get per run.
+                # But to call it a LAW, we generally want confirmation.
+                # However, for the 'Negative Control' logic, even N=1 matters.
+                consistent_results[action_key] = result_sig
+
+            # --- PHASE 2 & 3: Distinction (Direct vs Global) ---
+            # We now compare the consistent results across DIFFERENT actions.
+            
+            # Group by Result to find Globals
+            # Map: Result_Sig -> List of Actions that cause it
+            result_to_actions = {}
+            for act, res in consistent_results.items():
+                if res not in result_to_actions: result_to_actions[res] = []
+                result_to_actions[res].append(act)
+                
+            for action_key, result_sig in consistent_results.items():
+                
+                # A. GLOBAL CHECK
+                # If ANY other action causes the same result, it is Global.
+                causing_actions = result_to_actions[result_sig]
+                if len(causing_actions) > 1:
+                    # We have Action A -> X and Action B -> X.
+                    # Certify GLOBAL for this Object ID.
+                    self._certify_law(obj_id, 'GLOBAL', 'ANY', result_sig)
+                    continue
+                
+                # B. DIRECT CHECK
+                # If this is the ONLY action causing this result...
+                # We must verify we actually TRIED other actions (Negative Control).
+                
+                # All actions tried on this object
+                all_attempted_actions = set(consistent_results.keys())
+                
+                if len(all_attempted_actions) > 1:
+                    # We tried A, B, C. Only A caused X.
+                    # B and C caused something else (or No Change).
+                    # Certify DIRECT for this Object ID + Action.
+                    self._certify_law(obj_id, 'DIRECT', action_key, result_sig)
+                else:
+                    # C. AMBIGUOUS
+                    # We only ever tried Action A. We have no Negative Control.
+                    # We cannot scientifically certify this yet.
+                    # (Profiler should prioritize doing something else to this object).
+                    pass
+
+    def _certify_law(self, obj_id, law_type, action_key, result_sig):
+        """Helper to store the proven law in the registry."""
+        if obj_id not in self.certified_laws:
+            self.certified_laws[obj_id] = {}
+            
+        entry = {
+            'type': law_type,
+            'result': result_sig,
+            'proven': True
+        }
+        
+        # Store key depends on type
+        key = 'ANY' if law_type == 'GLOBAL' else action_key
+        
+        # Only print if this is a NEW discovery
+        if key not in self.certified_laws[obj_id]:
+            if self.debug_channels['HYPOTHESIS']:
+                r_str = result_sig[0] if isinstance(result_sig, tuple) else str(result_sig)
+                print(f"  [Science] CERTIFIED {law_type} LAW for {obj_id}: {action_key} -> {r_str}")
+        
+        self.certified_laws[obj_id][key] = entry
 
     def _get_feature_status(self, contexts: list[dict], base_sig: tuple, feature_type: str, sub_key: str) -> str:
         """
