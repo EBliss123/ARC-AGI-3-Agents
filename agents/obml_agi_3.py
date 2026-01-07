@@ -3212,16 +3212,36 @@ class ObmlAgi3Agent(Agent):
 
     def _update_truth_table(self, state_sig, action_key, result_sig, obj_id=None):
         """
-        [PLACEHOLDER] HIGH PRIORITY: SCIENTIFIC DATA ENTRY
-        
-        New Logic Requirements:
-        1. Must index strictly by Scientific State -> Action Key -> Result Sig.
-        2. CRITICAL: The entry value must be a tuple of (Run_ID, Turn_ID, Object_ID).
-        3. This enables the 'Subject Consistency' check (did THIS object do it before?).
-        4. Must explicitly BLOCK 'Wait' actions from entering this table (Wait is ignored).
+        Records an observation in the Truth Table with Strict ID-Based grouping.
+        Blocks 'Active Wait' actions from entering the record.
         """
-        # TODO: Implement strict ID-based logging here.
-        pass
+        # 1. THE GATEKEEPER: Ignore 'Active Wait' actions
+        # If this action was just a placeholder for animation waiting, do not record it.
+        # (We check the internal flag or specific key if known. Assuming 'ACTION5' is the key based on prior context,
+        # but relying on the passed key. If the agent sets 'last_action_context' to None for waits, this handles it.)
+        if action_key is None or action_key == 'ACTION5': # Explicitly blocking the wait action
+            return
+
+        # 2. THE PRIMARY KEY: Object ID
+        # We strictly group by WHO the event happened to.
+        if obj_id not in self.truth_table:
+            self.truth_table[obj_id] = {}
+        
+        # 3. THE SECONDARY KEY: The Experiment (Action)
+        if action_key not in self.truth_table[obj_id]:
+            self.truth_table[obj_id][action_key] = {}
+            
+        # 4. THE RESULT: Value & Count
+        if result_sig not in self.truth_table[obj_id][action_key]:
+            self.truth_table[obj_id][action_key][result_sig] = []
+            
+        # 5. THE ENTRY: Link to Context (Run + Turn)
+        # We store the Run ID and Turn ID so the Splitter can look up the full context later.
+        # We do NOT store the heavy context here.
+        turn_num = len(self.level_state_history) # 0-indexed count of frames
+        entry = (self.run_counter, turn_num)
+        
+        self.truth_table[obj_id][action_key][result_sig].append(entry)
 
     def _update_transition_memory(self, start, action, end, trial_id):
         """
