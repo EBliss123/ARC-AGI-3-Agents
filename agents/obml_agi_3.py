@@ -8,7 +8,7 @@ import statistics
 
 class ObmlAgi3Agent(Agent):
     """
-    Placeholder Agent for OBML AGI 3. Replace with actual implementation.
+    Agent for OBML AGI 3. 
     """
     def __init__(self, params: dict = None, **kwargs):
         super().__init__(**kwargs)
