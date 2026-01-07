@@ -3197,7 +3197,7 @@ class ObmlAgi3Agent(Agent):
         """
         [THE GATEKEEPER]
         Sorts raw events into DIRECT, GLOBAL, or AMBIGUOUS based strictly on Certified Laws.
-        Diagnoses Ambiguous events to give the Profiler a 'Fix' (Next Step).
+        Diagnoses Ambiguous events with a Scientific Roadmap (Requirements).
         """
         direct_events = []
         global_events = []
@@ -3207,72 +3207,106 @@ class ObmlAgi3Agent(Agent):
             obj_id = event.get('id')
             
             # 1. Valid ID Check
-            # If we don't know WHO it happened to, we can't classify it scientifically.
             if not obj_id:
                 ambiguous_events.append({
-                    'event': event,
-                    'reason': "No Object ID",
-                    'fix': "IGNORE",
-                    'detail': "Event has no target ID."
+                    'event': event, 'reason': "No Object ID", 'fix': "IGNORE",
+                    'requirements': [], 'detail': "Event has no target ID."
                 })
                 continue
 
             # 2. Construct the Signature
-            # We need to look up exactly what happened in the Law Book.
             result_sig = self._get_concrete_signature(event)
             
             # 3. Check the Law Book (Certified Laws)
-            # We check specific laws for THIS object ID.
             laws = self.certified_laws.get(obj_id, {})
             
             # A. Check for GLOBAL Law (Action-Independent)
-            # Key 'ANY' stores global laws.
             global_law = laws.get('ANY')
             if global_law and global_law['result'] == result_sig:
                 global_events.append(event)
                 continue
             
             # B. Check for DIRECT Law (Action-Specific)
-            # Key is the specific action we just took.
             direct_law = laws.get(action_key)
             if direct_law and direct_law['result'] == result_sig:
                 direct_events.append(event)
                 continue
                 
-            # 4. If we are here, it is AMBIGUOUS (Unproven).
-            # We must diagnose WHY to tell the Profiler what to do.
+            # 4. If we are here, it is AMBIGUOUS. 
+            # We must generate the Scientific Roadmap.
             
             diagnosis = "Unknown"
+            requirements = []
             fix = "EXPLORE"
             detail = ""
             
-            # Look up the raw data in the Truth Table
             if obj_id in self.truth_table and action_key in self.truth_table[obj_id]:
+                # Get history for THIS specific result
                 history = self.truth_table[obj_id][action_key].get(result_sig, [])
                 n_count = len(history)
                 
-                if n_count <= 1:
-                    # Case 1: Unverified Hypothesis
-                    diagnosis = "Unverified (N=1)"
-                    fix = "REPEAT_ACTION"
-                    detail = "Need N >= 2 to prove consistency."
+                # Check for Contradictions (Stability)
+                # Are there OTHER results for this same action?
+                all_results = self.truth_table[obj_id][action_key].keys()
+                if len(all_results) > 1:
+                    diagnosis = "Unstable/Inconsistent"
+                    requirements = ["STABILIZE_CONTEXT"]
+                    fix = "WAIT_FOR_SPLITTER"
+                    detail = "Action produces multiple conflicting results."
                 else:
-                    # Case 2: Lack of Distinction
-                    # We have N >= 2 (Consistent), but it wasn't in Certified Laws.
-                    # This implies we failed the Negative Control check (Phase 2).
-                    diagnosis = "Lack of Distinction"
-                    fix = "TRY_DIFFERENT_ACTION"
-                    detail = "Proven consistent, but need Negative Control (different action) to prove Directness."
+                    # No contradictions, so we check for missing proofs.
+                    
+                    # 1. Check Consistency (Positive Control)
+                    if n_count < 2:
+                        requirements.append("POSITIVE_CONTROL")
+                    
+                    # 2. Check Distinction (Negative Control)
+                    # Have we tried ANY other action on this object?
+                    # (We check the length of the action keys for this object)
+                    tried_actions = self.truth_table[obj_id].keys()
+                    if len(tried_actions) < 2:
+                        requirements.append("NEGATIVE_CONTROL")
+                    
+                    # 3. Determine Status & Fix
+                    if "POSITIVE_CONTROL" in requirements and "NEGATIVE_CONTROL" in requirements:
+                        diagnosis = "Hypothesis (Early Stage)"
+                        fix = "REPEAT_ACTION" # Priority: Establish consistency first
+                        detail = "Need to verify consistency (N>=2) AND try other actions."
+                        
+                    elif "POSITIVE_CONTROL" in requirements:
+                        diagnosis = "Unverified (N=1)"
+                        fix = "REPEAT_ACTION"
+                        detail = "Result seen once. Need confirmation."
+                        
+                    elif "NEGATIVE_CONTROL" in requirements:
+                        diagnosis = "Undistinguished"
+                        fix = "TRY_DIFFERENT_ACTION"
+                        detail = "Consistent (N>=2), but need Negative Control to rule out Global law."
+                    
+                    else:
+                        # We have N>=2 AND we have tried other actions.
+                        # Why isn't it certified? 
+                        # It might be waiting for the next _verify_and_certify cycle, 
+                        # or the other action produced the SAME result (Global candidate pending).
+                        diagnosis = "Pending Certification"
+                        fix = "ANALYZE" 
+                        detail = "Data is sufficient. Waiting for Judge cycle."
+
             else:
-                # Case 3: First sighting (should match N=1 logic usually, but safety catch)
+                # First sighting (no history accessible yet, or brand new)
                 diagnosis = "New Phenomenon"
+                requirements = ["POSITIVE_CONTROL", "NEGATIVE_CONTROL"]
                 fix = "REPEAT_ACTION"
-            
+
             ambiguous_events.append({
                 'event': event,
+                'type': 'AMBIGUOUS',
                 'reason': diagnosis,
+                'requirements': requirements, # List of missing proofs
                 'fix': fix,
-                'detail': detail
+                'detail': detail,
+                'target_action': action_key,
+                'target_object': obj_id
             })
 
         return direct_events, global_events, ambiguous_events
