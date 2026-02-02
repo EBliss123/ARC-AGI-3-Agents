@@ -280,34 +280,12 @@ class ObmlAgi3Agent(Agent):
         if not latest_frame.available_actions:
             return None
 
-        # --- 3. Stability Check (Robust Streak Logic) ---
+        # --- 3. Stability Check (DISABLED) ---
+        # Immediate pass-through: We act on every frame available.
         current_pixels = latest_frame.frame[0] if latest_frame.frame else []
-        
-        # A. Force wait after any action to see result
-        if self.forcing_wait:
-            self.forcing_wait = False
-            self.last_stable_pixels = current_pixels
-            self.stability_streak = 0
-            return None 
-            
-        # B. Compare pixels to last known state
-        is_visually_identical = (self.last_stable_pixels is not None and 
-                                 current_pixels == self.last_stable_pixels)
-
-        if not is_visually_identical:
-            if self.debug_channels['CHANGES'] and self.stability_streak > 0:
-                print("--- Stability Broken: Screen moved. Resetting streak. ---")
-            self.last_stable_pixels = current_pixels
-            self.stability_streak = 0
-            return None # Wait for stability
-        
-        else:
-            # Screen is stable. Increment streak.
-            self.stability_streak += 1
-            REQUIRED_STREAK = 1 # Wait for 2 consecutive stable frames (~1.0s)
-            
-            if self.stability_streak < REQUIRED_STREAK:
-                return None # Wait for confirmation
+        self.last_stable_pixels = current_pixels
+        self.forcing_wait = False 
+        # -------------------------------------
         
         # C. Authorized to ACT. Next time we must wait again.
         self.forcing_wait = True 
@@ -1048,8 +1026,11 @@ class ObmlAgi3Agent(Agent):
                 self._print_and_log(f"Profile: U:{best_profile['unknowns']} D:{best_profile['discoveries']} B:{best_profile['boring']} F:{best_profile['failures']}")
         
         else:
-            # Modified: If no moves found, just WAIT. Don't reset.
-            action_to_return = None
+            # Failsafe: If no intelligent moves are found, do NOT wait forever.
+            # Force a "Pass" action (random click or no-op) to agitate the state.
+            if self.debug_channels['ACTION_SCORE']:
+                self._print_and_log("  (No moves profiled. Forcing 'Pass' action.)")
+            action_to_return = self.get_pass_action()
 
         # --- Store action for next turn's analysis ---
         if action_to_return:
@@ -3363,7 +3344,7 @@ class ObmlAgi3Agent(Agent):
         # We store the Run ID and Turn ID so the Splitter can look up the full context later.
         # We do NOT store the heavy context here.
         turn_num = len(self.level_state_history) # 0-indexed count of frames
-        entry = (self.run_counter, turn_num)
+        entry = (self.run_counter, turn_num, state_sig)
         
         self.truth_table[obj_id][action_key][result_sig].append(entry)
 
@@ -3591,17 +3572,21 @@ class ObmlAgi3Agent(Agent):
         
         variations = {'Size': set(), 'Shape': set()}
         
-        # Scan all laws for this action
-        for (l_state, l_action), l_data in self.certified_laws.items():
-            if l_action == action_key:
-                # l_state is ((C, F, S), Context) or just (C, F, S)
-                base = l_state[0] if len(l_state) == 2 and isinstance(l_state[0], tuple) else l_state
-                try:
-                    # base is (Color, Fingerprint, Size)
-                    variations['Shape'].add(base[1])
-                    variations['Size'].add(base[2])
-                except IndexError:
-                    pass
+        # Scan all laws for this action to check for salience
+        # Structure: self.certified_laws[obj_id][action_key] = entry
+        for obj_id, laws in self.certified_laws.items():
+            if action_key in laws:
+                l_data = laws[action_key]
+                # Check stored state_sig if available
+                if l_data.get('state_sig'):
+                    s_sig = l_data['state_sig']
+                    # Handle tuple nesting if present
+                    base = s_sig[0] if len(s_sig) == 2 and isinstance(s_sig[0], tuple) else s_sig
+                    try:
+                        variations['Shape'].add(base[1])
+                        variations['Size'].add(base[2])
+                    except IndexError:
+                        pass
 
         show_size = len(variations['Size']) > 1
         show_shape = len(variations['Shape']) > 1
@@ -3613,45 +3598,28 @@ class ObmlAgi3Agent(Agent):
         critical_keys = self.state_refinements.get(state_sig, [])
         
         for cond in raw_conditions:
-            # Handle Intrinsic Properties
-            if cond.startswith("Color="):
-                refined_conditions.append(cond) # Always show Color
-            
-            elif cond.startswith("Size="):
-                if show_size: refined_conditions.append(cond)
-                
-            elif cond.startswith("Shape="):
-                if show_shape: refined_conditions.append(cond)
-            
-            # Handle Context Properties (Adj, Align, etc.)
+            if cond.startswith("Color="): refined_conditions.append(cond)
+            elif cond.startswith("Size=") and show_size: refined_conditions.append(cond)
+            elif cond.startswith("Shape=") and show_shape: refined_conditions.append(cond)
             else:
-                # clean formatting markers like '**'
+                # Context keys logic
                 clean_cond = cond.replace('*', '')
-                
                 keep = False
-                # Check mapping to critical keys
-                if "Adj(top=" in clean_cond and "adj_top" in critical_keys: keep = True
-                elif "Adj(right=" in clean_cond and "adj_right" in critical_keys: keep = True
-                elif "Adj(bottom=" in clean_cond and "adj_bottom" in critical_keys: keep = True
-                elif "Adj(left=" in clean_cond and "adj_left" in critical_keys: keep = True
+                if "Adj(" in clean_cond:
+                    for k in critical_keys:
+                        if k.startswith('adj_') and k.replace('adj_', '') in clean_cond: keep = True
                 elif "Align" in clean_cond:
                     for k in critical_keys:
-                        if k.startswith('align_') and k.replace('align_', '') in clean_cond:
-                            keep = True; break
+                        if k.startswith('align_') and k.replace('align_', '') in clean_cond: keep = True
                 elif "Match" in clean_cond:
                      for k in critical_keys:
-                        if k.startswith('match_') and k.replace('match_', '') in clean_cond:
-                            keep = True; break
+                        if k.startswith('match_') and k.replace('match_', '') in clean_cond: keep = True
                 
-                if keep:
-                    refined_conditions.append(cond)
+                if keep: refined_conditions.append(cond)
 
-        if not refined_conditions:
-            # If we stripped everything (e.g. Color was somehow constant globally?), show something.
-            return "Universal Rule"
-            
+        if not refined_conditions: return "Universal Rule"
         return " AND ".join(refined_conditions)
-
+            
     def _solve_conditional_rule(self, start_state, action_family, current_end_sig, current_context) -> str | None:
         """
         The 'Exception Solver'.
@@ -4203,6 +4171,12 @@ class ObmlAgi3Agent(Agent):
                 # If only 1 result type exists, check N count
                 result_sig, locs = list(valid_results.items())[0]
                 
+                # locs entry format: (run, turn, state_sig)
+                last_entry = locs[-1]
+                
+                # Handle legacy data if exists (len 2 vs 3)
+                current_state_sig = last_entry[2] if len(last_entry) > 2 else None
+
                 # Rigor: We need N >= 2 to prove it's not a fluke?
                 # For 'Single Action' levels, N=1 might be all we get per run.
                 # But to call it a LAW, we generally want confirmation.
@@ -4249,7 +4223,7 @@ class ObmlAgi3Agent(Agent):
                     # (Profiler should prioritize doing something else to this object).
                     pass
 
-    def _certify_law(self, obj_id, law_type, action_key, result_sig):
+    def _certify_law(self, obj_id, law_type, action_key, result_sig, state_sig=None):
         """Helper to store the proven law in the registry."""
         if obj_id not in self.certified_laws:
             self.certified_laws[obj_id] = {}
@@ -4257,13 +4231,12 @@ class ObmlAgi3Agent(Agent):
         entry = {
             'type': law_type,
             'result': result_sig,
+            'state_sig': state_sig, # Store this for salience checking
             'proven': True
         }
         
-        # Store key depends on type
         key = 'ANY' if law_type == 'GLOBAL' else action_key
         
-        # Only print if this is a NEW discovery
         if key not in self.certified_laws[obj_id]:
             if self.debug_channels['HYPOTHESIS']:
                 r_str = result_sig[0] if isinstance(result_sig, tuple) else str(result_sig)
@@ -4330,7 +4303,12 @@ class ObmlAgi3Agent(Agent):
         
         for r_sig, locs in conflicting_results.items():
             contexts_by_result[r_sig] = []
-            for run, turn in locs:
+            for entry in locs:
+                if len(entry) == 3:
+                    run, turn, _ = entry
+                else:
+                    run, turn = entry
+
                 if 0 <= turn < len(self.level_state_history):
                     contexts_by_result[r_sig].append({
                         'snapshot': self.level_state_history[turn],
