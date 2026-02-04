@@ -463,6 +463,20 @@ class ObmlAgi3Agent(Agent):
                 # 1. Parse text changes back to structured event dicts
                 events = self._parse_change_logs_to_events(changes)
 
+                # --- NEW: Identify Static Objects (Null Results) ---
+                # The change log only tells us what moved. We must explicitly record
+                # "NO_CHANGE" for objects that stood still, so the agent knows 
+                # it has "tested" them.
+                changed_ids = {e.get('id') for e in events if e.get('id')}
+                
+                for obj in prev_summary:
+                    if obj['id'] not in changed_ids:
+                        # Create synthetic NO_CHANGE event
+                        # This ensures we record that we TRIED the action and nothing happened.
+                        # This creates N=1 data, preventing the "Exploration Bonus" loop.
+                        no_change_event = {'type': 'NO_CHANGE', 'id': obj['id']}
+                        events.append(no_change_event)
+                # ---------------------------------------------------
                 # --- NEW: Pre-calculate Physics for Classification ---
                 # We run this BEFORE classification so the notes are available 
                 # for the classifier and debug logs.
@@ -792,42 +806,49 @@ class ObmlAgi3Agent(Agent):
                     req_type = mandate['req']
                     ref_action = mandate['ref']
                     
-                    # Does this move target this object?
-                    # Note: Global actions affect everyone. Targeted actions affect only target.
-                    # We assume 'ACTION6' is targeted. Others are global.
+                    this_action_key = self._get_learning_key(action_template.name, target_id)
+                    
+                    # --- FIX: Expanded Relevance ---
+                    # An object is relevant if:
+                    # 1. It is the target of the action.
+                    # 2. OR it has a specific scientific mandate regarding THIS action (e.g. "Stop doing X").
+                    is_relevant = (
+                        (not target_id) or 
+                        (target_id == obj_id) or 
+                        (this_action_key == ref_action)
+                    )
+                    
+                    if is_relevant:
+                        if req_type == 'POSITIVE_CONTROL':
+                            if this_action_key == ref_action: scientific_score += 1
+                            else: scientific_score -= 1
+                        
+                        elif req_type == 'NEGATIVE_CONTROL':
+                            if this_action_key != ref_action: scientific_score += 1
+                            else: scientific_score -= 1
+                
+                # 2. Check Exploration vs. Certified Knowledge
+                else:
+                    # For exploration, we keep strict relevance to avoid noise.
+                    # We only reward exploring the specific object we are clicking.
                     is_relevant = (not target_id) or (target_id == obj_id)
                     
                     if is_relevant:
                         this_action_key = self._get_learning_key(action_template.name, target_id)
                         
-                        if req_type == 'POSITIVE_CONTROL':
-                            # We NEED to repeat ref_action
-                            if this_action_key == ref_action: scientific_score += 1
-                            else: scientific_score -= 1
-                        
-                        elif req_type == 'NEGATIVE_CONTROL':
-                            # We NEED to avoid ref_action
-                            if this_action_key != ref_action: scientific_score += 1
-                            else: scientific_score -= 1
-                
-                # 2. Check Exploration (Unknowns)
-                else:
-                    is_relevant = (not target_id) or (target_id == obj_id)
-                    if is_relevant:
-                        this_action_key = self._get_learning_key(action_template.name, target_id)
-                        
-                        # Check if we have ANY data in Truth Table
-                        has_data = False
-                        if obj_id in self.truth_table and this_action_key in self.truth_table[obj_id]:
-                             has_data = True
-                        
-                        if not has_data:
-                            scientific_score += 1 # Exploration Bonus
-                        
-                        # Check Certified (Boring)
                         laws = self.certified_laws.get(obj_id, {})
-                        if this_action_key in laws or 'ANY' in laws:
-                            scientific_score -= 1 # Boring Penalty
+                        
+                        if 'ANY' in laws:
+                             scientific_score -= 1 # Boring (Global Law)
+                        elif this_action_key in laws:
+                             scientific_score -= 1 # Boring (Direct Law)
+                        else:
+                             has_data = False
+                             if obj_id in self.truth_table and this_action_key in self.truth_table[obj_id]:
+                                  has_data = True
+                             
+                             if not has_data:
+                                 scientific_score += 1 # Exploration Bonus
 
             move_profiles.append((move, scientific_score))
 
@@ -860,7 +881,13 @@ class ObmlAgi3Agent(Agent):
 
         # --- Store action for next turn's analysis ---
         if action_to_return:
-            learning_key_for_storage = self._get_learning_key(action_to_return.name, chosen_object_id if chosen_object else None)
+            # FIX: Explicitly extract ID from the object dict, do not rely on local vars
+            target_id = chosen_object['id'] if chosen_object else None
+            
+            learning_key_for_storage = self._get_learning_key(
+                action_to_return.name, 
+                target_id
+            )
             # --- UPDATED: Track Turn ID ---
             self.performed_action_types[learning_key_for_storage] = self.global_action_counter
         else:
