@@ -50,6 +50,11 @@ class ObmlAgi3Agent(Agent):
         self.global_action_counter = 0  # Tracks the passing of time/trials
         self.last_action_id = 0         # ID of the action that caused the current state
 
+        # --- NEW: The Scientific Agenda ---
+        # Key: Object_ID 
+        # Value: {'req': 'POSITIVE_CONTROL'|'NEGATIVE_CONTROL', 'ref': 'ACTION_X'}
+        self.active_experiments = {}
+
         # --- NEW: DETERMINISTIC SCIENTIFIC MEMORY ---
         # 1. The Truth Table: Stores raw results of experiments.
         # Structure: self.truth_table[Scientific_State][Action_Key] = {Result_Sig: [Turn_ID_List]}
@@ -178,6 +183,8 @@ class ObmlAgi3Agent(Agent):
         self.phenomenal_event_counts = {}
         self.action_consistency_counts = {} 
         self.performed_action_types = {}
+
+        self.active_experiments = {} # Clear agenda on reset
 
         self.truth_table = {}
         self.certified_laws = {}
@@ -763,8 +770,8 @@ class ObmlAgi3Agent(Agent):
                 # ---------------------------------------------
                 
                 all_possible_moves.append({'template': click_action_template, 'object': obj})
-        
-        # --- Deterministic Profiling ---
+                
+        # --- Scientific Profiling ---
         move_profiles = []
         
         for move in all_possible_moves:
@@ -772,262 +779,81 @@ class ObmlAgi3Agent(Agent):
             target_obj = move['object']
             target_id = target_obj['id'] if target_obj else None
             
-            # This is the "base" key for this action, e.g. "ACTION4" or "ACTION6_obj_5"
-            base_action_key_str = self._get_learning_key(action_template.name, target_id)
+            # Base score starts at 0
+            scientific_score = 0
             
-            profile = {'unknowns': 0, 'discoveries': 0, 'boring': 0, 'failures': 0}
-            predicted_fingerprints_for_this_move = set()
-            all_predicted_events_for_move = []
-
-            # --- Unified Profiling Logic ---
+            # We calculate impact on EVERY object in the scene
             for obj in current_summary:
                 obj_id = obj['id']
-                hypothesis_key = (base_action_key_str, obj_id)
-
-                # 1. Strict Prediction
-                predicted_events, confidence = self._predict_outcome(hypothesis_key, current_full_context)
                 
-                # 2. Categorize
-                if predicted_events is None:
-                    # Unknown: We have NO rule (Success or Failure) that matches this state.
-                    profile['unknowns'] += 1
-                elif not predicted_events:
-                    # Failure: We matched a "No Change" consistency rule.
-                    profile['failures'] += 1
-                else:
-                    # Success: We matched a "Change" consistency rule.
-                    # --- NEW: Check for Terminality (The "Safety Layer") ---
-                    is_lethal = False
-                    for e in predicted_events:
-                        if e['type'] == 'TERMINAL' and e.get('outcome') == 'LOSS':
-                            is_lethal = True
-                            break
+                # 1. Check Scientific Mandate (Ambiguity)
+                if obj_id in self.active_experiments:
+                    mandate = self.active_experiments[obj_id]
+                    req_type = mandate['req']
+                    ref_action = mandate['ref']
                     
-                    if is_lethal:
-                        # Treat as a failure (Lethal) - Count strictly as 1 object
-                        profile['failures'] += 1 
-                    else:
-                        hashable_events = [tuple(sorted(e.items())) for e in predicted_events]
-                        fp = tuple(sorted(hashable_events))
-                        predicted_fingerprints_for_this_move.add(fp)
-                        all_predicted_events_for_move.extend(predicted_events)
+                    # Does this move target this object?
+                    # Note: Global actions affect everyone. Targeted actions affect only target.
+                    # We assume 'ACTION6' is targeted. Others are global.
+                    is_relevant = (not target_id) or (target_id == obj_id)
+                    
+                    if is_relevant:
+                        this_action_key = self._get_learning_key(action_template.name, target_id)
                         
-                        if fp in self.seen_outcomes and confidence >= 2:
-                            profile['boring'] += 1
-                        else:
-                            profile['discoveries'] += 1
-            move_profiles.append((move, profile, predicted_fingerprints_for_this_move, all_predicted_events_for_move))
-
-    # --- Failsafe: 2-Stage Ban Filtering ---
-        
-        # --- Stage 1: Temporary "banned_action_keys" (cleared on success) ---
-        if self.banned_action_keys and len(move_profiles) > 1:
-            initial_count_temp = len(move_profiles)
-            filtered_profiles_temp = []
-            for move_tuple in move_profiles:
-                move, _, _, _ = move_tuple
-                move_key = self._get_learning_key(move['template'].name, move['object']['id'] if move['object'] else None)
-                if move_key not in self.banned_action_keys:
-                    filtered_profiles_temp.append(move_tuple)
-            
-            if not filtered_profiles_temp:
-                # All moves are *temporarily* banned. This is a stalemate.
-                # Clear the temporary list and proceed with all original moves.
-                if self.debug_channels['FAILURE']:
-                    print(f"--- Failsafe: All moves temporarily banned. Clearing {len(self.banned_action_keys)} temp bans. ---")
-                self.banned_action_keys.clear()
-                # We proceed with the original move_profiles
-            
-            elif len(filtered_profiles_temp) < initial_count_temp:
-                # We filtered some temp bans and have options left.
-                move_profiles = filtered_profiles_temp
-                if self.debug_channels['FAILURE']:
-                    print(f"--- Failsafe: Removed {initial_count_temp - len(filtered_profiles_temp)} temp banned actions. ---")
-            
-            # else: no temp bans were found, proceed with original move_profiles
-        
-        # --- Stage 2: Permanent "permanent_banned_actions" (ACTION6 only) ---
-        if self.permanent_banned_actions and len(move_profiles) > 1:
-            initial_count_perm = len(move_profiles)
-            filtered_profiles_perm = []
-            for move_tuple in move_profiles:
-                move, _, _, _ = move_tuple
-                move_key = self._get_learning_key(move['template'].name, move['object']['id'] if move['object'] else None)
-                if move_key not in self.permanent_banned_actions:
-                    filtered_profiles_perm.append(move_tuple)
-            
-            if not filtered_profiles_perm:
-                # All *remaining* moves are *permanently* banned.
-                # This is the "last resort" scenario.
-                # We do NOT clear the permanent list. We just ignore it for this turn.
-                if self.debug_channels['FAILURE']:
-                    print(f"--- Failsafe: All valid moves are permanently banned. Ignoring {len(self.permanent_banned_actions)} permanent bans for this turn. ---")
-                # We proceed with the move_profiles list from Stage 1
-            
-            elif len(filtered_profiles_perm) < initial_count_perm:
-                # We successfully filtered permanent bans.
-                move_profiles = filtered_profiles_perm
-                if self.debug_channels['FAILURE']:
-                    print(f"--- Failsafe: Removed {initial_count_perm - len(filtered_profiles_perm)} permanent banned actions. ---")
-            
-            # else: no permanent bans were found, proceed
-        
-        # --- End Failsafe ---
-
-        # --- NEW: Debug print of all move profiles ---
-        if self.debug_channels['ACTION_SCORE']:
-            self._print_and_log("\n--- Full Profile List (Before Sort) ---")
-            if not move_profiles:
-                self._print_and_log("  (No moves to profile)")
-            
-            # Helper for sorting logic (Defined here to use in both display and actual sort)
-            def get_sort_key(move_tuple):
-                move = move_tuple[0]
-                key = self._get_learning_key(move['template'].name, move['object']['id'] if move['object'] else None)
-                is_untried_val = 1 if key not in self.performed_action_types else 0
-                return (
-                    is_untried_val,
-                    move_tuple[1]['unknowns'], 
-                    move_tuple[1]['discoveries'], 
-                    -move_tuple[1]['failures'], 
-                    move_tuple[1]['boring']
-                )
-
-            # Sort for display matches actual logic
-            sorted_for_print = sorted(move_profiles, key=get_sort_key, reverse=True)
-
-            for i, (move, profile, _, _) in enumerate(sorted_for_print):
-                action_name = move['template'].name
-                target_name = f" on {move['object']['id']}" if move['object'] else ""
+                        if req_type == 'POSITIVE_CONTROL':
+                            # We NEED to repeat ref_action
+                            if this_action_key == ref_action: scientific_score += 1
+                            else: scientific_score -= 1
+                        
+                        elif req_type == 'NEGATIVE_CONTROL':
+                            # We NEED to avoid ref_action
+                            if this_action_key != ref_action: scientific_score += 1
+                            else: scientific_score -= 1
                 
-                prefix = "  -> " if i == 0 else "     " # Highlight the winner
-                
-                self._print_and_log(f"{prefix}{action_name}{target_name} -> "
-                        f"U:{profile['unknowns']} D:{profile['discoveries']} "
-                        f"B:{profile['boring']} F:{profile['failures']}")
+                # 2. Check Exploration (Unknowns)
+                else:
+                    is_relevant = (not target_id) or (target_id == obj_id)
+                    if is_relevant:
+                        this_action_key = self._get_learning_key(action_template.name, target_id)
+                        
+                        # Check if we have ANY data in Truth Table
+                        has_data = False
+                        if obj_id in self.truth_table and this_action_key in self.truth_table[obj_id]:
+                             has_data = True
+                        
+                        if not has_data:
+                            scientific_score += 1 # Exploration Bonus
+                        
+                        # Check Certified (Boring)
+                        laws = self.certified_laws.get(obj_id, {})
+                        if this_action_key in laws or 'ANY' in laws:
+                            scientific_score -= 1 # Boring Penalty
 
-        # --- Deterministic Priority-Based Sorting ---
+            move_profiles.append((move, scientific_score))
+
+        # --- Sort by Score ---
+        # Sort descending by Score
+        move_profiles.sort(key=lambda x: x[1], reverse=True)
+        
         if move_profiles:
-            def is_untried(move_tuple):
-                move = move_tuple[0]
-                key = self._get_learning_key(move['template'].name, move['object']['id'] if move['object'] else None)
-                return 1 if key not in self.performed_action_types else 0
-
-            # --- NEW: Recency Score (Fair Rotation) ---
-            # If we must repeat an action, pick the one done LONGEST ago.
-            # performed_action_types stores {key: turn_id}.
-            # We want Smallest Turn ID (Oldest) to be Best.
-            # Sort is Reverse=True (Biggest is Best).
-            # So we return -TurnID. (-1 is better than -100).
-            def get_recency_score(move_tuple):
-                move = move_tuple[0]
-                key = self._get_learning_key(move['template'].name, move['object']['id'] if move['object'] else None)
-                last_turn = self.performed_action_types.get(key, float('inf'))
-                return -last_turn
-
-            # 1. Primary Sort
-            move_profiles.sort(key=lambda x: (
-                is_untried(x),        # 1. Always do new things first
-                x[1]['unknowns'],     # 2. Resolve confusion
-                x[1]['discoveries'],  # 3. Verify new discoveries
-                -x[1]['failures'],    # 4. Avoid failures
-                get_recency_score(x), # 5. NEW: Rotate through old actions (LRU)
-                x[1]['boring']        # 6. Tie-breaker
-            ), reverse=True)
-            
-            # --- Updated: Recursive Lookahead Tie-Breaker ---
-            chosen_move_tuple = None
-            
-            # Check if the winner is "Boring" (U=0, D=0)
-            top_profile = move_profiles[0][1]
-            top_score_is_boring = (top_profile['unknowns'] == 0 and 
-                                   top_profile['discoveries'] == 0 and
-                                   top_profile['failures'] == 0)
-
-            if top_score_is_boring:
-                # Find all ties for first place.
-                # CRITICAL FIX: The tie definition MUST include 'is_untried'.
-                # Since the list is already sorted, we just check items until the sort key changes.
-                
-                tied_moves = []
-                best_sort_key = (
-                    is_untried(move_profiles[0]),
-                    top_profile['unknowns'],
-                    top_profile['discoveries'],
-                    -top_profile['failures']
-                )
-                
-                for mp in move_profiles:
-                    current_key = (
-                        is_untried(mp),
-                        mp[1]['unknowns'],
-                        mp[1]['discoveries'],
-                        -mp[1]['failures']
-                    )
-                    
-                    if current_key == best_sort_key:
-                        tied_moves.append(mp)
-                    else:
-                        # Since list is sorted, as soon as we mismatch, we are done.
-                        break
-                
-                if len(tied_moves) > 1:
-                    if self.debug_channels['ACTION_SCORE']: 
-                        print(f"\n--- Running Recursive Lookahead (Depth 3) for {len(tied_moves)} Boring Moves ---")
-                    
-                    best_deep_score = (-999, -999, -999, -999)
-                    best_move_idx = 0
-                    
-                    for i, move_tuple in enumerate(tied_moves):
-                        move, _, _, _ = move_tuple
-                        deep_score = self._recursive_lookahead_score(current_summary, move['template'], move['object'], 0)
-                        
-                        if self.debug_channels['ACTION_SCORE']:
-                             target = f" on {move['object']['id']}" if move['object'] else ""
-                             print(f"  - Move {move['template'].name}{target} -> Chain Score: {deep_score}")
-
-                        if deep_score > best_deep_score:
-                            best_deep_score = deep_score
-                            best_move_idx = i
-                    
-                    chosen_move_tuple = tied_moves[best_move_idx]
-                else:
-                    chosen_move_tuple = tied_moves[0]
-            else:
-                chosen_move_tuple = move_profiles[0]
-
-            # Choose the best move
-            chosen_move, best_profile, new_fingerprints_to_add, _best_events = chosen_move_tuple
-        
+            chosen_move, score = move_profiles[0]
             action_to_return = chosen_move['template']
             chosen_object = chosen_move['object']
             
-            # Add any new discoveries to our "seen" list
-            self.seen_outcomes.update(new_fingerprints_to_add)
-
-            # --- Logging ---
-            action_name = action_to_return.name
-            target_name = ""
-            
-            if chosen_object:
-                chosen_object_id = chosen_object['id']
-                pos = chosen_object['position']
-                action_to_return.set_data({'x': pos[1], 'y': pos[0]})
-                target_name = f" on {chosen_object_id.replace('obj_', 'id_')}"
-            
             if self.debug_channels['ACTION_SCORE']:
-                self._print_and_log(f"\n--- Discovery Profiler ---")
-                
-                # UPDATED: Print the Global Step Count (1-based index)
-                # self.global_action_counter is 0-based and incremented below, so we add 1 here.
+                self._print_and_log(f"\n--- Scientific Profiler ---")
                 current_step = self.global_action_counter + 1
-                self._print_and_log(f"Chose: {action_name}{target_name} (Step {current_step})")
+                t_name = f" on {chosen_object['id']}" if chosen_object else ""
+                self._print_and_log(f"Chose: {action_to_return.name}{t_name} (Score: {score})")
                 
-                self._print_and_log(f"Profile: U:{best_profile['unknowns']} D:{best_profile['discoveries']} B:{best_profile['boring']} F:{best_profile['failures']}")
-        
+                # CHANGED: Loop through ALL profiles instead of min(3, ...)
+                for i in range(len(move_profiles)):
+                    m, s = move_profiles[i]
+                    m_tn = f" on {m['object']['id']}" if m['object'] else ""
+                    self._print_and_log(f"  #{i+1}: {m['template'].name}{m_tn} -> {s}")
+
         else:
             # Failsafe: If no intelligent moves are found, do NOT wait forever.
-            # Force a "Pass" action (random click or no-op) to agitate the state.
             if self.debug_channels['ACTION_SCORE']:
                 self._print_and_log("  (No moves profiled. Forcing 'Pass' action.)")
             action_to_return = self.get_pass_action()
@@ -3228,12 +3054,16 @@ class ObmlAgi3Agent(Agent):
             global_law = laws.get('ANY')
             if global_law and global_law['result'] == result_sig:
                 global_events.append(event)
+                # Success! Task complete. Remove from agenda.
+                if obj_id in self.active_experiments: del self.active_experiments[obj_id]
                 continue
             
             # B. Check for DIRECT Law (Action-Specific)
             direct_law = laws.get(action_key)
             if direct_law and direct_law['result'] == result_sig:
                 direct_events.append(event)
+                # Success! Task complete. Remove from agenda.
+                if obj_id in self.active_experiments: del self.active_experiments[obj_id]
                 continue
                 
             # 4. If we are here, it is AMBIGUOUS. 
@@ -3289,18 +3119,24 @@ class ObmlAgi3Agent(Agent):
                     
                     else:
                         # We have N>=2 AND we have tried other actions.
-                        # Why isn't it certified? 
-                        # It might be waiting for the next _verify_and_certify cycle, 
-                        # or the other action produced the SAME result (Global candidate pending).
                         diagnosis = "Pending Certification"
                         fix = "ANALYZE" 
                         detail = "Data is sufficient. Waiting for Judge cycle."
+                        # We have data, just waiting for Judge. Clear agenda to prevent looping.
+                        if obj_id in self.active_experiments: del self.active_experiments[obj_id]
 
             else:
                 # First sighting (no history accessible yet, or brand new)
                 diagnosis = "New Phenomenon"
                 requirements = ["POSITIVE_CONTROL", "NEGATIVE_CONTROL"]
                 fix = "REPEAT_ACTION"
+                
+            # --- Update Active Experiments ---
+            if "POSITIVE_CONTROL" in requirements:
+                self.active_experiments[obj_id] = {'req': 'POSITIVE_CONTROL', 'ref': action_key}
+            elif "NEGATIVE_CONTROL" in requirements:
+                self.active_experiments[obj_id] = {'req': 'NEGATIVE_CONTROL', 'ref': action_key}
+            # ---------------------------------
 
             ambiguous_events.append({
                 'event': event,
@@ -3318,20 +3154,16 @@ class ObmlAgi3Agent(Agent):
     def _update_truth_table(self, state_sig, action_key, result_sig, obj_id=None):
         """
         Records an observation in the Truth Table with Strict ID-Based grouping.
-        Blocks 'Active Wait' actions from entering the record.
         """
-        # 1. THE GATEKEEPER: Ignore 'Active Wait' actions
-        # If this action was just a placeholder for animation waiting, do not record it.
-        # (We check the internal flag or specific key if known. Assuming 'ACTION5' is the key based on prior context,
-        # but relying on the passed key. If the agent sets 'last_action_context' to None for waits, this handles it.)
-        if action_key is None or action_key == 'ACTION5': # Explicitly blocking the wait action
+        # 1. THE GATEKEEPER: Ignore 'None' keys (actual system waits)
+        # REMOVED: "or action_key == 'ACTION5'" so Action 5 is recorded properly.
+        if action_key is None: 
             return
 
         # 2. THE PRIMARY KEY: Object ID
-        # We strictly group by WHO the event happened to.
         if obj_id not in self.truth_table:
             self.truth_table[obj_id] = {}
-        
+                
         # 3. THE SECONDARY KEY: The Experiment (Action)
         if action_key not in self.truth_table[obj_id]:
             self.truth_table[obj_id][action_key] = {}
