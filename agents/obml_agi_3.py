@@ -737,7 +737,6 @@ class ObmlAgi3Agent(Agent):
                     self._analyze_result(hypothesis_key, specific_events, prev_context)
                     
         # --- 3. Update Memory For Next Turn ---
-        # This runs every frame, saving the state we just analyzed
         self.last_object_summary = current_summary
         self.last_adjacencies = current_adjacencies
         self.last_diag_adjacencies = current_diag_adjacencies
@@ -747,11 +746,8 @@ class ObmlAgi3Agent(Agent):
         self.last_match_groups = current_match_groups
 
         # --- 4. Choose an Action (Discovery Profiler Logic) ---
-        action_to_return = None
-        chosen_object = None
-        chosen_object_id = None
         
-        # Get the full context of the *current* state for prediction
+        # [FIX] Define current_full_context before using it
         current_full_context = {
             'summary': current_summary,
             'rels': current_relationships,
@@ -762,30 +758,26 @@ class ObmlAgi3Agent(Agent):
             'match': current_match_groups
         }
 
-        # Build a list of all possible moves
+        # [FIX] Build all_possible_moves list
         all_possible_moves = []
         click_action_template = None
-        for action in latest_frame.available_actions:
+        available = latest_frame.available_actions if latest_frame.available_actions else []
+
+        for action in available:
             if action.name == 'ACTION6':
                 click_action_template = action
             else:
                 all_possible_moves.append({'template': action, 'object': None})
+        
         if click_action_template and current_summary:
             for obj in current_summary:
-                # --- NEW: Permanent Ignore for Dead Clicks ---
-                # If we have clicked this specific object ID before (performed),
-                # and it has NEVER caused a change (not productive),
-                # we remove it from consideration entirely. It won't even go to the profiler.
-                action_key = self._get_learning_key(click_action_template.name, obj['id'])
-                
-                if (action_key in self.performed_action_types and 
-                    action_key not in self.productive_action_types):
-                    continue 
-                # ---------------------------------------------
-                
                 all_possible_moves.append({'template': click_action_template, 'object': obj})
-                
-        # --- Scientific Profiling ---
+
+        # --- Pre-calculate current scientific states for comparison ---
+        current_obj_states = {}
+        for obj in current_summary:
+             current_obj_states[obj['id']] = self._get_scientific_state(obj, current_full_context)
+
         move_profiles = []
         
         for move in all_possible_moves:
@@ -793,67 +785,66 @@ class ObmlAgi3Agent(Agent):
             target_obj = move['object']
             target_id = target_obj['id'] if target_obj else None
             
-            # Base score starts at 0
             scientific_score = 0
             
-            # We calculate impact on EVERY object in the scene
+            # [NEW] Lookahead Simulation (Greedy Prediction)
+            predicted_events = []
+            
+            if target_id:
+                pred_key = (self._get_learning_key(action_template.name, target_id).split('_')[0], target_id)
+                # Use greedy predictor
+                pe, _ = self._predict_outcome(pred_key, current_full_context)
+                if pe: predicted_events = pe
+            else:
+                for o in current_summary:
+                    pred_key = (action_template.name, o['id'])
+                    pe, _ = self._predict_outcome(pred_key, current_full_context)
+                    if pe: predicted_events.extend(pe)
+            
+            # Generate Future State
+            future_summary = self._get_hypothetical_summary(current_summary, predicted_events)
+            
+            # Analyze Future Relationships (Lightweight)
+            (f_rels, f_adj, f_diag_adj, f_match, f_align, f_diag_align, _) = self._analyze_relationships(future_summary)
+            future_context = {
+                'summary': future_summary, 'adj': f_adj, 'align': f_align, 'match': f_match
+            }
+
             for obj in current_summary:
                 obj_id = obj['id']
                 
-                # 1. Check Scientific Mandate (Ambiguity)
+                # 1. Ambiguity Mandate (Existing Logic)
                 if obj_id in self.active_experiments:
                     mandate = self.active_experiments[obj_id]
                     req_type = mandate['req']
                     ref_action = mandate['ref']
-                    
                     this_action_key = self._get_learning_key(action_template.name, target_id)
                     
-                    # --- FIX: Expanded Relevance ---
-                    # An object is relevant if:
-                    # 1. It is the target of the action.
-                    # 2. OR it has a specific scientific mandate regarding THIS action (e.g. "Stop doing X").
-                    is_relevant = (
-                        (not target_id) or 
-                        (target_id == obj_id) or 
-                        (this_action_key == ref_action)
-                    )
-                    
+                    is_relevant = ((not target_id) or (target_id == obj_id) or (this_action_key == ref_action))
                     if is_relevant:
                         if req_type == 'POSITIVE_CONTROL':
-                            if this_action_key == ref_action: scientific_score += 1
-                            else: scientific_score -= 1
-                        
+                             if this_action_key == ref_action: scientific_score += 1
+                             else: scientific_score -= 1
                         elif req_type == 'NEGATIVE_CONTROL':
-                            if this_action_key != ref_action: scientific_score += 1
-                            else: scientific_score -= 1
-                
-                # 2. Check Exploration vs. Certified Knowledge
+                             if this_action_key != ref_action: scientific_score += 1
+                             else: scientific_score -= 1
+
+                # 2. Exploration (Existing Logic)
                 else:
-                    # For exploration, we keep strict relevance to avoid noise.
-                    # We only reward exploring the specific object we are clicking.
                     is_relevant = (not target_id) or (target_id == obj_id)
-                    
                     if is_relevant:
                         this_action_key = self._get_learning_key(action_template.name, target_id)
-                        
                         laws = self.certified_laws.get(obj_id, {})
                         
-                        if 'ANY' in laws:
-                             scientific_score -= 1 # Boring (Global Law)
-                        elif this_action_key in laws:
-                             scientific_score -= 1 # Boring (Direct Law)
+                        if 'ANY' in laws or this_action_key in laws: scientific_score -= 1
                         else:
-                             has_data = False
-                             if obj_id in self.truth_table and this_action_key in self.truth_table[obj_id]:
-                                  has_data = True
-                             
-                             if not has_data:
-                                 scientific_score += 1 # Exploration Bonus
+                             has_data = (obj_id in self.truth_table and this_action_key in self.truth_table[obj_id])
+                             # Standard Exploration Reward: Try things we haven't done
+                             if not has_data: scientific_score += 1
 
             move_profiles.append((move, scientific_score))
 
         # --- Sort by Score ---
-        # Sort descending by Score
         move_profiles.sort(key=lambda x: x[1], reverse=True)
         
         if move_profiles:
@@ -867,39 +858,33 @@ class ObmlAgi3Agent(Agent):
                 t_name = f" on {chosen_object['id']}" if chosen_object else ""
                 self._print_and_log(f"Chose: {action_to_return.name}{t_name} (Score: {score})")
                 
-                # CHANGED: Loop through ALL profiles instead of min(3, ...)
-                for i in range(len(move_profiles)):
+                # Show top 3 candidates
+                for i in range(min(3, len(move_profiles))):
                     m, s = move_profiles[i]
                     m_tn = f" on {m['object']['id']}" if m['object'] else ""
                     self._print_and_log(f"  #{i+1}: {m['template'].name}{m_tn} -> {s}")
 
         else:
-            # Failsafe: If no intelligent moves are found, do NOT wait forever.
             if self.debug_channels['ACTION_SCORE']:
                 self._print_and_log("  (No moves profiled. Forcing 'Pass' action.)")
             action_to_return = self.get_pass_action()
 
         # --- Store action for next turn's analysis ---
         if action_to_return:
-            # FIX: Explicitly extract ID from the object dict, do not rely on local vars
             target_id = chosen_object['id'] if chosen_object else None
-            
             learning_key_for_storage = self._get_learning_key(
                 action_to_return.name, 
                 target_id
             )
-            # --- UPDATED: Track Turn ID ---
             self.performed_action_types[learning_key_for_storage] = self.global_action_counter
         else:
             learning_key_for_storage = None
         
         self.last_action_context = learning_key_for_storage
         
-        # --- NEW: Timestamp the Action ---
-        # We increment the counter to define a new "Scientific Trial"
+        # --- Timestamp the Action ---
         self.global_action_counter += 1
         self.last_action_id = self.global_action_counter
-        # ---------------------------------
       
         # --- Store state for level history ---
         current_context = {
@@ -1719,85 +1704,64 @@ class ObmlAgi3Agent(Agent):
 
     def _predict_outcome(self, hypothesis_key: tuple, current_context: dict) -> tuple[list|None, int]:
         """
-        Scientific Prediction. Only predicts if a Certified Law exists.
+        Scientific Prediction. 
+        Priority 1: Certified Laws.
+        Priority 2: Greedy Assumption (Truth Table Lookup with Refined State).
         """
         action_name, target_id = hypothesis_key
         
-        # 1. Identify the Object and its Scientific State
         target_obj = None
         if target_id:
             target_obj = next((o for o in current_context['summary'] if o['id'] == target_id), None)
         
-        if not target_obj:
-            return None, 0
+        if not target_obj: return None, 0
         
+        # 1. Get the Scientific State (Includes Aggressive Refinements)
         state_sig = self._get_scientific_state(target_obj, current_context)
         
-        # 2. Check for Certified Laws
+        # 2. Check Certified Laws (Established Science)
         law = self.certified_laws.get((state_sig, action_name)) # Direct
         if not law:
             law = self.certified_laws.get((state_sig, 'ANY'))   # Global
 
-        # 3. Return Prediction
         if law:
-            # --- CASE A: Standard Global/Direct Law ---
+            # [Existing Law Execution Logic...]
             if 'result' in law:
-                result_sig = law['result']
-                return self._expand_result(result_sig, target_obj), 100
-            
-            # --- CASE B: Sequential Global Law ---
-            elif law.get('type') == 'GLOBAL_SEQUENCE':
-                # Check if this object is in the predicted set of targets
-                next_targets = law.get('next_target_ids')
-                
-                current_numeric_id = None
-                try:
-                    current_numeric_id = int(target_obj['id'].split('_')[-1])
-                except: pass
-                
-                is_target = False
-                
-                if next_targets is not None:
-                    # New Set-based logic
-                    if current_numeric_id in next_targets:
-                        is_target = True
-                else:
-                    # Fallback (Safety)
-                    pred = law.get('next_prediction')
-                    if isinstance(pred, int) and pred == current_numeric_id:
-                        is_target = True
-                
-                if is_target:
-                     r_type = law['result_type']
-                     r_val = law['result_value']
-                     result_sig = (r_type, target_obj['id'], r_val)
-                     return self._expand_result(result_sig, target_obj), 100
-                else:
-                     return [], 100
-            
-            # --- NEW CASE C: Sequential Direct Law (Value Cycles) ---
+                return self._expand_result(law['result'], target_obj), 100
             elif law.get('type') == 'DIRECT_SEQUENCE':
                 r_type = law['result_type']
                 seq = law['sequence']
-                
-                # 1. Determine current value based on the law type
-                current_val = None
-                if r_type == 'RECOLORED': current_val = target_obj['color']
-                elif r_type in ['SHAPE_CHANGED', 'TRANSFORM']: current_val = target_obj['fingerprint']
-                elif r_type in ['GROWTH', 'SHRINK']: current_val = target_obj['pixels'] # Or size, depending on tracking
-                
-                # 2. Find next step in cycle
+                current_val = target_obj['color'] if r_type == 'RECOLORED' else target_obj['fingerprint']
                 if current_val in seq:
                     idx = seq.index(current_val)
                     next_val = seq[(idx + 1) % len(seq)]
-                    
-                    # Construct result signature
-                    result_sig = (r_type, target_obj['id'], next_val)
-                    return self._expand_result(result_sig, target_obj), 100
-                else:
-                    # Current value not in known cycle? Assume cycle break or start of cycle.
-                    # Default to first in sequence or fail. Let's return None (Unknown).
-                    return None, 0
+                    return self._expand_result((r_type, target_obj['id'], next_val), target_obj), 100
+
+        # 3. [NEW] Greedy Prediction from Truth Table
+        # If we have refined the state via Splitter, we check if this EXACT state 
+        # has a recorded result in the raw data.
+        if target_id in self.truth_table:
+            # We look for the action key
+            action_data = self.truth_table[target_id].get(action_name, {})
+            
+            # We iterate through known results to see if any match our current state_sig
+            best_match_result = None
+            
+            for result_sig, history in action_data.items():
+                if not history: continue
+                # Check the state_sig of the most recent entry
+                last_entry = history[-1]
+                # Entry format: (run, turn, stored_state_sig)
+                if len(last_entry) >= 3:
+                    stored_sig = last_entry[2]
+                    if stored_sig == state_sig:
+                        best_match_result = result_sig
+                        break
+            
+            if best_match_result:
+                # We found a precedent for this EXACT refined state!
+                # Assume this result will repeat.
+                return self._expand_result(best_match_result, target_obj), 80 
 
         return None, 0
 
@@ -4075,117 +4039,79 @@ class ObmlAgi3Agent(Agent):
 
     def _trigger_splitter(self, obj_id, action, conflicting_results: dict):
         """
-        [THE UNIVERSAL SPLITTER]
-        Resolves inconsistency by performing 'Contrastive Analysis' on the contexts
-        of conflicting results.
-        
-        Logic:
-        1. Group snapshots by Result (e.g., Result A vs. Result B).
-        2. Scan ALL feature types (Adjacency, Alignment, Match Groups).
-        3. Scan ALL property modes (Presence, ID, Color, Size, Shape).
-        4. Find a feature that is CONSTANT for Result A but DIFFERENT/ABSENT for Result B.
+        [AGGRESSIVE SPLITTER]
+        Identifies ALL features that differ between conflicting results to create
+        a precise 'Scientific State' mask.
         """
-        # 1. Gather Contexts for each Result Type
-        # Structure: contexts_by_result[Result_Sig] = [ {snapshot, target_id}, ... ]
+        # 1. Gather Contexts
         contexts_by_result = {}
-        
         for r_sig, locs in conflicting_results.items():
             contexts_by_result[r_sig] = []
             for entry in locs:
-                # Unpack potentially variable tuple size (Run, Turn) or (Run, Turn, Sig)
-                if len(entry) == 3:
-                    run, turn, _ = entry
-                else:
-                    run, turn = entry
-
-                # Retrieve the full snapshot from history
+                if len(entry) == 3: run, turn, _ = entry
+                else: run, turn = entry
+                # Use history to reconstruct Total State
                 if 0 <= turn < len(self.level_state_history):
                     contexts_by_result[r_sig].append({
                         'snapshot': self.level_state_history[turn],
                         'target_id': obj_id
                     })
 
-        if len(contexts_by_result) < 2: return # Need at least 2 distinct results to contrast
+        if len(contexts_by_result) < 2: return
 
-        # 2. Define the Search Space (The "Everything" Scan)
-        # We test these hypotheses for every potential relation.
+        # 2. Define Search Space (The "Total State" Scan)
         hypotheses = []
         
-        # A. Adjacency Hypotheses
+        # Adjacency (Top, Bottom, Left, Right)
         for direction in ['top', 'right', 'bottom', 'left']:
             key = f"adj_{direction}"
-            # We check: Is the neighbor's ID/Color/Shape/Size the switch?
-            # Or is it just the *presence* of a neighbor (BINARY)?
             for mode in ['BINARY', 'ID', 'COLOR', 'SIZE', 'SHAPE']:
                 hypotheses.append((key, mode))
-                
-        # B. Alignment Hypotheses
-        # For now, we mostly care if it IS aligned (Binary) or aligned with a specific ID.
-        # Color/Shape alignment is complex (aligned with *what*?), sticking to Binary/ID for speed.
+        
+        # Alignment (Center, Edges)
         align_types = ['center_x', 'center_y', 'top_y', 'left_x', 'right_x', 'bottom_y']
         for a_type in align_types:
             key = f"align_{a_type}"
             for mode in ['BINARY', 'ID']: 
                 hypotheses.append((key, mode))
 
-        # C. Match Group Hypotheses (Global Context)
-        # "Am I part of the Red group?"
+        # Match Groups (Global Context)
         match_types = ['Color', 'Shape', 'Size', 'Exact']
         for m_type in match_types:
             key = f"match_{m_type}"
-            hypotheses.append((key, 'BINARY')) # Membership is usually binary
+            hypotheses.append((key, 'BINARY'))
 
-        # 3. Execute The Audit
-        best_refinement = None
+        # 3. Execute The Audit (AGGRESSIVE MODE)
+        valid_refinements = []
         
         for key, mode in hypotheses:
-            
-            # Step 3a: Build Profiles for this Feature
-            # Profile = Set of values seen for this feature in this Result group.
             profiles = {} 
-            
             for r_sig, ctx_list in contexts_by_result.items():
                 seen_values = set()
                 for ctx in ctx_list:
-                    # Extract the value of this feature in this snapshot
                     val = self._get_context_prop(ctx, key, mode)
                     seen_values.add(val)
                 profiles[r_sig] = seen_values
 
-            # Step 3b: Analyze Consistency & Contrast
-            # We are looking for a feature that "Explains" the split.
-            # Ideally: Result A always has Value X. Result B always has Value Y (or None).
-            
             is_valid_splitter = False
-            
-            # Check every pair of results
             r_sigs = list(profiles.keys())
             
-            # HEURISTIC: We prioritize the "Primary" result (the one with most data) vs others
-            # But strictly, we just need ONE valid split to make progress.
-            
+            # Compare every result group against every other group
             for i in range(len(r_sigs)):
                 sig_A = r_sigs[i]
                 values_A = profiles[sig_A]
                 
-                # Condition 1: Consistency within A
-                # The feature must be stable (1 value) to be a valid Predictor for A.
-                if len(values_A) != 1: 
-                    continue
-                
+                # NARROWING: Feature must be consistent (Invariant) within Result A
+                if len(values_A) != 1: continue
                 val_A = list(values_A)[0]
                 
-                # Condition 2: Contrast with B
-                # Does Result B have a DIFFERENT value (or set of values)?
-                # We check against ALL other results.
                 is_distinct = True
                 for j in range(len(r_sigs)):
                     if i == j: continue
                     sig_B = r_sigs[j]
                     values_B = profiles[sig_B]
                     
-                    # If Result B *also* strictly requires Value X, then this feature
-                    # does NOT explain the difference (it's common to both).
+                    # DIFFERENTIATION: Result B must NOT share this invariant value
                     if values_B == {val_A}:
                         is_distinct = False
                         break
@@ -4195,31 +4121,28 @@ class ObmlAgi3Agent(Agent):
                     break
             
             if is_valid_splitter:
-                best_refinement = (key, mode)
-                break # Found the mechanism! Stop scanning.
+                # [CHANGE] We do not break. We collect ALL candidates.
+                valid_refinements.append((key, mode))
 
-        # 4. Apply the Discovery
-        if best_refinement:
-            feature_key, mode = best_refinement
-            
-            # Get the Base Signature of the object we are analyzing
-            # (We just grab the first available snapshot to reconstruct it)
+        # 4. Apply ALL Discoveries
+        if valid_refinements:
+            # Get Base Signature for storage
             first_ctx = list(contexts_by_result.values())[0][0]
             t_obj = next((o for o in first_ctx['snapshot']['summary'] if o['id'] == obj_id), None)
             
             if t_obj:
                 base_sig = (t_obj['color'], t_obj['fingerprint'], t_obj['size'])
-                
                 if base_sig not in self.state_refinements:
                     self.state_refinements[base_sig] = []
                 
-                # Store the refinement if new
-                if best_refinement not in self.state_refinements[base_sig]:
-                    self.state_refinements[base_sig].append(best_refinement)
-                    
-                    if self.debug_channels['HYPOTHESIS']:
-                        print(f"  [Splitter] EUREKA! Refined State for {obj_id}:")
-                        print(f"             Variable: {feature_key} ({mode}) explains the conflict.")
+                added_count = 0
+                for refinement in valid_refinements:
+                    if refinement not in self.state_refinements[base_sig]:
+                        self.state_refinements[base_sig].append(refinement)
+                        added_count += 1
+                
+                if added_count > 0 and self.debug_channels['HYPOTHESIS']:
+                    print(f"  [Splitter] EUREKA! Refined State for {obj_id} with {added_count} new variables.")
 
     def _get_context_prop(self, ctx_entry: dict, key: str, mode: str):
         """
