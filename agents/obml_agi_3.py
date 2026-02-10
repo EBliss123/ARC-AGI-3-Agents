@@ -3891,84 +3891,6 @@ class ObmlAgi3Agent(Agent):
         
         return (f"CORRELATION: {type_str} caused by movement/removal of {mover_str}", agitator_list)
     
-    def _get_scientific_state(self, obj: dict, context: dict) -> tuple:
-        """
-        Constructs the State Signature. Starts with Intrinsic properties.
-        If the Splitter has activated for this object type, it appends specific Context features.
-        Supports Modes: BINARY, ID, COLOR.
-        """
-        # 1. Intrinsic Properties (The Base)
-        base_sig = (obj['color'], obj['fingerprint'], obj['size'])
-        
-        # 2. Check for Refinements (Context)
-        required_context_items = self.state_refinements.get(base_sig, [])
-        
-        context_features = []
-        for item in required_context_items:
-            # Handle legacy string-only keys (default to BINARY) just in case
-            if isinstance(item, str):
-                key = item
-                mode = 'BINARY'
-            else:
-                key, mode = item
-            
-            val = None
-            
-            if key.startswith('adj_'):
-                # Adjacency check
-                direction = key.split('_')[1] # top, right, etc.
-                d_idx = {'top':0, 'right':1, 'bottom':2, 'left':3}.get(direction)
-                adj_list = context.get('adj', {}).get(obj['id'], ['na']*4)
-                
-                neighbor_id = 'na'
-                if d_idx is not None:
-                    neighbor_id = adj_list[d_idx]
-                
-                if mode == 'BINARY':
-                    val = (neighbor_id != 'na')
-                
-                elif mode == 'ID':
-                    val = neighbor_id # Returns 'obj_5' or 'na'
-                
-                elif mode == 'COLOR':
-                    if neighbor_id == 'na':
-                        val = 'na'
-                    else:
-                        # We need to look up the neighbor object to get its color
-                        # This is slightly expensive but necessary for Scientific Rigor
-                        neighbor_obj = next((o for o in context['summary'] if o['id'] == neighbor_id), None)
-                        val = neighbor_obj['color'] if neighbor_obj else 'unknown'
-
-            elif key.startswith('align_'):
-                # Alignment check (Usually Binary, but could be ID-based later)
-                align_type = key.replace('align_', '')
-                groups = context.get('align', {}).get(align_type, {})
-                
-                # Check membership
-                is_member = False
-                for coord, ids in groups.items():
-                    if obj['id'] in ids:
-                        is_member = True
-                        break
-                val = is_member # Default to Binary for now until Splitter upgrades Alignment
-            
-            elif key.startswith('match_'):
-                # Match Group check
-                m_type = key.replace('match_', '')
-                groups = context.get('match', {}).get(m_type, {})
-                
-                is_member = False
-                for props, ids in groups.items():
-                    if obj['id'] in ids:
-                        is_member = True
-                        break
-                val = is_member
-
-            context_features.append((key, val))
-
-        # Return (Base, Context_Tuple)
-        return (base_sig, tuple(sorted(context_features)))
-    
     def _detect_sequential_global_laws(self, state_sig, actions_data):
         """
         [PLACEHOLDER] ID-BASED GLOBAL CYCLES
@@ -4153,107 +4075,135 @@ class ObmlAgi3Agent(Agent):
 
     def _trigger_splitter(self, obj_id, action, conflicting_results: dict):
         """
-        [THE SPLITTER]
-        Resolves inconsistency by profiling each result type independently.
-        Finds constants (ID, Color, Size) for each result and refines the State Signature.
+        [THE UNIVERSAL SPLITTER]
+        Resolves inconsistency by performing 'Contrastive Analysis' on the contexts
+        of conflicting results.
+        
+        Logic:
+        1. Group snapshots by Result (e.g., Result A vs. Result B).
+        2. Scan ALL feature types (Adjacency, Alignment, Match Groups).
+        3. Scan ALL property modes (Presence, ID, Color, Size, Shape).
+        4. Find a feature that is CONSTANT for Result A but DIFFERENT/ABSENT for Result B.
         """
         # 1. Gather Contexts for each Result Type
+        # Structure: contexts_by_result[Result_Sig] = [ {snapshot, target_id}, ... ]
         contexts_by_result = {}
         
         for r_sig, locs in conflicting_results.items():
             contexts_by_result[r_sig] = []
             for entry in locs:
+                # Unpack potentially variable tuple size (Run, Turn) or (Run, Turn, Sig)
                 if len(entry) == 3:
                     run, turn, _ = entry
                 else:
                     run, turn = entry
 
+                # Retrieve the full snapshot from history
                 if 0 <= turn < len(self.level_state_history):
                     contexts_by_result[r_sig].append({
                         'snapshot': self.level_state_history[turn],
                         'target_id': obj_id
                     })
 
-        if len(contexts_by_result) < 2: return # Need at least 2 to split
+        if len(contexts_by_result) < 2: return # Need at least 2 distinct results to contrast
 
-        # Helper to extract neighbor properties
-        def get_neighbor_prop(ctx_entry, direction, prop_type):
-            snap = ctx_entry['snapshot']
-            tid = ctx_entry['target_id']
-            # Get Neighbor ID from adjacency map
-            idx = {'top':0, 'right':1, 'bottom':2, 'left':3}.get(direction)
-            adj_list = snap.get('adj', {}).get(tid, ['na']*4)
-            neighbor_id = adj_list[idx]
-            
-            if neighbor_id == 'na': return 'na'
-            
-            # Find the actual object to get properties
-            neighbor_obj = next((o for o in snap['summary'] if o['id'] == neighbor_id), None)
-            if not neighbor_obj: return 'unknown'
-            
-            if prop_type == 'ID': return neighbor_id
-            if prop_type == 'COLOR': return neighbor_obj['color']
-            if prop_type == 'SIZE': return neighbor_obj['size']
-            return 'na'
+        # 2. Define the Search Space (The "Everything" Scan)
+        # We test these hypotheses for every potential relation.
+        hypotheses = []
+        
+        # A. Adjacency Hypotheses
+        for direction in ['top', 'right', 'bottom', 'left']:
+            key = f"adj_{direction}"
+            # We check: Is the neighbor's ID/Color/Shape/Size the switch?
+            # Or is it just the *presence* of a neighbor (BINARY)?
+            for mode in ['BINARY', 'ID', 'COLOR', 'SIZE', 'SHAPE']:
+                hypotheses.append((key, mode))
+                
+        # B. Alignment Hypotheses
+        # For now, we mostly care if it IS aligned (Binary) or aligned with a specific ID.
+        # Color/Shape alignment is complex (aligned with *what*?), sticking to Binary/ID for speed.
+        align_types = ['center_x', 'center_y', 'top_y', 'left_x', 'right_x', 'bottom_y']
+        for a_type in align_types:
+            key = f"align_{a_type}"
+            for mode in ['BINARY', 'ID']: 
+                hypotheses.append((key, mode))
 
-        # Analyze each direction for potential splitters
-        directions = ['top', 'right', 'bottom', 'left']
+        # C. Match Group Hypotheses (Global Context)
+        # "Am I part of the Red group?"
+        match_types = ['Color', 'Shape', 'Size', 'Exact']
+        for m_type in match_types:
+            key = f"match_{m_type}"
+            hypotheses.append((key, 'BINARY')) # Membership is usually binary
+
+        # 3. Execute The Audit
         best_refinement = None
         
-        for direction in directions:
-            # Check TIER 1: Identity (ID)
-            id_profiles = {} # Result -> Set of IDs seen
-            for r_sig, ctx_list in contexts_by_result.items():
-                seen = set()
-                for ctx in ctx_list:
-                    seen.add(get_neighbor_prop(ctx, direction, 'ID'))
-                id_profiles[r_sig] = seen
+        for key, mode in hypotheses:
             
-            # Is ID consistent for any result?
-            candidate_found = False
-            for r_sig, ids in id_profiles.items():
-                if len(ids) == 1: # Constant!
-                    constant_id = list(ids)[0]
-                    # Check overlap with others
-                    overlap = False
-                    for other_r, other_ids in id_profiles.items():
-                        if r_sig == other_r: continue
-                        if constant_id in other_ids: overlap = True
-                    
-                    if not overlap:
-                        # Found a splitter! ID is the key.
-                        best_refinement = (f'adj_{direction}', 'ID')
-                        candidate_found = True
-                        break
-            if candidate_found: break
+            # Step 3a: Build Profiles for this Feature
+            # Profile = Set of values seen for this feature in this Result group.
+            profiles = {} 
             
-            # Check TIER 2: Color
-            color_profiles = {}
             for r_sig, ctx_list in contexts_by_result.items():
-                seen = set()
+                seen_values = set()
                 for ctx in ctx_list:
-                    seen.add(get_neighbor_prop(ctx, direction, 'COLOR'))
-                color_profiles[r_sig] = seen
-                
-            candidate_found = False
-            for r_sig, colors in color_profiles.items():
-                if len(colors) == 1:
-                    constant_color = list(colors)[0]
-                    overlap = False
-                    for other_r, other_cols in color_profiles.items():
-                        if r_sig == other_r: continue
-                        if constant_color in other_cols: overlap = True
-                    if not overlap:
-                        best_refinement = (f'adj_{direction}', 'COLOR')
-                        candidate_found = True
-                        break
-            if candidate_found: break
+                    # Extract the value of this feature in this snapshot
+                    val = self._get_context_prop(ctx, key, mode)
+                    seen_values.add(val)
+                profiles[r_sig] = seen_values
 
-        # 3. Apply Refinement
+            # Step 3b: Analyze Consistency & Contrast
+            # We are looking for a feature that "Explains" the split.
+            # Ideally: Result A always has Value X. Result B always has Value Y (or None).
+            
+            is_valid_splitter = False
+            
+            # Check every pair of results
+            r_sigs = list(profiles.keys())
+            
+            # HEURISTIC: We prioritize the "Primary" result (the one with most data) vs others
+            # But strictly, we just need ONE valid split to make progress.
+            
+            for i in range(len(r_sigs)):
+                sig_A = r_sigs[i]
+                values_A = profiles[sig_A]
+                
+                # Condition 1: Consistency within A
+                # The feature must be stable (1 value) to be a valid Predictor for A.
+                if len(values_A) != 1: 
+                    continue
+                
+                val_A = list(values_A)[0]
+                
+                # Condition 2: Contrast with B
+                # Does Result B have a DIFFERENT value (or set of values)?
+                # We check against ALL other results.
+                is_distinct = True
+                for j in range(len(r_sigs)):
+                    if i == j: continue
+                    sig_B = r_sigs[j]
+                    values_B = profiles[sig_B]
+                    
+                    # If Result B *also* strictly requires Value X, then this feature
+                    # does NOT explain the difference (it's common to both).
+                    if values_B == {val_A}:
+                        is_distinct = False
+                        break
+                
+                if is_distinct:
+                    is_valid_splitter = True
+                    break
+            
+            if is_valid_splitter:
+                best_refinement = (key, mode)
+                break # Found the mechanism! Stop scanning.
+
+        # 4. Apply the Discovery
         if best_refinement:
             feature_key, mode = best_refinement
             
-            # Find the Base Signature
+            # Get the Base Signature of the object we are analyzing
+            # (We just grab the first available snapshot to reconstruct it)
             first_ctx = list(contexts_by_result.values())[0][0]
             t_obj = next((o for o in first_ctx['snapshot']['summary'] if o['id'] == obj_id), None)
             
@@ -4263,13 +4213,165 @@ class ObmlAgi3Agent(Agent):
                 if base_sig not in self.state_refinements:
                     self.state_refinements[base_sig] = []
                 
-                # FIX: Store the FULL TUPLE (Key, Mode)
-                # Check if we already have this refinement
+                # Store the refinement if new
                 if best_refinement not in self.state_refinements[base_sig]:
                     self.state_refinements[base_sig].append(best_refinement)
                     
-            if self.debug_channels['HYPOTHESIS']:
-                print(f"  [Splitter] Refined State for {obj_id}: Added {feature_key} ({mode})")
+                    if self.debug_channels['HYPOTHESIS']:
+                        print(f"  [Splitter] EUREKA! Refined State for {obj_id}:")
+                        print(f"             Variable: {feature_key} ({mode}) explains the conflict.")
+
+    def _get_context_prop(self, ctx_entry: dict, key: str, mode: str):
+        """
+        Helper: Robustly extracts a property from a history snapshot.
+        Handles complex lookups like 'The Shape of the object aligned on X'.
+        """
+        snap = ctx_entry['snapshot']
+        tid = ctx_entry['target_id']
+        
+        # --- A. Adjacency Logic ---
+        if key.startswith('adj_'):
+            direction = key.replace('adj_', '')
+            idx = {'top':0, 'right':1, 'bottom':2, 'left':3}.get(direction)
+            adj_list = snap.get('adj', {}).get(tid, ['na']*4)
+            neighbor_id = adj_list[idx]
+            
+            if mode == 'BINARY': return (neighbor_id != 'na')
+            if neighbor_id == 'na': return 'na'
+            if mode == 'ID': return neighbor_id
+            
+            # Property Lookup
+            n_obj = next((o for o in snap['summary'] if o['id'] == neighbor_id), None)
+            if not n_obj: return 'unknown'
+            
+            if mode == 'COLOR': return n_obj['color']
+            if mode == 'SIZE': return n_obj['size']
+            if mode == 'SHAPE': return n_obj['fingerprint']
+
+        # --- B. Alignment Logic ---
+        elif key.startswith('align_'):
+            a_type = key.replace('align_', '')
+            groups = snap.get('align', {}).get(a_type, {})
+            
+            # Find the group I am in
+            my_group_coord = None
+            my_group_ids = set()
+            for coord, ids in groups.items():
+                if tid in ids:
+                    my_group_coord = coord
+                    my_group_ids = ids
+                    break
+            
+            if mode == 'BINARY': return (my_group_coord is not None)
+            if my_group_coord is None: return 'na'
+            
+            if mode == 'ID':
+                # For alignment, ID is tricky because there might be multiple.
+                # We return a frozenset of ALL aligned IDs (excluding self)
+                others = my_group_ids - {tid}
+                if not others: return 'empty'
+                return frozenset(others)
+
+        # --- C. Match Group Logic ---
+        elif key.startswith('match_'):
+            m_type = key.replace('match_', '')
+            groups = snap.get('match', {}).get(m_type, {})
+            
+            is_member = False
+            for props, ids in groups.items():
+                if tid in ids:
+                    is_member = True
+                    break
+            return is_member
+
+        return 'unknown'
+
+    def _get_scientific_state(self, obj: dict, context: dict) -> tuple:
+        """
+        Constructs the State Signature. Starts with Intrinsic properties.
+        Appends refined Context features based on the Splitter's requirements.
+        
+        UPDATED: Supports SIZE and SHAPE modes.
+        """
+        # 1. Intrinsic Properties (The Base)
+        base_sig = (obj['color'], obj['fingerprint'], obj['size'])
+        
+        # 2. Check for Refinements (Context)
+        required_context_items = self.state_refinements.get(base_sig, [])
+        
+        context_features = []
+        for item in required_context_items:
+            # Handle legacy string-only keys
+            if isinstance(item, str):
+                key, mode = item, 'BINARY'
+            else:
+                key, mode = item
+            
+            val = None
+            
+            # --- Adjacency ---
+            if key.startswith('adj_'):
+                direction = key.split('_')[1]
+                d_idx = {'top':0, 'right':1, 'bottom':2, 'left':3}.get(direction)
+                adj_list = context.get('adj', {}).get(obj['id'], ['na']*4)
+                neighbor_id = adj_list[d_idx] if d_idx is not None else 'na'
+                
+                if mode == 'BINARY':
+                    val = (neighbor_id != 'na')
+                elif neighbor_id == 'na':
+                    val = 'na'
+                elif mode == 'ID':
+                    val = neighbor_id
+                else:
+                    # Lookup Neighbor Properties (Color, Size, Shape)
+                    neighbor_obj = next((o for o in context['summary'] if o['id'] == neighbor_id), None)
+                    if neighbor_obj:
+                        if mode == 'COLOR': val = neighbor_obj['color']
+                        elif mode == 'SIZE': val = neighbor_obj['size']
+                        elif mode == 'SHAPE': val = neighbor_obj['fingerprint']
+                    else:
+                        val = 'unknown'
+
+            # --- Alignment ---
+            elif key.startswith('align_'):
+                align_type = key.replace('align_', '')
+                groups = context.get('align', {}).get(align_type, {})
+                
+                is_member = False
+                aligned_ids = set()
+                for coord, ids in groups.items():
+                    if obj['id'] in ids:
+                        is_member = True
+                        aligned_ids = ids
+                        break
+                
+                if mode == 'BINARY':
+                    val = is_member
+                elif mode == 'ID':
+                    if is_member:
+                        others = aligned_ids - {obj['id']}
+                        val = frozenset(others) if others else 'empty'
+                    else:
+                        val = 'na'
+            
+            # --- Match Groups ---
+            elif key.startswith('match_'):
+                m_type = key.replace('match_', '')
+                groups = context.get('match', {}).get(m_type, {})
+                
+                is_member = False
+                for props, ids in groups.items():
+                    if obj['id'] in ids:
+                        is_member = True
+                        break
+                val = is_member
+
+            context_features.append((key, val))
+
+        # Return (Base, Context_Tuple)
+        # FIX: Use key=str to prevent "TypeError: '<' not supported between instances of 'str' and 'bool'"
+        # when multiple refinements for the same key exist (e.g. BINARY vs ID).
+        return (base_sig, tuple(sorted(context_features, key=str)))
 
     def _check_feature_presence(self, contexts, base_sig, feature_type, sub_key):
         """
