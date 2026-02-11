@@ -776,6 +776,7 @@ class ObmlAgi3Agent(Agent):
         # --- Pre-calculate current scientific states for comparison ---
         current_obj_states = {}
         for obj in current_summary:
+             # This captures the state *including* the active refinements (Suspect Variables)
              current_obj_states[obj['id']] = self._get_scientific_state(obj, current_full_context)
 
         move_profiles = []
@@ -787,12 +788,10 @@ class ObmlAgi3Agent(Agent):
             
             scientific_score = 0
             
-            # [NEW] Lookahead Simulation (Greedy Prediction)
+            # [Lookahead Simulation Logic...]
             predicted_events = []
-            
             if target_id:
                 pred_key = (self._get_learning_key(action_template.name, target_id).split('_')[0], target_id)
-                # Use greedy predictor
                 pe, _ = self._predict_outcome(pred_key, current_full_context)
                 if pe: predicted_events = pe
             else:
@@ -801,7 +800,7 @@ class ObmlAgi3Agent(Agent):
                     pe, _ = self._predict_outcome(pred_key, current_full_context)
                     if pe: predicted_events.extend(pe)
             
-            # Generate Future State
+            # Generate Future
             future_summary = self._get_hypothetical_summary(current_summary, predicted_events)
             
             # Analyze Future Relationships (Lightweight)
@@ -829,18 +828,37 @@ class ObmlAgi3Agent(Agent):
                              if this_action_key != ref_action: scientific_score += 1
                              else: scientific_score -= 1
 
-                # 2. Exploration (Existing Logic)
+                # 2. Exploration & Hypothesis Testing
                 else:
                     is_relevant = (not target_id) or (target_id == obj_id)
                     if is_relevant:
                         this_action_key = self._get_learning_key(action_template.name, target_id)
                         laws = self.certified_laws.get(obj_id, {})
                         
-                        if 'ANY' in laws or this_action_key in laws: scientific_score -= 1
+                        if 'ANY' in laws or this_action_key in laws: 
+                            scientific_score -= 1
                         else:
                              has_data = (obj_id in self.truth_table and this_action_key in self.truth_table[obj_id])
-                             # Standard Exploration Reward: Try things we haven't done
+                             # Standard Exploration Reward
                              if not has_data: scientific_score += 1
+                        
+                        # [NEW] Targeted Candidate Testing (+1 Bonus)
+                        # Does this action change a "Relevant Characteristic" (Refinement)?
+                        future_obj = next((o for o in future_summary if o['id'] == obj_id), None)
+                        if future_obj:
+                            # Recalculate state in the future context
+                            future_state = self._get_scientific_state(future_obj, future_context)
+                            current_state = current_obj_states.get(obj_id)
+                            
+                            # State Signature structure: (Base_Sig, Context_Tuple)
+                            # Context_Tuple contains only the refined variables.
+                            if current_state and future_state:
+                                # If the Context Tuple changed, it means we toggled a suspect variable.
+                                if current_state[1] != future_state[1]:
+                                    scientific_score += 1
+                                    if self.debug_channels['ACTION_SCORE']:
+                                        # Optional: verbose debug to verify it's working
+                                        pass 
 
             move_profiles.append((move, scientific_score))
 
@@ -3078,7 +3096,6 @@ class ObmlAgi3Agent(Agent):
                     self._trigger_splitter(obj_id, action_key, self.truth_table[obj_id][action_key])
                     
                     # 2. Retrieve the fresh hypothesis (if any)
-                    # We need the object's base signature to look up the refinement
                     target_obj = next((o for o in prev_context['summary'] if o['id'] == obj_id), None)
                     current_refinements = []
                     
@@ -3088,11 +3105,14 @@ class ObmlAgi3Agent(Agent):
 
                     if current_refinements:
                         # Success! We found candidates.
-                        # Format them for the log: "adj_top (BINARY), align_x (ID)"
-                        c_str = ", ".join([f"{k}" for k, m in current_refinements])
+                        # [CHANGE] improved formatting: "obj_id {var1, var2...}"
+                        # Filter duplicates (e.g. adj_top BINARY vs ID) by just showing the keys
+                        unique_vars = sorted(list(set(k for k, m in current_refinements)))
+                        vars_str = ", ".join(unique_vars)
+                        
                         diagnosis = "Hypothesis Generated"
-                        fix = "TEST_HYPOTHESIS"
-                        detail = f"Splitter identified {len(current_refinements)} candidates: [{c_str}]"
+                        fix = "TEST_CANDIDATES" # More descriptive
+                        detail = f"{obj_id} {{{vars_str}}}" # Clean format
                         requirements = ["VERIFY_VAR"]
                     else:
                         # Failure. Splitter ran but found no intersection.
