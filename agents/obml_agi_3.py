@@ -3017,8 +3017,9 @@ class ObmlAgi3Agent(Agent):
     def _classify_event_stream(self, current_events: list[dict], action_key: str, prev_context: dict) -> tuple[list[dict], list[dict], list[dict]]:
         """
         [THE GATEKEEPER]
-        Sorts raw events into DIRECT, GLOBAL, or AMBIGUOUS based strictly on Certified Laws.
-        Diagnoses Ambiguous events with a Scientific Roadmap (Requirements).
+        Sorts raw events into DIRECT, GLOBAL, or AMBIGUOUS.
+        UPDATED: Now runs the Splitter IMMEDIATELY upon detecting conflict
+        so the logs reflect the active hypothesis instead of just 'Waiting'.
         """
         direct_events = []
         global_events = []
@@ -3045,7 +3046,6 @@ class ObmlAgi3Agent(Agent):
             global_law = laws.get('ANY')
             if global_law and global_law['result'] == result_sig:
                 global_events.append(event)
-                # Success! Task complete. Remove from agenda.
                 if obj_id in self.active_experiments: del self.active_experiments[obj_id]
                 continue
             
@@ -3053,13 +3053,10 @@ class ObmlAgi3Agent(Agent):
             direct_law = laws.get(action_key)
             if direct_law and direct_law['result'] == result_sig:
                 direct_events.append(event)
-                # Success! Task complete. Remove from agenda.
                 if obj_id in self.active_experiments: del self.active_experiments[obj_id]
                 continue
                 
             # 4. If we are here, it is AMBIGUOUS. 
-            # We must generate the Scientific Roadmap.
-            
             diagnosis = "Unknown"
             requirements = []
             fix = "EXPLORE"
@@ -3071,53 +3068,66 @@ class ObmlAgi3Agent(Agent):
                 n_count = len(history)
                 
                 # Check for Contradictions (Stability)
-                # Are there OTHER results for this same action?
                 all_results = self.truth_table[obj_id][action_key].keys()
+                
                 if len(all_results) > 1:
+                    # [CRITICAL UPDATE]: Immediate Splitter Execution
                     diagnosis = "Unstable/Inconsistent"
-                    requirements = ["STABILIZE_CONTEXT"]
-                    fix = "WAIT_FOR_SPLITTER"
-                    detail = "Action produces multiple conflicting results."
-                else:
-                    # No contradictions, so we check for missing proofs.
                     
-                    # 1. Check Consistency (Positive Control)
+                    # 1. Run the Splitter NOW
+                    self._trigger_splitter(obj_id, action_key, self.truth_table[obj_id][action_key])
+                    
+                    # 2. Retrieve the fresh hypothesis (if any)
+                    # We need the object's base signature to look up the refinement
+                    target_obj = next((o for o in prev_context['summary'] if o['id'] == obj_id), None)
+                    current_refinements = []
+                    
+                    if target_obj:
+                        base_sig = (target_obj['color'], target_obj['fingerprint'], target_obj['size'])
+                        current_refinements = self.state_refinements.get(base_sig, [])
+
+                    if current_refinements:
+                        # Success! We found candidates.
+                        # Format them for the log: "adj_top (BINARY), align_x (ID)"
+                        c_str = ", ".join([f"{k}" for k, m in current_refinements])
+                        diagnosis = "Hypothesis Generated"
+                        fix = "TEST_HYPOTHESIS"
+                        detail = f"Splitter identified {len(current_refinements)} candidates: [{c_str}]"
+                        requirements = ["VERIFY_VAR"]
+                    else:
+                        # Failure. Splitter ran but found no intersection.
+                        fix = "WAIT_FOR_MORE_DATA"
+                        detail = "Splitter ran but found no consistent differentiator yet."
+                        requirements = ["STABILIZE_CONTEXT"]
+
+                else:
+                    # No contradictions, standard checks
                     if n_count < 2:
                         requirements.append("POSITIVE_CONTROL")
                     
-                    # 2. Check Distinction (Negative Control)
-                    # Have we tried ANY other action on this object?
-                    # (We check the length of the action keys for this object)
                     tried_actions = self.truth_table[obj_id].keys()
                     if len(tried_actions) < 2:
                         requirements.append("NEGATIVE_CONTROL")
                     
-                    # 3. Determine Status & Fix
                     if "POSITIVE_CONTROL" in requirements and "NEGATIVE_CONTROL" in requirements:
                         diagnosis = "Hypothesis (Early Stage)"
-                        fix = "REPEAT_ACTION" # Priority: Establish consistency first
+                        fix = "REPEAT_ACTION"
                         detail = "Need to verify consistency (N>=2) AND try other actions."
-                        
                     elif "POSITIVE_CONTROL" in requirements:
                         diagnosis = "Unverified (N=1)"
                         fix = "REPEAT_ACTION"
                         detail = "Result seen once. Need confirmation."
-                        
                     elif "NEGATIVE_CONTROL" in requirements:
                         diagnosis = "Undistinguished"
                         fix = "TRY_DIFFERENT_ACTION"
-                        detail = "Consistent (N>=2), but need Negative Control to rule out Global law."
-                    
+                        detail = "Consistent (N>=2), but need Negative Control."
                     else:
-                        # We have N>=2 AND we have tried other actions.
                         diagnosis = "Pending Certification"
                         fix = "ANALYZE" 
                         detail = "Data is sufficient. Waiting for Judge cycle."
-                        # We have data, just waiting for Judge. Clear agenda to prevent looping.
                         if obj_id in self.active_experiments: del self.active_experiments[obj_id]
 
             else:
-                # First sighting (no history accessible yet, or brand new)
                 diagnosis = "New Phenomenon"
                 requirements = ["POSITIVE_CONTROL", "NEGATIVE_CONTROL"]
                 fix = "REPEAT_ACTION"
@@ -3133,7 +3143,7 @@ class ObmlAgi3Agent(Agent):
                 'event': event,
                 'type': 'AMBIGUOUS',
                 'reason': diagnosis,
-                'requirements': requirements, # List of missing proofs
+                'requirements': requirements,
                 'fix': fix,
                 'detail': detail,
                 'target_action': action_key,
