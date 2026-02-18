@@ -1756,30 +1756,31 @@ class ObmlAgi3Agent(Agent):
                     return self._expand_result((r_type, target_obj['id'], next_val), target_obj), 100
 
         # 3. [NEW] Greedy Prediction from Truth Table
-        # If we have refined the state via Splitter, we check if this EXACT state 
-        # has a recorded result in the raw data.
         if target_id in self.truth_table:
-            # We look for the action key
             action_data = self.truth_table[target_id].get(action_name, {})
             
-            # We iterate through known results to see if any match our current state_sig
             best_match_result = None
-            
             for result_sig, history in action_data.items():
                 if not history: continue
-                # Check the state_sig of the most recent entry
+                # Look at the most recent entry
                 last_entry = history[-1]
-                # Entry format: (run, turn, stored_state_sig)
                 if len(last_entry) >= 3:
-                    stored_sig = last_entry[2]
-                    if stored_sig == state_sig:
-                        best_match_result = result_sig
-                        break
+                    run, turn = last_entry[0], last_entry[1]
+                    # The state that caused the event was the turn BEFORE the event
+                    ctx_idx = turn - 1
+                    if 0 <= ctx_idx < len(self.level_state_history):
+                        past_ctx = self.level_state_history[ctx_idx]
+                        past_obj = next((o for o in past_ctx['summary'] if o['id'] == target_id), None)
+                        if past_obj:
+                            # Recalculate the historical state signature using the NEW rules
+                            past_state_sig = self._get_scientific_state(past_obj, past_ctx)
+                            # If it matches the current state signature, we have a Greedy Match!
+                            if past_state_sig == state_sig:
+                                best_match_result = result_sig
+                                break
             
             if best_match_result:
-                # We found a precedent for this EXACT refined state!
-                # Assume this result will repeat.
-                return self._expand_result(best_match_result, target_obj), 80 
+                return self._expand_result(best_match_result, target_obj), 80
 
         return None, 0
 
@@ -3104,15 +3105,15 @@ class ObmlAgi3Agent(Agent):
                         current_refinements = self.state_refinements.get(base_sig, [])
 
                     if current_refinements:
-                        # Success! We found candidates.
-                        # [CHANGE] improved formatting: "obj_id {var1, var2...}"
-                        # Filter duplicates (e.g. adj_top BINARY vs ID) by just showing the keys
-                        unique_vars = sorted(list(set(k for k, m in current_refinements)))
-                        vars_str = ", ".join(unique_vars)
-                        
+                        unique_vars = sorted(list(set(current_refinements)))
+                        if len(unique_vars) > 10:
+                            vars_str = ", ".join(unique_vars[:10]) + f"... (+{len(unique_vars)-10} more)"
+                        else:
+                            vars_str = ", ".join(unique_vars)
+                            
                         diagnosis = "Hypothesis Generated"
-                        fix = "TEST_CANDIDATES" # More descriptive
-                        detail = f"{obj_id} {{{vars_str}}}" # Clean format
+                        fix = "TEST_CANDIDATES"
+                        detail = f"{obj_id} {{{vars_str}}}"
                         requirements = ["VERIFY_VAR"]
                     else:
                         # Failure. Splitter ran but found no intersection.
@@ -4069,94 +4070,63 @@ class ObmlAgi3Agent(Agent):
 
     def _trigger_splitter(self, obj_id, action, conflicting_results: dict):
         """
-        [AGGRESSIVE SPLITTER]
-        Identifies ALL features that differ between conflicting results to create
-        a precise 'Scientific State' mask.
+        [THE GLOBAL SPLITTER]
+        Uses Set Intersection to find constant conditions for each result, 
+        and Set Subtraction to isolate the differences between results.
         """
-        # 1. Gather Contexts
         contexts_by_result = {}
         for r_sig, locs in conflicting_results.items():
             contexts_by_result[r_sig] = []
             for entry in locs:
-                if len(entry) == 3: run, turn, _ = entry
-                else: run, turn = entry
-                # Use history to reconstruct Total State
-                if 0 <= turn < len(self.level_state_history):
+                # locs format: (run, turn, state_sig)
+                if len(entry) >= 3: run, turn = entry[0], entry[1]
+                else: run, turn = entry[0], entry[1]
+                
+                # The state that CAUSED the action is 1 frame before the result
+                ctx_idx = turn - 1
+                if 0 <= ctx_idx < len(self.level_state_history):
                     contexts_by_result[r_sig].append({
-                        'snapshot': self.level_state_history[turn],
+                        'snapshot': self.level_state_history[ctx_idx],
                         'target_id': obj_id
                     })
 
         if len(contexts_by_result) < 2: return
 
-        # 2. Define Search Space (The "Total State" Scan)
-        hypotheses = []
-        
-        # Adjacency (Top, Bottom, Left, Right)
-        for direction in ['top', 'right', 'bottom', 'left']:
-            key = f"adj_{direction}"
-            for mode in ['BINARY', 'ID', 'COLOR', 'SIZE', 'SHAPE']:
-                hypotheses.append((key, mode))
-        
-        # Alignment (Center, Edges)
-        align_types = ['center_x', 'center_y', 'top_y', 'left_x', 'right_x', 'bottom_y']
-        for a_type in align_types:
-            key = f"align_{a_type}"
-            for mode in ['BINARY', 'ID']: 
-                hypotheses.append((key, mode))
-
-        # Match Groups (Global Context)
-        match_types = ['Color', 'Shape', 'Size', 'Exact']
-        for m_type in match_types:
-            key = f"match_{m_type}"
-            hypotheses.append((key, 'BINARY'))
-
-        # 3. Execute The Audit (AGGRESSIVE MODE)
-        valid_refinements = []
-        
-        for key, mode in hypotheses:
-            profiles = {} 
-            for r_sig, ctx_list in contexts_by_result.items():
-                seen_values = set()
-                for ctx in ctx_list:
-                    val = self._get_context_prop(ctx, key, mode)
-                    seen_values.add(val)
-                profiles[r_sig] = seen_values
-
-            is_valid_splitter = False
-            r_sigs = list(profiles.keys())
+        # 1. NARROWING: Intersect features to build the 'Mask' for each Result
+        masks = {}
+        for r_sig, ctx_list in contexts_by_result.items():
+            if not ctx_list:
+                masks[r_sig] = set()
+                continue
             
-            # Compare every result group against every other group
-            for i in range(len(r_sigs)):
-                sig_A = r_sigs[i]
-                values_A = profiles[sig_A]
-                
-                # NARROWING: Feature must be consistent (Invariant) within Result A
-                if len(values_A) != 1: continue
-                val_A = list(values_A)[0]
-                
-                is_distinct = True
-                for j in range(len(r_sigs)):
-                    if i == j: continue
-                    sig_B = r_sigs[j]
-                    values_B = profiles[sig_B]
-                    
-                    # DIFFERENTIATION: Result B must NOT share this invariant value
-                    if values_B == {val_A}:
-                        is_distinct = False
-                        break
-                
-                if is_distinct:
-                    is_valid_splitter = True
-                    break
+            # Start with the first snapshot's features
+            result_mask = set(self._extract_all_features(ctx_list[0]['snapshot'], obj_id))
             
-            if is_valid_splitter:
-                # [CHANGE] We do not break. We collect ALL candidates.
-                valid_refinements.append((key, mode))
+            # Intersect with all subsequent snapshots (Leaves ONLY the constants)
+            for i in range(1, len(ctx_list)):
+                feats = self._extract_all_features(ctx_list[i]['snapshot'], obj_id)
+                result_mask.intersection_update(feats)
+                
+            masks[r_sig] = result_mask
 
-        # 4. Apply ALL Discoveries
+        # 2. DIFFERENTIATION: Subtract Masks to find the Triggers
+        valid_refinements = set()
+        r_sigs = list(masks.keys())
+        
+        for i in range(len(r_sigs)):
+            mask_A = masks[r_sigs[i]]
+            unique_to_A = set(mask_A)
+            
+            # Remove features that are ALSO constant in other results
+            for j in range(len(r_sigs)):
+                if i == j: continue
+                mask_B = masks[r_sigs[j]]
+                unique_to_A.difference_update(mask_B)
+                
+            valid_refinements.update(unique_to_A)
+
+        # 3. Apply Discoveries
         if valid_refinements:
-            # Get Base Signature for storage
             first_ctx = list(contexts_by_result.values())[0][0]
             t_obj = next((o for o in first_ctx['snapshot']['summary'] if o['id'] == obj_id), None)
             
@@ -4172,7 +4142,7 @@ class ObmlAgi3Agent(Agent):
                         added_count += 1
                 
                 if added_count > 0 and self.debug_channels['HYPOTHESIS']:
-                    print(f"  [Splitter] EUREKA! Refined State for {obj_id} with {added_count} new variables.")
+                    print(f"  [Splitter] EUREKA! Refined State for {obj_id} with {added_count} global variables.")
 
     def _get_context_prop(self, ctx_entry: dict, key: str, mode: str):
         """
@@ -4242,89 +4212,28 @@ class ObmlAgi3Agent(Agent):
     def _get_scientific_state(self, obj: dict, context: dict) -> tuple:
         """
         Constructs the State Signature. Starts with Intrinsic properties.
-        Appends refined Context features based on the Splitter's requirements.
-        
-        UPDATED: Supports SIZE and SHAPE modes.
+        Appends refined Context features based on the Global Splitter's findings.
         """
         # 1. Intrinsic Properties (The Base)
         base_sig = (obj['color'], obj['fingerprint'], obj['size'])
         
         # 2. Check for Refinements (Context)
-        required_context_items = self.state_refinements.get(base_sig, [])
+        required_features = self.state_refinements.get(base_sig, [])
         
+        if not required_features:
+            return (base_sig, tuple())
+            
+        # Extract all features for this context
+        all_feats = self._extract_all_features(context, obj['id'])
         context_features = []
-        for item in required_context_items:
-            # Handle legacy string-only keys
-            if isinstance(item, str):
-                key, mode = item, 'BINARY'
-            else:
-                key, mode = item
+        
+        for req_feat in required_features:
+            # Value is True if the proposition exists, False if absent
+            val = req_feat in all_feats
+            context_features.append((req_feat, val))
             
-            val = None
-            
-            # --- Adjacency ---
-            if key.startswith('adj_'):
-                direction = key.split('_')[1]
-                d_idx = {'top':0, 'right':1, 'bottom':2, 'left':3}.get(direction)
-                adj_list = context.get('adj', {}).get(obj['id'], ['na']*4)
-                neighbor_id = adj_list[d_idx] if d_idx is not None else 'na'
-                
-                if mode == 'BINARY':
-                    val = (neighbor_id != 'na')
-                elif neighbor_id == 'na':
-                    val = 'na'
-                elif mode == 'ID':
-                    val = neighbor_id
-                else:
-                    # Lookup Neighbor Properties (Color, Size, Shape)
-                    neighbor_obj = next((o for o in context['summary'] if o['id'] == neighbor_id), None)
-                    if neighbor_obj:
-                        if mode == 'COLOR': val = neighbor_obj['color']
-                        elif mode == 'SIZE': val = neighbor_obj['size']
-                        elif mode == 'SHAPE': val = neighbor_obj['fingerprint']
-                    else:
-                        val = 'unknown'
-
-            # --- Alignment ---
-            elif key.startswith('align_'):
-                align_type = key.replace('align_', '')
-                groups = context.get('align', {}).get(align_type, {})
-                
-                is_member = False
-                aligned_ids = set()
-                for coord, ids in groups.items():
-                    if obj['id'] in ids:
-                        is_member = True
-                        aligned_ids = ids
-                        break
-                
-                if mode == 'BINARY':
-                    val = is_member
-                elif mode == 'ID':
-                    if is_member:
-                        others = aligned_ids - {obj['id']}
-                        val = frozenset(others) if others else 'empty'
-                    else:
-                        val = 'na'
-            
-            # --- Match Groups ---
-            elif key.startswith('match_'):
-                m_type = key.replace('match_', '')
-                groups = context.get('match', {}).get(m_type, {})
-                
-                is_member = False
-                for props, ids in groups.items():
-                    if obj['id'] in ids:
-                        is_member = True
-                        break
-                val = is_member
-
-            context_features.append((key, val))
-
-        # Return (Base, Context_Tuple)
-        # FIX: Use key=str to prevent "TypeError: '<' not supported between instances of 'str' and 'bool'"
-        # when multiple refinements for the same key exist (e.g. BINARY vs ID).
-        return (base_sig, tuple(sorted(context_features, key=str)))
+        # Return sorted by string to ensure dictionary key matching
+        return (base_sig, tuple(sorted(context_features, key=lambda x: x[0])))
 
     def _check_feature_presence(self, contexts, base_sig, feature_type, sub_key):
         """
@@ -4371,3 +4280,68 @@ class ObmlAgi3Agent(Agent):
         
         # STRICT 100% CHECK
         return count == total
+
+    def _extract_all_features(self, ctx: dict, target_id: str) -> frozenset:
+        """
+        Extracts EVERY characteristic and relationship of the ENTIRE grid into 
+        a flat set of boolean string propositions.
+        """
+        features = set()
+        
+        # Safe-guard for empty context
+        if not ctx or 'summary' not in ctx: return frozenset()
+        
+        target_obj = next((o for o in ctx['summary'] if o['id'] == target_id), None)
+        
+        # 1. Global Object Characteristics (Everything on the board)
+        for obj in ctx['summary']:
+            oid = obj['id']
+            features.add(f"{oid}_exists")
+            features.add(f"{oid}_color_{obj['color']}")
+            features.add(f"{oid}_pixels_{obj['pixels']}")
+            features.add(f"{oid}_shape_{obj['fingerprint']}")
+            
+            # Global Adjacencies
+            for d_idx, direction in enumerate(['top', 'right', 'bottom', 'left']):
+                nid = ctx.get('adj', {}).get(oid, ['na']*4)[d_idx]
+                if nid not in ['na', 'x']:
+                    features.add(f"{oid}_adj_{direction}_{nid}")
+            
+            # Global Diagonal Adjacencies
+            for d_idx, direction in enumerate(['tr', 'br', 'bl', 'tl']):
+                nid = ctx.get('diag_adj', {}).get(oid, ['na']*4)[d_idx]
+                if nid not in ['na', 'x']:
+                    features.add(f"{oid}_diag_adj_{direction}_{nid}")
+
+        # 2. Target-Relative Characteristics (Important for context-shifting rules)
+        if target_obj:
+            # Adjacencies relative to target
+            for d_idx, direction in enumerate(['top', 'right', 'bottom', 'left']):
+                nid = ctx.get('adj', {}).get(target_id, ['na']*4)[d_idx]
+                if nid not in ['na', 'x']:
+                    features.add(f"target_adj_{direction}_exists")
+                    n_obj = next((o for o in ctx['summary'] if o['id'] == nid), None)
+                    if n_obj:
+                        features.add(f"target_adj_{direction}_color_{n_obj['color']}")
+                        features.add(f"target_adj_{direction}_shape_{n_obj['fingerprint']}")
+                        features.add(f"target_adj_{direction}_pixels_{n_obj['pixels']}")
+                        
+            # Target Alignments
+            for a_type, groups in ctx.get('align', {}).items():
+                for coord, ids in groups.items():
+                    if target_id in ids:
+                        features.add(f"target_align_{a_type}")
+                        for oid in ids:
+                            if oid != target_id:
+                                o_obj = next((o for o in ctx['summary'] if o['id'] == oid), None)
+                                if o_obj: 
+                                    features.add(f"target_align_{a_type}_with_color_{o_obj['color']}")
+                                    features.add(f"target_align_{a_type}_with_id_{oid}")
+                                    
+            # Target Match Groups
+            for m_type, groups in ctx.get('match', {}).items():
+                 for props, ids in groups.items():
+                     if target_id in ids:
+                         features.add(f"target_match_{m_type}")
+
+        return frozenset(features)
