@@ -3967,7 +3967,32 @@ class ObmlAgi3Agent(Agent):
                 # A. GLOBAL CHECK
                 # If ANY other action consistently causes the same result, it is Global.
                 causing_actions = result_to_actions[result_sig]
+                is_no_change = (result_sig[0] == 'NO_CHANGE')
+                
+                # --- BUG FIX: Strict Burden of Proof for NO_CHANGE ---
+                # A "NO_CHANGE" result can only be Global if we have literally tested 
+                # every possible tool currently available on the board.
+                is_global = False
                 if len(causing_actions) > 1:
+                    if is_no_change:
+                        # Dynamically calculate the total number of actions the Profiler evaluates
+                        total_known_tools = 7 # Fallback
+                        if hasattr(self, 'frames') and self.frames and self.frames[-1].available_actions:
+                            available = self.frames[-1].available_actions
+                            
+                            num_globals = sum(1 for a in available if a.name != 'ACTION6')
+                            has_click = any(a.name == 'ACTION6' for a in available)
+                            
+                            total_known_tools = num_globals
+                            if has_click and hasattr(self, 'last_object_summary'):
+                                total_known_tools += len(self.last_object_summary)
+                                
+                        if len(causing_actions) >= total_known_tools:
+                            is_global = True
+                    else:
+                        is_global = True
+                        
+                if is_global:
                     self._certify_law(obj_id, 'GLOBAL', 'ANY', result_sig)
                     continue
                 
