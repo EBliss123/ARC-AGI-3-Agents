@@ -81,6 +81,9 @@ class ObmlAgi3Agent(Agent):
         self.performed_action_types = set()
         self.productive_action_types = set() # Tracks actions that caused change
 
+        # Stores every feature string that a specific action has ever toggled.
+        self.action_effects_memory = {}
+
         # --- NEW: Relational Color Memory ---
         # Stores discovered laws like: ('ACTION6_obj_1', 'obj_5') -> {'Source: Adjacency(0,1)'}
         self.relational_constraints = {}
@@ -185,6 +188,7 @@ class ObmlAgi3Agent(Agent):
         self.performed_action_types = {}
 
         self.active_experiments = {} # Clear agenda on reset
+        self.action_effects_memory = {} # Clear causal map on hard reset
 
         self.truth_table = {}
         self.certified_laws = {}
@@ -758,6 +762,21 @@ class ObmlAgi3Agent(Agent):
             'match': current_match_groups
         }
 
+        if self.last_action_context and self.last_object_summary:
+            prev_context = {
+                'summary': self.last_object_summary, 'rels': self.last_relationships,
+                'adj': self.last_adjacencies, 'diag_adj': self.last_diag_adjacencies,
+                'align': self.last_alignments, 'diag_align': self.last_diag_alignments,
+                'match': self.last_match_groups
+            }
+            old_feats = self._extract_all_features(prev_context)
+            new_feats = self._extract_all_features(current_full_context)
+            changed_features = old_feats.symmetric_difference(new_feats)
+            
+            if self.last_action_context not in self.action_effects_memory:
+                self.action_effects_memory[self.last_action_context] = set()
+            self.action_effects_memory[self.last_action_context].update(changed_features)
+
         # [FIX] Build all_possible_moves list
         all_possible_moves = []
         click_action_template = None
@@ -773,11 +792,11 @@ class ObmlAgi3Agent(Agent):
             for obj in current_summary:
                 all_possible_moves.append({'template': click_action_template, 'object': obj})
 
-        # --- Pre-calculate current scientific states for comparison ---
-        current_obj_states = {}
+        active_suspects = set()
         for obj in current_summary:
-             # This captures the state *including* the active refinements (Suspect Variables)
-             current_obj_states[obj['id']] = self._get_scientific_state(obj, current_full_context)
+            if obj['id'] in self.active_experiments:
+                base_sig = (obj['color'], obj['fingerprint'], obj['size'])
+                active_suspects.update(self.state_refinements.get(base_sig, []))
 
         move_profiles = []
         
@@ -788,26 +807,14 @@ class ObmlAgi3Agent(Agent):
             
             scientific_score = 0
             
-            # [Lookahead Simulation Logic...]
-            predicted_events = []
-            if target_id:
-                pred_key = (self._get_learning_key(action_template.name, target_id).split('_')[0], target_id)
-                pe, _ = self._predict_outcome(pred_key, current_full_context)
-                if pe: predicted_events = pe
-            else:
-                for o in current_summary:
-                    pred_key = (action_template.name, o['id'])
-                    pe, _ = self._predict_outcome(pred_key, current_full_context)
-                    if pe: predicted_events.extend(pe)
+            action_key_for_move = self._get_learning_key(action_template.name, target_id)
+            known_effects = self.action_effects_memory.get(action_key_for_move, set())
+            relevant_toggles = known_effects.intersection(active_suspects)
             
-            # Generate Future
-            future_summary = self._get_hypothetical_summary(current_summary, predicted_events)
+            scientific_score += len(relevant_toggles)
             
-            # Analyze Future Relationships (Lightweight)
-            (f_rels, f_adj, f_diag_adj, f_match, f_align, f_diag_align, _) = self._analyze_relationships(future_summary)
-            future_context = {
-                'summary': future_summary, 'adj': f_adj, 'align': f_align, 'match': f_match
-            }
+            if relevant_toggles and self.debug_channels['ACTION_SCORE']:
+                self._print_and_log(f"    -> Interrogation Bonus: {action_key_for_move} hits {len(relevant_toggles)} suspects.")
 
             for obj in current_summary:
                 obj_id = obj['id']
@@ -840,25 +847,7 @@ class ObmlAgi3Agent(Agent):
                         else:
                              has_data = (obj_id in self.truth_table and this_action_key in self.truth_table[obj_id])
                              # Standard Exploration Reward
-                             if not has_data: scientific_score += 1
-                        
-                        # [NEW] Targeted Candidate Testing (+1 Bonus)
-                        # Does this action change a "Relevant Characteristic" (Refinement)?
-                        future_obj = next((o for o in future_summary if o['id'] == obj_id), None)
-                        if future_obj:
-                            # Recalculate state in the future context
-                            future_state = self._get_scientific_state(future_obj, future_context)
-                            current_state = current_obj_states.get(obj_id)
-                            
-                            # State Signature structure: (Base_Sig, Context_Tuple)
-                            # Context_Tuple contains only the refined variables.
-                            if current_state and future_state:
-                                # If the Context Tuple changed, it means we toggled a suspect variable.
-                                if current_state[1] != future_state[1]:
-                                    scientific_score += 1
-                                    if self.debug_channels['ACTION_SCORE']:
-                                        # Optional: verbose debug to verify it's working
-                                        pass 
+                             if not has_data: scientific_score += 1 
 
             move_profiles.append((move, scientific_score))
 
@@ -876,8 +865,8 @@ class ObmlAgi3Agent(Agent):
                 t_name = f" on {chosen_object['id']}" if chosen_object else ""
                 self._print_and_log(f"Chose: {action_to_return.name}{t_name} (Score: {score})")
                 
-                # Show top 3 candidates
-                for i in range(min(3, len(move_profiles))):
+                # Show top candidates (Increased limit to 10 to reveal tied global actions)
+                for i in range(min(10, len(move_profiles))):
                     m, s = move_profiles[i]
                     m_tn = f" on {m['object']['id']}" if m['object'] else ""
                     self._print_and_log(f"  #{i+1}: {m['template'].name}{m_tn} -> {s}")
@@ -3106,6 +3095,11 @@ class ObmlAgi3Agent(Agent):
 
                     if current_refinements:
                         unique_vars = sorted(list(set(current_refinements)))
+
+                        # [NEW] Clean formatting: Strip the redundant ID prefix for display
+                        prefix = f"{obj_id}_"
+                        clean_vars = [v.replace(prefix, "") if v.startswith(prefix) else v for v in unique_vars]
+
                         if len(unique_vars) > 10:
                             vars_str = ", ".join(unique_vars[:10]) + f"... (+{len(unique_vars)-10} more)"
                         else:
@@ -3113,7 +3107,7 @@ class ObmlAgi3Agent(Agent):
                             
                         diagnosis = "Hypothesis Generated"
                         fix = "TEST_CANDIDATES"
-                        detail = f"{obj_id} {{{vars_str}}}"
+                        detail = f"{{{vars_str}}}" # Removed the obj_X prefix here
                         requirements = ["VERIFY_VAR"]
                     else:
                         # Failure. Splitter ran but found no intersection.
@@ -4100,11 +4094,11 @@ class ObmlAgi3Agent(Agent):
                 continue
             
             # Start with the first snapshot's features
-            result_mask = set(self._extract_all_features(ctx_list[0]['snapshot'], obj_id))
+            result_mask = set(self._extract_all_features(ctx_list[0]['snapshot']))
             
             # Intersect with all subsequent snapshots (Leaves ONLY the constants)
             for i in range(1, len(ctx_list)):
-                feats = self._extract_all_features(ctx_list[i]['snapshot'], obj_id)
+                feats = self._extract_all_features(ctx_list[i]['snapshot'])
                 result_mask.intersection_update(feats)
                 
             masks[r_sig] = result_mask
@@ -4224,7 +4218,7 @@ class ObmlAgi3Agent(Agent):
             return (base_sig, tuple())
             
         # Extract all features for this context
-        all_feats = self._extract_all_features(context, obj['id'])
+        all_feats = self._extract_all_features(context)
         context_features = []
         
         for req_feat in required_features:
@@ -4281,19 +4275,14 @@ class ObmlAgi3Agent(Agent):
         # STRICT 100% CHECK
         return count == total
 
-    def _extract_all_features(self, ctx: dict, target_id: str) -> frozenset:
+    def _extract_all_features(self, ctx: dict) -> frozenset:
         """
         Extracts EVERY characteristic and relationship of the ENTIRE grid into 
-        a flat set of boolean string propositions.
+        a flat set of boolean string propositions. (Target-Agnostic)
         """
         features = set()
-        
-        # Safe-guard for empty context
         if not ctx or 'summary' not in ctx: return frozenset()
         
-        target_obj = next((o for o in ctx['summary'] if o['id'] == target_id), None)
-        
-        # 1. Global Object Characteristics (Everything on the board)
         for obj in ctx['summary']:
             oid = obj['id']
             features.add(f"{oid}_exists")
@@ -4301,47 +4290,28 @@ class ObmlAgi3Agent(Agent):
             features.add(f"{oid}_pixels_{obj['pixels']}")
             features.add(f"{oid}_shape_{obj['fingerprint']}")
             
-            # Global Adjacencies
+            # Adjacencies
             for d_idx, direction in enumerate(['top', 'right', 'bottom', 'left']):
                 nid = ctx.get('adj', {}).get(oid, ['na']*4)[d_idx]
                 if nid not in ['na', 'x']:
                     features.add(f"{oid}_adj_{direction}_{nid}")
             
-            # Global Diagonal Adjacencies
+            # Diagonal Adjacencies
             for d_idx, direction in enumerate(['tr', 'br', 'bl', 'tl']):
                 nid = ctx.get('diag_adj', {}).get(oid, ['na']*4)[d_idx]
                 if nid not in ['na', 'x']:
                     features.add(f"{oid}_diag_adj_{direction}_{nid}")
-
-        # 2. Target-Relative Characteristics (Important for context-shifting rules)
-        if target_obj:
-            # Adjacencies relative to target
-            for d_idx, direction in enumerate(['top', 'right', 'bottom', 'left']):
-                nid = ctx.get('adj', {}).get(target_id, ['na']*4)[d_idx]
-                if nid not in ['na', 'x']:
-                    features.add(f"target_adj_{direction}_exists")
-                    n_obj = next((o for o in ctx['summary'] if o['id'] == nid), None)
-                    if n_obj:
-                        features.add(f"target_adj_{direction}_color_{n_obj['color']}")
-                        features.add(f"target_adj_{direction}_shape_{n_obj['fingerprint']}")
-                        features.add(f"target_adj_{direction}_pixels_{n_obj['pixels']}")
-                        
-            # Target Alignments
+                    
+            # Alignments
             for a_type, groups in ctx.get('align', {}).items():
                 for coord, ids in groups.items():
-                    if target_id in ids:
-                        features.add(f"target_align_{a_type}")
-                        for oid in ids:
-                            if oid != target_id:
-                                o_obj = next((o for o in ctx['summary'] if o['id'] == oid), None)
-                                if o_obj: 
-                                    features.add(f"target_align_{a_type}_with_color_{o_obj['color']}")
-                                    features.add(f"target_align_{a_type}_with_id_{oid}")
-                                    
-            # Target Match Groups
+                    if oid in ids:
+                        features.add(f"{oid}_align_{a_type}_{coord}")
+                        
+            # Match Groups
             for m_type, groups in ctx.get('match', {}).items():
-                 for props, ids in groups.items():
-                     if target_id in ids:
-                         features.add(f"target_match_{m_type}")
-
+                for props, ids in groups.items():
+                    if oid in ids:
+                        features.add(f"{oid}_match_{m_type}_{props}")
+                        
         return frozenset(features)
