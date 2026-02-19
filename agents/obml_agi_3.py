@@ -818,36 +818,53 @@ class ObmlAgi3Agent(Agent):
 
             for obj in current_summary:
                 obj_id = obj['id']
+                is_relevant = (not target_id) or (target_id == obj_id)
+                if not is_relevant:
+                    continue
+
+                this_action_key = self._get_learning_key(action_template.name, target_id)
                 
-                # 1. Ambiguity Mandate (Existing Logic)
+                # 1. CERTAINTY CHECK (Certified Laws)
+                laws = self.certified_laws.get(obj_id, {})
+                if 'ANY' in laws or this_action_key in laws:
+                    scientific_score -= 1
+                    continue
+                
+                # 2. DATA CHECK (Truth Table)
+                has_data = (obj_id in self.truth_table and this_action_key in self.truth_table[obj_id])
+                
+                # 3. MANDATE CHECK (Active Experiments)
                 if obj_id in self.active_experiments:
                     mandate = self.active_experiments[obj_id]
                     req_type = mandate['req']
                     ref_action = mandate['ref']
-                    this_action_key = self._get_learning_key(action_template.name, target_id)
                     
-                    is_relevant = ((not target_id) or (target_id == obj_id) or (this_action_key == ref_action))
-                    if is_relevant:
-                        if req_type == 'POSITIVE_CONTROL':
-                             if this_action_key == ref_action: scientific_score += 1
-                             else: scientific_score -= 1
-                        elif req_type == 'NEGATIVE_CONTROL':
-                             if this_action_key != ref_action: scientific_score += 1
-                             else: scientific_score -= 1
-
-                # 2. Exploration & Hypothesis Testing
+                    if req_type == 'POSITIVE_CONTROL':
+                        if this_action_key == ref_action:
+                            scientific_score += 1 # Verify specific action
+                        elif not has_data:
+                            scientific_score += 1 # Unexplored alternative
+                            
+                    elif req_type == 'NEGATIVE_CONTROL':
+                        if this_action_key == ref_action:
+                            scientific_score -= 1 # Already verified (N >= 2)
+                        elif not has_data:
+                            scientific_score += 1 # Unexplored alternative
+                    
+                    else:
+                        # Ambiguous states (VERIFY_VAR, STABILIZE_CONTEXT).
+                        # The Interrogation Bonus handles targeted testing above.
+                        # For baseline action scoring, just reward ignorance.
+                        if not has_data:
+                            scientific_score += 1
+                            
                 else:
-                    is_relevant = (not target_id) or (target_id == obj_id)
-                    if is_relevant:
-                        this_action_key = self._get_learning_key(action_template.name, target_id)
-                        laws = self.certified_laws.get(obj_id, {})
-                        
-                        if 'ANY' in laws or this_action_key in laws: 
-                            scientific_score -= 1
-                        else:
-                             has_data = (obj_id in self.truth_table and this_action_key in self.truth_table[obj_id])
-                             # Standard Exploration Reward
-                             if not has_data: scientific_score += 1 
+                    # Not in active experiments.
+                    # If it has data, it means it's Pending Certification (we have N>=2 and Negative Control).
+                    if has_data:
+                        scientific_score -= 1 # Certainty
+                    else:
+                        scientific_score += 1 # Ignorance
 
             move_profiles.append((move, scientific_score))
 
@@ -3061,7 +3078,9 @@ class ObmlAgi3Agent(Agent):
             direct_law = laws.get(action_key)
             if direct_law and direct_law['result'] == result_sig:
                 direct_events.append(event)
-                if obj_id in self.active_experiments: del self.active_experiments[obj_id]
+                # --- BUG FIX: Only clear the agenda if the agenda was FOR THIS action ---
+                if obj_id in self.active_experiments and self.active_experiments[obj_id].get('ref') == action_key:
+                    del self.active_experiments[obj_id]
                 continue
                 
             # 4. If we are here, it is AMBIGUOUS. 
@@ -3152,6 +3171,10 @@ class ObmlAgi3Agent(Agent):
                 self.active_experiments[obj_id] = {'req': 'POSITIVE_CONTROL', 'ref': action_key}
             elif "NEGATIVE_CONTROL" in requirements:
                 self.active_experiments[obj_id] = {'req': 'NEGATIVE_CONTROL', 'ref': action_key}
+            elif "VERIFY_VAR" in requirements:
+                self.active_experiments[obj_id] = {'req': 'VERIFY_VAR', 'ref': action_key}
+            elif "STABILIZE_CONTEXT" in requirements:
+                self.active_experiments[obj_id] = {'req': 'STABILIZE_CONTEXT', 'ref': action_key}
             # ---------------------------------
 
             ambiguous_events.append({
@@ -3905,59 +3928,35 @@ class ObmlAgi3Agent(Agent):
         [SCIENTIFIC METHOD: ID-BASED VERIFICATION]
         Iterates through the Truth Table (organized by Object ID).
         Certifies laws ONLY if they pass:
-        1. Consistency (Run vs Run)
+        1. Consistency (N >= 2)
         2. Distinction (Action vs Action)
         """
-        # We ignore the passed state_sig because we iterate ALL objects in the table.
-        # This ensures we catch updates for any ID that had activity.
-        
         for obj_id, actions_data in self.truth_table.items():
             
-            # --- PRE-ANALYSIS: Gather all consistent results for this object ---
-            # Map: Action_Key -> Result_Sig (if consistent)
+            # Map: Action_Key -> Result_Sig (ONLY for actions with N >= 2)
             consistent_results = {}
+            # Set: Every action we have ever tried (Used for Negative Control)
+            all_attempted_actions = set(actions_data.keys())
             
             for action_key, results_map in actions_data.items():
-                # results_map is { Result_Sig: [(Run, Turn), ...] }
-                
-                # 1. Filter out empty/vestigial entries
                 valid_results = {r: locs for r, locs in results_map.items() if locs}
                 
                 if not valid_results:
                     continue
                     
-                # 2. Check Phase 1: Consistency (Per Action)
-                # Does this action *always* cause the same result?
                 if len(valid_results) > 1:
-                    # CONFLICT! Action A caused Result X AND Result Y.
-                    # This object is behaving inconsistently.
-                    # ACTION: Trigger Splitter to find the context difference.
                     if self.debug_channels['HYPOTHESIS']:
                         print(f"  [Science] Inconsistency detected for {obj_id} + {action_key}: {list(valid_results.keys())}")
-                    
                     self._trigger_splitter(obj_id, action_key, valid_results)
-                    continue # Cannot certify this action yet
+                    continue 
                 
-                # If only 1 result type exists, check N count
                 result_sig, locs = list(valid_results.items())[0]
                 
-                # locs entry format: (run, turn, state_sig)
-                last_entry = locs[-1]
-                
-                # Handle legacy data if exists (len 2 vs 3)
-                current_state_sig = last_entry[2] if len(last_entry) > 2 else None
-
-                # Rigor: We need N >= 2 to prove it's not a fluke?
-                # For 'Single Action' levels, N=1 might be all we get per run.
-                # But to call it a LAW, we generally want confirmation.
-                # However, for the 'Negative Control' logic, even N=1 matters.
-                consistent_results[action_key] = result_sig
+                # --- BUG FIX: Require N >= 2 to even consider this a reliable result ---
+                if len(locs) >= 2:
+                    consistent_results[action_key] = result_sig
 
             # --- PHASE 2 & 3: Distinction (Direct vs Global) ---
-            # We now compare the consistent results across DIFFERENT actions.
-            
-            # Group by Result to find Globals
-            # Map: Result_Sig -> List of Actions that cause it
             result_to_actions = {}
             for act, res in consistent_results.items():
                 if res not in result_to_actions: result_to_actions[res] = []
@@ -3966,31 +3965,20 @@ class ObmlAgi3Agent(Agent):
             for action_key, result_sig in consistent_results.items():
                 
                 # A. GLOBAL CHECK
-                # If ANY other action causes the same result, it is Global.
+                # If ANY other action consistently causes the same result, it is Global.
                 causing_actions = result_to_actions[result_sig]
                 if len(causing_actions) > 1:
-                    # We have Action A -> X and Action B -> X.
-                    # Certify GLOBAL for this Object ID.
                     self._certify_law(obj_id, 'GLOBAL', 'ANY', result_sig)
                     continue
                 
                 # B. DIRECT CHECK
-                # If this is the ONLY action causing this result...
-                # We must verify we actually TRIED other actions (Negative Control).
-                
-                # All actions tried on this object
-                all_attempted_actions = set(consistent_results.keys())
-                
+                # We use ALL attempted actions for Negative Control.
+                # Example: If ACTION1 has N=5 (consistent), and ACTION4 has N=1,
+                # length is 2. We can legally certify ACTION1 as DIRECT, but ACTION4 
+                # stays pending until it gets N=2.
                 if len(all_attempted_actions) > 1:
-                    # We tried A, B, C. Only A caused X.
-                    # B and C caused something else (or No Change).
-                    # Certify DIRECT for this Object ID + Action.
                     self._certify_law(obj_id, 'DIRECT', action_key, result_sig)
                 else:
-                    # C. AMBIGUOUS
-                    # We only ever tried Action A. We have no Negative Control.
-                    # We cannot scientifically certify this yet.
-                    # (Profiler should prioritize doing something else to this object).
                     pass
 
     def _certify_law(self, obj_id, law_type, action_key, result_sig, state_sig=None):
