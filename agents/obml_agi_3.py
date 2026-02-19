@@ -4076,6 +4076,9 @@ class ObmlAgi3Agent(Agent):
                         'target_id': obj_id
                     })
 
+        # --- FIX: Purge results that have no contexts in the current run ---
+        contexts_by_result = {sig: ctx_list for sig, ctx_list in contexts_by_result.items() if len(ctx_list) > 0}
+
         if len(contexts_by_result) < 2: return
 
         # 1. NARROWING: Intersect features to build the 'Mask' for each Result
