@@ -516,7 +516,12 @@ class ObmlAgi3Agent(Agent):
                             # learning_key is the Action (e.g., 'ACTION6_obj_5')
                             self._update_truth_table(state_sig, learning_key, result_sig, obj_id=obj_id)
 
-                # 2. Classify Events (Now reads from the populated Truth Table)
+                # --- NEW: Run The Scientific Judge HERE ---
+                # Now that data is recorded, let the Judge certify any rules immediately 
+                # BEFORE the Gatekeeper runs and prints the logs.
+                self._verify_and_certify()
+
+                # 2. Classify Events (Now reads from the populated Truth Table AND updated Certified Laws)
                 direct_events, global_events, ambiguous_events = self._classify_event_stream(events, learning_key, prev_context)
                 
                 # 3. Resolve Ambiguity (The Pipeline)
@@ -534,11 +539,6 @@ class ObmlAgi3Agent(Agent):
                 for event in direct_events:
                     if 'id' in event and event['id'] in obj_events_map:
                         obj_events_map[event['id']].append(event)
-
-                # [INSERTION POINT] 5. Run The Scientific Judge
-                # After we have processed all learning, we ask the Judge to review the
-                # updated Truth Table and certify any new laws.
-                self._verify_and_certify()
                 
                 # A. Learn Direct Rules (Action -> Result)
                 for obj in self.last_object_summary:
