@@ -825,9 +825,6 @@ class ObmlAgi3Agent(Agent):
 
             for obj in current_summary:
                 obj_id = obj['id']
-                is_relevant = (not target_id) or (target_id == obj_id)
-                if not is_relevant:
-                    continue
 
                 this_action_key = self._get_learning_key(action_template.name, target_id)
                 has_data = (obj_id in self.truth_table and this_action_key in self.truth_table[obj_id])
