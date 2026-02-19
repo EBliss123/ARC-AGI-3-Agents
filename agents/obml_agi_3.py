@@ -762,6 +762,7 @@ class ObmlAgi3Agent(Agent):
             'match': current_match_groups
         }
 
+        # --- CAUSAL MEMORY: Track what the last action did ---
         if self.last_action_context and self.last_object_summary:
             prev_context = {
                 'summary': self.last_object_summary, 'rels': self.last_relationships,
@@ -773,11 +774,14 @@ class ObmlAgi3Agent(Agent):
             new_feats = self._extract_all_features(current_full_context)
             changed_features = old_feats.symmetric_difference(new_feats)
             
+            # --- FIX: Store Base Variables instead of hyper-specific values ---
+            changed_base_vars = {self._get_base_variable(f) for f in changed_features}
+            
             if self.last_action_context not in self.action_effects_memory:
                 self.action_effects_memory[self.last_action_context] = set()
-            self.action_effects_memory[self.last_action_context].update(changed_features)
+            self.action_effects_memory[self.last_action_context].update(changed_base_vars)
 
-        # [FIX] Build all_possible_moves list
+        # [Build all_possible_moves list...]
         all_possible_moves = []
         click_action_template = None
         available = latest_frame.available_actions if latest_frame.available_actions else []
@@ -792,11 +796,13 @@ class ObmlAgi3Agent(Agent):
             for obj in current_summary:
                 all_possible_moves.append({'template': click_action_template, 'object': obj})
 
+        # --- FIX: Extract Base Variables for the Agenda ---
         active_suspects = set()
         for obj in current_summary:
             if obj['id'] in self.active_experiments:
                 base_sig = (obj['color'], obj['fingerprint'], obj['size'])
-                active_suspects.update(self.state_refinements.get(base_sig, []))
+                raw_suspects = self.state_refinements.get(base_sig, [])
+                active_suspects.update({self._get_base_variable(f) for f in raw_suspects})
 
         move_profiles = []
         
@@ -806,8 +812,9 @@ class ObmlAgi3Agent(Agent):
             target_id = target_obj['id'] if target_obj else None
             
             scientific_score = 0
-            
             action_key_for_move = self._get_learning_key(action_template.name, target_id)
+            
+            # --- INTERROGATION BONUS (Now uses base variables) ---
             known_effects = self.action_effects_memory.get(action_key_for_move, set())
             relevant_toggles = known_effects.intersection(active_suspects)
             
@@ -823,17 +830,9 @@ class ObmlAgi3Agent(Agent):
                     continue
 
                 this_action_key = self._get_learning_key(action_template.name, target_id)
-                
-                # 1. CERTAINTY CHECK (Certified Laws)
-                laws = self.certified_laws.get(obj_id, {})
-                if 'ANY' in laws or this_action_key in laws:
-                    scientific_score -= 1
-                    continue
-                
-                # 2. DATA CHECK (Truth Table)
                 has_data = (obj_id in self.truth_table and this_action_key in self.truth_table[obj_id])
                 
-                # 3. MANDATE CHECK (Active Experiments)
+                # --- FIX: MANDATE CHECK MUST BE FIRST ---
                 if obj_id in self.active_experiments:
                     mandate = self.active_experiments[obj_id]
                     req_type = mandate['req']
@@ -841,30 +840,34 @@ class ObmlAgi3Agent(Agent):
                     
                     if req_type == 'POSITIVE_CONTROL':
                         if this_action_key == ref_action:
-                            scientific_score += 1 # Verify specific action
+                            scientific_score += 1 
                         elif not has_data:
-                            scientific_score += 1 # Unexplored alternative
+                            scientific_score += 1 
                             
                     elif req_type == 'NEGATIVE_CONTROL':
                         if this_action_key == ref_action:
-                            scientific_score -= 1 # Already verified (N >= 2)
+                            scientific_score -= 1 
                         elif not has_data:
-                            scientific_score += 1 # Unexplored alternative
-                    
+                            scientific_score += 1 
                     else:
-                        # Ambiguous states (VERIFY_VAR, STABILIZE_CONTEXT).
-                        # The Interrogation Bonus handles targeted testing above.
-                        # For baseline action scoring, just reward ignorance.
+                        # VERIFY_VAR or STABILIZE_CONTEXT
                         if not has_data:
                             scientific_score += 1
                             
+                    # Because it is an active experiment, bypass certainty penalties!
+                    continue
+                
+                # 2. CERTAINTY CHECK (Only applies if NOT actively experimenting)
+                laws = self.certified_laws.get(obj_id, {})
+                if 'ANY' in laws or this_action_key in laws:
+                    scientific_score -= 1
+                    continue
+                
+                # 3. DATA CHECK (Uncertified but has data)
+                if has_data:
+                    scientific_score -= 1 # Certainty
                 else:
-                    # Not in active experiments.
-                    # If it has data, it means it's Pending Certification (we have N>=2 and Negative Control).
-                    if has_data:
-                        scientific_score -= 1 # Certainty
-                    else:
-                        scientific_score += 1 # Ignorance
+                    scientific_score += 1 # Ignorance
 
             move_profiles.append((move, scientific_score))
 
@@ -4060,11 +4063,12 @@ class ObmlAgi3Agent(Agent):
         for r_sig, locs in conflicting_results.items():
             contexts_by_result[r_sig] = []
             for entry in locs:
-                # locs format: (run, turn, state_sig)
                 if len(entry) >= 3: run, turn = entry[0], entry[1]
                 else: run, turn = entry[0], entry[1]
                 
-                # The state that CAUSED the action is 1 frame before the result
+                # --- FIX: Only use contexts from the CURRENT run ---
+                if run != self.run_counter: continue 
+                
                 ctx_idx = turn - 1
                 if 0 <= ctx_idx < len(self.level_state_history):
                     contexts_by_result[r_sig].append({
@@ -4303,3 +4307,38 @@ class ObmlAgi3Agent(Agent):
                         features.add(f"{oid}_match_{m_type}_{props}")
                         
         return frozenset(features)
+
+    def _get_base_variable(self, f_str: str) -> str:
+        """
+        Strips specific values from a feature string to return the core variable.
+        e.g., 'obj_11_color_3' -> 'obj_11_color'
+              'obj_11_diag_adj_tl_obj_2' -> 'obj_11_diag_adj_tl'
+        """
+        if '_color_' in f_str:
+            return f_str.split('_color_')[0] + '_color'
+        if '_pixels_' in f_str:
+            return f_str.split('_pixels_')[0] + '_pixels'
+        if '_shape_' in f_str:
+            return f_str.split('_shape_')[0] + '_shape'
+            
+        if '_diag_adj_' in f_str:
+            # Keeps the object ID and the direction (e.g. 'obj_11_diag_adj_tl')
+            base = f_str.split('_diag_adj_')[0] + '_diag_adj_'
+            direction = f_str.split('_diag_adj_')[1].split('_')[0]
+            return base + direction
+            
+        if '_adj_' in f_str:
+            base = f_str.split('_adj_')[0] + '_adj_'
+            direction = f_str.split('_adj_')[1].split('_')[0]
+            return base + direction
+            
+        if '_align_' in f_str:
+            # Drops only the coordinate value at the very end
+            return f_str.rsplit('_', 1)[0]
+            
+        if '_match_' in f_str:
+            base = f_str.split('_match_')[0] + '_match_'
+            match_type = f_str.split('_match_')[1].split('_')[0]
+            return base + match_type
+            
+        return f_str
