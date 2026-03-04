@@ -325,10 +325,10 @@ class ObmlAgi3Agent(Agent):
             
             if self.is_new_level:
                 # --- This is a NEW LEVEL (from score increase) ---
-                # We must wipe the brain.
-                self._reset_agent_memory()
+                # --- FIX: Preserve the Brain across wins! ---
+                self._reset_level_state()
                 if self.debug_channels['PERCEPTION']:
-                     print(f"\n--- Level Cleared (Score: {current_score}): Wiping brain and resetting history. ---")
+                     print(f"\n--- Level Cleared (Score: {current_score}): Preserving brain, resetting local history. ---")
 
             else:
                 # --- This is a RETRY (from GAME_OVER) ---
@@ -885,6 +885,12 @@ class ObmlAgi3Agent(Agent):
             chosen_move, score = move_profiles[0]
             action_to_return = chosen_move['template']
             chosen_object = chosen_move['object']
+            
+            # --- FIX: Inject the missing target coordinates! ---
+            if action_to_return and action_to_return.name == 'ACTION6' and chosen_object:
+                r, c = chosen_object['position']
+                action_to_return.set_data({'x': c, 'y': r})
+            # ---------------------------------------------------
             
             if self.debug_channels['ACTION_SCORE']:
                 self._print_and_log(f"\n--- Scientific Profiler ---")
@@ -3940,26 +3946,36 @@ class ObmlAgi3Agent(Agent):
             for action_key, results_map in actions_data.items():
                 for result_sig, locs in results_map.items():
                     for entry in locs:
+                        # --- FIX: The Memory Corruption Check ---
                         if len(entry) >= 3:
-                            run, turn = entry[0], entry[1]
+                            run, turn, stored_sig = entry[0], entry[1], entry[2]
                         else:
-                            run, turn = 0, entry[0]
+                            run, turn, stored_sig = 0, entry[0], None
                         
-                        ctx_idx = turn - 1
-                        if 0 <= ctx_idx < len(self.level_state_history):
-                            past_ctx = self.level_state_history[ctx_idx]
+                        current_state_sig = None
+                        
+                        # Only re-calculate the signature if the event happened in the CURRENT life
+                        if run == self.run_counter and 0 <= turn - 1 < len(self.level_state_history):
+                            past_ctx = self.level_state_history[turn - 1]
                             past_obj = next((o for o in past_ctx['summary'] if o['id'] == obj_id), None)
                             if past_obj:
                                 current_state_sig = self._get_scientific_state(past_obj, past_ctx)
-                                
-                                if current_state_sig not in state_buckets:
-                                    state_buckets[current_state_sig] = {}
-                                if action_key not in state_buckets[current_state_sig]:
-                                    state_buckets[current_state_sig][action_key] = {}
-                                if result_sig not in state_buckets[current_state_sig][action_key]:
-                                    state_buckets[current_state_sig][action_key][result_sig] = []
-                                    
-                                state_buckets[current_state_sig][action_key][result_sig].append(entry)
+                        
+                        # If it's from a past life, safely fall back to the signature we saved at the time
+                        if not current_state_sig:
+                            current_state_sig = stored_sig
+                            
+                        if not current_state_sig:
+                            continue
+                            
+                        if current_state_sig not in state_buckets:
+                            state_buckets[current_state_sig] = {}
+                        if action_key not in state_buckets[current_state_sig]:
+                            state_buckets[current_state_sig][action_key] = {}
+                        if result_sig not in state_buckets[current_state_sig][action_key]:
+                            state_buckets[current_state_sig][action_key][result_sig] = []
+                            
+                        state_buckets[current_state_sig][action_key][result_sig].append(entry)
 
             # 2. Judge each State Signature independently
             for current_state_sig, state_actions_data in state_buckets.items():
