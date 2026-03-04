@@ -3105,12 +3105,8 @@ class ObmlAgi3Agent(Agent):
                     self._trigger_splitter(obj_id, action_key, self.truth_table[obj_id][action_key])
                     
                     # 2. Retrieve the fresh hypothesis (if any)
-                    target_obj = next((o for o in prev_context['summary'] if o['id'] == obj_id), None)
-                    current_refinements = []
-                    
-                    if target_obj:
-                        base_sig = (target_obj['color'], target_obj['fingerprint'], target_obj['size'])
-                        current_refinements = self.state_refinements.get(base_sig, [])
+                    # --- FIX: Look up the hypothesis using the stable Object ID ---
+                    current_refinements = self.state_refinements.get(obj_id, [])
 
                     if current_refinements:
                         unique_vars = sorted(list(set(current_refinements)))
@@ -4103,57 +4099,71 @@ class ObmlAgi3Agent(Agent):
 
         if len(contexts_by_result) < 2: return
 
-        # 1. NARROWING: Intersect features to build the 'Mask' for each Result
-        masks = {}
-        for r_sig, ctx_list in contexts_by_result.items():
-            if not ctx_list:
-                masks[r_sig] = set()
-                continue
-            
-            # Start with the first snapshot's features
-            result_mask = set(self._extract_all_features(ctx_list[0]['snapshot']))
-            
-            # Intersect with all subsequent snapshots (Leaves ONLY the constants)
-            for i in range(1, len(ctx_list)):
-                feats = self._extract_all_features(ctx_list[i]['snapshot'])
-                result_mask.intersection_update(feats)
-                
-            masks[r_sig] = result_mask
-
-        # 2. DIFFERENTIATION: Subtract Masks to find the Triggers
-        valid_refinements = set()
-        r_sigs = list(masks.keys())
+        # --- 1. EXTRACTION & AGGREGATION (Building the Buckets) ---
+        # Group features by their Base Variable for each specific outcome.
+        # Structure: result_variable_values[result_sig][base_var] = set(raw_strings)
+        result_variable_values = {}
         
-        for i in range(len(r_sigs)):
-            mask_A = masks[r_sigs[i]]
-            unique_to_A = set(mask_A)
-            
-            # Remove features that are ALSO constant in other results
-            for j in range(len(r_sigs)):
-                if i == j: continue
-                mask_B = masks[r_sigs[j]]
-                unique_to_A.difference_update(mask_B)
-                
-            valid_refinements.update(unique_to_A)
+        for r_sig, ctx_list in contexts_by_result.items():
+            result_variable_values[r_sig] = {}
+            for ctx_entry in ctx_list:
+                raw_features = self._extract_all_features(ctx_entry['snapshot'])
+                for f_str in raw_features:
+                    base_var = self._get_base_variable(f_str)
+                    if base_var not in result_variable_values[r_sig]:
+                        result_variable_values[r_sig][base_var] = set()
+                    result_variable_values[r_sig][base_var].add(f_str)
 
-        # 3. Apply Discoveries
+        # --- 2. DIFFERENTIATION (The Disjoint Set Check) ---
+        # Find variables whose 'Value Sets' never overlap between any two different outcomes.
+        valid_refinements = set()
+        r_sigs = list(contexts_by_result.keys())
+        
+        # Gather all unique base variables seen across all results
+        all_base_vars = set()
+        for r_sig in r_sigs:
+            all_base_vars.update(result_variable_values[r_sig].keys())
+            
+        for base_var in all_base_vars:
+            is_disjoint_everywhere = True
+            
+            # Compare the buckets for every outcome against every other outcome
+            for i in range(len(r_sigs)):
+                for j in range(i + 1, len(r_sigs)):
+                    sig_A = r_sigs[i]
+                    sig_B = r_sigs[j]
+                    
+                    values_A = result_variable_values[sig_A].get(base_var, set())
+                    values_B = result_variable_values[sig_B].get(base_var, set())
+                    
+                    # If they share even one state, this variable does not reliably separate them
+                    if not values_A.isdisjoint(values_B):
+                        is_disjoint_everywhere = False
+                        break
+                if not is_disjoint_everywhere:
+                    break
+                    
+            if is_disjoint_everywhere:
+                valid_refinements.add(base_var)
+
+        # --- 3. APPLY DISCOVERIES ---
         if valid_refinements:
             first_ctx = list(contexts_by_result.values())[0][0]
             t_obj = next((o for o in first_ctx['snapshot']['summary'] if o['id'] == obj_id), None)
             
             if t_obj:
-                base_sig = (t_obj['color'], t_obj['fingerprint'], t_obj['size'])
-                if base_sig not in self.state_refinements:
-                    self.state_refinements[base_sig] = []
+                # --- FIX: Store refinements using the stable Object ID ---
+                if obj_id not in self.state_refinements:
+                    self.state_refinements[obj_id] = []
                 
                 added_count = 0
                 for refinement in valid_refinements:
-                    if refinement not in self.state_refinements[base_sig]:
-                        self.state_refinements[base_sig].append(refinement)
+                    if refinement not in self.state_refinements[obj_id]:
+                        self.state_refinements[obj_id].append(refinement)
                         added_count += 1
                 
                 if added_count > 0 and self.debug_channels['HYPOTHESIS']:
-                    print(f"  [Splitter] EUREKA! Refined State for {obj_id} with {added_count} global variables.")
+                    print(f"  [Splitter] EUREKA! Refined State for {obj_id} with {added_count} categorizable variables.")
 
     def _get_context_prop(self, ctx_entry: dict, key: str, mode: str):
         """
@@ -4229,19 +4239,32 @@ class ObmlAgi3Agent(Agent):
         base_sig = (obj['color'], obj['fingerprint'], obj['size'])
         
         # 2. Check for Refinements (Context)
-        required_features = self.state_refinements.get(base_sig, [])
+        # --- FIX: Look up required features using the stable Object ID ---
+        required_features = self.state_refinements.get(obj['id'], [])
         
         if not required_features:
             return (base_sig, tuple())
             
-        # Extract all features for this context
+        # Extract all raw features for this context
         all_feats = self._extract_all_features(context)
-        context_features = []
         
-        for req_feat in required_features:
-            # Value is True if the proposition exists, False if absent
-            val = req_feat in all_feats
-            context_features.append((req_feat, val))
+        # --- NEW: Group live features by their Base Variable ---
+        base_to_raw = {}
+        for f in all_feats:
+            bv = self._get_base_variable(f)
+            if bv not in base_to_raw:
+                base_to_raw[bv] = set()
+            base_to_raw[bv].add(f)
+            
+        context_features = []
+        for req_base_var in required_features:
+            # Retrieve the exact current value(s) for this specific variable
+            # (If it is absent, the set is safely empty)
+            active_values = base_to_raw.get(req_base_var, set())
+            
+            # Convert to a sorted tuple so it is hashable for the Truth Table
+            val = tuple(sorted(list(active_values)))
+            context_features.append((req_base_var, val))
             
         # Return sorted by string to ensure dictionary key matching
         return (base_sig, tuple(sorted(context_features, key=lambda x: x[0])))
