@@ -67,6 +67,7 @@ class ObmlAgi3Agent(Agent):
         # 3. State Refinements (The Splitter): Tracks how we define "State".
         # Key: Base_Intrinsic_Sig -> Value: List of Context Keys (e.g. ['adj_top', 'match_Color'])
         self.state_refinements = {}
+        self.pending_refinements = {} # --- NEW: The Shadow Splitter Memory ---
 
         # 4. Global Invariants: Rules that apply to EVERYTHING (e.g. Gravity).
         self.global_invariants = {}
@@ -193,6 +194,7 @@ class ObmlAgi3Agent(Agent):
         self.truth_table = {}
         self.certified_laws = {}
         self.state_refinements = {}
+        self.pending_refinements = {} # Reset the shadow memory too
         self.global_invariants = {}
         self.level_state_history = []
         self.global_action_counter = 0
@@ -3122,26 +3124,40 @@ class ObmlAgi3Agent(Agent):
                     # 1. Run the Splitter NOW
                     self._trigger_splitter(obj_id, action_key, self.truth_table[obj_id][action_key])
                     
-                    # 2. Retrieve the fresh hypothesis (if any)
-                    # --- FIX: Look up the hypothesis using the stable Object ID ---
+                    # 2. Retrieve the fresh hypothesis
                     current_refinements = self.state_refinements.get(obj_id, [])
+                    pending_data = self.pending_refinements.get(obj_id)
 
                     if current_refinements:
                         unique_vars = sorted(list(set(current_refinements)))
-
-                        # [NEW] Clean formatting: Strip the redundant ID prefix for display
                         prefix = f"{obj_id}_"
                         clean_vars = [v.replace(prefix, "") if v.startswith(prefix) else v for v in unique_vars]
 
-                        if len(unique_vars) > 10:
-                            vars_str = ", ".join(unique_vars[:10]) + f"... (+{len(unique_vars)-10} more)"
+                        if len(clean_vars) > 10:
+                            vars_str = ", ".join(clean_vars[:10]) + f"... (+{len(clean_vars)-10} more)"
                         else:
-                            vars_str = ", ".join(unique_vars)
+                            vars_str = ", ".join(clean_vars)
                             
-                        diagnosis = "Hypothesis Generated"
+                        diagnosis = "Hypothesis Proven (Splitting Universes)"
                         fix = "TEST_CANDIDATES"
-                        detail = f"{{{vars_str}}}" # Removed the obj_X prefix here
+                        detail = f"Promoted: {{{vars_str}}}"
                         requirements = ["VERIFY_VAR"]
+                        
+                    elif pending_data:
+                        unique_vars = sorted(list(pending_data['suspects']))
+                        prefix = f"{obj_id}_"
+                        clean_vars = [v.replace(prefix, "") if v.startswith(prefix) else v for v in unique_vars]
+                        
+                        if len(clean_vars) > 10:
+                            vars_str = ", ".join(clean_vars[:10]) + f"... (+{len(clean_vars)-10} more)"
+                        else:
+                            vars_str = ", ".join(clean_vars)
+                            
+                        diagnosis = f"Whittling Suspects (Stable: {pending_data['stable_count']}/2)"
+                        fix = "FORCE_COLLISIONS"
+                        detail = f"Contenders: {{{vars_str}}}"
+                        requirements = ["STABILIZE_CONTEXT"]
+                        
                     else:
                         # Failure. Splitter ran but found no intersection.
                         fix = "WAIT_FOR_MORE_DATA"
@@ -3299,15 +3315,12 @@ class ObmlAgi3Agent(Agent):
         first_ctx = self.level_state_history[pos_history[0][0] - 1]
         t_obj = next((o for o in first_ctx['summary'] if o['id'] == obj_id), None)
         
-        conditions = []
+        conditions = [f"Target=id_{obj_id.replace('obj_', '')}"]
         if t_obj:
-            conditions.append(f"Color={t_obj['color']}")
             conditions.append(f"Size={t_obj['size']}")
             fp_str = str(t_obj['fingerprint'])
             short_fp = fp_str[:6] + ".." if len(fp_str) > 6 else fp_str
             conditions.append(f"Shape={short_fp}")
-        else:
-            conditions.append(f"ID={obj_id}")
 
         # --- Contextual Invariants (The "Why") ---
         def extract_features(ctx, oid):
@@ -3447,13 +3460,20 @@ class ObmlAgi3Agent(Agent):
         # 3. Filter Conditions
         refined_conditions = []
         
-        # Get the list of critical context keys for this state
-        critical_keys = self.state_refinements.get(state_sig, [])
+        if isinstance(state_sig, tuple) and len(state_sig) == 2 and isinstance(state_sig[1], tuple):
+            obj_id = state_sig[0]
+        else:
+            obj_id = state_sig
+            
+        critical_keys = self.state_refinements.get(obj_id, [])
+        critical_base_vars = {self._get_base_variable(k) for k in critical_keys}
         
         for cond in raw_conditions:
-            if cond.startswith("Color="): refined_conditions.append(cond)
-            elif cond.startswith("Size=") and show_size: refined_conditions.append(cond)
-            elif cond.startswith("Shape=") and show_shape: refined_conditions.append(cond)
+            if cond.startswith("Target="): refined_conditions.append(cond)
+            elif cond.startswith("Size=") and (show_size or any('pixels' in k for k in critical_base_vars)): 
+                refined_conditions.append(cond)
+            elif cond.startswith("Shape=") and (show_shape or any('shape' in k for k in critical_base_vars)): 
+                refined_conditions.append(cond)
             else:
                 # Context keys logic
                 clean_cond = cond.replace('*', '')
@@ -4164,18 +4184,35 @@ class ObmlAgi3Agent(Agent):
             t_obj = next((o for o in first_ctx['snapshot']['summary'] if o['id'] == obj_id), None)
             
             if t_obj:
-                # --- FIX: Store refinements using the stable Object ID ---
-                if obj_id not in self.state_refinements:
-                    self.state_refinements[obj_id] = []
+                # --- NEW: The Shadow Splitter (Purgatory) ---
+                if obj_id not in self.pending_refinements:
+                    self.pending_refinements[obj_id] = {'suspects': valid_refinements, 'stable_count': 0}
+                else:
+                    current_suspects = self.pending_refinements[obj_id]['suspects']
+                    if current_suspects == valid_refinements:
+                        self.pending_refinements[obj_id]['stable_count'] += 1
+                    else:
+                        # Suspects were whittled down or changed! Reset the stability count.
+                        self.pending_refinements[obj_id]['suspects'] = valid_refinements
+                        self.pending_refinements[obj_id]['stable_count'] = 0
                 
-                added_count = 0
-                for refinement in valid_refinements:
-                    if refinement not in self.state_refinements[obj_id]:
-                        self.state_refinements[obj_id].append(refinement)
-                        added_count += 1
-                
-                if added_count > 0 and self.debug_channels['HYPOTHESIS']:
-                    print(f"  [Splitter] EUREKA! Refined State for {obj_id} with {added_count} categorizable variables.")
+                # Check for Promotion to official State Signature
+                STABILITY_THRESHOLD = 2
+                if self.pending_refinements[obj_id]['stable_count'] >= STABILITY_THRESHOLD:
+                    if obj_id not in self.state_refinements:
+                        self.state_refinements[obj_id] = []
+                    
+                    added_count = 0
+                    for refinement in valid_refinements:
+                        if refinement not in self.state_refinements[obj_id]:
+                            self.state_refinements[obj_id].append(refinement)
+                            added_count += 1
+                    
+                    # Clear from purgatory so we don't keep promoting
+                    del self.pending_refinements[obj_id]
+                    
+                    if added_count > 0 and self.debug_channels['HYPOTHESIS']:
+                        print(f"  [Splitter] PROMOTION! Officially Refined State for {obj_id} with {added_count} categorizable variables.")
 
     def _get_context_prop(self, ctx_entry: dict, key: str, mode: str):
         """
