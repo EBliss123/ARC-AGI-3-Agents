@@ -4385,24 +4385,49 @@ class ObmlAgi3Agent(Agent):
                 nid = ctx.get('adj', {}).get(oid, ['na']*4)[d_idx]
                 if nid not in ['na', 'x']:
                     features.add(f"{oid}_adj_{direction}_{nid}")
+                else:
+                    features.add(f"{oid}_adj_{direction}_none")
             
             # Diagonal Adjacencies
             for d_idx, direction in enumerate(['tr', 'br', 'bl', 'tl']):
                 nid = ctx.get('diag_adj', {}).get(oid, ['na']*4)[d_idx]
                 if nid not in ['na', 'x']:
                     features.add(f"{oid}_diag_adj_{direction}_{nid}")
+                else:
+                    features.add(f"{oid}_diag_adj_{direction}_none")
                     
             # Alignments
-            for a_type, groups in ctx.get('align', {}).items():
-                for coord, ids in groups.items():
+            alignment_types = ['top_y', 'bottom_y', 'center_y', 'left_x', 'right_x', 'center_x']
+            for a_type in alignment_types:
+                found = False
+                for coord, ids in ctx.get('align', {}).get(a_type, {}).items():
                     if oid in ids:
                         features.add(f"{oid}_align_{a_type}_{coord}")
-                        
+                        found = True
+                if not found:
+                    features.add(f"{oid}_align_{a_type}_none")
+            
+            # Diagonal Alignments
+            diag_align_types = ['top_left_to_bottom_right', 'top_right_to_bottom_left']
+            for a_type in diag_align_types:
+                found = False
+                for line_idx, ids in enumerate(ctx.get('diag_align', {}).get(a_type, [])):
+                    if oid in ids:
+                        features.add(f"{oid}_diag_align_{a_type}_{line_idx}")
+                        found = True
+                if not found:
+                    features.add(f"{oid}_diag_align_{a_type}_none")
+
             # Match Groups
-            for m_type, groups in ctx.get('match', {}).items():
-                for props, ids in groups.items():
+            match_types = ['Exact', 'Color', 'Fingerprint', 'Size', 'Pixels']
+            for m_type in match_types:
+                found = False
+                for props, ids in ctx.get('match', {}).get(m_type, {}).items():
                     if oid in ids:
                         features.add(f"{oid}_match_{m_type}_{props}")
+                        found = True
+                if not found:
+                    features.add(f"{oid}_match_{m_type}_none")
                         
         return frozenset(features)
 
@@ -4429,9 +4454,13 @@ class ObmlAgi3Agent(Agent):
             base = f_str.split('_adj_')[0] + '_adj_'
             direction = f_str.split('_adj_')[1].split('_')[0]
             return base + direction
+
+        if '_diag_align_' in f_str:
+            # Drops only the line_idx/none value at the very end
+            return f_str.rsplit('_', 1)[0]
             
         if '_align_' in f_str:
-            # Drops only the coordinate value at the very end
+            # Drops only the coordinate/none value at the very end
             return f_str.rsplit('_', 1)[0]
             
         if '_match_' in f_str:
