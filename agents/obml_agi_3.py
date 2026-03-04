@@ -608,7 +608,9 @@ class ObmlAgi3Agent(Agent):
                             state_sig = self._get_scientific_state(prev_obj, prev_context)
                             
                             # Check for Global Sequence Law
-                            law = self.certified_laws.get((state_sig, 'ANY'))
+                            laws_for_obj = self.certified_laws.get(obj_id, {})
+                            laws = laws_for_obj.get(state_sig, {})
+                            law = laws.get('ANY')
                             
                             self._print_and_log(f"     * [GLOBAL] {e['type']} on {e.get('id', 'Unknown')}")
 
@@ -633,7 +635,9 @@ class ObmlAgi3Agent(Agent):
                             state_sig = self._get_scientific_state(prev_obj, prev_context)
 
                             # Check for Direct Sequence Law
-                            law = self.certified_laws.get((state_sig, learning_key))
+                            laws_for_obj = self.certified_laws.get(obj_id, {})
+                            laws = laws_for_obj.get(state_sig, {})
+                            law = laws.get(learning_key)
                             
                             self._print_and_log(f"     * [DIRECT] {e['type']} on {e.get('id', 'Unknown')}")
                             if '_physics_note' in e:
@@ -855,10 +859,14 @@ class ObmlAgi3Agent(Agent):
                     continue
                 
                 # 2. CERTAINTY CHECK (Only applies if NOT actively experimenting)
-                laws = self.certified_laws.get(obj_id, {})
-                if 'ANY' in laws or this_action_key in laws:
-                    scientific_score -= 1
-                    continue
+                target_obj_for_score = next((o for o in current_summary if o['id'] == obj_id), None)
+                if target_obj_for_score:
+                    state_sig_for_score = self._get_scientific_state(target_obj_for_score, current_full_context)
+                    laws_for_obj = self.certified_laws.get(obj_id, {})
+                    laws = laws_for_obj.get(state_sig_for_score, {})
+                    if 'ANY' in laws or this_action_key in laws:
+                        scientific_score -= 1
+                        continue
                 
                 # 3. DATA CHECK (Uncertified but has data)
                 if has_data:
@@ -1744,9 +1752,11 @@ class ObmlAgi3Agent(Agent):
         state_sig = self._get_scientific_state(target_obj, current_context)
         
         # 2. Check Certified Laws (Established Science)
-        law = self.certified_laws.get((state_sig, action_name)) # Direct
+        laws_for_obj = self.certified_laws.get(target_id, {})
+        laws = laws_for_obj.get(state_sig, {})
+        law = laws.get(action_name) # Direct
         if not law:
-            law = self.certified_laws.get((state_sig, 'ANY'))   # Global
+            law = laws.get('ANY')   # Global
 
         if law:
             # [Existing Law Execution Logic...]
@@ -3064,8 +3074,16 @@ class ObmlAgi3Agent(Agent):
             # 2. Construct the Signature
             result_sig = self._get_concrete_signature(event)
             
+            # --- GET CURRENT STATE SIG ---
+            target_obj = next((o for o in prev_context['summary'] if o['id'] == obj_id), None)
+            if target_obj:
+                state_sig = self._get_scientific_state(target_obj, prev_context)
+            else:
+                state_sig = None
+
             # 3. Check the Law Book (Certified Laws)
-            laws = self.certified_laws.get(obj_id, {})
+            laws_for_obj = self.certified_laws.get(obj_id, {})
+            laws = laws_for_obj.get(state_sig, {})
             
             # A. Check for GLOBAL Law (Action-Independent)
             global_law = laws.get('ANY')
@@ -3245,71 +3263,57 @@ class ObmlAgi3Agent(Agent):
         """
         Scans the history of a specific Outcome to find properties that are 
         CONSTANT across all instances.
-        
-        UPDATED: Contrastive Analysis + Run-Aware Unpacking.
-        Only analyzes context from the CURRENT RUN, as previous run contexts are discarded.
         """
-        if state_sig not in self.truth_table: return []
-        if action_key not in self.truth_table[state_sig]: return []
-        
         # 1. Robust State Signature Unpacking
-        if len(state_sig) == 2 and isinstance(state_sig[0], tuple):
-            base_sig = state_sig[0]
+        if len(state_sig) == 2 and isinstance(state_sig[1], tuple):
+            obj_id = state_sig[0]
         else:
-            base_sig = state_sig
+            obj_id = state_sig
             
-        try:
-            color, fp, size = base_sig
-        except ValueError:
-            return ["State Error"]
+        if obj_id not in self.truth_table: return []
+        if action_key not in self.truth_table[obj_id]: return []
 
         # --- STEP 1: Fetch and Normalize History (Current Run Only) ---
-        # We effectively flatten the 3-tuple (run, turn, id) back to (turn, id)
-        # BUT only for the current run, so downstream logic works safely.
-        
-        raw_pos_history = self.truth_table[state_sig][action_key].get(result_sig, [])
+        raw_pos_history = self.truth_table[obj_id][action_key].get(result_sig, [])
         pos_history = []
         for entry in raw_pos_history:
-            if len(entry) == 3: run, turn, oid = entry
-            else: run, turn, oid = 0, entry[0], entry[1]
-            
-            if run == self.run_counter:
-                pos_history.append((turn, oid))
+            if len(entry) == 3: run, turn, s_sig = entry
+            else: continue
+            if run == self.run_counter and s_sig == state_sig:
+                pos_history.append((turn, obj_id))
         
-        # If we have no history in this run (e.g. just reset), return basic stats
         if not pos_history: 
-            fp_str = str(fp)
-            short_fp = fp_str[:6] + ".." if len(fp_str) > 6 else fp_str
-            return [f"Color={color}", f"Size={size}", f"Shape={short_fp}"]
+            return [f"ID={obj_id}"]
         
-        # Get Negative History (No Change) for Contrast - Current Run Only
+        # Get Negative History (No Change) for Contrast
         neg_history = []
-        if ('NO_CHANGE', None, None) in self.truth_table[state_sig][action_key]:
-            raw_neg = self.truth_table[state_sig][action_key][('NO_CHANGE', None, None)]
-            for entry in raw_neg:
-                if len(entry) == 3: run, turn, oid = entry
-                else: run, turn, oid = 0, entry[0], entry[1]
-                
-                if run == self.run_counter:
-                    neg_history.append((turn, oid))
+        for r_sig, raw_hist in self.truth_table[obj_id][action_key].items():
+            if r_sig[0] == 'NO_CHANGE':
+                for entry in raw_hist:
+                    if len(entry) == 3: run, turn, s_sig = entry
+                    else: continue
+                    if run == self.run_counter and s_sig == state_sig:
+                        neg_history.append((turn, obj_id))
 
         # --- Base Invariants (Always True) ---
+        first_ctx = self.level_state_history[pos_history[0][0] - 1]
+        t_obj = next((o for o in first_ctx['summary'] if o['id'] == obj_id), None)
+        
         conditions = []
-        conditions.append(f"Color={color}")
-        conditions.append(f"Size={size}")
-        fp_str = str(fp)
-        short_fp = fp_str[:6] + ".." if len(fp_str) > 6 else fp_str
-        conditions.append(f"Shape={short_fp}")
+        if t_obj:
+            conditions.append(f"Color={t_obj['color']}")
+            conditions.append(f"Size={t_obj['size']}")
+            fp_str = str(t_obj['fingerprint'])
+            short_fp = fp_str[:6] + ".." if len(fp_str) > 6 else fp_str
+            conditions.append(f"Shape={short_fp}")
+        else:
+            conditions.append(f"ID={obj_id}")
 
         # --- Contextual Invariants (The "Why") ---
-        
-        # Helper to extract ALL features for an object in a context
         def extract_features(ctx, oid):
             feats = {}
-            if 'adj' in ctx and oid in ctx['adj']:
-                feats['adj'] = ctx['adj'][oid] 
-            if 'diag_adj' in ctx and oid in ctx['diag_adj']:
-                feats['diag_adj'] = ctx['diag_adj'][oid]
+            if 'adj' in ctx and oid in ctx['adj']: feats['adj'] = ctx['adj'][oid] 
+            if 'diag_adj' in ctx and oid in ctx['diag_adj']: feats['diag_adj'] = ctx['diag_adj'][oid]
             feats['align'] = set()
             if 'align' in ctx:
                 for a_type, groups in ctx['align'].items():
@@ -3323,11 +3327,7 @@ class ObmlAgi3Agent(Agent):
             return feats
 
         # 1. Compute Intersection of POSITIVES
-        # Validation: Check if history index exists
-        if not (0 <= pos_history[0][0] - 1 < len(self.level_state_history)): 
-            return conditions
-            
-        first_ctx = self.level_state_history[pos_history[0][0] - 1]
+        if not (0 <= pos_history[0][0] - 1 < len(self.level_state_history)): return conditions
         common_feats = extract_features(first_ctx, pos_history[0][1])
 
         for i in range(1, len(pos_history)):
@@ -3336,7 +3336,6 @@ class ObmlAgi3Agent(Agent):
             ctx = self.level_state_history[tid - 1]
             curr_feats = extract_features(ctx, oid)
             
-            # Intersect Adj
             if 'adj' in common_feats:
                 if 'adj' not in curr_feats: del common_feats['adj']
                 else:
@@ -3347,7 +3346,6 @@ class ObmlAgi3Agent(Agent):
                     if all(x is None for x in new_adj): del common_feats['adj']
                     else: common_feats['adj'] = new_adj
 
-            # Intersect Diag Adj
             if 'diag_adj' in common_feats:
                 if 'diag_adj' not in curr_feats: del common_feats['diag_adj']
                 else:
@@ -3358,17 +3356,13 @@ class ObmlAgi3Agent(Agent):
                     if all(x is None for x in new_dadj): del common_feats['diag_adj']
                     else: common_feats['diag_adj'] = new_dadj
             
-            # Intersect Sets
             for key in ['align', 'diag_align']:
                 if key in common_feats:
-                    if key in curr_feats:
-                        common_feats[key] = common_feats[key].intersection(curr_feats[key])
-                    else:
-                        del common_feats[key]
+                    if key in curr_feats: common_feats[key] = common_feats[key].intersection(curr_feats[key])
+                    else: del common_feats[key]
 
         # 2. Check Contrast with NEGATIVES
         neg_features_union = {'adj': set(), 'diag_adj': set(), 'align': set(), 'diag_align': set()}
-        
         for i in range(len(neg_history)):
             tid, oid = neg_history[i]
             if not (0 <= tid - 1 < len(self.level_state_history)): continue
@@ -3379,10 +3373,8 @@ class ObmlAgi3Agent(Agent):
                 for k in range(4): neg_features_union['adj'].add((k, nf['adj'][k]))
             if 'diag_adj' in nf:
                 for k in range(4): neg_features_union['diag_adj'].add((k, nf['diag_adj'][k]))
-            if 'align' in nf:
-                neg_features_union['align'].update(nf['align'])
-            if 'diag_align' in nf:
-                neg_features_union['diag_align'].update(nf['diag_align'])
+            if 'align' in nf: neg_features_union['align'].update(nf['align'])
+            if 'diag_align' in nf: neg_features_union['diag_align'].update(nf['diag_align'])
 
         # 3. Format Output
         dirs = ['top', 'right', 'bottom', 'left']
@@ -3391,8 +3383,7 @@ class ObmlAgi3Agent(Agent):
                 if neighbor and neighbor != 'na':
                     n_clean = neighbor.replace('obj_', 'id_')
                     feat_str = f"Adj({dirs[i]}={n_clean})"
-                    if (i, neighbor) not in neg_features_union['adj']:
-                        feat_str = f"**{feat_str}**"
+                    if (i, neighbor) not in neg_features_union['adj']: feat_str = f"**{feat_str}**"
                     conditions.append(feat_str)
                     
         diag_dirs = ['top_right', 'bottom_right', 'bottom_left', 'top_left']
@@ -3401,22 +3392,19 @@ class ObmlAgi3Agent(Agent):
                 if neighbor and neighbor != 'na':
                     n_clean = neighbor.replace('obj_', 'id_')
                     feat_str = f"DiagAdj({diag_dirs[i]}={n_clean})"
-                    if (i, neighbor) not in neg_features_union['diag_adj']:
-                        feat_str = f"**{feat_str}**"
+                    if (i, neighbor) not in neg_features_union['diag_adj']: feat_str = f"**{feat_str}**"
                     conditions.append(feat_str)
 
         if 'align' in common_feats:
             for (a_type, coord) in common_feats['align']:
                 feat_str = f"{a_type}={coord}"
-                if (a_type, coord) not in neg_features_union['align']:
-                    feat_str = f"**{feat_str}**"
+                if (a_type, coord) not in neg_features_union['align']: feat_str = f"**{feat_str}**"
                 conditions.append(feat_str)
                 
         if 'diag_align' in common_feats:
             for (a_type, line_idx) in common_feats['diag_align']:
                 feat_str = f"{a_type}(Line {line_idx})"
-                if (a_type, line_idx) not in neg_features_union['diag_align']:
-                    feat_str = f"**{feat_str}**"
+                if (a_type, line_idx) not in neg_features_union['diag_align']: feat_str = f"**{feat_str}**"
                 conditions.append(feat_str)
 
         return conditions
@@ -3439,21 +3427,19 @@ class ObmlAgi3Agent(Agent):
         
         variations = {'Size': set(), 'Shape': set()}
         
-        # Scan all laws for this action to check for salience
-        # Structure: self.certified_laws[obj_id][action_key] = entry
-        for obj_id, laws in self.certified_laws.items():
-            if action_key in laws:
-                l_data = laws[action_key]
-                # Check stored state_sig if available
-                if l_data.get('state_sig'):
-                    s_sig = l_data['state_sig']
-                    # Handle tuple nesting if present
-                    base = s_sig[0] if len(s_sig) == 2 and isinstance(s_sig[0], tuple) else s_sig
-                    try:
-                        variations['Shape'].add(base[1])
-                        variations['Size'].add(base[2])
-                    except IndexError:
-                        pass
+        # Scan Truth Table to check for salience (Do Size/Shape vary for this action?)
+        for o_id, actions_data in self.truth_table.items():
+            if action_key in actions_data:
+                for r_sig, locs in actions_data[action_key].items():
+                    for entry in locs:
+                        if len(entry) >= 3: run, turn = entry[0], entry[1]
+                        else: run, turn = 0, entry[0]
+                        if run == self.run_counter and 0 <= turn - 1 < len(self.level_state_history):
+                            ctx = self.level_state_history[turn - 1]
+                            t_obj = next((o for o in ctx['summary'] if o['id'] == o_id), None)
+                            if t_obj:
+                                variations['Shape'].add(t_obj['fingerprint'])
+                                variations['Size'].add(t_obj['size'])
 
         show_size = len(variations['Size']) > 1
         show_shape = len(variations['Shape']) > 1
@@ -3921,91 +3907,118 @@ class ObmlAgi3Agent(Agent):
 
     def _verify_and_certify(self, state_sig=None):
         """
-        [SCIENTIFIC METHOD: ID-BASED VERIFICATION]
-        Iterates through the Truth Table (organized by Object ID).
-        Certifies laws ONLY if they pass:
-        1. Consistency (N >= 2)
-        2. Distinction (Action vs Action)
+        [SCIENTIFIC METHOD: ID & STATE-BASED VERIFICATION]
         """
+        self.certified_laws = {} # Clear to rebuild based on the LATEST state definitions
+        
         for obj_id, actions_data in self.truth_table.items():
+            self.certified_laws[obj_id] = {}
             
-            # Map: Action_Key -> Result_Sig (ONLY for actions with N >= 2)
-            consistent_results = {}
-            # Set: Every action we have ever tried (Used for Negative Control)
-            all_attempted_actions = set(actions_data.keys())
+            # 1. Dynamically re-bucket historical data using the LATEST state definitions
+            state_buckets = {}
             
             for action_key, results_map in actions_data.items():
-                valid_results = {r: locs for r, locs in results_map.items() if locs}
-                
-                if not valid_results:
-                    continue
-                    
-                if len(valid_results) > 1:
-                    if self.debug_channels['HYPOTHESIS']:
-                        print(f"  [Science] Inconsistency detected for {obj_id} + {action_key}: {list(valid_results.keys())}")
-                    self._trigger_splitter(obj_id, action_key, valid_results)
-                    continue 
-                
-                result_sig, locs = list(valid_results.items())[0]
-                
-                # --- BUG FIX: Require N >= 2 to even consider this a reliable result ---
-                if len(locs) >= 2:
-                    consistent_results[action_key] = result_sig
-
-            # --- PHASE 2 & 3: Distinction (Direct vs Global) ---
-            result_to_actions = {}
-            for act, res in consistent_results.items():
-                if res not in result_to_actions: result_to_actions[res] = []
-                result_to_actions[res].append(act)
-                
-            for action_key, result_sig in consistent_results.items():
-                
-                # A. GLOBAL CHECK
-                # If ANY other action consistently causes the same result, it is Global.
-                causing_actions = result_to_actions[result_sig]
-                is_no_change = (result_sig[0] == 'NO_CHANGE')
-                
-                # --- BUG FIX: Strict Burden of Proof for NO_CHANGE ---
-                # A "NO_CHANGE" result can only be Global if we have literally tested 
-                # every possible tool currently available on the board.
-                is_global = False
-                if len(causing_actions) > 1:
-                    if is_no_change:
-                        # Dynamically calculate the total number of actions the Profiler evaluates
-                        total_known_tools = 7 # Fallback
-                        if hasattr(self, 'frames') and self.frames and self.frames[-1].available_actions:
-                            available = self.frames[-1].available_actions
-                            
-                            num_globals = sum(1 for a in available if a.name != 'ACTION6')
-                            has_click = any(a.name == 'ACTION6' for a in available)
-                            
-                            total_known_tools = num_globals
-                            if has_click and hasattr(self, 'last_object_summary'):
-                                total_known_tools += len(self.last_object_summary)
-                                
-                        if len(causing_actions) >= total_known_tools:
-                            is_global = True
-                    else:
-                        is_global = True
+                for result_sig, locs in results_map.items():
+                    for entry in locs:
+                        if len(entry) >= 3:
+                            run, turn = entry[0], entry[1]
+                        else:
+                            run, turn = 0, entry[0]
                         
-                if is_global:
-                    self._certify_law(obj_id, 'GLOBAL', 'ANY', result_sig)
-                    continue
+                        ctx_idx = turn - 1
+                        if 0 <= ctx_idx < len(self.level_state_history):
+                            past_ctx = self.level_state_history[ctx_idx]
+                            past_obj = next((o for o in past_ctx['summary'] if o['id'] == obj_id), None)
+                            if past_obj:
+                                current_state_sig = self._get_scientific_state(past_obj, past_ctx)
+                                
+                                if current_state_sig not in state_buckets:
+                                    state_buckets[current_state_sig] = {}
+                                if action_key not in state_buckets[current_state_sig]:
+                                    state_buckets[current_state_sig][action_key] = {}
+                                if result_sig not in state_buckets[current_state_sig][action_key]:
+                                    state_buckets[current_state_sig][action_key][result_sig] = []
+                                    
+                                state_buckets[current_state_sig][action_key][result_sig].append(entry)
+
+            # 2. Judge each State Signature independently
+            for current_state_sig, state_actions_data in state_buckets.items():
+                self.certified_laws[obj_id][current_state_sig] = {}
                 
-                # B. DIRECT CHECK
-                # We use ALL attempted actions for Negative Control.
-                # Example: If ACTION1 has N=5 (consistent), and ACTION4 has N=1,
-                # length is 2. We can legally certify ACTION1 as DIRECT, but ACTION4 
-                # stays pending until it gets N=2.
-                if len(all_attempted_actions) > 1:
-                    self._certify_law(obj_id, 'DIRECT', action_key, result_sig)
-                else:
-                    pass
+                consistent_results = {}
+                all_attempted_actions = set(state_actions_data.keys())
+                
+                for action_key, results_map in state_actions_data.items():
+                    valid_results = {r: locs for r, locs in results_map.items() if locs}
+                    
+                    if not valid_results: continue
+                    
+                    if len(valid_results) > 1:
+                        if self.debug_channels['HYPOTHESIS']:
+                            print(f"  [Science] Inconsistency detected for {obj_id} in state {current_state_sig} + {action_key}: {list(valid_results.keys())}")
+                        # Pass the raw valid_results so the Splitter can find the missing variable!
+                        self._trigger_splitter(obj_id, action_key, valid_results)
+                        continue 
+                    
+                    result_sig, locs = list(valid_results.items())[0]
+                    if len(locs) >= 2:
+                        consistent_results[action_key] = result_sig
+
+                # --- PHASE 2 & 3: Distinction (Direct vs Global) ---
+                result_to_actions = {}
+                for act, res in consistent_results.items():
+                    if res not in result_to_actions: result_to_actions[res] = []
+                    result_to_actions[res].append(act)
+                    
+                for action_key, result_sig in consistent_results.items():
+                    causing_actions = result_to_actions[result_sig]
+                    is_no_change = (result_sig[0] == 'NO_CHANGE')
+                    
+                    # --- NEW BUG FIX: The Contradiction Check ---
+                    # It cannot be a Global Law if ANY action in this state caused a different result!
+                    has_contradiction = False
+                    for a_key, r_map in state_actions_data.items():
+                        for r_sig in r_map.keys():
+                            if r_sig != result_sig:
+                                has_contradiction = True
+                                break
+                        if has_contradiction: break
+
+                    is_global = False
+                    if len(causing_actions) > 1 and not has_contradiction:
+                        if is_no_change:
+                            total_known_tools = 7 # Fallback
+                            if hasattr(self, 'frames') and self.frames and self.frames[-1].available_actions:
+                                available = self.frames[-1].available_actions
+                                num_globals = sum(1 for a in available if a.name != 'ACTION6')
+                                has_click = any(a.name == 'ACTION6' for a in available)
+                                total_known_tools = num_globals
+                                if has_click and hasattr(self, 'last_object_summary'):
+                                    total_known_tools += len(self.last_object_summary)
+                                    
+                            if len(causing_actions) >= total_known_tools:
+                                is_global = True
+                        else:
+                            is_global = True
+                            
+                    if is_global:
+                        self._certify_law(obj_id, 'GLOBAL', 'ANY', result_sig, current_state_sig)
+                        continue
+                    
+                    if len(all_attempted_actions) > 1:
+                        self._certify_law(obj_id, 'DIRECT', action_key, result_sig, current_state_sig)
+
+        # Cleanup empty dicts
+        for obj_id in list(self.certified_laws.keys()):
+            if not self.certified_laws[obj_id]:
+                del self.certified_laws[obj_id]
 
     def _certify_law(self, obj_id, law_type, action_key, result_sig, state_sig=None):
         """Helper to store the proven law in the registry."""
         if obj_id not in self.certified_laws:
             self.certified_laws[obj_id] = {}
+        if state_sig not in self.certified_laws[obj_id]:
+            self.certified_laws[obj_id][state_sig] = {}
             
         entry = {
             'type': law_type,
@@ -4016,12 +4029,12 @@ class ObmlAgi3Agent(Agent):
         
         key = 'ANY' if law_type == 'GLOBAL' else action_key
         
-        if key not in self.certified_laws[obj_id]:
+        if key not in self.certified_laws[obj_id][state_sig]:
             if self.debug_channels['HYPOTHESIS']:
                 r_str = result_sig[0] if isinstance(result_sig, tuple) else str(result_sig)
-                print(f"  [Science] CERTIFIED {law_type} LAW for {obj_id}: {action_key} -> {r_str}")
+                print(f"  [Science] CERTIFIED {law_type} LAW for {obj_id} (State: {state_sig}): {action_key} -> {r_str}")
         
-        self.certified_laws[obj_id][key] = entry
+        self.certified_laws[obj_id][state_sig][key] = entry
 
     def _get_feature_status(self, contexts: list[dict], base_sig: tuple, feature_type: str, sub_key: str) -> str:
         """
@@ -4032,11 +4045,10 @@ class ObmlAgi3Agent(Agent):
         total = 0
         
         for ctx in contexts:
-            # Find the object matching base_sig in this historical context
-            # (Logic copied to ensure we are looking at the specific actor in the specific past)
+            # Find the object matching the ID in this historical context
             target_obj = None
             for obj in ctx['summary']:
-                if (obj['color'], obj['fingerprint'], obj['size']) == base_sig:
+                if obj['id'] == base_sig: # base_sig is now the Object ID
                     target_obj = obj
                     break
             
@@ -4232,11 +4244,12 @@ class ObmlAgi3Agent(Agent):
 
     def _get_scientific_state(self, obj: dict, context: dict) -> tuple:
         """
-        Constructs the State Signature. Starts with Intrinsic properties.
+        Constructs the State Signature.
         Appends refined Context features based on the Global Splitter's findings.
         """
-        # 1. Intrinsic Properties (The Base)
-        base_sig = (obj['color'], obj['fingerprint'], obj['size'])
+        # 1. The Base is now strictly the Object ID. 
+        # This guarantees observations collide and trigger the Splitter.
+        base_sig = obj['id']
         
         # 2. Check for Refinements (Context)
         # --- FIX: Look up required features using the stable Object ID ---
@@ -4278,10 +4291,10 @@ class ObmlAgi3Agent(Agent):
         total = 0
         
         for ctx in contexts:
-            # Find the object matching base_sig in this historical context
+            # Find the object matching the ID in this historical context
             target_obj = None
             for obj in ctx['summary']:
-                if (obj['color'], obj['fingerprint'], obj['size']) == base_sig:
+                if obj['id'] == base_sig: # base_sig is now the Object ID
                     target_obj = obj
                     break
             
