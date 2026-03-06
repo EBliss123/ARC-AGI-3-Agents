@@ -218,7 +218,8 @@ class ObmlAgi3Agent(Agent):
         self.final_summary_before_level_change = None
         self.current_level_id_map = {}
         self.last_action_context = None
-        self.level_state_history = []
+        # --- FIX: Stop erasing the history book! ---
+        # self.level_state_history = []
         self.banned_action_keys = set()
         self.actions_printed = False # This is per-level, not per-game
 
@@ -3116,19 +3117,23 @@ class ObmlAgi3Agent(Agent):
             detail = ""
             
             if obj_id in self.truth_table and action_key in self.truth_table[obj_id]:
-                # Get history for THIS specific result
-                history = self.truth_table[obj_id][action_key].get(result_sig, [])
-                n_count = len(history)
-                
-                # Check for Contradictions (Stability)
-                all_results = self.truth_table[obj_id][action_key].keys()
+                # --- FIX: State-Specific Filtering ---
+                # Only look at history that matches the CURRENT refined state!
+                state_specific_results = {}
+                for r_sig, locs in self.truth_table[obj_id][action_key].items():
+                    matching_locs = [e for e in locs if len(e) >= 3 and e[2] == state_sig]
+                    if matching_locs:
+                        state_specific_results[r_sig] = matching_locs
+                        
+                n_count = len(state_specific_results.get(result_sig, []))
+                all_results = list(state_specific_results.keys())
                 
                 if len(all_results) > 1:
                     # [CRITICAL UPDATE]: Immediate Splitter Execution
                     diagnosis = "Unstable/Inconsistent"
                     
-                    # 1. Run the Splitter NOW
-                    self._trigger_splitter(obj_id, action_key, self.truth_table[obj_id][action_key])
+                    # 1. Run the Splitter NOW using the filtered data
+                    self._trigger_splitter(obj_id, action_key, state_specific_results)
                     
                     # 2. Retrieve the fresh hypothesis
                     current_refinements = self.state_refinements.get(obj_id, [])
@@ -3175,8 +3180,15 @@ class ObmlAgi3Agent(Agent):
                     if n_count < 2:
                         requirements.append("POSITIVE_CONTROL")
                     
-                    tried_actions = self.truth_table[obj_id].keys()
-                    if len(tried_actions) < 2:
+                    # --- FIX: State-Specific Negative Control ---
+                    tried_actions_in_state = set()
+                    for a_key, r_map in self.truth_table[obj_id].items():
+                        for r_sig, locs in r_map.items():
+                            if any(len(e) >= 3 and e[2] == state_sig for e in locs):
+                                tried_actions_in_state.add(a_key)
+                                break
+                                
+                    if len(tried_actions_in_state) < 2:
                         requirements.append("NEGATIVE_CONTROL")
                     
                     if "POSITIVE_CONTROL" in requirements and "NEGATIVE_CONTROL" in requirements:
@@ -3301,7 +3313,7 @@ class ObmlAgi3Agent(Agent):
         for entry in raw_pos_history:
             if len(entry) == 3: run, turn, s_sig = entry
             else: continue
-            if run == self.run_counter and s_sig == state_sig:
+            if s_sig == state_sig:
                 pos_history.append((turn, obj_id))
         
         if not pos_history: 
@@ -3314,7 +3326,7 @@ class ObmlAgi3Agent(Agent):
                 for entry in raw_hist:
                     if len(entry) == 3: run, turn, s_sig = entry
                     else: continue
-                    if run == self.run_counter and s_sig == state_sig:
+                    if s_sig == state_sig:
                         neg_history.append((turn, obj_id))
 
         # --- Base Invariants (Always True) ---
@@ -3453,7 +3465,7 @@ class ObmlAgi3Agent(Agent):
                     for entry in locs:
                         if len(entry) >= 3: run, turn = entry[0], entry[1]
                         else: run, turn = 0, entry[0]
-                        if run == self.run_counter and 0 <= turn - 1 < len(self.level_state_history):
+                        if 0 <= turn - 1 < len(self.level_state_history):
                             ctx = self.level_state_history[turn - 1]
                             t_obj = next((o for o in ctx['summary'] if o['id'] == o_id), None)
                             if t_obj:
@@ -3954,8 +3966,8 @@ class ObmlAgi3Agent(Agent):
                         
                         current_state_sig = None
                         
-                        # Only re-calculate the signature if the event happened in the CURRENT life
-                        if run == self.run_counter and 0 <= turn - 1 < len(self.level_state_history):
+                        # --- FIX: Allow the Judge to read old data from past lives ---
+                        if 0 <= turn - 1 < len(self.level_state_history):
                             past_ctx = self.level_state_history[turn - 1]
                             past_obj = next((o for o in past_ctx['summary'] if o['id'] == obj_id), None)
                             if past_obj:
@@ -4132,8 +4144,7 @@ class ObmlAgi3Agent(Agent):
                 if len(entry) >= 3: run, turn = entry[0], entry[1]
                 else: run, turn = entry[0], entry[1]
                 
-                # --- FIX: Only use contexts from the CURRENT run ---
-                if run != self.run_counter: continue 
+                # --- FIX: Allow the Splitter to use old data ---
                 
                 ctx_idx = turn - 1
                 if 0 <= ctx_idx < len(self.level_state_history):
