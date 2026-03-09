@@ -670,28 +670,42 @@ class ObmlAgi3Agent(Agent):
                                 self._print_and_log(f"       [Prediction]  IF {rule_str}")
 
                     if ambiguous_events:
-                        self._print_and_log(f"  -> Ignored {len(ambiguous_events)} Ambiguous events:")
-                        for wrapper in ambiguous_events:
-                            e = wrapper['event']
-                            reason = wrapper['reason']
-                            fix = wrapper['fix']
-                            detail = wrapper.get('detail', '')
-                            
-                            # 1. Get the Readable Value (e.g., "Move (0, -1)")
-                            val_str = _fmt_val(e)
-
-                            self._print_and_log(f"     * [AMBIGUOUS] {e['type']} on {e.get('id', 'Unknown')}")
-                            
-                            # 2. Print WHAT happened (The "New" observation)
-                            self._print_and_log(f"       [Observed] {val_str}")
-                            
-                            self._print_and_log(f"       [Status]   {reason}")
-                            if detail:
-                                self._print_and_log(f"       [Detail]   {detail}")
+                        # Split the events for clean printing
+                        semi_global_list = [w for w in ambiguous_events if w.get('type') == 'SEMI_GLOBAL']
+                        true_ambiguous_list = [w for w in ambiguous_events if w.get('type') != 'SEMI_GLOBAL']
+                        
+                        if semi_global_list:
+                            self._print_and_log(f"  -> Tracking {len(semi_global_list)} Semi-Global events:")
+                            for wrapper in semi_global_list:
+                                e = wrapper['event']
+                                reason = wrapper['reason']
+                                fix = wrapper['fix']
+                                detail = wrapper.get('detail', '')
+                                val_str = _fmt_val(e)
                                 
-                            # 3. REMOVED: [Context] dump (too verbose)
-                            
-                            self._print_and_log(f"       [Needs]    {fix}")
+                                self._print_and_log(f"     * [SEMI_GLOBAL] {e['type']} on {e.get('id', 'Unknown')}")
+                                self._print_and_log(f"       [Observed] {val_str}")
+                                self._print_and_log(f"       [Status]   {reason}")
+                                if detail:
+                                    self._print_and_log(f"       [Detail]   {detail}")
+                                self._print_and_log(f"       [Needs]    {fix}")
+                                
+                        if true_ambiguous_list:
+                            self._print_and_log(f"  -> Ignored {len(true_ambiguous_list)} Ambiguous events:")
+                            for wrapper in true_ambiguous_list:
+                                e = wrapper['event']
+                                reason = wrapper['reason']
+                                fix = wrapper['fix']
+                                detail = wrapper.get('detail', '')
+                                val_str = _fmt_val(e)
+                                e_category = wrapper.get('type', 'AMBIGUOUS')
+
+                                self._print_and_log(f"     * [{e_category}] {e['type']} on {e.get('id', 'Unknown')}")
+                                self._print_and_log(f"       [Observed] {val_str}")
+                                self._print_and_log(f"       [Status]   {reason}")
+                                if detail:
+                                    self._print_and_log(f"       [Detail]   {detail}")
+                                self._print_and_log(f"       [Needs]    {fix}")
                 
                 # --- Failsafe: Track banned actions ---
                 # UPDATED: Success = Any change detected (events) OR score increase.
@@ -3094,12 +3108,29 @@ class ObmlAgi3Agent(Agent):
             laws_for_obj = self.certified_laws.get(obj_id, {})
             laws = laws_for_obj.get(state_sig, {})
             
-            # A. Check for GLOBAL Law (Action-Independent)
-            global_law = laws.get('ANY')
-            if global_law and global_law['result'] == result_sig:
-                global_events.append(event)
-                if obj_id in self.active_experiments: del self.active_experiments[obj_id]
-                continue
+            # A. Check for GLOBAL / SEMI-GLOBAL Law (Action-Independent)
+            any_law = laws.get('ANY')
+            if any_law and any_law['result'] == result_sig:
+                if any_law['type'] == 'GLOBAL':
+                    global_events.append(event)
+                    if obj_id in self.active_experiments: del self.active_experiments[obj_id]
+                    continue
+                elif any_law['type'] == 'SEMI_GLOBAL':
+                    # It's Semi-Global! Route it to Ambiguous so the Profiler keeps testing OTHER actions
+                    # to eventually upgrade it to Global or downgrade to Direct.
+                    ambiguous_events.append({
+                        'event': event,
+                        'type': 'SEMI_GLOBAL',
+                        'reason': "Semi-Global (Assumed Physics)",
+                        'requirements': ["NEGATIVE_CONTROL"],
+                        'fix': "TRY_DIFFERENT_ACTION",
+                        'detail': "Pattern holds across tested actions. Need to test ALL actions to certify Global.",
+                        'target_action': action_key,
+                        'target_object': obj_id
+                    })
+                    # Add to active experiments to drive the Profiler
+                    self.active_experiments[obj_id] = {'req': 'NEGATIVE_CONTROL', 'ref': action_key}
+                    continue
             
             # B. Check for DIRECT Law (Action-Specific)
             direct_law = laws.get(action_key)
@@ -4012,18 +4043,26 @@ class ObmlAgi3Agent(Agent):
                     if len(locs) >= 2:
                         consistent_results[action_key] = result_sig
 
-                # --- PHASE 2 & 3: Distinction (Direct vs Global) ---
+                # --- PHASE 2 & 3: Distinction (Direct vs Semi-Global vs Global) ---
                 result_to_actions = {}
                 for act, res in consistent_results.items():
                     if res not in result_to_actions: result_to_actions[res] = []
                     result_to_actions[res].append(act)
                     
+                # Calculate total possible actions to verify GLOBAL
+                total_known_tools = 7 # Fallback
+                if hasattr(self, 'frames') and self.frames and self.frames[-1].available_actions:
+                    available = self.frames[-1].available_actions
+                    num_globals = sum(1 for a in available if a.name != 'ACTION6')
+                    has_click = any(a.name == 'ACTION6' for a in available)
+                    total_known_tools = num_globals
+                    if has_click and hasattr(self, 'last_object_summary'):
+                        total_known_tools += len(self.last_object_summary)
+
                 for action_key, result_sig in consistent_results.items():
                     causing_actions = result_to_actions[result_sig]
-                    is_no_change = (result_sig[0] == 'NO_CHANGE')
                     
-                    # --- NEW BUG FIX: The Contradiction Check ---
-                    # It cannot be a Global Law if ANY action in this state caused a different result!
+                    # --- The Contradiction Check ---
                     has_contradiction = False
                     for a_key, r_map in state_actions_data.items():
                         for r_sig in r_map.keys():
@@ -4032,29 +4071,22 @@ class ObmlAgi3Agent(Agent):
                                 break
                         if has_contradiction: break
 
-                    is_global = False
-                    if len(causing_actions) > 1 and not has_contradiction:
-                        if is_no_change:
-                            total_known_tools = 7 # Fallback
-                            if hasattr(self, 'frames') and self.frames and self.frames[-1].available_actions:
-                                available = self.frames[-1].available_actions
-                                num_globals = sum(1 for a in available if a.name != 'ACTION6')
-                                has_click = any(a.name == 'ACTION6' for a in available)
-                                total_known_tools = num_globals
-                                if has_click and hasattr(self, 'last_object_summary'):
-                                    total_known_tools += len(self.last_object_summary)
-                                    
-                            if len(causing_actions) >= total_known_tools:
-                                is_global = True
-                        else:
-                            is_global = True
-                            
-                    if is_global:
-                        self._certify_law(obj_id, 'GLOBAL', 'ANY', result_sig, current_state_sig)
-                        continue
-                    
-                    if len(all_attempted_actions) > 1:
+                    # Categorization Logic
+                    if has_contradiction:
+                        # Another action caused a DIFFERENT result. This action is uniquely causal.
                         self._certify_law(obj_id, 'DIRECT', action_key, result_sig, current_state_sig)
+                        
+                    elif len(causing_actions) > 1:
+                        # Multiple actions caused the EXACT same thing, and NO actions caused anything else.
+                        if len(causing_actions) >= total_known_tools:
+                            self._certify_law(obj_id, 'GLOBAL', 'ANY', result_sig, current_state_sig)
+                        else:
+                            self._certify_law(obj_id, 'SEMI_GLOBAL', 'ANY', result_sig, current_state_sig)
+                            
+                    elif len(all_attempted_actions) > 1:
+                        # We tried other actions, but they haven't reached N=2 yet. 
+                        # We leave it uncertified so the Gatekeeper asks for more data.
+                        pass
 
         # Cleanup empty dicts
         for obj_id in list(self.certified_laws.keys()):
