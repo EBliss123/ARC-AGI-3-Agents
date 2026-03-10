@@ -81,7 +81,7 @@ class Agent(ABC):
         self.timer = time.time()
         while (
             not self.is_done(self.frames, self.frames[-1])
-            and self.action_counter <= self.MAX_ACTIONS
+            and self.action_counter < self.MAX_ACTIONS
         ):
             action = self.choose_action(self.frames, self.frames[-1])
             
@@ -100,6 +100,10 @@ class Agent(ABC):
                 previous_score = self.score
 
                 self.append_frame(frame)
+
+                if action != GameAction.RESET:
+                    self.action_counter += 1
+
                 logger.info(
                     f"{self.game_id} - {action.name}: count {self.action_counter}, score {frame.score}, avg fps {self.fps})"
                 )
@@ -110,9 +114,6 @@ class Agent(ABC):
                         f"Score increased to {frame.score}. Resetting action counter."
                     )
                     self.action_counter = 0
-
-                # --- This line is now moved inside the 'if' block ---
-                self.action_counter += 1
 
         self.cleanup()
 
@@ -189,8 +190,12 @@ class Agent(ABC):
 
     def do_action_request(self, action: GameAction) -> Response:
         data = action.action_data.model_dump()
-        if action == GameAction.RESET:
+        
+        # --- FIX: The API requires card_id on EVERY action to tally the scorecard! ---
+        if self.card_id:
             data["card_id"] = self.card_id
+        # -----------------------------------------------------------------------------
+            
         if self.guid:
             data["guid"] = self.guid
         if action.reasoning:
