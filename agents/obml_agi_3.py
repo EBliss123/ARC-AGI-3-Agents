@@ -3208,37 +3208,18 @@ class ObmlAgi3Agent(Agent):
 
                 else:
                     # No contradictions, standard checks
+                    # With the Asymmetrical Judge, if it is not certified by now, 
+                    # it mathematically guarantees either N=1, OR no other actions have been tried.
                     if n_count < 2:
                         requirements.append("POSITIVE_CONTROL")
-                    
-                    # --- FIX: State-Specific Negative Control ---
-                    tried_actions_in_state = set()
-                    for a_key, r_map in self.truth_table[obj_id].items():
-                        for r_sig, locs in r_map.items():
-                            if any(len(e) >= 3 and e[2] == state_sig for e in locs):
-                                tried_actions_in_state.add(a_key)
-                                break
-                                
-                    if len(tried_actions_in_state) < 2:
-                        requirements.append("NEGATIVE_CONTROL")
-                    
-                    if "POSITIVE_CONTROL" in requirements and "NEGATIVE_CONTROL" in requirements:
-                        diagnosis = "Hypothesis (Early Stage)"
-                        fix = "REPEAT_ACTION"
-                        detail = "Need to verify consistency (N>=2) AND try other actions."
-                    elif "POSITIVE_CONTROL" in requirements:
                         diagnosis = "Unverified (N=1)"
                         fix = "REPEAT_ACTION"
                         detail = "Result seen once. Need confirmation."
-                    elif "NEGATIVE_CONTROL" in requirements:
+                    else:
+                        requirements.append("NEGATIVE_CONTROL")
                         diagnosis = "Undistinguished"
                         fix = "TRY_DIFFERENT_ACTION"
                         detail = "Consistent (N>=2), but need Negative Control."
-                    else:
-                        diagnosis = "Pending Certification"
-                        fix = "ANALYZE" 
-                        detail = "Data is sufficient. Waiting for Judge cycle."
-                        if obj_id in self.active_experiments: del self.active_experiments[obj_id]
 
             else:
                 diagnosis = "New Phenomenon"
@@ -4024,8 +4005,8 @@ class ObmlAgi3Agent(Agent):
             for current_state_sig, state_actions_data in state_buckets.items():
                 self.certified_laws[obj_id][current_state_sig] = {}
                 
-                consistent_results = {}
-                all_attempted_actions = set(state_actions_data.keys())
+                # --- NEW: Asymmetrical Judge (Group by Result) ---
+                results_to_actions = {} # Map: result_sig -> {action_key: N_count}
                 
                 for action_key, results_map in state_actions_data.items():
                     valid_results = {r: locs for r, locs in results_map.items() if locs}
@@ -4035,20 +4016,16 @@ class ObmlAgi3Agent(Agent):
                     if len(valid_results) > 1:
                         if self.debug_channels['HYPOTHESIS']:
                             print(f"  [Science] Inconsistency detected for {obj_id} in state {current_state_sig} + {action_key}: {list(valid_results.keys())}")
-                        # Pass the raw valid_results so the Splitter can find the missing variable!
                         self._trigger_splitter(obj_id, action_key, valid_results)
                         continue 
                     
                     result_sig, locs = list(valid_results.items())[0]
-                    if len(locs) >= 2:
-                        consistent_results[action_key] = result_sig
-
-                # --- PHASE 2 & 3: Distinction (Direct vs Semi-Global vs Global) ---
-                result_to_actions = {}
-                for act, res in consistent_results.items():
-                    if res not in result_to_actions: result_to_actions[res] = []
-                    result_to_actions[res].append(act)
+                    n_count = len(locs)
                     
+                    if result_sig not in results_to_actions:
+                        results_to_actions[result_sig] = {}
+                    results_to_actions[result_sig][action_key] = n_count
+
                 # Calculate total possible actions to verify GLOBAL
                 total_known_tools = 7 # Fallback
                 if hasattr(self, 'frames') and self.frames and self.frames[-1].available_actions:
@@ -4059,33 +4036,37 @@ class ObmlAgi3Agent(Agent):
                     if has_click and hasattr(self, 'last_object_summary'):
                         total_known_tools += len(self.last_object_summary)
 
-                for action_key, result_sig in consistent_results.items():
-                    causing_actions = result_to_actions[result_sig]
+                # --- Categorization Logic (Anchor & Echo) ---
+                for result_sig, causing_actions_map in results_to_actions.items():
                     
-                    # --- The Contradiction Check ---
-                    has_contradiction = False
-                    for a_key, r_map in state_actions_data.items():
-                        for r_sig in r_map.keys():
-                            if r_sig != result_sig:
-                                has_contradiction = True
-                                break
-                        if has_contradiction: break
-
-                    # Categorization Logic
-                    if has_contradiction:
-                        # Another action caused a DIFFERENT result. This action is uniquely causal.
-                        self._certify_law(obj_id, 'DIRECT', action_key, result_sig, current_state_sig)
+                    # 1. Check for Anchor (At least one action has N >= 2)
+                    has_anchor = any(count >= 2 for count in causing_actions_map.values())
+                    if not has_anchor:
+                        continue # No anchor, wait for more data.
                         
-                    elif len(causing_actions) > 1:
-                        # Multiple actions caused the EXACT same thing, and NO actions caused anything else.
-                        if len(causing_actions) >= total_known_tools:
+                    # 2. Check for Contradictions (Did another action do something ELSE?)
+                    has_contradiction = False
+                    for other_r_sig in results_to_actions.keys():
+                        if other_r_sig != result_sig:
+                            has_contradiction = True
+                            break
+                            
+                    # 3. Apply the Law
+                    if has_contradiction:
+                        # Direct Law: Other actions do different things. 
+                        for a_key, count in causing_actions_map.items():
+                            if count >= 2: # Only certify the proven Anchors
+                                self._certify_law(obj_id, 'DIRECT', a_key, result_sig, current_state_sig)
+                                
+                    elif len(causing_actions_map) > 1:
+                        # Semi-Global / Global Law: Multiple actions do the exact same thing! (Anchor + Echo)
+                        if len(causing_actions_map) >= total_known_tools:
                             self._certify_law(obj_id, 'GLOBAL', 'ANY', result_sig, current_state_sig)
                         else:
                             self._certify_law(obj_id, 'SEMI_GLOBAL', 'ANY', result_sig, current_state_sig)
                             
-                    elif len(all_attempted_actions) > 1:
-                        # We tried other actions, but they haven't reached N=2 yet. 
-                        # We leave it uncertified so the Gatekeeper asks for more data.
+                    else:
+                        # Only 1 action tested. Needs Negative Control.
                         pass
 
         # Cleanup empty dicts
