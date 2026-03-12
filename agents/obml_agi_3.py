@@ -1776,23 +1776,31 @@ class ObmlAgi3Agent(Agent):
         
         # 2. Check Certified Laws (Established Science)
         laws_for_obj = self.certified_laws.get(target_id, {})
-        laws = laws_for_obj.get(state_sig, {})
-        law = laws.get(action_name) # Direct
-        if not law:
-            law = laws.get('ANY')   # Global
-
+        univ_laws = laws_for_obj.get('UNIVERSAL_STATE', {})
+        law = univ_laws.get(action_name) or univ_laws.get('ANY')
+        
         if law:
-            # [Existing Law Execution Logic...]
             if 'result' in law:
                 return self._expand_result(law['result'], target_obj), 100
-            elif law.get('type') == 'DIRECT_SEQUENCE':
-                r_type = law['result_type']
-                seq = law['sequence']
-                current_val = target_obj['color'] if r_type == 'RECOLORED' else target_obj['fingerprint']
-                if current_val in seq:
-                    idx = seq.index(current_val)
-                    next_val = seq[(idx + 1) % len(seq)]
-                    return self._expand_result((r_type, target_obj['id'], next_val), target_obj), 100
+        
+        # TIER 2: Isolated Bucket Laws
+        refined_vars = self.state_refinements.get(target_id, {})
+        current_features = self._extract_all_features(current_context)
+        predictions = []
+        
+        for base_var, buckets in refined_vars.items():
+            active_val = next((f for f in current_features if self._get_base_variable(f) == base_var), None)
+            if active_val:
+                for r_sig, bucket in buckets.items():
+                    if active_val in bucket:
+                        count = len(self.truth_table.get(target_id, {}).get(action_name, {}).get(r_sig, []))
+                        if count >= 2:
+                            predictions.append((r_sig, count))
+                            
+        if predictions:
+            # If multiple hypotheses agree, pick the one with the highest N count
+            best_r_sig = sorted(predictions, key=lambda x: x[1], reverse=True)[0][0]
+            return self._expand_result(best_r_sig, target_obj), 100
 
         # 3. [NEW] Greedy Prediction from Truth Table
         if target_id in self.truth_table:
@@ -3106,37 +3114,50 @@ class ObmlAgi3Agent(Agent):
 
             # 3. Check the Law Book (Certified Laws)
             laws_for_obj = self.certified_laws.get(obj_id, {})
-            laws = laws_for_obj.get(state_sig, {})
+            univ_laws = laws_for_obj.get('UNIVERSAL_STATE', {})
             
-            # A. Check for GLOBAL / SEMI-GLOBAL Law (Action-Independent)
-            any_law = laws.get('ANY')
+            # A. Check for UNIVERSAL GLOBAL / SEMI-GLOBAL Law
+            any_law = univ_laws.get('ANY')
             if any_law and any_law['result'] == result_sig:
                 if any_law['type'] == 'GLOBAL':
                     global_events.append(event)
                     if obj_id in self.active_experiments: del self.active_experiments[obj_id]
                     continue
                 elif any_law['type'] == 'SEMI_GLOBAL':
-                    # It's Semi-Global! Route it to Ambiguous so the Profiler keeps testing OTHER actions
-                    # to eventually upgrade it to Global or downgrade to Direct.
                     ambiguous_events.append({
-                        'event': event,
-                        'type': 'SEMI_GLOBAL',
-                        'reason': "Semi-Global (Assumed Physics)",
-                        'requirements': ["NEGATIVE_CONTROL"],
-                        'fix': "TRY_DIFFERENT_ACTION",
+                        'event': event, 'type': 'SEMI_GLOBAL', 'reason': "Semi-Global (Assumed Physics)",
+                        'requirements': ["NEGATIVE_CONTROL"], 'fix': "TRY_DIFFERENT_ACTION",
                         'detail': "Pattern holds across tested actions. Need to test ALL actions to certify Global.",
-                        'target_action': action_key,
-                        'target_object': obj_id
+                        'target_action': action_key, 'target_object': obj_id
                     })
-                    # Add to active experiments to drive the Profiler
                     self.active_experiments[obj_id] = {'req': 'NEGATIVE_CONTROL', 'ref': action_key}
                     continue
             
-            # B. Check for DIRECT Law (Action-Specific)
-            direct_law = laws.get(action_key)
+            # B. Check for UNIVERSAL DIRECT Law
+            direct_law = univ_laws.get(action_key)
             if direct_law and direct_law['result'] == result_sig:
                 direct_events.append(event)
-                # --- BUG FIX: Only clear the agenda if the agenda was FOR THIS action ---
+                if obj_id in self.active_experiments and self.active_experiments[obj_id].get('ref') == action_key:
+                    del self.active_experiments[obj_id]
+                continue
+                
+            # C. Check for TIER 2 ISOLATED BUCKET Law (Parallel Hypotheses)
+            refined_vars = self.state_refinements.get(obj_id, {})
+            current_features = self._extract_all_features(prev_context)
+            is_certified_isolated = False
+            
+            for base_var, buckets in refined_vars.items():
+                active_val = next((f for f in current_features if self._get_base_variable(f) == base_var), None)
+                if active_val and active_val in buckets.get(result_sig, set()):
+                    # The hypothesis predicts this result! Does the bucket have N >= 2?
+                    if obj_id in self.truth_table and action_key in self.truth_table[obj_id]:
+                        count = sum(1 for e in self.truth_table[obj_id][action_key].get(result_sig, []) if len(e) >= 2)
+                        if count >= 2:
+                            is_certified_isolated = True
+                            break
+                            
+            if is_certified_isolated:
+                direct_events.append(event)
                 if obj_id in self.active_experiments and self.active_experiments[obj_id].get('ref') == action_key:
                     del self.active_experiments[obj_id]
                 continue
@@ -3167,11 +3188,11 @@ class ObmlAgi3Agent(Agent):
                     self._trigger_splitter(obj_id, action_key, state_specific_results)
                     
                     # 2. Retrieve the fresh hypothesis
-                    current_refinements = self.state_refinements.get(obj_id, [])
+                    current_refinements = self.state_refinements.get(obj_id, {}) # Now a dict!
                     pending_data = self.pending_refinements.get(obj_id)
 
                     if current_refinements:
-                        unique_vars = sorted(list(set(current_refinements)))
+                        unique_vars = sorted(list(current_refinements.keys()))
                         prefix = f"{obj_id}_"
                         clean_vars = [v.replace(prefix, "") if v.startswith(prefix) else v for v in unique_vars]
 
@@ -3180,9 +3201,9 @@ class ObmlAgi3Agent(Agent):
                         else:
                             vars_str = ", ".join(clean_vars)
                             
-                        diagnosis = "Hypothesis Proven (Splitting Universes)"
+                        diagnosis = "Parallel Hypotheses Active"
                         fix = "TEST_CANDIDATES"
-                        detail = f"Promoted: {{{vars_str}}}"
+                        detail = f"Tracking {len(unique_vars)} isolated variables: {{{vars_str}}}"
                         requirements = ["VERIFY_VAR"]
                         
                     elif pending_data:
@@ -3957,122 +3978,51 @@ class ObmlAgi3Agent(Agent):
 
     def _verify_and_certify(self, state_sig=None):
         """
-        [SCIENTIFIC METHOD: ID & STATE-BASED VERIFICATION]
+        [THE DUAL-TIERED JUDGE]
+        Tier 1: Certifies Universal Laws if an action ALWAYS does the same thing.
+        Tier 2: (Bucket-Level Isolated Variables) is evaluated on-the-fly in Predictor/Gatekeeper.
         """
-        self.certified_laws = {} # Clear to rebuild based on the LATEST state definitions
+        self.certified_laws = {} 
         
+        # Calculate total known tools for Global checks
+        total_known_tools = 7
+        if hasattr(self, 'frames') and self.frames and self.frames[-1].available_actions:
+            available = self.frames[-1].available_actions
+            num_globals = sum(1 for a in available if a.name != 'ACTION6')
+            has_click = any(a.name == 'ACTION6' for a in available)
+            total_known_tools = num_globals + (len(self.last_object_summary) if has_click and hasattr(self, 'last_object_summary') else 0)
+
         for obj_id, actions_data in self.truth_table.items():
             self.certified_laws[obj_id] = {}
             
-            # 1. Dynamically re-bucket historical data using the LATEST state definitions
-            state_buckets = {}
-            
-            for action_key, results_map in actions_data.items():
-                for result_sig, locs in results_map.items():
-                    for entry in locs:
-                        # --- FIX: The Memory Corruption Check ---
-                        if len(entry) >= 3:
-                            run, turn, stored_sig = entry[0], entry[1], entry[2]
-                        else:
-                            run, turn, stored_sig = 0, entry[0], None
+            # --- TIER 1: THE UNIVERSAL CHECK ---
+            action_to_results = {}
+            for a_key, r_map in actions_data.items():
+                action_to_results[a_key] = {}
+                for r_sig, locs in r_map.items():
+                    if locs: action_to_results[a_key][r_sig] = len(locs)
+                    
+            for a_key, r_counts in action_to_results.items():
+                if len(r_counts) == 1:
+                    r_sig, n_count = list(r_counts.items())[0]
+                    if n_count >= 2:
+                        # Consistent! Check Controls
+                        has_neg_control = False
+                        same_result_actions = set([a_key])
                         
-                        current_state_sig = None
-                        
-                        # --- FIX: Allow the Judge to read old data from past lives ---
-                        if 0 <= turn - 1 < len(self.level_state_history):
-                            past_ctx = self.level_state_history[turn - 1]
-                            past_obj = next((o for o in past_ctx['summary'] if o['id'] == obj_id), None)
-                            if past_obj:
-                                current_state_sig = self._get_scientific_state(past_obj, past_ctx)
-                        
-                        # If it's from a past life, safely fall back to the signature we saved at the time
-                        if not current_state_sig:
-                            current_state_sig = stored_sig
-                            
-                        if not current_state_sig:
-                            continue
-                            
-                        if current_state_sig not in state_buckets:
-                            state_buckets[current_state_sig] = {}
-                        if action_key not in state_buckets[current_state_sig]:
-                            state_buckets[current_state_sig][action_key] = {}
-                        if result_sig not in state_buckets[current_state_sig][action_key]:
-                            state_buckets[current_state_sig][action_key][result_sig] = []
-                            
-                        state_buckets[current_state_sig][action_key][result_sig].append(entry)
-
-            # 2. Judge each State Signature independently
-            for current_state_sig, state_actions_data in state_buckets.items():
-                self.certified_laws[obj_id][current_state_sig] = {}
-                
-                # --- NEW: Asymmetrical Judge (Group by Result) ---
-                results_to_actions = {} # Map: result_sig -> {action_key: N_count}
-                
-                for action_key, results_map in state_actions_data.items():
-                    valid_results = {r: locs for r, locs in results_map.items() if locs}
-                    
-                    if not valid_results: continue
-                    
-                    if len(valid_results) > 1:
-                        if self.debug_channels['HYPOTHESIS']:
-                            print(f"  [Science] Inconsistency detected for {obj_id} in state {current_state_sig} + {action_key}: {list(valid_results.keys())}")
-                        self._trigger_splitter(obj_id, action_key, valid_results)
-                        continue 
-                    
-                    result_sig, locs = list(valid_results.items())[0]
-                    n_count = len(locs)
-                    
-                    if result_sig not in results_to_actions:
-                        results_to_actions[result_sig] = {}
-                    results_to_actions[result_sig][action_key] = n_count
-
-                # Calculate total possible actions to verify GLOBAL
-                total_known_tools = 7 # Fallback
-                if hasattr(self, 'frames') and self.frames and self.frames[-1].available_actions:
-                    available = self.frames[-1].available_actions
-                    num_globals = sum(1 for a in available if a.name != 'ACTION6')
-                    has_click = any(a.name == 'ACTION6' for a in available)
-                    total_known_tools = num_globals
-                    if has_click and hasattr(self, 'last_object_summary'):
-                        total_known_tools += len(self.last_object_summary)
-
-                # --- Categorization Logic (Anchor & Echo) ---
-                for result_sig, causing_actions_map in results_to_actions.items():
-                    
-                    # 1. Check for Anchor (At least one action has N >= 2)
-                    has_anchor = any(count >= 2 for count in causing_actions_map.values())
-                    if not has_anchor:
-                        continue # No anchor, wait for more data.
-                        
-                    # 2. Check for Contradictions (Did another action do something ELSE?)
-                    has_contradiction = False
-                    for other_r_sig in results_to_actions.keys():
-                        if other_r_sig != result_sig:
-                            has_contradiction = True
-                            break
-                            
-                    # 3. Apply the Law
-                    if has_contradiction:
-                        # Direct Law: Other actions do different things. 
-                        for a_key, count in causing_actions_map.items():
-                            if count >= 2: # Only certify the proven Anchors
-                                self._certify_law(obj_id, 'DIRECT', a_key, result_sig, current_state_sig)
-                                
-                    elif len(causing_actions_map) > 1:
-                        # Semi-Global / Global Law: Multiple actions do the exact same thing! (Anchor + Echo)
-                        if len(causing_actions_map) >= total_known_tools:
-                            self._certify_law(obj_id, 'GLOBAL', 'ANY', result_sig, current_state_sig)
-                        else:
-                            self._certify_law(obj_id, 'SEMI_GLOBAL', 'ANY', result_sig, current_state_sig)
-                            
-                    else:
-                        # Only 1 action tested. Needs Negative Control.
-                        pass
-
-        # Cleanup empty dicts
-        for obj_id in list(self.certified_laws.keys()):
-            if not self.certified_laws[obj_id]:
-                del self.certified_laws[obj_id]
+                        for other_a, other_r_counts in action_to_results.items():
+                            if other_a != a_key:
+                                if r_sig in other_r_counts:
+                                    same_result_actions.add(other_a)
+                                else:
+                                    has_neg_control = True
+                                    
+                        if len(same_result_actions) >= total_known_tools:
+                            self._certify_law(obj_id, 'GLOBAL', 'ANY', r_sig, 'UNIVERSAL_STATE')
+                        elif len(same_result_actions) > 1:
+                            self._certify_law(obj_id, 'SEMI_GLOBAL', 'ANY', r_sig, 'UNIVERSAL_STATE')
+                        elif has_neg_control:
+                            self._certify_law(obj_id, 'DIRECT', a_key, r_sig, 'UNIVERSAL_STATE')
 
     def _certify_law(self, obj_id, law_type, action_key, result_sig, state_sig=None):
         """Helper to store the proven law in the registry."""
@@ -4224,7 +4174,7 @@ class ObmlAgi3Agent(Agent):
             t_obj = next((o for o in first_ctx['snapshot']['summary'] if o['id'] == obj_id), None)
             
             if t_obj:
-                # --- NEW: The Shadow Splitter (Purgatory) ---
+                # --- The Shadow Splitter (Purgatory) ---
                 if obj_id not in self.pending_refinements:
                     self.pending_refinements[obj_id] = {'suspects': valid_refinements, 'stable_count': 0}
                 else:
@@ -4232,27 +4182,31 @@ class ObmlAgi3Agent(Agent):
                     if current_suspects == valid_refinements:
                         self.pending_refinements[obj_id]['stable_count'] += 1
                     else:
-                        # Suspects were whittled down or changed! Reset the stability count.
                         self.pending_refinements[obj_id]['suspects'] = valid_refinements
                         self.pending_refinements[obj_id]['stable_count'] = 0
                 
-                # Check for Promotion to official State Signature
+                # Check for Promotion to Parallel Hypotheses
                 STABILITY_THRESHOLD = 2
                 if self.pending_refinements[obj_id]['stable_count'] >= STABILITY_THRESHOLD:
                     if obj_id not in self.state_refinements:
-                        self.state_refinements[obj_id] = []
+                        self.state_refinements[obj_id] = {} # Dict instead of list!
                     
                     added_count = 0
                     for refinement in valid_refinements:
-                        if refinement not in self.state_refinements[obj_id]:
-                            self.state_refinements[obj_id].append(refinement)
+                        # Build the bucket map for this isolated variable
+                        bucket_map = {}
+                        for r_sig in r_sigs:
+                            bucket_map[r_sig] = result_variable_values[r_sig].get(refinement, set())
+                            
+                        # Store the exact boundaries of the bucket
+                        if refinement not in self.state_refinements[obj_id] or self.state_refinements[obj_id][refinement] != bucket_map:
+                            self.state_refinements[obj_id][refinement] = bucket_map
                             added_count += 1
                     
-                    # Clear from purgatory so we don't keep promoting
                     del self.pending_refinements[obj_id]
                     
                     if added_count > 0 and self.debug_channels['HYPOTHESIS']:
-                        print(f"  [Splitter] PROMOTION! Officially Refined State for {obj_id} with {added_count} categorizable variables.")
+                        print(f"  [Splitter] PROMOTION! Spawning {added_count} Parallel Hypotheses for {obj_id}.")
 
     def _get_context_prop(self, ctx_entry: dict, key: str, mode: str):
         """
@@ -4321,43 +4275,10 @@ class ObmlAgi3Agent(Agent):
 
     def _get_scientific_state(self, obj: dict, context: dict) -> tuple:
         """
-        Constructs the State Signature.
-        Appends refined Context features based on the Global Splitter's findings.
+        State Signature is now purely the Object ID. 
+        All refinements (Size, Adjacency) are handled dynamically via Parallel Hypothesis Testing.
         """
-        # 1. The Base is now strictly the Object ID. 
-        # This guarantees observations collide and trigger the Splitter.
-        base_sig = obj['id']
-        
-        # 2. Check for Refinements (Context)
-        # --- FIX: Look up required features using the stable Object ID ---
-        required_features = self.state_refinements.get(obj['id'], [])
-        
-        if not required_features:
-            return (base_sig, tuple())
-            
-        # Extract all raw features for this context
-        all_feats = self._extract_all_features(context)
-        
-        # --- NEW: Group live features by their Base Variable ---
-        base_to_raw = {}
-        for f in all_feats:
-            bv = self._get_base_variable(f)
-            if bv not in base_to_raw:
-                base_to_raw[bv] = set()
-            base_to_raw[bv].add(f)
-            
-        context_features = []
-        for req_base_var in required_features:
-            # Retrieve the exact current value(s) for this specific variable
-            # (If it is absent, the set is safely empty)
-            active_values = base_to_raw.get(req_base_var, set())
-            
-            # Convert to a sorted tuple so it is hashable for the Truth Table
-            val = tuple(sorted(list(active_values)))
-            context_features.append((req_base_var, val))
-            
-        # Return sorted by string to ensure dictionary key matching
-        return (base_sig, tuple(sorted(context_features, key=lambda x: x[0])))
+        return obj['id']
 
     def _check_feature_presence(self, contexts, base_sig, feature_type, sub_key):
         """
