@@ -910,11 +910,18 @@ class ObmlAgi3Agent(Agent):
                 # --- PRIORITY 3: THE AGITATOR ---
                 agitator_move = None
                 for move in all_possible_moves:
-                    t_id = move['object']['id'] if move['object'] else None
-                    predicted_events, conf = self._predict_outcome((move['template'].name, t_id), current_full_context)
-                    if predicted_events:
-                        agitator_move = move
-                        break
+                    move_target_id = move['object']['id'] if move['object'] else None
+                    full_action_name = self._get_learning_key(move['template'].name, move_target_id)
+                    
+                    # Check every object on the board to see if THIS action moves ANYTHING
+                    for eval_obj in current_full_context.get('summary', []):
+                        predicted_events, conf = self._predict_outcome((full_action_name, eval_obj['id']), current_full_context)
+                        if predicted_events:
+                            agitator_move = move
+                            break # Found a change! We can stop checking objects.
+                    
+                    if agitator_move:
+                        break # Found a productive move! Stop checking other actions.
                 
                 if agitator_move:
                     action_to_return = agitator_move['template']
@@ -1778,13 +1785,16 @@ class ObmlAgi3Agent(Agent):
         
         if not target_obj: return None, 0
         
-        # 1. Get the Scientific State (Includes Aggressive Refinements)
+        # --- FIX: Construct the full action key (e.g. 'ACTION6_obj_1') ---
+        full_action_key = self._get_learning_key(action_name, target_id)
+        
+        # 1. Get the Scientific State
         state_sig = self._get_scientific_state(target_obj, current_context)
         
         # 2. Check Certified Laws (Established Science)
         laws_for_obj = self.certified_laws.get(target_id, {})
         univ_laws = laws_for_obj.get('UNIVERSAL_STATE', {})
-        law = univ_laws.get(action_name) or univ_laws.get('ANY')
+        law = univ_laws.get(full_action_key) or univ_laws.get('ANY')
         
         if law:
             if 'result' in law:
@@ -1800,14 +1810,27 @@ class ObmlAgi3Agent(Agent):
             if active_val:
                 for r_sig, bucket in buckets.items():
                     if active_val in bucket:
-                        count = len(self.truth_table.get(target_id, {}).get(action_name, {}).get(r_sig, []))
-                        if count >= 2:
-                            predictions.append((r_sig, count))
+                        # --- FIX: Check count for the specific action AND global total ---
+                        action_count = len(self.truth_table.get(target_id, {}).get(full_action_key, {}).get(r_sig, []))
+                        
+                        total_global_count = 0
+                        for a_key, r_map in self.truth_table.get(target_id, {}).items():
+                            total_global_count += len(r_map.get(r_sig, []))
+                            
+                        if action_count >= 2:
+                            predictions.append((r_sig, action_count))
+                        elif total_global_count >= 2:
+                            predictions.append((r_sig, total_global_count))
                             
         if predictions:
             # If multiple hypotheses agree, pick the one with the highest N count
             best_r_sig = sorted(predictions, key=lambda x: x[1], reverse=True)[0][0]
             return self._expand_result(best_r_sig, target_obj), 100
+
+        # 3. [NEW] Greedy Prediction from Truth Table
+        if target_id in self.truth_table:
+            # --- FIX: Use full_action_key ---
+            action_data = self.truth_table[target_id].get(full_action_key, {})
 
         # 3. [NEW] Greedy Prediction from Truth Table
         if target_id in self.truth_table:
@@ -4425,24 +4448,38 @@ class ObmlAgi3Agent(Agent):
                     all_possible_moves.append({'template': click_template, 'object': obj})
                     
             for move in all_possible_moves:
-                target_id = move['object']['id'] if move['object'] else None
-                hypothesis_key = (move['template'].name, target_id)
+                # 1. Get the true action name (e.g., 'ACTION1' or 'ACTION6_obj_1')
+                move_target_id = move['object']['id'] if move['object'] else None
+                full_action_name = self._get_learning_key(move['template'].name, move_target_id)
                 
-                predicted_events, conf = self._predict_outcome(hypothesis_key, curr_ctx)
+                all_move_events = []
+                move_is_ambiguous = False
                 
-                # 1. "Here Be Dragons" (Ambiguity / Unknown Physics)
-                # If we can't predict it, we MUST test it. Infinite priority.
-                if predicted_events is None:
+                # 2. Predict outcome for EVERY object on the board, regardless of action type
+                for eval_obj in curr_ctx.get('summary', []):
+                    # We pass the full action name and the object being evaluated
+                    hypothesis_key = (full_action_name, eval_obj['id'])
+                    predicted_events, conf = self._predict_outcome(hypothesis_key, curr_ctx)
+                    
+                    if predicted_events is None:
+                        move_is_ambiguous = True
+                        break # One unknown is enough to warrant exploring it
+                    elif predicted_events:
+                        all_move_events.extend(predicted_events)
+                
+                # 3. "Here Be Dragons" (Ambiguity / Unknown Physics)
+                if move_is_ambiguous:
                     return (path[0] if path else move, float('inf'))
                 
-                # 2. Prune No-Ops (Action caused no change)
-                if not predicted_events:
+                # 4. Prune No-Ops (Action caused absolutely no change anywhere)
+                if not all_move_events:
                     continue
                     
-                # 3. Simulate Future
-                future_summary = self._get_hypothetical_summary(curr_ctx['summary'], predicted_events)
+                # 5. Simulate Future
+                future_summary = self._get_hypothetical_summary(curr_ctx['summary'], all_move_events)
                 if not future_summary: continue
                 
+                # --- RESTORED: Evaluate the new future state ---
                 # Re-analyze relationships for the new state
                 (f_rels, f_adj, f_diag_adj, f_match, f_align, f_diag_align, f_conj) = self._analyze_relationships(future_summary)
                 future_ctx = {
@@ -4450,12 +4487,12 @@ class ObmlAgi3Agent(Agent):
                     'align': f_align, 'diag_align': f_diag_align, 'match': f_match
                 }
                 
-                # 4. Prune Loops (We have been in this exact physical state before in this thought-branch)
+                # Prune Loops (We have been in this exact physical state before in this thought-branch)
                 future_hash = self._extract_all_features(future_ctx)
                 if future_hash in seen_hashes:
                     continue
                     
-                # 5. Check Novelty (The +1 Math Engine)
+                # Check Novelty (The +1 Math Engine)
                 future_rels = self._extract_relational_archive_strings(future_ctx)
                 novel_rels = future_rels - self.relational_archive
                 
