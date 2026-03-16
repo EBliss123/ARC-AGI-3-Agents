@@ -4369,6 +4369,79 @@ class ObmlAgi3Agent(Agent):
                         
         return features
 
+    def _search_for_novelty(self, start_context: dict, available_actions: list) -> tuple:
+        """
+        Infinite Horizon BFS Simulator.
+        Searches for the shortest path to a novel relational state or an Ambiguity.
+        Returns: (first_move_dict, novelty_score)
+        """
+        initial_hash = self._extract_all_features(start_context)
+        queue = deque([(start_context, [], {initial_hash})])
+        
+        MAX_NODES = 2000 # Failsafe to prevent CPU lockup in massive levels
+        nodes_explored = 0
+        
+        while queue and nodes_explored < MAX_NODES:
+            curr_ctx, path, seen_hashes = queue.popleft()
+            nodes_explored += 1
+            
+            all_possible_moves = []
+            click_template = None
+            for action in available_actions:
+                if action.name == 'ACTION6': click_template = action
+                else: all_possible_moves.append({'template': action, 'object': None})
+            
+            if click_template and curr_ctx.get('summary'):
+                for obj in curr_ctx['summary']:
+                    all_possible_moves.append({'template': click_template, 'object': obj})
+                    
+            for move in all_possible_moves:
+                target_id = move['object']['id'] if move['object'] else None
+                hypothesis_key = (move['template'].name, target_id)
+                
+                predicted_events, conf = self._predict_outcome(hypothesis_key, curr_ctx)
+                
+                # 1. "Here Be Dragons" (Ambiguity / Unknown Physics)
+                # If we can't predict it, we MUST test it. Infinite priority.
+                if predicted_events is None:
+                    return (path[0] if path else move, float('inf'))
+                
+                # 2. Prune No-Ops (Action caused no change)
+                if not predicted_events:
+                    continue
+                    
+                # 3. Simulate Future
+                future_summary = self._get_hypothetical_summary(curr_ctx['summary'], predicted_events)
+                if not future_summary: continue
+                
+                # Re-analyze relationships for the new state
+                (f_rels, f_adj, f_diag_adj, f_match, f_align, f_diag_align, f_conj) = self._analyze_relationships(future_summary)
+                future_ctx = {
+                    'summary': future_summary, 'rels': f_rels, 'adj': f_adj, 'diag_adj': f_diag_adj,
+                    'align': f_align, 'diag_align': f_diag_align, 'match': f_match
+                }
+                
+                # 4. Prune Loops (We have been in this exact physical state before in this thought-branch)
+                future_hash = self._extract_all_features(future_ctx)
+                if future_hash in seen_hashes:
+                    continue
+                    
+                # 5. Check Novelty (The +1 Math Engine)
+                future_rels = self._extract_relational_archive_strings(future_ctx)
+                novel_rels = future_rels - self.relational_archive
+                
+                new_path = path + [move]
+                if novel_rels:
+                    # We found novelty! Return the FIRST move of this path and the score.
+                    return (new_path[0], len(novel_rels))
+                
+                # 6. Queue for Deeper Lookahead (Move is productive, but not novel yet)
+                new_seen = set(seen_hashes)
+                new_seen.add(future_hash)
+                queue.append((future_ctx, new_path, new_seen))
+                
+        return (None, 0)
+
     def _extract_all_features(self, ctx: dict) -> frozenset:
         """
         Extracts EVERY characteristic and relationship of the ENTIRE grid into 
