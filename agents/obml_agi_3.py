@@ -839,6 +839,8 @@ class ObmlAgi3Agent(Agent):
 
         # --- PRIORITY 1: THE SCIENTIST ---
         science_moves = []
+        mandated_move = None
+        
         for move in all_possible_moves:
             action_template = move['template']
             target_obj = move['object']
@@ -847,6 +849,23 @@ class ObmlAgi3Agent(Agent):
             scientific_score = 0
             this_action_key = self._get_learning_key(action_template.name, target_id)
             
+            # --- TIER 1A: ACTIVE MANDATES (Absolute Override) ---
+            # If this move fulfills an active requirement, lock it in instantly.
+            if target_id and target_id in self.active_experiments:
+                mandate = self.active_experiments[target_id]
+                has_data = (target_id in self.truth_table and this_action_key in self.truth_table[target_id])
+                
+                if mandate['req'] == 'POSITIVE_CONTROL' and (this_action_key == mandate['ref'] or not has_data):
+                    mandated_move = move
+                    break
+                elif mandate['req'] == 'NEGATIVE_CONTROL' and this_action_key != mandate['ref'] and not has_data:
+                    mandated_move = move
+                    break
+                elif mandate['req'] in ['VERIFY_VAR', 'STABILIZE_CONTEXT'] and not has_data:
+                    mandated_move = move
+                    break
+
+            # --- TIER 1B: CURIOSITY & IGNORANCE (Score Math) ---
             # Interrogation Bonus
             known_effects = self.action_effects_memory.get(this_action_key, set())
             relevant_toggles = known_effects.intersection(active_suspects)
@@ -855,18 +874,6 @@ class ObmlAgi3Agent(Agent):
             for obj in current_summary:
                 obj_id = obj['id']
                 has_data = (obj_id in self.truth_table and this_action_key in self.truth_table[obj_id])
-                
-                # Experiment Mandates Overrule Certainty Penalties
-                if obj_id in self.active_experiments:
-                    mandate = self.active_experiments[obj_id]
-                    if mandate['req'] == 'POSITIVE_CONTROL':
-                        if this_action_key == mandate['ref'] or not has_data: scientific_score += 1 
-                    elif mandate['req'] == 'NEGATIVE_CONTROL':
-                        if this_action_key == mandate['ref']: scientific_score -= 1 
-                        elif not has_data: scientific_score += 1 
-                    else:
-                        if not has_data: scientific_score += 1
-                    continue
                 
                 # Check Certainty (Do we already have a certified law for this?)
                 target_obj_for_score = next((o for o in current_summary if o['id'] == obj_id), None)
@@ -888,15 +895,18 @@ class ObmlAgi3Agent(Agent):
         action_to_return = None
         chosen_object = None
 
-        if science_moves:
+        if mandated_move:
+            action_to_return = mandated_move['template']
+            chosen_object = mandated_move['object']
+            if self.debug_channels['ACTION_SCORE']:
+                self._print_and_log(f"\n--- [Priority 1A: Mandate] Chose: {action_to_return.name}{' on '+chosen_object['id'] if chosen_object else ''} (Bypassed Scoring) ---")
+        elif science_moves:
             science_moves.sort(key=lambda x: x[1], reverse=True)
             chosen_move, score = science_moves[0]
             action_to_return = chosen_move['template']
             chosen_object = chosen_move['object']
-            
             if self.debug_channels['ACTION_SCORE']:
-                self._print_and_log(f"\n--- [Priority 1: Science] Chose: {action_to_return.name}{' on '+chosen_object['id'] if chosen_object else ''} (Score: {score}) ---")
-        
+                self._print_and_log(f"\n--- [Priority 1B: Science] Chose: {action_to_return.name}{' on '+chosen_object['id'] if chosen_object else ''} (Score: {score}) ---")
         else:
             # --- PRIORITY 2: THE EXPLORER (Infinite Horizon BFS) ---
             explorer_move, novelty_score = self._search_for_novelty(current_full_context, available)
@@ -908,7 +918,7 @@ class ObmlAgi3Agent(Agent):
                     self._print_and_log(f"\n--- [Priority 2: Exploration] Chose: {action_to_return.name}{' on '+chosen_object['id'] if chosen_object else ''} (Novelty Score: {novelty_score}) ---")
             else:
                 # --- PRIORITY 3: THE AGITATOR ---
-                agitator_move = None
+                agitator_candidates = []
                 for move in all_possible_moves:
                     move_target_id = move['object']['id'] if move['object'] else None
                     full_action_name = self._get_learning_key(move['template'].name, move_target_id)
@@ -917,11 +927,16 @@ class ObmlAgi3Agent(Agent):
                     for eval_obj in current_full_context.get('summary', []):
                         predicted_events, conf = self._predict_outcome((full_action_name, eval_obj['id']), current_full_context)
                         if predicted_events:
-                            agitator_move = move
+                            agitator_candidates.append(move)
                             break # Found a change! We can stop checking objects.
-                    
-                    if agitator_move:
-                        break # Found a productive move! Stop checking other actions.
+                
+                agitator_move = None
+                if agitator_candidates:
+                    # FIX: Round-Robin. Pick the candidate we haven't used recently to prevent infinite fallback loops.
+                    agitator_candidates.sort(key=lambda m: self.performed_action_types.get(
+                        self._get_learning_key(m['template'].name, m['object']['id'] if m['object'] else None), 0
+                    ))
+                    agitator_move = agitator_candidates[0]
                 
                 if agitator_move:
                     action_to_return = agitator_move['template']
@@ -1829,12 +1844,8 @@ class ObmlAgi3Agent(Agent):
 
         # 3. [NEW] Greedy Prediction from Truth Table
         if target_id in self.truth_table:
-            # --- FIX: Use full_action_key ---
+            # --- FIX: Use full_action_key so it actually finds the history ---
             action_data = self.truth_table[target_id].get(full_action_key, {})
-
-        # 3. [NEW] Greedy Prediction from Truth Table
-        if target_id in self.truth_table:
-            action_data = self.truth_table[target_id].get(action_name, {})
             
             best_match_result = None
             for result_sig, history in action_data.items():
@@ -4427,13 +4438,20 @@ class ObmlAgi3Agent(Agent):
         Searches for the shortest path to a novel relational state or an Ambiguity.
         Returns: (first_move_dict, novelty_score)
         """
+        import time
+        start_time = time.time()
+        
         initial_hash = self._extract_all_features(start_context)
         queue = deque([(start_context, [], {initial_hash})])
         
-        MAX_NODES = 2000 # Failsafe to prevent CPU lockup in massive levels
+        MAX_NODES = 400 # Reduced from 2000 to prevent CPU lockup
         nodes_explored = 0
         
         while queue and nodes_explored < MAX_NODES:
+            # FIX: Hard timeout to guarantee the server never kills the agent
+            if time.time() - start_time > 0.5:
+                break 
+                
             curr_ctx, path, seen_hashes = queue.popleft()
             nodes_explored += 1
             
