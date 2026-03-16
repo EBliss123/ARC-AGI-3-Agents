@@ -834,61 +834,41 @@ class ObmlAgi3Agent(Agent):
         active_suspects = set()
         for obj in current_summary:
             if obj['id'] in self.active_experiments:
-                base_sig = (obj['color'], obj['fingerprint'], obj['size'])
-                raw_suspects = self.state_refinements.get(base_sig, [])
-                active_suspects.update({self._get_base_variable(f) for f in raw_suspects})
+                suspect_vars = self.state_refinements.get(obj['id'], {}).keys()
+                active_suspects.update(suspect_vars)
 
-        move_profiles = []
-        
+        # --- PRIORITY 1: THE SCIENTIST ---
+        science_moves = []
         for move in all_possible_moves:
             action_template = move['template']
             target_obj = move['object']
             target_id = target_obj['id'] if target_obj else None
             
             scientific_score = 0
-            action_key_for_move = self._get_learning_key(action_template.name, target_id)
+            this_action_key = self._get_learning_key(action_template.name, target_id)
             
-            # --- INTERROGATION BONUS (Now uses base variables) ---
-            known_effects = self.action_effects_memory.get(action_key_for_move, set())
+            # Interrogation Bonus
+            known_effects = self.action_effects_memory.get(this_action_key, set())
             relevant_toggles = known_effects.intersection(active_suspects)
-            
             scientific_score += len(relevant_toggles)
-            
-            if relevant_toggles and self.debug_channels['ACTION_SCORE']:
-                self._print_and_log(f"    -> Interrogation Bonus: {action_key_for_move} hits {len(relevant_toggles)} suspects.")
 
             for obj in current_summary:
                 obj_id = obj['id']
-
-                this_action_key = self._get_learning_key(action_template.name, target_id)
                 has_data = (obj_id in self.truth_table and this_action_key in self.truth_table[obj_id])
                 
-                # --- FIX: MANDATE CHECK MUST BE FIRST ---
+                # Experiment Mandates Overrule Certainty Penalties
                 if obj_id in self.active_experiments:
                     mandate = self.active_experiments[obj_id]
-                    req_type = mandate['req']
-                    ref_action = mandate['ref']
-                    
-                    if req_type == 'POSITIVE_CONTROL':
-                        if this_action_key == ref_action:
-                            scientific_score += 1 
-                        elif not has_data:
-                            scientific_score += 1 
-                            
-                    elif req_type == 'NEGATIVE_CONTROL':
-                        if this_action_key == ref_action:
-                            scientific_score -= 1 
-                        elif not has_data:
-                            scientific_score += 1 
+                    if mandate['req'] == 'POSITIVE_CONTROL':
+                        if this_action_key == mandate['ref'] or not has_data: scientific_score += 1 
+                    elif mandate['req'] == 'NEGATIVE_CONTROL':
+                        if this_action_key == mandate['ref']: scientific_score -= 1 
+                        elif not has_data: scientific_score += 1 
                     else:
-                        # VERIFY_VAR or STABILIZE_CONTEXT
-                        if not has_data:
-                            scientific_score += 1
-                            
-                    # Because it is an active experiment, bypass certainty penalties!
+                        if not has_data: scientific_score += 1
                     continue
                 
-                # 2. CERTAINTY CHECK (Only applies if NOT actively experimenting)
+                # Check Certainty (Do we already have a certified law for this?)
                 target_obj_for_score = next((o for o in current_summary if o['id'] == obj_id), None)
                 if target_obj_for_score:
                     state_sig_for_score = self._get_scientific_state(target_obj_for_score, current_full_context)
@@ -898,44 +878,58 @@ class ObmlAgi3Agent(Agent):
                         scientific_score -= 1
                         continue
                 
-                # 3. DATA CHECK (Uncertified but has data)
-                if has_data:
-                    scientific_score -= 1 # Certainty
-                else:
-                    scientific_score += 1 # Ignorance
+                # Base Ignorance Scoring
+                if has_data: scientific_score -= 1
+                else: scientific_score += 1
 
-            move_profiles.append((move, scientific_score))
+            if scientific_score > 0:
+                science_moves.append((move, scientific_score))
 
-        # --- Sort by Score ---
-        move_profiles.sort(key=lambda x: x[1], reverse=True)
-        
-        if move_profiles:
-            chosen_move, score = move_profiles[0]
+        action_to_return = None
+        chosen_object = None
+
+        if science_moves:
+            science_moves.sort(key=lambda x: x[1], reverse=True)
+            chosen_move, score = science_moves[0]
             action_to_return = chosen_move['template']
             chosen_object = chosen_move['object']
             
-            # --- FIX: Inject the missing target coordinates! ---
-            if action_to_return and action_to_return.name == 'ACTION6' and chosen_object:
-                r, c = chosen_object['position']
-                action_to_return.set_data({'x': c, 'y': r})
-            # ---------------------------------------------------
-            
             if self.debug_channels['ACTION_SCORE']:
-                self._print_and_log(f"\n--- Scientific Profiler ---")
-                current_step = self.global_action_counter + 1
-                t_name = f" on {chosen_object['id']}" if chosen_object else ""
-                self._print_and_log(f"Chose: {action_to_return.name}{t_name} (Score: {score})")
-                
-                # Show top candidates (Increased limit to 10 to reveal tied global actions)
-                for i in range(min(10, len(move_profiles))):
-                    m, s = move_profiles[i]
-                    m_tn = f" on {m['object']['id']}" if m['object'] else ""
-                    self._print_and_log(f"  #{i+1}: {m['template'].name}{m_tn} -> {s}")
-
+                self._print_and_log(f"\n--- [Priority 1: Science] Chose: {action_to_return.name}{' on '+chosen_object['id'] if chosen_object else ''} (Score: {score}) ---")
+        
         else:
-            if self.debug_channels['ACTION_SCORE']:
-                self._print_and_log("  (No moves profiled. Forcing 'Pass' action.)")
-            action_to_return = self.get_pass_action()
+            # --- PRIORITY 2: THE EXPLORER (Infinite Horizon BFS) ---
+            explorer_move, novelty_score = self._search_for_novelty(current_full_context, available)
+            
+            if explorer_move:
+                action_to_return = explorer_move['template']
+                chosen_object = explorer_move['object']
+                if self.debug_channels['ACTION_SCORE']:
+                    self._print_and_log(f"\n--- [Priority 2: Exploration] Chose: {action_to_return.name}{' on '+chosen_object['id'] if chosen_object else ''} (Novelty Score: {novelty_score}) ---")
+            else:
+                # --- PRIORITY 3: THE AGITATOR ---
+                agitator_move = None
+                for move in all_possible_moves:
+                    t_id = move['object']['id'] if move['object'] else None
+                    predicted_events, conf = self._predict_outcome((move['template'].name, t_id), current_full_context)
+                    if predicted_events:
+                        agitator_move = move
+                        break
+                
+                if agitator_move:
+                    action_to_return = agitator_move['template']
+                    chosen_object = agitator_move['object']
+                    if self.debug_channels['ACTION_SCORE']:
+                        self._print_and_log(f"\n--- [Priority 3: Agitation] Chose: {action_to_return.name}{' on '+chosen_object['id'] if chosen_object else ''} (Stirring the pot) ---")
+                else:
+                    action_to_return = self.get_pass_action()
+                    if self.debug_channels['ACTION_SCORE']:
+                        self._print_and_log(f"\n--- [Priority 3: Agitation] Chose: Pass (Completely trapped) ---")
+
+        # Inject coordinates for Click Actions
+        if action_to_return and action_to_return.name == 'ACTION6' and chosen_object:
+            r, c = chosen_object['position']
+            action_to_return.set_data({'x': c, 'y': r})
 
         # --- Store action for next turn's analysis ---
         if action_to_return:
