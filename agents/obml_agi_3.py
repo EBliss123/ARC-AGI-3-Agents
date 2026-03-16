@@ -198,6 +198,7 @@ class ObmlAgi3Agent(Agent):
         self.global_invariants = {}
         self.level_state_history = []
         self.global_action_counter = 0
+        self.relational_archive = set() # NEW: Reset on hard game restarts
         
         # Reset per-level state
         self._reset_level_state()
@@ -328,6 +329,7 @@ class ObmlAgi3Agent(Agent):
                 # --- This is a NEW LEVEL (from score increase) ---
                 # --- FIX: Preserve the Brain across wins! ---
                 self._reset_level_state()
+                self.relational_archive = set() # NEW: Wipe novelty only on brand new maps
                 if self.debug_channels['PERCEPTION']:
                      print(f"\n--- Level Cleared (Score: {current_score}): Preserving brain, resetting local history. ---")
 
@@ -782,6 +784,17 @@ class ObmlAgi3Agent(Agent):
             'diag_align': current_diag_alignments,
             'match': current_match_groups
         }
+
+        # --- Update Relational Archive ---
+        self.relational_archive.update(self._extract_relational_archive_strings(current_full_context))
+
+        # --- NEW: Debug Relational Archive ---
+        if self.debug_channels.get('CONTEXT_DETAILS', False):
+            archive_size = len(self.relational_archive)
+            self._print_and_log(f"\n--- [Debug] Relational Archive Size: {archive_size} ---")
+            if archive_size > 0:
+                sample = list(self.relational_archive)[:min(5, archive_size)]
+                self._print_and_log(f"  Sample entries: {sample}")
 
         # --- CAUSAL MEMORY: Track what the last action did ---
         if self.last_action_context and self.last_object_summary:
@@ -4325,6 +4338,36 @@ class ObmlAgi3Agent(Agent):
         
         # STRICT 100% CHECK
         return count == total
+
+    def _extract_relational_archive_strings(self, ctx: dict) -> set:
+        """Flattens ONLY the relational topology of the grid into strings."""
+        features = set()
+        if not ctx or 'summary' not in ctx: return features
+        
+        for obj in ctx['summary']:
+            oid = obj['id']
+            
+            for d_idx, direction in enumerate(['top', 'right', 'bottom', 'left']):
+                nid = ctx.get('adj', {}).get(oid, ['na']*4)[d_idx]
+                if nid not in ['na', 'x']: features.add(f"{oid}_adj_{direction}_{nid}")
+            
+            for d_idx, direction in enumerate(['tr', 'br', 'bl', 'tl']):
+                nid = ctx.get('diag_adj', {}).get(oid, ['na']*4)[d_idx]
+                if nid not in ['na', 'x']: features.add(f"{oid}_diag_adj_{direction}_{nid}")
+                    
+            for a_type in ['top_y', 'bottom_y', 'center_y', 'left_x', 'right_x', 'center_x']:
+                for coord, ids in ctx.get('align', {}).get(a_type, {}).items():
+                    if oid in ids and len(ids) > 1: features.add(f"{oid}_align_{a_type}_{coord}")
+            
+            for a_type in ['top_left_to_bottom_right', 'top_right_to_bottom_left']:
+                for line_idx, ids in enumerate(ctx.get('diag_align', {}).get(a_type, [])):
+                    if oid in ids and len(ids) > 1: features.add(f"{oid}_diag_align_{a_type}_{line_idx}")
+
+            for m_type in ['Exact', 'Color', 'Fingerprint', 'Size', 'Pixels']:
+                for props, ids in ctx.get('match', {}).get(m_type, {}).items():
+                    if oid in ids and len(ids) > 1: features.add(f"{oid}_match_{m_type}_{props}")
+                        
+        return features
 
     def _extract_all_features(self, ctx: dict) -> frozenset:
         """
