@@ -112,7 +112,7 @@ class ObmlAgi3Agent(Agent):
             'PERCEPTION': False,      # Object finding, relationships, new level setup
             'CHANGES': True,         # All "Change Log" prints
             'STATE_GRAPH': False,     # State understanding
-            'HYPOTHESIS': False,      # "Initial Hypotheses", "Refined Hypothesis"
+            'HYPOTHESIS': True,      # "Initial Hypotheses", "Refined Hypothesis"
             'FAILURE': False,         # "Failure Analysis", "Failure Detected"
             'WIN_CONDITION': False,   # "LEVEL CHANGE DETECTED", "Win Condition Analysis"
             'ACTION_SCORE': True,    # All scoring prints
@@ -3151,7 +3151,8 @@ class ObmlAgi3Agent(Agent):
             # C. Check for TIER 2 ISOLATED BUCKET Law (Parallel Hypotheses)
             refined_vars = self.state_refinements.get(obj_id, {})
             current_features = self._extract_all_features(prev_context)
-            is_certified_isolated = False
+            is_certified_isolated_direct = False
+            is_certified_isolated_global = False
             
             for base_var, buckets in refined_vars.items():
                 active_val = next((f for f in current_features if self._get_base_variable(f) == base_var), None)
@@ -3160,10 +3161,34 @@ class ObmlAgi3Agent(Agent):
                     if obj_id in self.truth_table and action_key in self.truth_table[obj_id]:
                         count = sum(1 for e in self.truth_table[obj_id][action_key].get(result_sig, []) if len(e) >= 2)
                         if count >= 2:
-                            is_certified_isolated = True
+                            # --- NEW: CONDITIONAL GLOBAL CHECK ---
+                            # It is consistent for THIS action. Do OTHER actions trigger it too?
+                            other_actions_with_result = 0
+                            for other_a, r_map in self.truth_table[obj_id].items():
+                                if other_a != action_key and result_sig in r_map:
+                                    other_actions_with_result += 1
+                                    
+                            if other_actions_with_result > 0:
+                                is_certified_isolated_global = True
+                                
+                                if self.debug_channels['HYPOTHESIS']:
+                                    self._print_and_log(f"\n--- [Science Debug] Caught by TIER 2 SPLITTER (Transcendence to GLOBAL) ---")
+                                    self._print_and_log(f"    Target: {obj_id} | Event: {result_sig}")
+                                    self._print_and_log(f"    Reason: Occurs under specific condition '{base_var}' across multiple actions.")
+                            else:
+                                is_certified_isolated_direct = True
+                                
+                                if self.debug_channels['HYPOTHESIS']:
+                                    self._print_and_log(f"\n--- [Science Debug] Caught by TIER 2 SPLITTER (Remains DIRECT) ---")
+                                    self._print_and_log(f"    Target: {obj_id} | Event: {result_sig}")
+                                    self._print_and_log(f"    Reason: Condition '{base_var}' is exclusive to this action.")
                             break
                             
-            if is_certified_isolated:
+            if is_certified_isolated_global:
+                global_events.append(event)
+                if obj_id in self.active_experiments: del self.active_experiments[obj_id]
+                continue
+            elif is_certified_isolated_direct:
                 direct_events.append(event)
                 if obj_id in self.active_experiments and self.active_experiments[obj_id].get('ref') == action_key:
                     del self.active_experiments[obj_id]
@@ -4029,6 +4054,16 @@ class ObmlAgi3Agent(Agent):
                         elif len(same_result_actions) > 1:
                             self._certify_law(obj_id, 'SEMI_GLOBAL', 'ANY', r_sig, 'UNIVERSAL_STATE')
                         elif has_neg_control:
+                            # --- NEW: Interrogate the False Negative ---
+                            if self.debug_channels['HYPOTHESIS']:
+                                self._print_and_log(f"\n--- [Science Debug] Classifying as DIRECT instead of GLOBAL ---")
+                                self._print_and_log(f"Target: {obj_id} | Event: {r_sig}")
+                                self._print_and_log(f"Why? Action '{a_key}' triggered it {n_count} times...")
+                                self._print_and_log(f"BUT, these other actions failed to trigger it:")
+                                for other_a, other_r_counts in action_to_results.items():
+                                    if other_a != a_key:
+                                        self._print_and_log(f"  - '{other_a}' resulted in: {list(other_r_counts.keys())}")
+                            # ------------------------------------------
                             self._certify_law(obj_id, 'DIRECT', a_key, r_sig, 'UNIVERSAL_STATE')
 
     def _certify_law(self, obj_id, law_type, action_key, result_sig, state_sig=None):
