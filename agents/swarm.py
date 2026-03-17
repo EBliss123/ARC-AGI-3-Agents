@@ -120,8 +120,13 @@ class Swarm:
         if total_actions == 0 and self.agents:
             logger.info("Server scorecard empty (run abandoned/timed out). Using local agent metrics.")
             final_score = max(max((f.score for f in a.frames), default=0) for a in self.agents)
-            # Pull the official counter which ignores RESET
-            total_actions = sum(a.action_counter for a in self.agents) 
+            
+            # FIX 1: Count EVERY frame to get the true total actions across all levels
+            total_actions = sum(len(a.frames) - 1 for a in self.agents) 
+            
+            # FIX 2: Extract the highest level reached from the frame history
+            max_levels = max(max((getattr(f, 'levels_completed', 0) for f in a.frames), default=0) for a in self.agents)
+            
             is_local_bypass = True
             
         if scorecard:
@@ -130,6 +135,7 @@ class Swarm:
                 scorecard_dict['score'] = final_score
                 scorecard_dict['total_actions'] = total_actions
                 scorecard_dict['played'] = 1
+                scorecard_dict['levels_passed'] = max_levels  # Inject the levels!
                 
             logger.info("--- FINAL SCORECARD REPORT ---")
             logger.info(json.dumps(scorecard_dict, indent=2))
