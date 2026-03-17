@@ -96,8 +96,8 @@ class Agent(ABC):
             frame = self.take_action(action)
             
             if frame:
-                # Store the score from before the latest action
-                previous_score = self.score
+                # Store the levels from before the latest action
+                previous_levels = getattr(self.frames[-2], 'levels_completed', 0) if len(self.frames) > 1 else 0
 
                 self.append_frame(frame)
 
@@ -105,13 +105,13 @@ class Agent(ABC):
                     self.action_counter += 1
 
                 logger.info(
-                    f"{self.game_id} - {action.name}: count {self.action_counter}, score {frame.score}, avg fps {self.fps})"
+                    f"{self.game_id} - {action.name}: count {self.action_counter}, levels {frame.levels_completed}/{frame.win_levels}, avg fps {self.fps})"
                 )
 
-                # If the new score is higher, reset the action counter
-                if frame.score > previous_score:
+                # If the levels increased, reset the action counter
+                if frame.levels_completed > previous_levels:
                     logger.info(
-                        f"Score increased to {frame.score}. Resetting action counter."
+                        f"Level increased to {frame.levels_completed}. Resetting action counter."
                     )
                     self.action_counter = 0
 

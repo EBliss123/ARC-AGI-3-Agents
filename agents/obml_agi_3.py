@@ -419,10 +419,26 @@ class ObmlAgi3Agent(Agent):
             # --- SUBSEQUENT FRAME LOGIC ---
             prev_summary = self.last_object_summary
             
-            # --- NEW: Check for score increase *before* analysis ---
-            current_score = latest_frame.score
-            score_increased = current_score > self.last_score
-            # --- End NEW ---
+            # --- Absolute API Signal Detection ---
+            if not hasattr(self, 'last_levels'): self.last_levels = 0
+            
+            current_levels = getattr(latest_frame, 'levels_completed', 0)
+            current_score = getattr(latest_frame, 'score', 0.0)
+            level_increased = current_levels > self.last_levels
+
+            is_win_state = (latest_frame.state == GameState.WIN)
+            is_full_reset = getattr(latest_frame, 'full_reset', False)
+
+            if level_increased or is_win_state or is_full_reset:
+                self._print_and_log(f"\n--- LEVEL CLEARED ---")
+                if level_increased:
+                    self._print_and_log(f"    API reported Level {current_levels} completed!")
+                
+                self.last_levels = current_levels
+                self.is_new_level = True
+                
+                # Force the pass action so we don't corrupt the physics engine
+                return self.get_pass_action()
             
             # This function compares old and new summaries, assigns persistent IDs,
             # and returns a list of change strings.
@@ -433,12 +449,6 @@ class ObmlAgi3Agent(Agent):
              current_match_groups, current_alignments, current_diag_alignments, 
              current_conjunctions) = self._analyze_relationships(current_summary)
 
-            # --- Check for score changes (win detection) ---
-            if score_increased:
-                if self.debug_channels['WIN_CONDITION']:
-                    print(f"\n--- LEVEL CHANGE DETECTED (Score increased from {self.last_score} to {current_score}) ---")
-                # (Win analysis logic will go here)
-                self.is_new_level = True # Signal for the *next* frame
             self.last_score = current_score
 
             # --- Log all changes found ---
@@ -710,8 +720,8 @@ class ObmlAgi3Agent(Agent):
                                 self._print_and_log(f"       [Needs]    {fix}")
                 
                 # --- Failsafe: Track banned actions ---
-                # UPDATED: Success = Any change detected (events) OR score increase.
-                action_succeeded = bool(events) or score_increased
+                # UPDATED: Success = Any change detected (events) OR level increase.
+                action_succeeded = bool(events) or level_increased
                 
                 # --- NEW: Track Productive Actions (ACTION6 Only) ---
                 if action_succeeded and self.last_action_context and self.last_action_context.startswith('ACTION6'):

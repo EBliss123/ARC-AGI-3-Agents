@@ -24,7 +24,8 @@ class Card(BaseModel):
     total_plays: int = 0
 
     guids: list[str] = Field(default_factory=list, exclude=True)
-    scores: list[int] = Field(default_factory=list)
+    scores: list[float] = Field(default_factory=list)
+    levels_completed: list[int] = Field(default_factory=list)
     states: list[GameState] = Field(default_factory=list)
     actions: list[int] = Field(default_factory=list)
     resets: list[int] = Field(default_factory=list)
@@ -45,6 +46,10 @@ class Card(BaseModel):
     @property
     def high_score(self) -> int:
         return max(self.scores) if self.started else 0
+
+    @property
+    def max_level(self) -> int:
+        return max(self.levels_completed) if self.started and self.levels_completed else 0
 
     @property
     def state(self) -> str:
@@ -92,6 +97,10 @@ class Scorecard(BaseModel):
     def score(self) -> int:
         return sum(g.high_score for g in self.cards.values())
 
+    @computed_field(return_type=int)
+    def levels_passed(self) -> int:
+        return sum(g.max_level for g in self.cards.values())
+    
     def get(self, game_id: Optional[str] = None) -> dict[str, Any]:
         if game_id is not None:
             card = self.cards.get(game_id)
@@ -208,7 +217,9 @@ class FrameData(BaseModel):
     game_id: str = ""
     frame: list[list[list[int]]] = []
     state: GameState = GameState.NOT_PLAYED
-    score: int = Field(0, ge=0, le=254)
+    levels_completed: int = 0  # <--- THE MISSING LINK
+    win_levels: int = 0        # <--- THE TOTAL LEVELS
+    score: float = 0.0         
     action_input: ActionInput = Field(default_factory=lambda: ActionInput())
     guid: Optional[str] = None
     full_reset: bool = False
