@@ -85,6 +85,9 @@ class ObmlAgi3Agent(Agent):
         # Stores every feature string that a specific action has ever toggled.
         self.action_effects_memory = {}
 
+        #Win laws
+        self.global_win_laws = {}
+
         # --- NEW: Relational Color Memory ---
         # Stores discovered laws like: ('ACTION6_obj_1', 'obj_5') -> {'Source: Adjacency(0,1)'}
         self.relational_constraints = {}
@@ -171,6 +174,7 @@ class ObmlAgi3Agent(Agent):
         self.last_score = 0
         self.permanent_banned_actions = set()
         self.successful_click_actions = set()
+        self.global_win_laws = {}
 
         # NEW: Reset Transition Memory
         self.transition_counts = {}
@@ -433,6 +437,16 @@ class ObmlAgi3Agent(Agent):
                 self._print_and_log(f"\n--- LEVEL CLEARED ---")
                 if level_increased:
                     self._print_and_log(f"    API reported Level {current_levels} completed!")
+                
+                # --- NEW: Phase 1 & 2 Win Logic ---
+                if self.level_state_history and current_summary:
+                    # Quickly build the final context
+                    (rels, adj, diag_adj, match, align, diag_align, conj) = self._analyze_relationships(current_summary)
+                    final_context = {'rels': rels, 'adj': adj, 'diag_adj': diag_adj, 'align': align, 'diag_align': diag_align, 'match': match}
+                    
+                    candidate_signature = self._isolate_win_signature(final_context)
+                    self._refine_global_win_laws(candidate_signature)
+                # -----------------------------------
                 
                 self.last_levels = current_levels
                 self.is_new_level = True
@@ -4640,3 +4654,43 @@ class ObmlAgi3Agent(Agent):
             return base + match_type
             
         return f_str
+
+    def _isolate_win_signature(self, final_context: dict) -> dict:
+        """Phase 1: Isolates the Candidate Win Signature by strict subtraction."""
+        candidate = copy.deepcopy(final_context)
+        
+        for past_state in self.level_state_history:
+            # Subtract Adjacencies
+            for key in ['adj', 'diag_adj']:
+                if key in candidate and key in past_state:
+                    for obj_id in list(candidate[key].keys()):
+                        if obj_id in past_state[key] and candidate[key][obj_id] == past_state[key][obj_id]:
+                            del candidate[key][obj_id]
+                    if not candidate[key]: del candidate[key]
+            
+            # Subtract Global Relationships
+            for key in ['rels', 'align', 'match']:
+                if key in candidate and key in past_state:
+                    for t_name in list(candidate[key].keys()):
+                        if t_name in past_state[key]:
+                            for val in list(candidate[key][t_name].keys()):
+                                if val in past_state[key][t_name] and set(candidate[key][t_name][val]) == set(past_state[key][t_name][val]):
+                                    del candidate[key][t_name][val]
+                            if not candidate[key][t_name]: del candidate[key][t_name]
+                    if not candidate[key]: del candidate[key]
+                    
+        if self.debug_channels.get('WIN_CONDITION', True):
+            self._print_and_log(f"  [Win Logic] Isolated Candidate Signature: {candidate}")
+        return candidate
+
+    def _refine_global_win_laws(self, candidate_signature: dict):
+        """Phase 2: Intersects Candidate Signature with persistent Multi-Level Laws."""
+        if not self.global_win_laws:
+            self.global_win_laws = candidate_signature
+            if self.debug_channels.get('WIN_CONDITION', True):
+                self._print_and_log(f"  [Win Logic] Initialized Global Laws: {self.global_win_laws}")
+            return
+            
+        self.global_win_laws = self._intersect_contexts(self.global_win_laws, candidate_signature)
+        if self.debug_channels.get('WIN_CONDITION', True):
+            self._print_and_log(f"  [Win Logic] Refined Global Laws: {self.global_win_laws}")
