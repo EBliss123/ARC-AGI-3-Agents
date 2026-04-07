@@ -9,7 +9,7 @@ import gymnasium as gym
 import requests
 from dotenv import load_dotenv
 
-# --- Load Environment Variables (Match main.py setup) ---
+# --- Load Environment Variables ---
 load_dotenv(dotenv_path=".env.example")
 load_dotenv(dotenv_path=".env", override=True)
 
@@ -22,32 +22,54 @@ if (SCHEME == "http" and str(PORT) == "80") or (SCHEME == "https" and str(PORT) 
 else:
     ROOT_URL = f"{SCHEME}://{HOST}:{PORT}"
 
+# --- NEW: Add API Key Headers ---
+ARC_API_KEY = os.environ.get("ARC_API_KEY", "")
+HEADERS = {
+    "X-API-Key": ARC_API_KEY,
+    "Accept": "application/json",
+}
+
 # --- Import the Toolkit Correctly ---
 import arc_agi 
 
-# --- Import your Agent ---
 sys.path.insert(0, os.getcwd())
-from agents.obrl_agi3 import ObrlAgi3Agent
+
+# --- Dynamically Load Agents ---
+try:
+    from agents import AVAILABLE_AGENTS
+except ImportError:
+    AVAILABLE_AGENTS = {}
+
+# Fallback specifically to your provided ObmlAgi3Agent if AVAILABLE_AGENTS is missing
+try:
+    from agents.obml_agi_3 import ObmlAgi3Agent as FallbackAgent
+except ImportError:
+    try:
+        from agents.obrl_agi3 import ObrlAgi3Agent as FallbackAgent
+    except ImportError:
+        FallbackAgent = None
+
 from agents.structs import GameAction, GameState
 from agents.agent import FrameData
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="High-Speed Local Runner for ARC-AGI")
+    parser.add_argument("-a", "--agent", choices=AVAILABLE_AGENTS.keys() if AVAILABLE_AGENTS else None, type=str, help="Choose which agent to run.")
     parser.add_argument("-g", "--game", type=str, help="Game ID (e.g. 'ls20'). If omitted, runs ALL discovered games.")
-    parser.add_argument("-a", "--agent", type=str, help="Ignored (compatibility flag).")
     return parser.parse_args()
 
 def get_game_list(specific_game=None):
     if specific_game:
-        return [specific_game]
+        return [g.strip() for g in specific_game.split(",")]
     
     print("--- Discovering ARC-AGI games ---")
     games = []
     
-    # --- STRATEGY 1: Fetch from API Server (Source of Truth) ---
     print(f"Attempting to fetch game list from {ROOT_URL}/api/games ...")
     try:
-        r = requests.get(f"{ROOT_URL}/api/games", timeout=2)
+        # --- NEW: Pass the HEADERS to the request ---
+        r = requests.get(f"{ROOT_URL}/api/games", headers=HEADERS, timeout=10)
+        
         if r.status_code == 200:
             api_games = [g["game_id"] for g in r.json()]
             print(f"-> API Server returned {len(api_games)} games.")
@@ -58,7 +80,6 @@ def get_game_list(specific_game=None):
     except Exception as e:
         print(f"-> Could not connect to API server ({e}). Assuming offline mode.")
 
-    # --- STRATEGY 2: Check Gym Registry (Local Fallback) ---
     print("Scanning local Gym registry...")
     for env_id in gym.envs.registry.keys():
         if "ARC-AGI/" in env_id and "-v" in env_id:
@@ -68,9 +89,8 @@ def get_game_list(specific_game=None):
 
     if not games:
         print("Warning: No games found via API or Registry.")
-        # Fallback to known common training sets if totally empty
-        #games = ["ls20", "vc33", "ft09"]
         print(f"GAMES NOT FOUND. EXITING")
+        sys.exit(1)
         
     print(f"Total Games Scheduled: {len(games)}")
     return games
@@ -127,7 +147,7 @@ def translate_action_to_env(agent_output):
         
     return (0, {})
 
-def run_single_game(game_id):
+def run_single_game(game_id, args_agent_name):
     print(f"\n>>> STARTING GAME: {game_id} <<<")
     
     result = {
@@ -146,21 +166,26 @@ def run_single_game(game_id):
         result["error"] = str(e)
         return result
 
-    agent = ObrlAgi3Agent(
+    # Determine which agent to use
+    if args_agent_name and args_agent_name in AVAILABLE_AGENTS:
+        AgentClass = AVAILABLE_AGENTS[args_agent_name]
+    else:
+        AgentClass = FallbackAgent
+
+    if not AgentClass:
+        print("CRITICAL ERROR: No valid Agent Class found to run.")
+        result["error"] = "Agent import failed."
+        return result
+
+    # Initialize agent without hyperparameter clutter
+    agent = AgentClass(
         card_id="local-run",
         game_id=game_id,
-        agent_name="ScientificAgent",
+        agent_name=args_agent_name or "ScientificAgent",
         ROOT_URL="local",
         record=False
     )
     
-    # Quiet Logs
-    agent.debug_channels['PERCEPTION'] = False
-    agent.debug_channels['CONTEXT_DETAILS'] = False
-    agent.debug_channels['ACTION_SCORE'] = True
-    agent.debug_channels['CHANGES'] = True
-    agent.debug_channels['HYPOTHESIS'] = True 
-
     valid_actions = get_dynamic_actions(env)
 
     # --- RESET ---
@@ -181,8 +206,9 @@ def run_single_game(game_id):
     
     try:
         while True:
-            if total_steps >= agent.MAX_ACTIONS:
-                print(f"--- MAX ACTIONS REACHED ({agent.MAX_ACTIONS}) ---")
+            max_actions = getattr(agent, 'MAX_ACTIONS', 1000)
+            if total_steps >= max_actions:
+                print(f"--- MAX ACTIONS REACHED ({max_actions}) ---")
                 result["status"] = "TIMEOUT"
                 break
 
@@ -259,7 +285,6 @@ def run_single_game(game_id):
         print(f"\nRuntime Error in {game_id}: {e}")
         traceback.print_exc()
         result["error"] = str(e)
-    # env.close() # Removed to prevent crashes
         
     result["steps"] = total_steps
     return result
@@ -277,7 +302,8 @@ def run_fast():
     for i, game_id in enumerate(games_to_play):
         print(f"\n[{i+1}/{len(games_to_play)}] Running {game_id}...")
         try:
-            res = run_single_game(game_id)
+            # Clean call: Just the game ID and the Agent string. No hyperparameters.
+            res = run_single_game(game_id, args.agent)
             all_results.append(res)
         except KeyboardInterrupt:
             print("\nGlobal Stop requested.")
