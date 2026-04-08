@@ -874,20 +874,57 @@ class ObmlAgi3Agent(Agent):
             this_action_key = self._get_learning_key(action_template.name, target_id)
             
             # --- TIER 1A: ACTIVE MANDATES (Absolute Override) ---
-            # If this move fulfills an active requirement, lock it in instantly.
-            if target_id and target_id in self.active_experiments:
-                mandate = self.active_experiments[target_id]
-                has_data = (target_id in self.truth_table and this_action_key in self.truth_table[target_id])
+            # Check if this move can satisfy ANY active mandate on the board
+            for exp_obj_id, mandate in self.active_experiments.items():
+                has_data = (exp_obj_id in self.truth_table and this_action_key in self.truth_table[exp_obj_id])
                 
-                if mandate['req'] == 'POSITIVE_CONTROL' and (this_action_key == mandate['ref'] or not has_data):
+                if mandate['req'] == 'POSITIVE_CONTROL' and this_action_key == mandate['ref']:
                     mandated_move = move
                     break
                 elif mandate['req'] == 'NEGATIVE_CONTROL' and this_action_key != mandate['ref'] and not has_data:
                     mandated_move = move
                     break
                 elif mandate['req'] in ['VERIFY_VAR', 'STABILIZE_CONTEXT'] and this_action_key == mandate['ref']:
-                    mandated_move = move
-                    break
+                    # --- LOCAL SCIENTIFIC STATE CHECK ---
+                    suspects = set()
+                    if mandate['req'] == 'VERIFY_VAR':
+                        suspects = set(self.state_refinements.get(exp_obj_id, {}).keys())
+                    else:
+                        suspects = set(self.pending_refinements.get(exp_obj_id, {}).get('suspects', set()))
+                        
+                    if not suspects:
+                        mandated_move = move
+                        break
+                        
+                    current_features = self._extract_all_features(current_full_context)
+                    current_suspect_vals = {f for f in current_features if self._get_base_variable(f) in suspects}
+                    
+                    already_tested_this_setup = False
+                    action_history = self.truth_table.get(exp_obj_id, {}).get(this_action_key, {})
+                    
+                    for r_sig, locs in action_history.items():
+                        for entry in locs:
+                            if len(entry) >= 3:
+                                turn = entry[1]
+                                ctx_idx = turn - 1
+                                if 0 <= ctx_idx < len(self.level_state_history):
+                                    hist_ctx = self.level_state_history[ctx_idx]
+                                    hist_features = self._extract_all_features(hist_ctx)
+                                    hist_suspect_vals = {f for f in hist_features if self._get_base_variable(f) in suspects}
+                                    
+                                    if hist_suspect_vals == current_suspect_vals:
+                                        already_tested_this_setup = True
+                                        break
+                        if already_tested_this_setup:
+                            break
+                            
+                    if not already_tested_this_setup:
+                        mandated_move = move
+                        break
+                    # If already tested, do nothing. Yield to Tier 1B to "Setup" a new state.
+                    
+            if mandated_move:
+                break
 
             # --- TIER 1B: CURIOSITY & IGNORANCE (Score Math) ---
             # Interrogation Bonus
