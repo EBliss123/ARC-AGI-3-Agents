@@ -885,7 +885,7 @@ class ObmlAgi3Agent(Agent):
                 elif mandate['req'] == 'NEGATIVE_CONTROL' and this_action_key != mandate['ref'] and not has_data:
                     mandated_move = move
                     break
-                elif mandate['req'] in ['VERIFY_VAR', 'STABILIZE_CONTEXT'] and not has_data:
+                elif mandate['req'] in ['VERIFY_VAR', 'STABILIZE_CONTEXT'] and this_action_key == mandate['ref']:
                     mandated_move = move
                     break
 
