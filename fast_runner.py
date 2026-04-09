@@ -300,7 +300,16 @@ def run_single_game(game_id, args_agent_name):
             
             # 5. Step
             action_id, action_data = translate_action_to_env(action)
-            step_result = env.step(action_id, data=action_data)
+            
+            if action_id == 6:
+                print(f"    [Physics Engine] Firing CLICK at X:{action_data.get('x')} Y:{action_data.get('y')}")
+                
+            try:
+                # Pydantic schema expects (id: int, data: dict)
+                step_result = env.step(action_id, data=action_data)
+            except TypeError:
+                # Final fallback if the wrapper unpacks kwargs directly
+                step_result = env.step(action_id, **action_data)
             
             # 6. Unpack
             if isinstance(step_result, tuple):
