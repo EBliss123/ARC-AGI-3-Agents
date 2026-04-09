@@ -963,9 +963,15 @@ class ObmlAgi3Agent(Agent):
                     state_sig_for_score = self._get_scientific_state(target_obj_for_score, current_full_context)
                     laws_for_obj = self.certified_laws.get(obj_id, {})
                     laws = laws_for_obj.get(state_sig_for_score, {})
-                    if 'ANY' in laws or this_action_key in laws:
+                    
+                    # --- NEW: Strict Scientific Credentials ---
+                    has_direct_law = this_action_key in laws
+                    has_global_law = 'ANY' in laws and laws['ANY'].get('type') == 'GLOBAL'
+                    
+                    if has_direct_law or has_global_law:
                         scientific_score -= 1
                         continue
+                    # ----------------------------------------
                 
                 # Base Ignorance Scoring
                 if has_data: scientific_score -= 1
@@ -1918,7 +1924,15 @@ class ObmlAgi3Agent(Agent):
         # 2. Check Certified Laws (Established Science)
         laws_for_obj = self.certified_laws.get(target_id, {})
         univ_laws = laws_for_obj.get('UNIVERSAL_STATE', {})
-        law = univ_laws.get(full_action_key) or univ_laws.get('ANY')
+        
+        # --- NEW: Prevent Arrogant Predictions ---
+        law = univ_laws.get(full_action_key)
+        
+        # If we don't have a direct law, check for an ANY law, 
+        # but ONLY apply it if it's a truly proven GLOBAL law.
+        if not law and 'ANY' in univ_laws and univ_laws['ANY'].get('type') == 'GLOBAL':
+            law = univ_laws['ANY']
+        # -----------------------------------------
         
         if law:
             if 'result' in law:
