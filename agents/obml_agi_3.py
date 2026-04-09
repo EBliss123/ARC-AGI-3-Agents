@@ -1037,9 +1037,16 @@ class ObmlAgi3Agent(Agent):
                         self._print_and_log(f"\n--- [Priority 3: Agitation] Chose: Pass (Completely trapped) ---")
 
         # Inject coordinates for Click Actions
-        if action_to_return and action_to_return.name == 'ACTION6' and chosen_object:
-            r, c = chosen_object['position']
-            action_to_return.set_data({'x': c, 'y': r})
+        click_payload = None
+        if action_to_return and action_to_return.name == 'ACTION6':
+            if chosen_object:
+                guaranteed_pixels = sorted(list(chosen_object['pixel_coords']))
+                # Cast to standard int to prevent Numpy serialization errors
+                r, c = int(guaranteed_pixels[0][0]), int(guaranteed_pixels[0][1])
+                click_payload = {'x': c, 'y': r}
+            else:
+                raw_data = getattr(action_to_return, 'data', {})
+                click_payload = {'x': int(raw_data.get('x', 0)), 'y': int(raw_data.get('y', 0))}
 
         # --- Store action for next turn's analysis ---
         if action_to_return:
@@ -1071,6 +1078,10 @@ class ObmlAgi3Agent(Agent):
         }
         self.level_state_history.append(current_context)
 
+        # Return a robust tuple so the payload is never dropped
+        if click_payload is not None:
+            return (action_to_return, click_payload)
+            
         return action_to_return
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
