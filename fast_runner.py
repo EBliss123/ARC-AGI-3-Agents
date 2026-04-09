@@ -95,30 +95,85 @@ def get_game_list(specific_game=None):
     print(f"Total Games Scheduled: {len(games)}")
     return games
 
-def get_dynamic_actions(env):
+def get_dynamic_actions(env, game_id):
     valid_actions = []
-    space = env.action_space
+    api_actions = None
     
-    if isinstance(space, gym.spaces.Discrete):
-        n = space.n
-        if n >= 2: valid_actions.append(GameAction.ACTION1)
-        if n >= 3: valid_actions.append(GameAction.ACTION2)
-        if n >= 4: valid_actions.append(GameAction.ACTION3)
-        if n >= 5: valid_actions.append(GameAction.ACTION4)
-        if n >= 6: valid_actions.append(GameAction.ACTION5)
+    # 1. PULL FROM THE ARC AGI WEBSITE/API
+    try:
+        r = requests.get(f"{ROOT_URL}/api/games/{game_id}", headers=HEADERS, timeout=5)
+        if r.status_code == 200:
+            game_data = r.json()
+            # Depending on the exact API schema, actions are usually stored here:
+            api_actions = game_data.get('actions') or game_data.get('config', {}).get('actions') or game_data.get('buttons')
+    except Exception as e:
+        print(f"Could not reach API for actions: {e}")
 
-    elif isinstance(space, gym.spaces.Tuple) or isinstance(space, gym.spaces.Dict):
-        valid_actions = [
-            GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3,
-            GameAction.ACTION4, GameAction.ACTION5, GameAction.ACTION6
-        ]
+    # 2. PULL FROM THE ENVIRONMENT NATIVELY
+    env_actions = None
+    base_env = getattr(env, 'unwrapped', env)
     
-    if not valid_actions:
-        return [
-            GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, 
-            GameAction.ACTION4, GameAction.ACTION5
-        ]
+    if hasattr(base_env, 'get_action_meanings'):
+        env_actions = base_env.get_action_meanings()
+    elif hasattr(base_env, 'action_names'):
+        env_actions = base_env.action_names
         
+    # 3. PRINT THE SOURCE OF TRUTH BEFORE RUNNING
+    print("\n" + "="*50)
+    print(f" SOURCE OF TRUTH: AVAILABLE ACTIONS FOR {game_id}")
+    print("="*50)
+    print(f"Gym Action Space: {env.action_space}")
+    if api_actions is not None:
+        print(f"Website/API Allowed Actions: {api_actions}")
+    if env_actions is not None:
+        print(f"Environment Allowed Actions: {env_actions}")
+    print("="*50 + "\n")
+
+    # 4. STRICTLY USE ONLY WHAT IS AVAILABLE
+    # Map the agent's internal buttons to what the API reported
+    if api_actions or env_actions:
+        source = api_actions if api_actions else env_actions
+        source_str = str(source).lower()
+        
+        if 'up' in source_str or '1' in source_str: valid_actions.append(GameAction.ACTION1)
+        if 'down' in source_str or '2' in source_str: valid_actions.append(GameAction.ACTION2)
+        if 'left' in source_str or '3' in source_str: valid_actions.append(GameAction.ACTION3)
+        if 'right' in source_str or '4' in source_str: valid_actions.append(GameAction.ACTION4)
+        if 'space' in source_str or 'action5' in source_str: valid_actions.append(GameAction.ACTION5)
+        
+        # Check if clicking/coordinates are permitted
+        if 'click' in source_str or 'touch' in source_str or 'interact' in source_str: 
+            valid_actions.append(GameAction.ACTION6)
+
+    # Fallback to strict Action Space mapping ONLY if API didn't provide readable strings
+    if not valid_actions:
+        space = env.action_space
+        space_str = str(space).upper()
+        
+        # --- NEW: Catch raw lists of GameActions ---
+        if isinstance(space, list):
+            if 'ACTION1' in space_str: valid_actions.append(GameAction.ACTION1)
+            if 'ACTION2' in space_str: valid_actions.append(GameAction.ACTION2)
+            if 'ACTION3' in space_str: valid_actions.append(GameAction.ACTION3)
+            if 'ACTION4' in space_str: valid_actions.append(GameAction.ACTION4)
+            if 'ACTION5' in space_str: valid_actions.append(GameAction.ACTION5)
+            if 'ACTION6' in space_str: valid_actions.append(GameAction.ACTION6)
+            
+        # Standard Gym Spaces
+        elif isinstance(space, gym.spaces.Discrete):
+            n = space.n
+            if n >= 2: valid_actions.append(GameAction.ACTION1)
+            if n >= 3: valid_actions.append(GameAction.ACTION2)
+            if n >= 4: valid_actions.append(GameAction.ACTION3)
+            if n >= 5: valid_actions.append(GameAction.ACTION4)
+            if n >= 6: valid_actions.append(GameAction.ACTION5)
+            # If discrete space is massive (e.g. Discrete(4096)), it's a flattened coordinate grid for clicking
+            if n > 10: valid_actions.append(GameAction.ACTION6) 
+            
+        elif isinstance(space, gym.spaces.Tuple) or isinstance(space, gym.spaces.Dict):
+            valid_actions = [GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4, GameAction.ACTION5, GameAction.ACTION6]
+
+    print(f"Agent is legally restricted to: {[a.name for a in valid_actions]}\n")
     return valid_actions
 
 def translate_action_to_env(agent_output):
@@ -186,7 +241,7 @@ def run_single_game(game_id, args_agent_name):
         record=False
     )
     
-    valid_actions = get_dynamic_actions(env)
+    valid_actions = get_dynamic_actions(env, game_id)
 
     # --- RESET ---
     try:
