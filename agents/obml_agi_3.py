@@ -496,6 +496,27 @@ class ObmlAgi3Agent(Agent):
                 # 1. Parse text changes back to structured event dicts
                 events = self._parse_change_logs_to_events(changes)
 
+                # --- NEW: EVENT MUTING (HUD IGNORANCE) ---
+                # Filter out events related to HUD objects so the scientist completely ignores them.
+                filtered_events = []
+                for e in events:
+                    obj_id = e.get('id')
+                    is_hud = False
+                    
+                    # Check if it was HUD in previous frame (e.g. shrinking)
+                    prev_obj = next((o for o in prev_summary if o['id'] == obj_id), None)
+                    if prev_obj and prev_obj.get('is_hud'): is_hud = True
+                        
+                    # Check if it is HUD in current frame (e.g. newly spawned background color)
+                    curr_obj = next((o for o in current_summary if o['id'] == obj_id), None)
+                    if curr_obj and curr_obj.get('is_hud'): is_hud = True
+                        
+                    if not is_hud:
+                        filtered_events.append(e)
+                
+                events = filtered_events
+                # -----------------------------------------
+
                 # --- NEW: Identify Static Objects (Null Results) ---
                 # The change log only tells us what moved. We must explicitly record
                 # "NO_CHANGE" for objects that stood still, so the agent knows 
@@ -1111,8 +1132,35 @@ class ObmlAgi3Agent(Agent):
                 }
                 objects.append(obj)
 
+        # --- NEW: HUD / Resource Bar Detection ---
+        # A HUD spans exactly the full width or height of the grid on the absolute edges.
+        # It can be composed of multiple objects (e.g., a shrinking color and a growing background).
+        for obj in objects:
+            obj['is_hud'] = False
+            
+        # Check Top Edge
+        top_objs = [o for o in objects if o['size'][0] == 1 and o['position'][0] == 0]
+        if sum(o['size'][1] for o in top_objs) == width:
+            for o in top_objs: o['is_hud'] = True
+            
+        # Check Bottom Edge
+        bottom_objs = [o for o in objects if o['size'][0] == 1 and o['position'][0] == height - 1]
+        if sum(o['size'][1] for o in bottom_objs) == width:
+            for o in bottom_objs: o['is_hud'] = True
+            
+        # Check Left Edge
+        left_objs = [o for o in objects if o['size'][1] == 1 and o['position'][1] == 0]
+        if sum(o['size'][0] for o in left_objs) == height:
+            for o in left_objs: o['is_hud'] = True
+            
+        # Check Right Edge
+        right_objs = [o for o in objects if o['size'][1] == 1 and o['position'][1] == width - 1]
+        if sum(o['size'][0] for o in right_objs) == height:
+            for o in right_objs: o['is_hud'] = True
+        # -----------------------------------------
+
         return objects
-    
+        
     def _get_stable_id(self, obj):
         """Creates a hashable, stable ID for an object based on its intrinsic properties."""
         return (obj['fingerprint'], obj['color'], obj['size'], obj['pixels'])
@@ -2259,21 +2307,18 @@ class ObmlAgi3Agent(Agent):
         return best_future_score
 
     def _analyze_relationships(self, object_summary: list[dict]) -> tuple:
-        """
-        Analyzes all object relationships, adjacencies, alignments, and
-        conjunctions from a given object summary.
-        
-        Returns a tuple containing all 7 analysis dictionaries:
-        (relationships, adjacencies, diag_adjacencies, match_groups,
-         alignments, diag_alignments, conjunctions)
-        """
-        
+        """..."""
         # --- 0. Handle Empty/Trivial Cases ---
         if not object_summary:
             return {}, {}, {}, {}, {}, {}, {}
+            
+        # --- NEW: Scientific Blindfold ---
+        # Strip HUD elements from the local summary so they can NEVER be 
+        # registered as Adjacent, Aligned, or Matching with physical puzzle pieces.
+        object_summary = [obj for obj in object_summary if not obj.get('is_hud')]
+        # ---------------------------------
         
         if len(object_summary) < 2:
-            # Can't have relationships with only one object
             return {}, {}, {}, {}, {}, {}, {}
             
         # --- 1. Basic Relationships, Adjacencies, & Match Groups ---
@@ -4588,14 +4633,17 @@ class ObmlAgi3Agent(Agent):
         return (None, 0)
 
     def _extract_all_features(self, ctx: dict) -> frozenset:
-        """
-        Extracts EVERY characteristic and relationship of the ENTIRE grid into 
-        a flat set of boolean string propositions. (Target-Agnostic)
-        """
+        """..."""
         features = set()
         if not ctx or 'summary' not in ctx: return frozenset()
         
         for obj in ctx['summary']:
+            # --- NEW: The Splitter Blindfold ---
+            # Do not extract any variables for the HUD, so it never becomes a Suspect.
+            if obj.get('is_hud'):
+                continue
+            # -----------------------------------
+            
             oid = obj['id']
             features.add(f"{oid}_exists")
             features.add(f"{oid}_color_{obj['color']}")
