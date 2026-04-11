@@ -529,10 +529,17 @@ class ObmlAgi3Agent(Agent):
                 for obj in prev_summary:
                     if obj['id'] not in changed_ids:
                         # Create synthetic NO_CHANGE event
-                        # This ensures we record that we TRIED the action and nothing happened.
-                        # This creates N=1 data, preventing the "Exploration Bonus" loop.
                         no_change_event = {'type': 'NO_CHANGE', 'id': obj['id']}
                         events.append(no_change_event)
+
+                # --- FIX: The "Guest List" Check (Object Permanence) ---
+                # Check if the Gatekeeper is waiting for data on an object that no longer exists.
+                for mandate_obj_id in list(self.active_experiments.keys()):
+                    if mandate_obj_id not in changed_ids and not any(o['id'] == mandate_obj_id for o in prev_summary):
+                        # The object is completely gone from the room. 
+                        # Submit a synthetic failure so the Splitter learns its presence is required.
+                        events.append({'type': 'NO_CHANGE', 'id': mandate_obj_id})
+                # ---------------------------------------------------
                 # ---------------------------------------------------
                 # --- NEW: Pre-calculate Physics for Classification ---
                 # We run this BEFORE classification so the notes are available 
@@ -561,13 +568,18 @@ class ObmlAgi3Agent(Agent):
                         if prev_obj:
                             # 1. Get Scientific State (Color/Shape/Size + Context)
                             state_sig = self._get_scientific_state(prev_obj, prev_context)
+                        else:
+                            # --- FIX: Ghost Object Signature ---
+                            # The object no longer exists, but we still use its ID as its state
+                            # to record the NO_CHANGE data and clear the active mandate.
+                            state_sig = obj_id
                             
-                            # 2. Get Concrete Result (The "What happened")
-                            result_sig = self._get_concrete_signature(event)
-                            
-                            # 3. Log to Truth Table
-                            # learning_key is the Action (e.g., 'ACTION6_obj_5')
-                            self._update_truth_table(state_sig, learning_key, result_sig, obj_id=obj_id)
+                        # 2. Get Concrete Result (The "What happened")
+                        result_sig = self._get_concrete_signature(event)
+                        
+                        # 3. Log to Truth Table
+                        # learning_key is the Action (e.g., 'ACTION6_obj_5')
+                        self._update_truth_table(state_sig, learning_key, result_sig, obj_id=obj_id)
 
                 # --- NEW: Run The Scientific Judge HERE ---
                 # Now that data is recorded, let the Judge certify any rules immediately 
@@ -1954,32 +1966,41 @@ class ObmlAgi3Agent(Agent):
             if 'result' in law:
                 return self._expand_result(law['result'], target_obj), 100
         
-        # TIER 2: Isolated Bucket Laws
+        # TIER 2: Positive-First Conjunction (The Goldilocks Zone)
         refined_vars = self.state_refinements.get(target_id, {})
         current_features = self._extract_all_features(current_context)
-        predictions = []
         
-        for base_var, buckets in refined_vars.items():
-            active_val = next((f for f in current_features if self._get_base_variable(f) == base_var), None)
-            if active_val:
-                for r_sig, bucket in buckets.items():
-                    if active_val in bucket:
-                        # --- FIX: Check count for the specific action AND global total ---
-                        action_count = len(self.truth_table.get(target_id, {}).get(full_action_key, {}).get(r_sig, []))
-                        
-                        total_global_count = 0
-                        for a_key, r_map in self.truth_table.get(target_id, {}).items():
-                            total_global_count += len(r_map.get(r_sig, []))
-                            
-                        if action_count >= 2:
-                            predictions.append((r_sig, action_count))
-                        elif total_global_count >= 2:
-                            predictions.append((r_sig, total_global_count))
-                            
-        if predictions:
-            # If multiple hypotheses agree, pick the one with the highest N count
-            best_r_sig = sorted(predictions, key=lambda x: x[1], reverse=True)[0][0]
-            return self._expand_result(best_r_sig, target_obj), 100
+        if refined_vars:
+            # Assume success unless proven otherwise
+            predict_failure = False
+            best_success_sig = None
+            
+            for base_var, buckets in refined_vars.items():
+                active_val = next((f for f in current_features if self._get_base_variable(f) == base_var), None)
+                
+                # Find the SUCCESS bucket and FAILURE bucket for this variable
+                success_bucket = set()
+                failure_bucket = set()
+                for r_sig, b_vals in buckets.items():
+                    if r_sig[0] == 'NO_CHANGE': failure_bucket.update(b_vals)
+                    else: 
+                        success_bucket.update(b_vals)
+                        best_success_sig = r_sig 
+                
+                # Check for Violation A: Missing Prerequisite
+                if not active_val and success_bucket:
+                    predict_failure = True
+                    break
+                    
+                # Check for Violation B: Poisoned Value
+                if active_val and active_val in failure_bucket and active_val not in success_bucket:
+                    predict_failure = True
+                    break
+            
+            if predict_failure:
+                return [], 100 # NO_CHANGE
+            elif best_success_sig:
+                return self._expand_result(best_success_sig, target_obj), 100
 
         # 3. [NEW] Greedy Prediction from Truth Table
         if target_id in self.truth_table:
@@ -3292,7 +3313,8 @@ class ObmlAgi3Agent(Agent):
             if target_obj:
                 state_sig = self._get_scientific_state(target_obj, prev_context)
             else:
-                state_sig = None
+                # --- FIX: Handle Ghost Signatures during Classification ---
+                state_sig = obj_id
 
             # 3. Check the Law Book (Certified Laws)
             laws_for_obj = self.certified_laws.get(obj_id, {})
@@ -4342,11 +4364,70 @@ class ObmlAgi3Agent(Agent):
 
         if len(contexts_by_result) < 2: return
 
-        # --- 1. EXTRACTION & AGGREGATION (Building the Buckets) ---
-        # Group features by their Base Variable for each specific outcome.
-        # Structure: result_variable_values[result_sig][base_var] = set(raw_strings)
-        result_variable_values = {}
+        # --- 1. POSITIVE-FIRST AGGREGATION (The Goldilocks Zone) ---
+        success_contexts = []
+        failure_contexts = []
         
+        for r_sig, ctx_list in contexts_by_result.items():
+            if r_sig[0] == 'NO_CHANGE':
+                failure_contexts.extend(ctx_list)
+            else:
+                success_contexts.extend(ctx_list)
+                
+        if not success_contexts or not failure_contexts:
+            return # We need both to find a differentiator
+
+        # Build the Success Profile
+        success_base_var_counts = {}
+        success_base_var_values = {}
+        
+        for ctx_entry in success_contexts:
+            raw_features = self._extract_all_features(ctx_entry['snapshot'])
+            seen_in_this_ctx = set()
+            
+            for f_str in raw_features:
+                base_var = self._get_base_variable(f_str)
+                seen_in_this_ctx.add(base_var)
+                
+                if base_var not in success_base_var_values:
+                    success_base_var_values[base_var] = set()
+                success_base_var_values[base_var].add(f_str)
+                
+            for base_var in seen_in_this_ctx:
+                success_base_var_counts[base_var] = success_base_var_counts.get(base_var, 0) + 1
+
+        # --- 2. DIFFERENTIATION (Finding the Violators) ---
+        valid_refinements = set()
+        num_successes = len(success_contexts)
+        
+        for f_ctx_entry in failure_contexts:
+            raw_features = self._extract_all_features(f_ctx_entry['snapshot'])
+            f_base_vars_present = set()
+            f_base_var_values = {}
+            
+            for f_str in raw_features:
+                base_var = self._get_base_variable(f_str)
+                f_base_vars_present.add(base_var)
+                f_base_var_values[base_var] = f_str
+                
+            violators_for_this_failure = set()
+            
+            # Reason A: Poisoned Value (A value causing failure that was NEVER seen in success)
+            for base_var, val in f_base_var_values.items():
+                if base_var in success_base_var_values:
+                    if val not in success_base_var_values[base_var]:
+                        violators_for_this_failure.add(base_var)
+                        
+            # Reason B: Missing Prerequisite (Strictly required in success, missing in failure)
+            for base_var, count in success_base_var_counts.items():
+                if count == num_successes: 
+                    if base_var not in f_base_vars_present:
+                        violators_for_this_failure.add(base_var)
+                        
+            valid_refinements.update(violators_for_this_failure)
+            
+        # Build the result_variable_values dictionary for the bucket mapping below
+        result_variable_values = {}
         for r_sig, ctx_list in contexts_by_result.items():
             result_variable_values[r_sig] = {}
             for ctx_entry in ctx_list:
@@ -4356,38 +4437,6 @@ class ObmlAgi3Agent(Agent):
                     if base_var not in result_variable_values[r_sig]:
                         result_variable_values[r_sig][base_var] = set()
                     result_variable_values[r_sig][base_var].add(f_str)
-
-        # --- 2. DIFFERENTIATION (The Disjoint Set Check) ---
-        # Find variables whose 'Value Sets' never overlap between any two different outcomes.
-        valid_refinements = set()
-        r_sigs = list(contexts_by_result.keys())
-        
-        # Gather all unique base variables seen across all results
-        all_base_vars = set()
-        for r_sig in r_sigs:
-            all_base_vars.update(result_variable_values[r_sig].keys())
-            
-        for base_var in all_base_vars:
-            is_disjoint_everywhere = True
-            
-            # Compare the buckets for every outcome against every other outcome
-            for i in range(len(r_sigs)):
-                for j in range(i + 1, len(r_sigs)):
-                    sig_A = r_sigs[i]
-                    sig_B = r_sigs[j]
-                    
-                    values_A = result_variable_values[sig_A].get(base_var, set())
-                    values_B = result_variable_values[sig_B].get(base_var, set())
-                    
-                    # If they share even one state, this variable does not reliably separate them
-                    if not values_A.isdisjoint(values_B):
-                        is_disjoint_everywhere = False
-                        break
-                if not is_disjoint_everywhere:
-                    break
-                    
-            if is_disjoint_everywhere:
-                valid_refinements.add(base_var)
 
         # --- 3. APPLY DISCOVERIES ---
         if valid_refinements:
@@ -4426,7 +4475,8 @@ class ObmlAgi3Agent(Agent):
                     for refinement in valid_refinements:
                         # Build the bucket map for this isolated variable
                         bucket_map = {}
-                        for r_sig in r_sigs:
+                        # --- FIX: Use the keys from the dictionary we just built ---
+                        for r_sig in result_variable_values.keys():
                             bucket_map[r_sig] = result_variable_values[r_sig].get(refinement, set())
                             
                         # Store the exact boundaries of the bucket
