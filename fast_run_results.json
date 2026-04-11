@@ -2,8 +2,8 @@
   {
     "game_id": "vc33",
     "score": 0,
-    "steps": 1,
-    "status": "FAILED",
-    "error": "No grid found in observation"
+    "steps": 50,
+    "status": "COMPLETED",
+    "error": null
   }
 ]
