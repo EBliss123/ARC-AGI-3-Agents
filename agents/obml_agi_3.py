@@ -299,6 +299,9 @@ class ObmlAgi3Agent(Agent):
         if not latest_frame.available_actions:
             return None
 
+        # --- FIX: Store for the Gatekeeper ---
+        self._last_available_actions = latest_frame.available_actions
+
         # --- 3. Stability Check (DISABLED) ---
         # Immediate pass-through: We act on every frame available.
         current_pixels = latest_frame.frame[0] if latest_frame.frame else []
@@ -955,27 +958,34 @@ class ObmlAgi3Agent(Agent):
 
             for obj in current_summary:
                 obj_id = obj['id']
-                has_data = (obj_id in self.truth_table and this_action_key in self.truth_table[obj_id])
                 
-                # Check Certainty (Do we already have a certified law for this?)
-                target_obj_for_score = next((o for o in current_summary if o['id'] == obj_id), None)
-                if target_obj_for_score:
-                    state_sig_for_score = self._get_scientific_state(target_obj_for_score, current_full_context)
-                    laws_for_obj = self.certified_laws.get(obj_id, {})
-                    laws = laws_for_obj.get(state_sig_for_score, {})
-                    
-                    # --- NEW: Strict Scientific Credentials ---
-                    has_direct_law = this_action_key in laws
-                    has_global_law = 'ANY' in laws and laws['ANY'].get('type') == 'GLOBAL'
-                    
-                    if has_direct_law or has_global_law:
-                        scientific_score -= 1
-                        continue
-                    # ----------------------------------------
+                # --- FIX: Splitter-Aware Curiosity ---
+                # Predict what THIS move (this_action_key) will do to THIS object (obj_id)
+                predicted_events, confidence = self._predict_outcome(this_action_key, obj_id, current_full_context)
                 
-                # Base Ignorance Scoring
-                if has_data: scientific_score -= 1
-                else: scientific_score += 1
+                state_sig = self._get_scientific_state(obj, current_full_context)
+                action_history = self.truth_table.get(obj_id, {}).get(this_action_key, {})
+                
+                # Calculate raw observation counts for this exact state
+                results_in_this_state = sum(1 for r_sig, locs in action_history.items() if any(len(e) >= 3 and e[2] == state_sig for e in locs))
+                total_n_for_this_state = sum(len([e for e in locs if len(e) >= 3 and e[2] == state_sig]) for r_sig, locs in action_history.items())
+                
+                # 1. Is the science completely settled? (Predictor is 100% confident)
+                if confidence == 100:
+                    scientific_score -= 1
+                    
+                # 2. Is there an active, unsolved contradiction? (Splitter needs data)
+                elif results_in_this_state > 1:
+                    scientific_score += 1  # Adjusted to +1 as requested
+                    
+                # 3. Have we never physically tried this?
+                elif total_n_for_this_state == 0:
+                    scientific_score += 1
+                    
+                # 4. Consistent so far, waiting on Controls (handled by Tier 1A)
+                else:
+                    scientific_score -= 1
+                # -------------------------------------
 
             if scientific_score > 0:
                 science_moves.append((move, scientific_score))
@@ -1013,7 +1023,7 @@ class ObmlAgi3Agent(Agent):
                     
                     # Check every object on the board to see if THIS action moves ANYTHING
                     for eval_obj in current_full_context.get('summary', []):
-                        predicted_events, conf = self._predict_outcome((full_action_name, eval_obj['id']), current_full_context)
+                        predicted_events, conf = self._predict_outcome(full_action_name, eval_obj['id'], current_full_context)
                         if predicted_events:
                             agitator_candidates.append(move)
                             break # Found a change! We can stop checking objects.
@@ -1912,31 +1922,25 @@ class ObmlAgi3Agent(Agent):
                     if self.debug_channels['HYPOTHESIS']:
                         print(f"  [Global Forecaster] Discovered Signal: Event {sig} is preceded by a specific state.")
 
-    def _predict_outcome(self, hypothesis_key: tuple, current_context: dict) -> tuple[list|None, int]:
+    def _predict_outcome(self, action_key: str, eval_obj_id: str, current_context: dict) -> tuple[list|None, int]:
         """
         Scientific Prediction. 
         Priority 1: Certified Laws.
         Priority 2: Greedy Assumption (Truth Table Lookup with Refined State).
         """
-        action_name, target_id = hypothesis_key
+        # --- FIX: Map the variable so the lower half of the function doesn't crash ---
+        target_id = eval_obj_id
         
-        target_obj = None
-        if target_id:
-            target_obj = next((o for o in current_context['summary'] if o['id'] == target_id), None)
-        
+        target_obj = next((o for o in current_context['summary'] if o['id'] == target_id), None)
         if not target_obj: return None, 0
         
-        # --- FIX: Construct the full action key (e.g. 'ACTION6_obj_1') ---
-        full_action_key = self._get_learning_key(action_name, target_id)
-        
-        # 1. Get the Scientific State
         state_sig = self._get_scientific_state(target_obj, current_context)
         
-        # 2. Check Certified Laws (Established Science)
-        laws_for_obj = self.certified_laws.get(target_id, {})
+        laws_for_obj = self.certified_laws.get(eval_obj_id, {})
         univ_laws = laws_for_obj.get('UNIVERSAL_STATE', {})
         
-        # --- NEW: Prevent Arrogant Predictions ---
+        full_action_key = action_key
+        
         law = univ_laws.get(full_action_key)
         
         # If we don't have a direct law, check for an ANY law, 
@@ -2154,20 +2158,28 @@ class ObmlAgi3Agent(Agent):
                     failure_rule = self.failure_patterns[base_action_key_str]
                     if self._context_matches_pattern(current_full_context, failure_rule):
                         profile['failures'] = 1
-                    
-                # 2. If no failure was triggered, predict the SUCCESS outcome
+                        
+                # 2. If no failure was triggered, evaluate ALL objects for this action
                 if profile['failures'] == 0:
-                    hypothesis_key = (base_action_key_str.split('_')[0], target_id)
-                    # FIX: Unpack tuple (events, confidence)
-                    predicted_event_list, confidence = self._predict_outcome(hypothesis_key, current_full_context)
+                    for eval_obj in hypothetical_summary:
+                        predicted_event_list, confidence = self._predict_outcome(base_action_key_str, eval_obj['id'], current_full_context)
+                        
+                        if predicted_event_list is None:
+                            profile['unknowns'] += 1
+                        elif predicted_event_list:
+                            hashable_events = [tuple(sorted(e.items())) for e in predicted_event_list]
+                            predicted_outcome_fingerprint = tuple(sorted(hashable_events))
+                            all_predicted_events_for_move.extend(predicted_event_list)
+                            
+                            if predicted_outcome_fingerprint in self.seen_outcomes and confidence >= 2:
+                                profile['boring'] += 1
+                            else:
+                                profile['discoveries'] += 1
+                                predicted_fingerprints_for_this_move.add(predicted_outcome_fingerprint)
                     
-                    # --- Convert event list to a hashable fingerprint ---
-                    predicted_outcome_fingerprint = None
-                    if predicted_event_list is not None:
-                        hashable_events = [tuple(sorted(e.items())) for e in predicted_event_list]
-                        predicted_outcome_fingerprint = tuple(sorted(hashable_events))
-                        all_predicted_events_for_move.extend(predicted_event_list)
-                    # --- End conversion ---
+                    # If all objects had no change
+                    if profile['unknowns'] == 0 and profile['discoveries'] == 0 and profile['boring'] == 0:
+                        profile['failures'] += 1
                     
                     # 3. Tally the result
                     if predicted_event_list is None:
@@ -2191,8 +2203,9 @@ class ObmlAgi3Agent(Agent):
                             continue
 
                     # 2. If no failure, predict the per-object SUCCESS outcome
-                    # FIX: Unpack tuple (events, confidence)
-                    predicted_event_list, confidence = self._predict_outcome(hypothesis_key, current_full_context)
+                    # --- FIX: Pass 3 arguments (Action Key, Object ID, Context) ---
+                    action_str_part = base_action_key_str.split('_')[0]
+                    predicted_event_list, confidence = self._predict_outcome(action_str_part, obj_id, current_full_context)
                     
                     # --- Convert event list to a hashable fingerprint ---
                     predicted_outcome_fingerprint = None
@@ -2247,34 +2260,30 @@ class ObmlAgi3Agent(Agent):
         target_id = target_obj['id'] if target_obj else None
         action_key = self._get_learning_key(action_template.name, target_id)
         
-        # We need to predict for ALL objects (Global) or just the Target
+        # Check Failure Landmines first (Veto)
+        if action_key in self.failure_patterns and self._context_matches_pattern(context, self.failure_patterns[action_key]):
+            return (0, 0, -1, 0) # Immediate Failure
+            
         predicted_events = []
-        
-        if target_id:
-            # Targeted Action
-            base_key = (action_key.split('_')[0], target_id)
+        for obj in current_summary:
+            events, conf = self._predict_outcome(action_key, obj['id'], context)
             
-            # Check Failure Landmines first (Veto)
-            if action_key in self.failure_patterns and self._context_matches_pattern(context, self.failure_patterns[action_key]):
-                return (0, 0, -1, 0) # Immediate Failure
-            
-            events, conf = self._predict_outcome(base_key, context)
             if events is None: return (1, 0, 0, 0) # Found an Unknown! Immediate reward.
-            if not events: return (0, 0, -1, 0) # Failure
-            predicted_events = events
-            
-            # Check if this specific outcome is a Discovery
-            hashable = tuple(sorted([tuple(sorted(e.items())) for e in events]))
-            if hashable not in self.seen_outcomes or conf < 2:
-                return (0, 1, 0, 0) # Found a Discovery!
+            if events:
+                hashable = tuple(sorted([tuple(sorted(e.items())) for e in events]))
+                if hashable not in self.seen_outcomes or conf < 2:
+                    return (0, 1, 0, 0) # Discovery
+                predicted_events.extend(events)
+        
+        if not predicted_events: return (0, 0, -1, 0) # All objects failed
                 
         else:
             # Global Action (simulate for all objects)
             # For simplicity in lookahead, we just check if ANY object triggers Unknown/Discovery
             total_events = []
             for obj in current_summary:
-                base_key = (action_key, obj['id'])
-                events, conf = self._predict_outcome(base_key, context)
+                # --- FIX: Pass 3 arguments ---
+                events, conf = self._predict_outcome(action_key, obj['id'], context)
                 
                 if events is None: return (1, 0, 0, 0) # Unknown
                 if events:
@@ -4183,8 +4192,8 @@ class ObmlAgi3Agent(Agent):
         
         # Calculate total known tools for Global checks
         total_known_tools = 7
-        if hasattr(self, 'frames') and self.frames and self.frames[-1].available_actions:
-            available = self.frames[-1].available_actions
+        if hasattr(self, '_last_available_actions') and self._last_available_actions:
+            available = self._last_available_actions
             num_globals = sum(1 for a in available if a.name != 'ACTION6')
             has_click = any(a.name == 'ACTION6' for a in available)
             total_known_tools = num_globals + (len(self.last_object_summary) if has_click and hasattr(self, 'last_object_summary') else 0)
@@ -4209,10 +4218,14 @@ class ObmlAgi3Agent(Agent):
                         
                         for other_a, other_r_counts in action_to_results.items():
                             if other_a != a_key:
-                                if r_sig in other_r_counts:
+                                # --- FIX: Strict Global Consistency ---
+                                # The other action must ONLY cause this result to be grouped in.
+                                # If it causes multiple results, it proves the result is NOT universal.
+                                if len(other_r_counts) == 1 and r_sig in other_r_counts:
                                     same_result_actions.add(other_a)
                                 else:
                                     has_neg_control = True
+                                # --------------------------------------
                                     
                         if len(same_result_actions) >= total_known_tools:
                             self._certify_law(obj_id, 'GLOBAL', 'ANY', r_sig, 'UNIVERSAL_STATE')
@@ -4606,9 +4619,8 @@ class ObmlAgi3Agent(Agent):
                 
                 # 2. Predict outcome for EVERY object on the board, regardless of action type
                 for eval_obj in curr_ctx.get('summary', []):
-                    # We pass the full action name and the object being evaluated
-                    hypothesis_key = (full_action_name, eval_obj['id'])
-                    predicted_events, conf = self._predict_outcome(hypothesis_key, curr_ctx)
+                    # --- FIX: Pass 3 arguments instead of the old hypothesis_key tuple ---
+                    predicted_events, conf = self._predict_outcome(full_action_name, eval_obj['id'], curr_ctx)
                     
                     if predicted_events is None:
                         move_is_ambiguous = True
