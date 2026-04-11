@@ -1,9 +1,9 @@
 [
   {
     "game_id": "vc33",
-    "score": 0,
-    "steps": 50,
-    "status": "COMPLETED",
+    "score": 1,
+    "steps": 240,
+    "status": "TIMEOUT",
     "error": null
   }
 ]

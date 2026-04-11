@@ -758,8 +758,9 @@ class ObmlAgi3Agent(Agent):
                                 self._print_and_log(f"       [Needs]    {fix}")
                 
                 # --- Failsafe: Track banned actions ---
-                # UPDATED: Success = Any change detected (events) OR level increase.
-                action_succeeded = bool(events) or level_increased
+                # UPDATED: Success = Any REAL change detected OR level increase.
+                has_real_change = any(e.get('type') != 'NO_CHANGE' for e in events)
+                action_succeeded = has_real_change or level_increased
                 
                 # --- NEW: Track Productive Actions (ACTION6 Only) ---
                 if action_succeeded and self.last_action_context and self.last_action_context.startswith('ACTION6'):
@@ -4408,6 +4409,16 @@ class ObmlAgi3Agent(Agent):
                 # Check for Promotion to Parallel Hypotheses
                 STABILITY_THRESHOLD = 2
                 if self.pending_refinements[obj_id]['stable_count'] >= STABILITY_THRESHOLD:
+                    
+                    # --- NEW: Purge old falsified hypotheses ---
+                    old_refinements = set(self.state_refinements.get(obj_id, {}).keys())
+                    falsified = old_refinements - valid_refinements
+                    for f in falsified:
+                        del self.state_refinements[obj_id][f]
+                        if self.debug_channels['HYPOTHESIS']:
+                            self._print_and_log(f"  [Splitter] FALSIFIED Variable: Removed '{f}' for {obj_id}.")
+                    # -------------------------------------------
+
                     if obj_id not in self.state_refinements:
                         self.state_refinements[obj_id] = {} # Dict instead of list!
                     
@@ -4426,7 +4437,15 @@ class ObmlAgi3Agent(Agent):
                     del self.pending_refinements[obj_id]
                     
                     if added_count > 0 and self.debug_channels['HYPOTHESIS']:
-                        print(f"  [Splitter] PROMOTION! Spawning {added_count} Parallel Hypotheses for {obj_id}.")
+                        self._print_and_log(f"  [Splitter] PROMOTION! Spawning {added_count} Parallel Hypotheses for {obj_id}.")
+        else:
+            # --- NEW: TOTAL FALSIFICATION ---
+            if obj_id in self.pending_refinements:
+                del self.pending_refinements[obj_id]
+            if obj_id in self.state_refinements:
+                del self.state_refinements[obj_id]
+                if self.debug_channels['HYPOTHESIS']:
+                    self._print_and_log(f"  [Splitter] TOTAL FALSIFICATION! Destroyed all Parallel Hypotheses for {obj_id}.")
 
     def _get_context_prop(self, ctx_entry: dict, key: str, mode: str):
         """
