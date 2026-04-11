@@ -258,6 +258,7 @@ def run_single_game(game_id, args_agent_name):
         info = {'score': getattr(obs, 'levels_completed', 0)}
     
     total_steps = 0
+    previous_levels = info.get('score', 0) # --- NEW: Track the starting score ---
     
     try:
         while True:
@@ -328,9 +329,29 @@ def run_single_game(game_id, args_agent_name):
                 state_str = str(state_val)
                 terminated = "NOT_FINISHED" not in state_str
                 truncated = False
-                info = {'score': getattr(obs, 'levels_completed', 0)}
+                info = {}
+
+            # --- FIX: Bulletproof Score Extraction ---
+            # Ensure info always has the score, whether it's hidden in the 
+            # Gym dict or directly on the observation object.
+            if hasattr(obs, 'levels_completed'):
+                info['score'] = getattr(obs, 'levels_completed')
+            elif isinstance(obs, dict) and 'levels_completed' in obs:
+                info['score'] = obs['levels_completed']
+            elif 'score' not in info:
+                info['score'] = 0
+            # -----------------------------------------
 
             total_steps += 1
+            
+            # --- Fresh budget for new levels ---
+            current_levels = info.get('score', 0)
+            if current_levels > previous_levels:
+                total_steps = 0
+                previous_levels = current_levels
+                print(f"\n--- Level Up! Resetting step counter to 0 for the new board. ---")
+            # ----------------------------------------
+
             if total_steps % 1000 == 0:
                 print(f"Step {total_steps} | Score: {info.get('score', 0)}")
             
