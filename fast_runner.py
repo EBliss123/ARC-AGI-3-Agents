@@ -336,12 +336,34 @@ def run_single_game(game_id, args_agent_name):
             
             if terminated or truncated:
                 final_score = info.get('score', 0)
-                print(f"--- GAME OVER: {game_id} ---")
-                print(f"Final Score: {final_score}")
+                result["score"] = max(result["score"], final_score)
+                print(f"\n--- LEVEL ATTEMPT OVER: {game_id} (Score: {final_score}) ---")
                 
-                result["score"] = final_score
-                result["status"] = "COMPLETED"
-                break
+                # 1. Feed the GAME_OVER state to the agent so it learns from its death
+                death_frame = FrameData(
+                    frame=grid,
+                    state=GameState.GAME_OVER,
+                    available_actions=valid_actions,
+                    score=final_score
+                )
+                agent.choose_action([death_frame], death_frame)
+                
+                # 2. Reset the environment for the next attempt
+                try:
+                    reset_result = env.reset()
+                    if isinstance(reset_result, tuple) and len(reset_result) == 2:
+                        obs, info = reset_result
+                    else:
+                        obs = reset_result
+                        info = {'score': getattr(obs, 'levels_completed', 0)}
+                    print("--- Environment Reset. Agent is retrying with learned knowledge... ---")
+                    
+                    # 3. Use CONTINUE so the total_steps counter keeps going up to 240
+                    continue 
+                except Exception as e:
+                    print(f"Environment refused to reset (Game likely fully complete): {e}")
+                    result["status"] = "COMPLETED"
+                    break
                 
     except KeyboardInterrupt:
         raise 
