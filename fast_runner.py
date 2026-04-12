@@ -13,9 +13,16 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=".env.example")
 load_dotenv(dotenv_path=".env", override=True)
 
-SCHEME = os.environ.get("SCHEME", "http")
-HOST = os.environ.get("HOST", "localhost")
-PORT = os.environ.get("PORT", 8001)
+# ADD THESE LINES: Detect if running on Kaggle and override host/port
+KAGGLE_MODE = os.path.exists('/kaggle/working')
+if KAGGLE_MODE:
+    HOST = "gateway"
+    PORT = 8001
+    SCHEME = "http"
+else:
+    SCHEME = os.environ.get("SCHEME", "http")
+    HOST = os.environ.get("HOST", "localhost")
+    PORT = os.environ.get("PORT", 8001)
 
 if (SCHEME == "http" and str(PORT) == "80") or (SCHEME == "https" and str(PORT) == "443"):
     ROOT_URL = f"{SCHEME}://{HOST}"
@@ -441,6 +448,14 @@ def run_fast():
         print("Results saved to 'fast_run_results.json'")
     except Exception as e:
         print(f"Could not save JSON results: {e}")
+
+    # Required for Kaggle submission validation
+    try:
+        with open("submission.csv", "w") as f:
+            f.write("dummy\n0")
+        print("Created submission.csv for Kaggle validation.")
+    except Exception as e:
+        print(f"Could not create submission.csv: {e}")
 
 if __name__ == "__main__":
     run_fast()
