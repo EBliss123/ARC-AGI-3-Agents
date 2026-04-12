@@ -232,6 +232,7 @@ class ObmlAgi3Agent(Agent):
         
         # --- NEW: Behavioral HUD Tracking ---
         self.hud_pair = None
+        self.hud_colors = None        # --- NEW: Persistent color mapping ---
         self.hud_history = []
         self.death_clock = None
         self.known_growers = set()    # --- FIX: Track monotonicity per-run ---
@@ -513,16 +514,15 @@ class ObmlAgi3Agent(Agent):
 
                 # --- NEW: BEHAVIORAL HUD IDENTIFICATION & SCRUBBING ---
                 if not hasattr(self, 'hud_pair'): self.hud_pair = None
-                if not hasattr(self, 'hud_history'): self.hud_history = []
-                if not hasattr(self, 'known_growers'): self.known_growers = set()
-                if not hasattr(self, 'known_shrinkers'): self.known_shrinkers = set()
+                if not hasattr(self, 'hud_colors'): self.hud_colors = None
 
-                # Track monotonic violations for the current run
-                for e in events:
-                    if e['type'] == 'GROWTH': self.known_growers.add(e.get('id'))
-                    if e['type'] == 'SHRINK': self.known_shrinkers.add(e.get('id'))
-                
-                # 1. The True HUD Filter
+                # --- NEW: Continuity Guard ---
+                # If a locked ID disappears, unlock to re-identify (handles rare ID reassignments)
+                if self.hud_pair and not all(any(o['id'] == hid for o in current_summary) for hid in self.hud_pair):
+                    self.hud_pair = None
+                    self.hud_colors = None
+
+                # 1. Identification Phase (Only runs until a HUD is locked)
                 if not self.hud_pair:
                     shrink_events = [e for e in events if e['type'] == 'SHRINK']
                     growth_events = [e for e in events if e['type'] == 'GROWTH']
@@ -532,136 +532,117 @@ class ObmlAgi3Agent(Agent):
                         s_id = s_ev['id']
                         s_obj = next((o for o in prev_summary if o['id'] == s_id), None)
                         
-                        # Geometric Purity: Shrinking object must be a perfect rectangle
+                        # Prerequisite: Must be a perfect rectangle
                         if not s_obj or not s_obj.get('is_perfect_rectangle'): continue
-                        
-                        # Strict Monotonicity: Must never have grown THIS RUN
-                        if s_id in self.known_growers: continue
                         
                         for g_ev in growth_events:
                             g_id = g_ev['id']
+                            g_obj = next((o for o in current_summary if o['id'] == g_id), None)
                             
-                            # Strict Monotonicity: Must never have shrunk THIS RUN
-                            if g_id in self.known_shrinkers: continue
+                            # Prerequisite: Grower must also be a perfect rectangle
+                            if not g_obj or not g_obj.get('is_perfect_rectangle'): continue
                             
                             # Conservation of Mass: Exact pixel exchange
                             if abs(s_ev['pixel_delta']) == g_ev['pixel_delta']:
                                 candidates.append((s_id, g_id))
                     
-                    # The Highlander Rule: Only one valid pair can exist
+                    # The Highlander Rule: Once exactly 1 candidate is found, it's finalized
                     if len(candidates) == 1:
                         self.hud_pair = candidates[0]
                         s_id, g_id = self.hud_pair
+                        
+                        # --- NEW: Anchor roles by color ---
+                        s_obj = next(o for o in prev_summary if o['id'] == s_id)
+                        g_obj = next(o for o in current_summary if o['id'] == g_id)
+                        self.hud_colors = {'bar_color': s_obj['color'], 'track_color': g_obj['color']}
+                        
                         if self.debug_channels.get('CHANGES', True):
-                            self._print_and_log(f"\n--- [HUD DETECTED] Behavioral Linked Pair: {s_id} (Shrinker) & {g_id} (Grower) ---")
+                            self._print_and_log(f"\n--- [HUD FINALIZED] Locked: Bar(Color {s_obj['color']}) & Track(Color {g_obj['color']}) ---")
                         
                         # --- 2. RECURSIVE MEMORY SCRUB ---
+                        # Permanently erase these IDs from the physics engine's memory
                         hud_ids = {s_id, g_id}
-                        
-                        # Purge from Direct & Global Rule Memory
                         for hid in hud_ids:
                             self.truth_table.pop(hid, None)
                             self.certified_laws.pop(hid, None)
+                            self.active_experiments.pop(hid, None)
                             self.state_refinements.pop(hid, None)
                             self.pending_refinements.pop(hid, None)
-                            self.active_experiments.pop(hid, None)
                         
-                        # Purge from Causal Memory
                         for a_key, effects in self.action_effects_memory.items():
                             to_remove = [f for f in effects if any(hid in f for hid in hud_ids)]
                             for f in to_remove: effects.remove(f)
                             
-                        # Purge from Relational Graph Archive
-                        to_remove_rel = [s for s in self.relational_archive if any(hid in s for hid in hud_ids)]
-                        for s in to_remove_rel: self.relational_archive.remove(s)
-                            
-                        # Retroactive Muting (Infects history so past contexts ignore it)
+                        # Retroactively mark history so the scientist ignores past frames
                         for past_ctx in self.level_state_history:
                             for obj in past_ctx.get('summary', []):
-                                if obj['id'] in hud_ids:
-                                    obj['is_hud'] = True
-                                    
-                        if self.debug_channels.get('CHANGES', True):
-                            self._print_and_log("--- [HUD SCRUB] Erased HUD objects from all scientific and relational memory. ---")
+                                if obj['id'] in hud_ids: obj['is_hud'] = True
                         
-                # 3. The Sequence Solver & Oracle
+                # 3. Refill-Tolerant Oracle (Runs once HUD is locked)
                 if self.hud_pair:
-                    s_id, g_id = self.hud_pair
-                    
-                    # Forward Muting: Ensure current frames ignore them
+                    # --- NEW: Identify roles by persistent color, not ID order ---
+                    objs = [o for o in current_summary if o['id'] in self.hud_pair]
+                    if len(objs) == 2 and self.hud_colors:
+                        bar_obj = next((o for o in objs if o['color'] == self.hud_colors['bar_color']), None)
+                        if bar_obj:
+                            bar_id = bar_obj['id']
+                            track_id = next(oid for oid in self.hud_pair if oid != bar_id)
+                        else:
+                            bar_id, track_id = self.hud_pair # Fallback
+                    else:
+                        bar_id, track_id = self.hud_pair
+                                        
+                    # Forward Muting: Ensure both frames ignore the locked IDs
                     for obj in prev_summary:
                         if obj['id'] in self.hud_pair: obj['is_hud'] = True
                     for obj in current_summary:
                         if obj['id'] in self.hud_pair: obj['is_hud'] = True
                         
-                    curr_s_obj = next((o for o in current_summary if o['id'] == s_id), None)
-                    if curr_s_obj:
-                        curr_pixels = curr_s_obj['pixels']
-                        prev_s_obj = next((o for o in prev_summary if o['id'] == s_id), None)
+                    curr_bar = next((o for o in current_summary if o['id'] == bar_id), None)
+                    prev_bar = next((o for o in prev_summary if o['id'] == bar_id), None)
+                    
+                    if curr_bar and prev_bar:
+                        curr_pixels = curr_bar['pixels']
+                        prev_pixels = prev_bar['pixels']
                         
                         if not hasattr(self, 'hud_state_map'): self.hud_state_map = {}
                         
-                        # 1. Record the State Transition
-                        if prev_s_obj:
-                            prev_pixels = prev_s_obj['pixels']
-                            if prev_pixels > curr_pixels: # A drop occurred!
-                                
-                                # --- FIX: Falsifiable Cross-Level Memory ---
-                                # If the map expects a different drop, the level rules have changed.
-                                if prev_pixels in self.hud_state_map and self.hud_state_map[prev_pixels] != curr_pixels:
-                                    if self.debug_channels.get('CHANGES', True):
-                                        self._print_and_log(f"  [ORACLE] HUD Rule Contradiction! Expected {self.hud_state_map[prev_pixels]}, got {curr_pixels}. Wiping old map.")
-                                    self.hud_state_map = {} 
-                                
-                                self.hud_state_map[prev_pixels] = curr_pixels
-                                
-                        # 2. Oracle: Project Death Clock using the Map
+                        # Record Positional Transition
+                        if prev_pixels > curr_pixels: # Standard Drop
+                            self.hud_state_map[prev_pixels] = curr_pixels
+                        elif prev_pixels < curr_pixels: # Refill
+                            if self.debug_channels.get('CHANGES', True):
+                                self._print_and_log(f"  [ORACLE] HUD Refill detected ({prev_pixels} -> {curr_pixels}). Maintaining lock.")
+
+                        # Project Death Clock
                         steps = 0
                         sim_pixels = curr_pixels
-                        
-                        # Traverse the known state map into the future
                         while sim_pixels in self.hud_state_map and self.hud_state_map[sim_pixels] < sim_pixels:
                             sim_pixels = self.hud_state_map[sim_pixels]
                             steps += 1
                             if sim_pixels <= 0: break
                             
-                        # 3. Report Findings
                         if sim_pixels <= 0:
                             self.death_clock = steps
-                            rule_name = "Exact Positional Map (Proven to 0)"
+                            rule_name = "Finalized Positional Map (Proven)"
                         elif steps > 0:
-                            total_mapped_loss = curr_pixels - sim_pixels
-                            avg_loss_per_step = total_mapped_loss / steps
-                            est_remaining = int(sim_pixels / avg_loss_per_step) if avg_loss_per_step > 0 else 999
-                            self.death_clock = f"{steps} + ~{est_remaining} (Est)"
-                            rule_name = f"Partial Positional Map (Mapped {steps} steps deep)"
+                            self.death_clock = f"{steps} + ???"
+                            rule_name = f"Partial Positional Map (Depth {steps})"
                         else:
-                            # We haven't mapped the drop from this specific pixel state yet
                             self.death_clock = "???"
-                            rule_name = "Mapping Positional HUD (Round 1 Exploration)"
+                            rule_name = "Mapping Positional HUD"
                             
-                        if self.debug_channels.get('CHANGES', True) and prev_s_obj and prev_s_obj['pixels'] > curr_pixels:
+                        if self.debug_channels.get('CHANGES', True) and prev_pixels != curr_pixels:
                             self._print_and_log(f"  [ORACLE] HUD Rule: {rule_name} | Death Clock: {self.death_clock} moves remaining.")
 
                 # --- NEW: EVENT MUTING (HUD IGNORANCE) ---
-                # Filter out events related to HUD objects so the scientist completely ignores them.
+                # Strip all events related to the finalized HUD IDs
                 filtered_events = []
-
                 for e in events:
                     obj_id = e.get('id')
                     is_hud = False
-                    
-                    # Check if it was HUD in previous frame (e.g. shrinking)
-                    prev_obj = next((o for o in prev_summary if o['id'] == obj_id), None)
-                    if prev_obj and prev_obj.get('is_hud'): is_hud = True
-                        
-                    # Check if it is HUD in current frame (e.g. newly spawned background color)
-                    curr_obj = next((o for o in current_summary if o['id'] == obj_id), None)
-                    if curr_obj and curr_obj.get('is_hud'): is_hud = True
-                        
-                    if not is_hud:
-                        filtered_events.append(e)
-                
+                    if self.hud_pair and obj_id in self.hud_pair: is_hud = True
+                    if not is_hud: filtered_events.append(e)
                 events = filtered_events
                 # -----------------------------------------
 
