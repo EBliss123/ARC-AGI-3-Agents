@@ -47,14 +47,11 @@ try:
 except ImportError:
     AVAILABLE_AGENTS = {}
 
-# Fallback specifically to your provided ObmlAgi3Agent if AVAILABLE_AGENTS is missing
+# Fallback to ObmlAgi3Agent if registry is empty or missing
 try:
     from agents.obml_agi_3 import ObmlAgi3Agent as FallbackAgent
 except ImportError:
-    try:
-        from agents.obrl_agi3 import ObrlAgi3Agent as FallbackAgent
-    except ImportError:
-        FallbackAgent = None
+    FallbackAgent = None
 
 from agents.structs import GameAction, GameState
 from agents.agent import FrameData
@@ -69,24 +66,29 @@ def get_game_list(specific_game=None):
     if specific_game:
         return [g.strip() for g in specific_game.split(",")]
     
+    # ADD THESE LINES: Detect scoring mode and set retry limit
+    IS_RERUN = os.environ.get('KAGGLE_IS_COMPETITION_RERUN', 'false') == 'true'
+    max_retries = 30 if IS_RERUN else 1 
+    
     print("--- Discovering ARC-AGI games ---")
     games = []
     
-    print(f"Attempting to fetch game list from {ROOT_URL}/api/games ...")
-    try:
-        # --- NEW: Pass the HEADERS to the request ---
-        r = requests.get(f"{ROOT_URL}/api/games", headers=HEADERS, timeout=10)
-        
-        if r.status_code == 200:
-            api_games = [g["game_id"] for g in r.json()]
-            print(f"-> API Server returned {len(api_games)} games.")
-            for g in api_games:
-                if g not in games: games.append(g)
-        else:
-            print(f"-> API request failed: {r.status_code}")
-    except Exception as e:
-        print(f"-> Could not connect to API server ({e}). Assuming offline mode.")
-
+    # Wrap the request in a loop
+    for attempt in range(max_retries):
+        try:
+            print(f"Attempting to fetch game list from {ROOT_URL}/api/games (Attempt {attempt+1})...")
+            r = requests.get(f"{ROOT_URL}/api/games", headers=HEADERS, timeout=10)
+            if r.status_code == 200:
+                api_games = [g["game_id"] for g in r.json()]
+                print(f"-> API Server returned {len(api_games)} games.")
+                return api_games
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(1)
+                continue
+            print(f"-> Could not connect to API server ({e}).")
+    
+    # Fallback to local registry if gateway is unreachable
     print("Scanning local Gym registry...")
     for env_id in gym.envs.registry.keys():
         if "ARC-AGI/" in env_id and "-v" in env_id:
@@ -96,8 +98,8 @@ def get_game_list(specific_game=None):
 
     if not games:
         print("Warning: No games found via API or Registry.")
-        print(f"GAMES NOT FOUND. EXITING")
-        sys.exit(1)
+        print("GAMES NOT FOUND. Proceeding to dummy submission logic.")
+        return [] # <--- CHANGE THIS: Return empty list instead of sys.exit(1)
         
     print(f"Total Games Scheduled: {len(games)}")
     return games
@@ -405,10 +407,15 @@ def run_single_game(game_id, args_agent_name):
 
 def run_fast():
     args = parse_arguments()
-    
-    # 1. Discover Games
     games_to_play = get_game_list(args.game)
     
+    # ADD THIS BLOCK: Satisfy Kaggle if no games exist (Commit Mode)
+    if not games_to_play:
+        print("Warning: No games found. Creating dummy submission.csv.")
+        with open("submission.csv", "w") as f:
+            f.write("dummy\n0")
+        return
+
     total_start = time.time()
     all_results = []
     
