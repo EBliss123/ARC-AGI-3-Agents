@@ -2,8 +2,8 @@
   {
     "game_id": "vc33",
     "score": 0,
-    "steps": 2,
-    "status": "FAILED",
-    "error": "'str' object has no attribute 'get'"
+    "steps": 240,
+    "status": "TIMEOUT",
+    "error": null
   }
 ]
