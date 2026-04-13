@@ -113,12 +113,12 @@ class ObmlAgi3Agent(Agent):
         # Set these to True or False to control the debug output.
         self.debug_channels = {
             'PERCEPTION': False,      # Object finding, relationships, new level setup
-            'CHANGES': True,         # All "Change Log" prints
+            'CHANGES': False,    #TRUE     # All "Change Log" prints
             'STATE_GRAPH': False,     # State understanding
-            'HYPOTHESIS': True,      # "Initial Hypotheses", "Refined Hypothesis"
+            'HYPOTHESIS': False, #TRUE     # "Initial Hypotheses", "Refined Hypothesis"
             'FAILURE': False,         # "Failure Analysis", "Failure Detected"
             'WIN_CONDITION': False,   # "LEVEL CHANGE DETECTED", "Win Condition Analysis"
-            'ACTION_SCORE': True,    # All scoring prints
+            'ACTION_SCORE': False,  #TRUE  # All scoring prints
             'CONTEXT_DETAILS': False # Keep or remove large prints
         }
 
@@ -1185,17 +1185,16 @@ class ObmlAgi3Agent(Agent):
                     if self.debug_channels['ACTION_SCORE']:
                         self._print_and_log(f"\n--- [Priority 3: Agitation] Chose: Pass (Completely trapped) ---")
 
-        # Inject coordinates for Click Actions
-        click_payload = None
+        # Inject coordinates for Click Actions using the OFFICIAL API method
         if action_to_return and action_to_return.name == 'ACTION6':
             if chosen_object:
                 guaranteed_pixels = sorted(list(chosen_object['pixel_coords']))
                 # Cast to standard int to prevent Numpy serialization errors
                 r, c = int(guaranteed_pixels[0][0]), int(guaranteed_pixels[0][1])
-                click_payload = {'x': c, 'y': r}
+                action_to_return.set_data({'x': c, 'y': r})
             else:
                 raw_data = getattr(action_to_return, 'data', {})
-                click_payload = {'x': int(raw_data.get('x', 0)), 'y': int(raw_data.get('y', 0))}
+                action_to_return.set_data({'x': int(raw_data.get('x', 0)), 'y': int(raw_data.get('y', 0))})
 
         # --- Store action for next turn's analysis ---
         if action_to_return:
@@ -1227,13 +1226,22 @@ class ObmlAgi3Agent(Agent):
         }
         self.level_state_history.append(current_context)
 
-        # Return a robust tuple so the payload is never dropped
-        if click_payload is not None:
-            return (action_to_return, click_payload)
-            
+        # RETURN ONLY THE OBJECT (No Tuples!)
         return action_to_return
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
+        # 1. Natural Win: Safely disconnect and bank the points!
+        if latest_frame.state == GameState.WIN:
+            return True
+            
+        # 2. Infinite Loop Failsafe: Pull the ripcord
+        # If we take 1,000 actions on a single puzzle, we are trapped.
+        # Returning True forces the orchestrator to abandon this puzzle 
+        # and move to the next one before Kaggle terminates the container.
+        if self.global_action_counter > 1000:
+            self._print_and_log(f"  [Failsafe] Exceeded 1000 actions. Force-disconnecting to save container.")
+            return True
+            
         return False
     
     def _perceive_objects(self, frame: FrameData) -> list[dict]:
@@ -3978,42 +3986,32 @@ class ObmlAgi3Agent(Agent):
     def get_pass_action(self) -> Optional[GameAction]:
         """
         Determines the safest action to take solely to refresh the game state.
-        Strategy:
-        1. Try an action that is NOT valid for the current state (1-7).
-        2. If all are valid, click (ACTION6) an object that has never caused a change.
+        STRICT KAGGLE FIX: Must ONLY return actions explicitly allowed by the API.
         """
         latest_frame = self.frames[-1]
-        available_names = {a.name for a in latest_frame.available_actions}
+        available = latest_frame.available_actions if latest_frame.available_actions else []
         
-        # --- Strategy 1: Use an Invalid Action ---
-        for i in range(1, 8):
-            try:
-                candidate = GameAction.from_id(i)
-                if candidate.name not in available_names:
-                    # Invalid actions are often treated as No-Ops
-                    if candidate.name == 'ACTION6':
-                         candidate.set_data({'x': 0, 'y': 0})
-                    return candidate
-            except ValueError:
-                continue
+        click_action = None
+        other_actions = []
+        
+        for a in available:
+            if a.name == 'ACTION6':
+                click_action = a
+            elif a.name != 'RESET':
+                other_actions.append(a)
 
-        # --- Strategy 2: Click a "Safe" Object ---
-        current_summary = self.last_object_summary
-        for obj in current_summary:
-            obj_id = obj['id']
-            action_key = self._get_learning_key('ACTION6', obj_id)
+        # Safest "Pass" is a click on a static coordinate if clicking is permitted
+        if click_action:
+            click_action.set_data({'x': 0, 'y': 0})
+            return click_action
             
-            # If this object has never been productive, clicking it is likely safe
-            if action_key not in self.productive_action_types:
-                action = GameAction.ACTION6
-                r, c = obj['position']
-                action.set_data({'x': c, 'y': r}) 
-                return action
-        
-        # --- Fallback: Click Top-Left ---
-        action = GameAction.ACTION6
-        action.set_data({'x': 0, 'y': 0})
-        return action
+        # Otherwise, safely cycle the first available legally permitted action
+        if other_actions:
+            return other_actions[0]
+            
+        # Absolute fallback
+        fallback = GameAction.ACTION1
+        return fallback
     
     def _find_color_source(self, target_obj_id: str, target_color: int, full_context: dict) -> set:
         """
