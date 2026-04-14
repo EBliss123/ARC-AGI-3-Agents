@@ -243,991 +243,1007 @@ class ObmlAgi3Agent(Agent):
         """
         Analyzes the current frame, checks for stability, and logs perceived changes.
         """
-        # --- 1. Game Start / Game Over Logic ---
-        if latest_frame.state == GameState.NOT_PLAYED:
-            self._reset_agent_memory()
-            self.run_counter += 1 # New Run
-            self.global_action_counter += 1
-            self.last_action_id = self.global_action_counter
-            return GameAction.RESET
-        
-        if latest_frame.state == GameState.GAME_OVER:
-            # --- NEW: Scientific Death Analysis ---
-            # Instead of just resetting, we treat this as a "Terminal Event" for the previous action.
-            if self.last_action_context and self.last_object_summary:
-                learning_key = self.last_action_context
-                
-                # Reconstruct the context of the world *before* we died
-                prev_context = {
-                    'summary': self.last_object_summary,
-                    'rels': self.last_relationships,
-                    'adj': self.last_adjacencies,
-                    'diag_adj': self.last_diag_adjacencies,
-                    'align': self.last_alignments,
-                    'diag_align': self.last_diag_alignments,
-                    'match': self.last_match_groups
-                }
-                
-                # Broadcast the "Death" event to every object in memory.
-                # The Survivor System will filter out which object's state actually *correlated* with the death.
-                terminal_events = []
-                for obj in self.last_object_summary:
-                    terminal_events.append({'type': 'TERMINAL', 'outcome': 'LOSS', 'id': obj['id']})
-                
-                if self.debug_channels['FAILURE']:
-                    print(f"\n--- GAME OVER DETECTED ---")
-                    print(f"Injecting TERMINAL events for analysis on action {learning_key}...")
-
-                # Run the standard classification pipeline
-                direct, global_ev, ambiguous = self._classify_event_stream(terminal_events, learning_key, prev_context)
-                
-                # Learn from the classified results
-                # A. Direct (Action-Specific Death)
-                obj_events_map = {obj['id']: [] for obj in self.last_object_summary}
-                for event in direct:
-                    if 'id' in event and event['id'] in obj_events_map:
-                        obj_events_map[event['id']].append(event)
-                
-                for obj in self.last_object_summary:
-                    hypothesis_key = (learning_key, obj['id'])
-                    self._analyze_result(hypothesis_key, obj_events_map[obj['id']], prev_context)
-
-                # B. Global (State-Specific Death)
-                for event in global_ev:
-                    abst_sig = self._get_abstract_signature(event)
-                    global_key = ('GLOBAL', str(abst_sig)) 
-                    self._analyze_result(global_key, [event], prev_context)
-            # --------------------------------------
-
-            self._reset_level_state()
-            self.forcing_wait = False
-            self.run_counter += 1 # New Run
-            self.global_action_counter += 1
-            self.last_action_id = self.global_action_counter
-            return GameAction.RESET
-
-        # --- 2. Animation Guard: If server says busy, we wait ---
-        if not latest_frame.available_actions:
-            return None
-
-        # --- FIX: Store for the Gatekeeper ---
-        self._last_available_actions = latest_frame.available_actions
-
-        # --- 3. Stability Check (DISABLED) ---
-        # Immediate pass-through: We act on every frame available.
-        current_pixels = latest_frame.frame[0] if latest_frame.frame else []
-        self.last_stable_pixels = current_pixels
-        self.forcing_wait = False 
-        # -------------------------------------
-        
-        # C. Authorized to ACT. Next time we must wait again.
-        self.forcing_wait = True 
-        self.last_stable_pixels = current_pixels
-        # -----------------------------------------------------
-        
-        # --- 1. Perceive Raw Objects ---
-        # --- Print available actions once ---
-        if latest_frame.available_actions and not self.actions_printed:
-            action_names = [action.name for action in latest_frame.available_actions]
-            if self.debug_channels['PERCEPTION']:
-                print(f"\n--- Discovered game-specific actions: {action_names} ---")
-            self.actions_printed = True
-        
-        # This just finds the blobs of pixels, without persistent IDs
-        current_summary = self._perceive_objects(latest_frame)
-        changes = []
-
-        # --- 2. Compare Current State to Previous State ---
-        if not self.last_object_summary or self.is_new_level:
-            # --- FIRST FRAME LOGIC ---
-            # This block runs on the first frame of a new level, OR a retry.
-            current_score = latest_frame.score
+        try:
+            # --- 1. Game Start / Game Over Logic ---
+            if latest_frame.state == GameState.NOT_PLAYED:
+                self._reset_agent_memory()
+                self.run_counter += 1 # New Run
+                self.global_action_counter += 1
+                self.last_action_id = self.global_action_counter
+                return GameAction.RESET
             
-            if self.is_new_level:
-                # --- This is a NEW LEVEL (from score increase) ---
-                # --- FIX: Preserve the Brain across wins! ---
-                self._reset_level_state()
-                self.relational_archive = set() # NEW: Wipe novelty only on brand new maps
-                if self.debug_channels['PERCEPTION']:
-                     print(f"\n--- Level Cleared (Score: {current_score}): Preserving brain, resetting local history. ---")
-
-            else:
-                # --- This is a RETRY (from GAME_OVER) ---
-                # We are just re-perceiving the level. DO NOT wipe the brain.
-                # The brain was preserved by the GAME_OVER check.
-                if self.debug_channels['PERCEPTION']:
-                    print(f"\n--- Retrying Level (Score: {current_score}): Re-perceiving level. ---")
-
-            # Now, set the state for this "first frame" (applies to both cases)
-            self.is_new_level = False # We have now handled the "new level" state
-            self.last_score = current_score
-
-            id_map = {}
-            new_obj_to_old_id_map = {}
-            
-            # (Skipping cross-level correlation for now, as it requires
-            # self.final_summary_before_level_change, which is not yet set)
-
-            # --- Final Re-Numbering (simple version for first frame) ---
-            if self.debug_channels['PERCEPTION']: print("--- Finalizing Frame with Sequential IDs ---")
-            self.object_id_counter = 0
-            sorted_summary = sorted(current_summary, key=lambda o: (o['position'][0], o['position'][1]))
-            for obj in sorted_summary:
-                self.object_id_counter += 1
-                new_id = f'obj_{self.object_id_counter}'
-                obj['id'] = new_id
-            current_summary = sorted_summary
-
-            # --- Analyze the fully ID'd summary ---
-            (current_relationships, current_adjacencies, current_diag_adjacencies, 
-             current_match_groups, current_alignments, current_diag_alignments, 
-             current_conjunctions) = self._analyze_relationships(current_summary)
-
-            # --- Print Initial Summary (if debug is on) ---
-            if self.debug_channels['PERCEPTION']:
-                print("--- Initial Frame Summary ---")
-                self._print_full_summary(current_summary)
-                
-                print("\n--- Initial Relationship Analysis ---")
-                def format_id_list_str(id_set):
-                    id_list = sorted(list(id_set))
-                    if len(id_list) < 2: return f"Object {id_list[0]}"
-                    if len(id_list) == 2: return f"Objects {id_list[0]} and {id_list[1]}"
-                    return "Objects " + ", ".join(map(str, id_list[:-1])) + f", and {id_list[-1]}"
-
-                for rel_type, groups in sorted(current_relationships.items()):
-                    for value, ids in sorted(groups.items()):
-                        value_str = f"{value[0]}x{value[1]}" if rel_type == 'Size' else value
-                        print(f"- {rel_type} Group ({value_str}): {format_id_list_str(ids)}")
-                
-                if current_adjacencies:
-                    print("\n--- Initial Adjacency Analysis (T,R,B,L) ---")
-                    for obj_id, contacts in sorted(current_adjacencies.items(), key=lambda item: int(item[0].split('_')[1])):
-                        contact_ids = [c.replace('obj_', '') if 'obj_' in c else c for c in contacts]
-                        print(f"- Object {obj_id.replace('obj_', 'id_')} ({', '.join(contact_ids)})")
-
-                if current_diag_adjacencies:
-                    print("\n--- Initial Diagonal Adjacency (TR,BR,BL,TL) ---")
-                    for obj_id, contacts in sorted(current_diag_adjacencies.items(), key=lambda item: int(item[0].split('_')[1])):
-                        contact_ids = [c.replace('obj_', '') if 'obj_' in c else c for c in contacts]
-                        print(f"- Object {obj_id.replace('obj_', 'id_')} ({', '.join(contact_ids)})")
-
-                if current_alignments:
-                    print("\n--- Initial Alignment Analysis ---")   
-                    for align_type, groups in sorted(current_alignments.items()):
-                        for coord, ids in sorted(groups.items()):
-                            print(f"- '{align_type}' Alignment at {coord}: {format_id_list_str(ids)}")
-
-                if current_diag_alignments:
-                    print("\n--- Initial Diagonal Alignment Analysis ---")
-                    for align_type, groups in sorted(current_diag_alignments.items()):
-                        for line_idx, ids in enumerate(groups):
-                            print(f"- '{align_type}' Alignment (Line {line_idx + 1}): {format_id_list_str(ids)}")
-
-                if current_match_groups:
-                    print("\n--- Object Match Type Analysis ---")
-                    for match_type, groups_dict in current_match_groups.items():
-                        label = f"Exact Matches" if match_type == "Exact" else f"Matches (Except {match_type})"
-                        print(f"- {label}:")
-                        for props, group in groups_dict.items():
-                            id_list_str = ", ".join([i.replace('obj_', 'id_') for i in sorted(group, key=lambda x: int(x.split('_')[1]))])
-                            print(f"  - Group {props}: {id_list_str}")
-
-        else:
-            # --- SUBSEQUENT FRAME LOGIC ---
-            prev_summary = self.last_object_summary
-            
-            # --- Absolute API Signal Detection ---
-            if not hasattr(self, 'last_levels'): self.last_levels = 0
-            
-            current_levels = getattr(latest_frame, 'levels_completed', 0)
-            current_score = getattr(latest_frame, 'score', 0.0)
-            level_increased = current_levels > self.last_levels
-
-            is_win_state = (latest_frame.state == GameState.WIN)
-            is_full_reset = getattr(latest_frame, 'full_reset', False)
-
-            if level_increased or is_win_state or is_full_reset:
-                self._print_and_log(f"\n--- LEVEL CLEARED ---")
-                if level_increased:
-                    self._print_and_log(f"    API reported Level {current_levels} completed!")
-                
-                # We intentionally keep self.hud_state_map intact across levels!
-                
-                # --- NEW: Phase 1 & 2 Win Logic ---
-                if self.level_state_history and current_summary:
-                    # Quickly build the final context
-                    (rels, adj, diag_adj, match, align, diag_align, conj) = self._analyze_relationships(current_summary)
-                    final_context = {'rels': rels, 'adj': adj, 'diag_adj': diag_adj, 'align': align, 'diag_align': diag_align, 'match': match}
+            if latest_frame.state == GameState.GAME_OVER:
+                # --- NEW: Scientific Death Analysis ---
+                # Instead of just resetting, we treat this as a "Terminal Event" for the previous action.
+                if self.last_action_context and self.last_object_summary:
+                    learning_key = self.last_action_context
                     
-                    candidate_signature = self._isolate_win_signature(final_context)
-                    self._refine_global_win_laws(candidate_signature)
-                # -----------------------------------
-                
-                self.last_levels = current_levels
-                self.is_new_level = True
-                
-                # Force the pass action so we don't corrupt the physics engine
-                return self.get_pass_action()
-            
-            # This function compares old and new summaries, assigns persistent IDs,
-            # and returns a list of change strings.
-            changes, current_summary = self._log_changes(prev_summary, current_summary)
-
-            # Now, analyze the new summary *after* persistent IDs are assigned
-            (current_relationships, current_adjacencies, current_diag_adjacencies, 
-             current_match_groups, current_alignments, current_diag_alignments, 
-             current_conjunctions) = self._analyze_relationships(current_summary)
-
-            self.last_score = current_score
-
-            # --- Log all changes found ---
-            if changes and self.debug_channels['CHANGES']:
-                self._print_and_log("--- Change Log ---")
-                for change in changes:
-                    self._print_and_log(change)
-
-            self._log_relationship_changes(self.last_relationships, current_relationships)
-            self._log_adjacency_changes(self.last_adjacencies, current_adjacencies)
-            self._log_diag_adjacency_changes(self.last_diag_adjacencies, current_diag_adjacencies)
-            self._log_match_type_changes(self.last_match_groups, current_match_groups)
-            self._log_alignment_changes(self.last_alignments, current_alignments, is_diagonal=False)
-            self._log_alignment_changes(self.last_diag_alignments, current_diag_alignments, is_diagonal=True)
-
-            # --- Analyze the outcome of the previous action ---
-            if self.last_action_context and self.last_object_summary:
-                learning_key = self.last_action_context 
-        
-                # This is the full context of the *previous* state
-                prev_context = {
-                    'summary': prev_summary,
-                    'rels': self.last_relationships,
-                    'adj': self.last_adjacencies,
-                    'diag_adj': self.last_diag_adjacencies,
-                    'align': self.last_alignments,
-                    'diag_align': self.last_diag_alignments,
-                    'match': self.last_match_groups
-                }
-
-                # 1. Parse text changes back to structured event dicts
-                events = self._parse_change_logs_to_events(changes)
-
-                # --- NEW: BEHAVIORAL HUD IDENTIFICATION & SCRUBBING ---
-                if not hasattr(self, 'hud_pair'): self.hud_pair = None
-                if not hasattr(self, 'hud_colors'): self.hud_colors = None
-
-                # --- NEW: Continuity Guard ---
-                # If a locked ID disappears, unlock to re-identify (handles rare ID reassignments)
-                if self.hud_pair and not all(any(o['id'] == hid for o in current_summary) for hid in self.hud_pair):
-                    self.hud_pair = None
-                    self.hud_colors = None
-
-                # 1. Identification Phase (Only runs until a HUD is locked)
-                if not self.hud_pair:
-                    shrink_events = [e for e in events if e['type'] == 'SHRINK']
-                    growth_events = [e for e in events if e['type'] == 'GROWTH']
+                    # Reconstruct the context of the world *before* we died
+                    prev_context = {
+                        'summary': self.last_object_summary,
+                        'rels': self.last_relationships,
+                        'adj': self.last_adjacencies,
+                        'diag_adj': self.last_diag_adjacencies,
+                        'align': self.last_alignments,
+                        'diag_align': self.last_diag_alignments,
+                        'match': self.last_match_groups
+                    }
                     
-                    candidates = []
-                    for s_ev in shrink_events:
-                        s_id = s_ev['id']
-                        s_obj = next((o for o in prev_summary if o['id'] == s_id), None)
-                        
-                        # Prerequisite: Must be a perfect rectangle
-                        if not s_obj or not s_obj.get('is_perfect_rectangle'): continue
-                        
-                        for g_ev in growth_events:
-                            g_id = g_ev['id']
-                            g_obj = next((o for o in current_summary if o['id'] == g_id), None)
-                            
-                            # Prerequisite: Grower must also be a perfect rectangle
-                            if not g_obj or not g_obj.get('is_perfect_rectangle'): continue
-                            
-                            # Conservation of Mass: Exact pixel exchange
-                            if abs(s_ev['pixel_delta']) == g_ev['pixel_delta']:
-                                candidates.append((s_id, g_id))
+                    # Broadcast the "Death" event to every object in memory.
+                    # The Survivor System will filter out which object's state actually *correlated* with the death.
+                    terminal_events = []
+                    for obj in self.last_object_summary:
+                        terminal_events.append({'type': 'TERMINAL', 'outcome': 'LOSS', 'id': obj['id']})
                     
-                    # The Highlander Rule: Once exactly 1 candidate is found, it's finalized
-                    if len(candidates) == 1:
-                        self.hud_pair = candidates[0]
-                        s_id, g_id = self.hud_pair
-                        
-                        # --- NEW: Anchor roles by color ---
-                        s_obj = next(o for o in prev_summary if o['id'] == s_id)
-                        g_obj = next(o for o in current_summary if o['id'] == g_id)
-                        self.hud_colors = {'bar_color': s_obj['color'], 'track_color': g_obj['color']}
-                        
-                        if self.debug_channels.get('CHANGES', True):
-                            self._print_and_log(f"\n--- [HUD FINALIZED] Locked: Bar(Color {s_obj['color']}) & Track(Color {g_obj['color']}) ---")
-                        
-                        # --- 2. RECURSIVE MEMORY SCRUB ---
-                        # Permanently erase these IDs from the physics engine's memory
-                        hud_ids = {s_id, g_id}
-                        for hid in hud_ids:
-                            self.truth_table.pop(hid, None)
-                            self.certified_laws.pop(hid, None)
-                            self.active_experiments.pop(hid, None)
-                            self.state_refinements.pop(hid, None)
-                            self.pending_refinements.pop(hid, None)
-                        
-                        for a_key, effects in self.action_effects_memory.items():
-                            to_remove = [f for f in effects if any(hid in f for hid in hud_ids)]
-                            for f in to_remove: effects.remove(f)
-                            
-                        # Retroactively mark history so the scientist ignores past frames
-                        for past_ctx in self.level_state_history:
-                            for obj in past_ctx.get('summary', []):
-                                if obj['id'] in hud_ids: obj['is_hud'] = True
-                        
-                # 3. Refill-Tolerant Oracle (Runs once HUD is locked)
-                if self.hud_pair:
-                    # --- NEW: Identify roles by persistent color, not ID order ---
-                    objs = [o for o in current_summary if o['id'] in self.hud_pair]
-                    if len(objs) == 2 and self.hud_colors:
-                        bar_obj = next((o for o in objs if o['color'] == self.hud_colors['bar_color']), None)
-                        if bar_obj:
-                            bar_id = bar_obj['id']
-                            track_id = next(oid for oid in self.hud_pair if oid != bar_id)
-                        else:
-                            bar_id, track_id = self.hud_pair # Fallback
-                    else:
-                        bar_id, track_id = self.hud_pair
-                                        
-                    # Forward Muting: Ensure both frames ignore the locked IDs
-                    for obj in prev_summary:
-                        if obj['id'] in self.hud_pair: obj['is_hud'] = True
-                    for obj in current_summary:
-                        if obj['id'] in self.hud_pair: obj['is_hud'] = True
-                        
-                    curr_bar = next((o for o in current_summary if o['id'] == bar_id), None)
-                    prev_bar = next((o for o in prev_summary if o['id'] == bar_id), None)
-                    
-                    if curr_bar and prev_bar:
-                        curr_pixels = curr_bar['pixels']
-                        prev_pixels = prev_bar['pixels']
-                        
-                        if not hasattr(self, 'hud_state_map'): self.hud_state_map = {}
-                        
-                        # Record Positional Transition
-                        if prev_pixels > curr_pixels: # Standard Drop
-                            self.hud_state_map[prev_pixels] = curr_pixels
-                        elif prev_pixels < curr_pixels: # Refill
-                            if self.debug_channels.get('CHANGES', True):
-                                self._print_and_log(f"  [ORACLE] HUD Refill detected ({prev_pixels} -> {curr_pixels}). Maintaining lock.")
-
-                        # Project Death Clock
-                        steps = 0
-                        sim_pixels = curr_pixels
-                        while sim_pixels in self.hud_state_map and self.hud_state_map[sim_pixels] < sim_pixels:
-                            sim_pixels = self.hud_state_map[sim_pixels]
-                            steps += 1
-                            if sim_pixels <= 0: break
-                            
-                        if sim_pixels <= 0:
-                            self.death_clock = steps
-                            rule_name = "Finalized Positional Map (Proven)"
-                        elif steps > 0:
-                            self.death_clock = f"{steps} + ???"
-                            rule_name = f"Partial Positional Map (Depth {steps})"
-                        else:
-                            self.death_clock = "???"
-                            rule_name = "Mapping Positional HUD"
-                            
-                        if self.debug_channels.get('CHANGES', True) and prev_pixels != curr_pixels:
-                            self._print_and_log(f"  [ORACLE] HUD Rule: {rule_name} | Death Clock: {self.death_clock} moves remaining.")
-
-                # --- NEW: EVENT MUTING (HUD IGNORANCE) ---
-                # Strip all events related to the finalized HUD IDs
-                filtered_events = []
-                for e in events:
-                    obj_id = e.get('id')
-                    is_hud = False
-                    if self.hud_pair and obj_id in self.hud_pair: is_hud = True
-                    if not is_hud: filtered_events.append(e)
-                events = filtered_events
-                # -----------------------------------------
-
-                # --- NEW: Identify Static Objects (Null Results) ---
-                # The change log only tells us what moved. We must explicitly record
-                # "NO_CHANGE" for objects that stood still, so the agent knows 
-                # it has "tested" them.
-                changed_ids = {e.get('id') for e in events if e.get('id')}
-                
-                for obj in prev_summary:
-                    if obj['id'] not in changed_ids:
-                        # Create synthetic NO_CHANGE event
-                        no_change_event = {'type': 'NO_CHANGE', 'id': obj['id']}
-                        events.append(no_change_event)
-
-                # --- FIX: The "Guest List" Check (Object Permanence) ---
-                # Check if the Gatekeeper is waiting for data on an object that no longer exists.
-                for mandate_obj_id in list(self.active_experiments.keys()):
-                    if mandate_obj_id not in changed_ids and not any(o['id'] == mandate_obj_id for o in prev_summary):
-                        # The object is completely gone from the room. 
-                        # Submit a synthetic failure so the Splitter learns its presence is required.
-                        events.append({'type': 'NO_CHANGE', 'id': mandate_obj_id})
-                # ---------------------------------------------------
-                # ---------------------------------------------------
-                # --- NEW: Pre-calculate Physics for Classification ---
-                # We run this BEFORE classification so the notes are available 
-                # for the classifier and debug logs.
-                for e in events:
-                    # UPDATED: Allow Mass Changes (Growth/Shrink) to enter Physics
-                    if e['type'] in ['SHAPE_CHANGED', 'TRANSFORM', 'GROWTH', 'SHRINK']:
-                        # Unpack Tuple
-                        result = self._check_interaction_physics(e['id'], events, prev_context, current_summary)
-                        if result:
-                            note, agitators = result
-                            e['_physics_note'] = note
-                            e['_physics_agitators'] = agitators
-                # -----------------------------------------------------
-
-                # [INSERTION POINT] 1.5. Record Raw Data into Scientific Memory
-                # We must record the events BEFORE we classify them, so the classifier
-                # can see the "N=1" count immediately for new phenomena.
-                for event in events:
-                    obj_id = event.get('id')
-                    if obj_id:
-                        # We need the state from the PREVIOUS context (Cause)
-                        # to associate with this Result.
-                        prev_obj = next((o for o in prev_summary if o['id'] == obj_id), None)
-                        
-                        if prev_obj:
-                            # 1. Get Scientific State (Color/Shape/Size + Context)
-                            state_sig = self._get_scientific_state(prev_obj, prev_context)
-                        else:
-                            # --- FIX: Ghost Object Signature ---
-                            # The object no longer exists, but we still use its ID as its state
-                            # to record the NO_CHANGE data and clear the active mandate.
-                            state_sig = obj_id
-                            
-                        # 2. Get Concrete Result (The "What happened")
-                        result_sig = self._get_concrete_signature(event)
-                        
-                        # 3. Log to Truth Table
-                        # learning_key is the Action (e.g., 'ACTION6_obj_5')
-                        self._update_truth_table(state_sig, learning_key, result_sig, obj_id=obj_id)
-
-                # --- NEW: Run The Scientific Judge HERE ---
-                # Now that data is recorded, let the Judge certify any rules immediately 
-                # BEFORE the Gatekeeper runs and prints the logs.
-                self._verify_and_certify()
-
-                # 2. Classify Events (Now reads from the populated Truth Table AND updated Certified Laws)
-                direct_events, global_events, ambiguous_events = self._classify_event_stream(events, learning_key, prev_context)
-                
-                # 3. Resolve Ambiguity (The Pipeline)
-                promoted_events = self._resolve_ambiguous_events(
-                    ambiguous_events, events, current_summary, prev_summary, 
-                    current_adjacencies, self.last_adjacencies, learning_key
-                )
-                
-                # Merge promoted events into Direct for learning
-                direct_events.extend(promoted_events)
-                ambiguous_events = [e for e in ambiguous_events if e not in promoted_events]
-
-                # 4. Map events to specific objects for DIRECT learning
-                obj_events_map = {obj['id']: [] for obj in self.last_object_summary}
-                for event in direct_events:
-                    if 'id' in event and event['id'] in obj_events_map:
-                        obj_events_map[event['id']].append(event)
-                
-                # A. Learn Direct Rules (Action -> Result)
-                for obj in self.last_object_summary:
-                    obj_id = obj['id']
-                    specific_events = obj_events_map[obj_id]
-                    hypothesis_key = (learning_key, obj_id)
-                
-
-                    self._analyze_result(hypothesis_key, specific_events, prev_context)
-                
-                # B. Learn Global Rules (Environment -> Result)
-                for event in global_events:
-                    abst_sig = self._get_abstract_signature(event)
-                    
-                    # --- NEW: Update Global History ---
-                    if abst_sig not in self.global_event_history:
-                        self.global_event_history[abst_sig] = []
-                    
-                    # Avoid duplicates for the same turn
-                    if self.last_action_id not in self.global_event_history[abst_sig]:
-                        self.global_event_history[abst_sig].append(self.last_action_id)
-                    # ----------------------------------
-
-                    global_key = ('GLOBAL', str(abst_sig)) 
-                    self._analyze_result(global_key, [event], prev_context)
-
-                # --- NEW: Run Global Forecasting Analysis ---
-                self._analyze_global_patterns()
-
-                # --- NEW: Rescue Ambiguous Events via Relational Logic ---
-                # UPDATED: Disabled. We do not rescue ambiguous events with hypotheses.
-                # We strictly wait for the Truth Table to certify them.
-                # ---------------------------------------------------------
-
-                # --- DETAILED PRINTING (Now uses updated brain) ---
-                if self.debug_channels['CHANGES']:
-                    
-                    # Define map for logging lookups
-                    prev_obj_map = {o['id']: o for o in prev_context['summary']}
-                    
-                    def _fmt_val(e):
-                        if e.get('is_until'):
-                            val = e.get('vector') if 'vector' in e else f"+{e.get('pixel_delta')}"
-                            action_verb = "Move" if 'vector' in e else "Grow"
-                            return f"{action_verb} {val} (Until {e['until_cond']})"
-                        
-                        if e.get('is_absolute'):
-                            if 'vector' in e: return f"Move to {e['abs_coords']}"
-                            if 'to_size' in e: return f"Grow to Size {e['abs_coords']}"
-                        
-                        suffix = ""
-                        if e.get('_is_variable'): suffix = " (Variable Magnitude/Shape)"
-                        
-                        if 'vector' in e: return f"Move {e['vector']}{suffix}"
-                        if 'to_color' in e: return f"Recolor to {e['to_color']}{suffix}"
-                        if 'pixel_delta' in e: return f"Size {'+' if e['pixel_delta']>0 else ''}{e['pixel_delta']}{suffix}"
-                        if 'to_fingerprint' in e: return f"Shape {e['to_fingerprint']}{suffix}"
-                        return e['type']
-
-                    if global_events: 
-                        self._print_and_log(f"  -> Filtered {len(global_events)} Global events:")
-                        for e in global_events:
-                            obj_id = e.get('id')
-                            if not obj_id or obj_id not in prev_obj_map: continue
-                            
-                            prev_obj = prev_obj_map[obj_id]
-                            state_sig = self._get_scientific_state(prev_obj, prev_context)
-                            
-                            # Check for Global Sequence Law
-                            laws_for_obj = self.certified_laws.get(obj_id, {})
-                            laws = laws_for_obj.get(state_sig, {})
-                            law = laws.get('ANY')
-                            
-                            self._print_and_log(f"     * [GLOBAL] {e['type']} on {e.get('id', 'Unknown')}")
-
-                            if law and law.get('type') == 'GLOBAL_SEQUENCE':
-                                seq_str = " -> ".join(map(str, law['sequence']))
-                                self._print_and_log(f"       [Explanation] Global Cycle: Target ID Pattern {seq_str}")
-                                self._print_and_log(f"       [Prediction]  Next Target ID: {law.get('next_prediction', 'Unknown')}")
-                            else:
-                                result_sig = self._get_concrete_signature(e)
-                                # FIX: Use 'learning_key' instead of 'action_key'
-                                rule_str = self._format_rule_description('GLOBAL', learning_key, state_sig, result_sig)
-                                self._print_and_log(f"       [Explanation] Global Rule: Inevitable '{_fmt_val(e)}'.")
-                                self._print_and_log(f"       [Prediction]  IF {rule_str}")
-
-                    if direct_events: 
-                        self._print_and_log(f"  -> Processing {len(direct_events)} Direct events:")
-                        for e in direct_events:
-                            obj_id = e.get('id')
-                            if not obj_id or obj_id not in prev_obj_map: continue
-                            
-                            prev_obj = prev_obj_map[obj_id]
-                            state_sig = self._get_scientific_state(prev_obj, prev_context)
-
-                            # Check for Direct Sequence Law
-                            laws_for_obj = self.certified_laws.get(obj_id, {})
-                            laws = laws_for_obj.get(state_sig, {})
-                            law = laws.get(learning_key)
-                            
-                            self._print_and_log(f"     * [DIRECT] {e['type']} on {e.get('id', 'Unknown')}")
-                            if '_physics_note' in e:
-                                self._print_and_log(f"       [Physics]     {e['_physics_note']}")
-                            
-                            if law and law.get('type') == 'DIRECT_SEQUENCE':
-                                seq_str = " -> ".join(map(str, law['sequence']))
-                                self._print_and_log(f"       [Explanation] Direct Cycle: Value Pattern {seq_str}")
-                                
-                                # Calculate next value for display (replicating prediction logic)
-                                current_val = None
-                                r_type = law['result_type']
-                                if r_type == 'RECOLORED': current_val = prev_obj['color']
-                                elif r_type in ['SHAPE_CHANGED', 'TRANSFORM']: current_val = prev_obj['fingerprint']
-                                elif r_type in ['GROWTH', 'SHRINK']: current_val = prev_obj['pixels']
-                                
-                                next_val = "Unknown"
-                                if current_val in law['sequence']:
-                                    idx = law['sequence'].index(current_val)
-                                    next_val = law['sequence'][(idx + 1) % len(law['sequence'])]
-                                
-                                self._print_and_log(f"       [Prediction]  Next Value: {next_val}")
-                            else:
-                                result_sig = self._get_concrete_signature(e)
-                                rule_str = self._format_rule_description('DIRECT', learning_key, state_sig, result_sig)
-                                self._print_and_log(f"       [Explanation] Direct Causality: Action consistently causes '{_fmt_val(e)}'")
-                                self._print_and_log(f"       [Prediction]  IF {rule_str}")
-
-                    if ambiguous_events:
-                        # Split the events for clean printing
-                        semi_global_list = [w for w in ambiguous_events if w.get('type') == 'SEMI_GLOBAL']
-                        true_ambiguous_list = [w for w in ambiguous_events if w.get('type') != 'SEMI_GLOBAL']
-                        
-                        if semi_global_list:
-                            self._print_and_log(f"  -> Tracking {len(semi_global_list)} Semi-Global events:")
-                            for wrapper in semi_global_list:
-                                e = wrapper['event']
-                                reason = wrapper['reason']
-                                fix = wrapper['fix']
-                                detail = wrapper.get('detail', '')
-                                val_str = _fmt_val(e)
-                                
-                                self._print_and_log(f"     * [SEMI_GLOBAL] {e['type']} on {e.get('id', 'Unknown')}")
-                                self._print_and_log(f"       [Observed] {val_str}")
-                                self._print_and_log(f"       [Status]   {reason}")
-                                if detail:
-                                    self._print_and_log(f"       [Detail]   {detail}")
-                                self._print_and_log(f"       [Needs]    {fix}")
-                                
-                        if true_ambiguous_list:
-                            self._print_and_log(f"  -> Ignored {len(true_ambiguous_list)} Ambiguous events:")
-                            for wrapper in true_ambiguous_list:
-                                e = wrapper['event']
-                                reason = wrapper['reason']
-                                fix = wrapper['fix']
-                                detail = wrapper.get('detail', '')
-                                val_str = _fmt_val(e)
-                                e_category = wrapper.get('type', 'AMBIGUOUS')
-
-                                self._print_and_log(f"     * [{e_category}] {e['type']} on {e.get('id', 'Unknown')}")
-                                self._print_and_log(f"       [Observed] {val_str}")
-                                self._print_and_log(f"       [Status]   {reason}")
-                                if detail:
-                                    self._print_and_log(f"       [Detail]   {detail}")
-                                self._print_and_log(f"       [Needs]    {fix}")
-                
-                # --- Failsafe: Track banned actions ---
-                # UPDATED: Success = Any REAL change detected OR level increase.
-                has_real_change = any(e.get('type') != 'NO_CHANGE' for e in events)
-                action_succeeded = has_real_change or level_increased
-                
-                # --- NEW: Track Productive Actions (ACTION6 Only) ---
-                if action_succeeded and self.last_action_context and self.last_action_context.startswith('ACTION6'):
-                    self.productive_action_types.add(self.last_action_context)
-                # -------------------------------------
-
-                if not action_succeeded and self.last_action_context: # Last action was a total failure
-                    self.banned_action_keys.add(self.last_action_context)
                     if self.debug_channels['FAILURE']:
-                        print(f"--- Failsafe: Banning action '{self.last_action_context}' due to failure. Total banned: {len(self.banned_action_keys)} ---")
+                        print(f"\n--- GAME OVER DETECTED ---")
+                        print(f"Injecting TERMINAL events for analysis on action {learning_key}...")
+
+                    # Run the standard classification pipeline
+                    direct, global_ev, ambiguous = self._classify_event_stream(terminal_events, learning_key, prev_context)
                     
-                    # --- MODIFIED: Permanent Ban Logic ---
-                    if (self.last_action_context.startswith('ACTION6_') and
-                        self.last_action_context not in self.successful_click_actions):
-                        self.permanent_banned_actions.add(self.last_action_context)
-                        if self.debug_channels['FAILURE']:
-                            print(f"--- Failsafe: Permanently banning '{self.last_action_context}' (never succeeded). Total permanent: {len(self.permanent_banned_actions)} ---")
-                    # --- End MODIFIED ---
-                
-                elif action_succeeded: # Last action had *some* success
-                    if self.banned_action_keys:
-                        if self.debug_channels['FAILURE']:
-                            print(f"--- Failsafe: Success detected. Clearing {len(self.banned_action_keys)} banned actions. ---")
-                        self.banned_action_keys.clear() # Clear ban
+                    # Learn from the classified results
+                    # A. Direct (Action-Specific Death)
+                    obj_events_map = {obj['id']: [] for obj in self.last_object_summary}
+                    for event in direct:
+                        if 'id' in event and event['id'] in obj_events_map:
+                            obj_events_map[event['id']].append(event)
                     
-                    # --- NEW: Track Successful Clicks ---
-                    if self.last_action_context and self.last_action_context.startswith('ACTION6_'):
-                        self.successful_click_actions.add(self.last_action_context)
-                    # --- End NEW ---
-                # --- End Failsafe ---
+                    for obj in self.last_object_summary:
+                        hypothesis_key = (learning_key, obj['id'])
+                        self._analyze_result(hypothesis_key, obj_events_map[obj['id']], prev_context)
 
-                # 2. Map events to specific objects
-                # Only map DIRECT events to the learner.
-                obj_events_map = {obj['id']: [] for obj in self.last_object_summary}
-                
-                for event in direct_events:
-                    if 'id' in event and event['id'] in obj_events_map:
-                        obj_events_map[event['id']].append(event)
+                    # B. Global (State-Specific Death)
+                    for event in global_ev:
+                        abst_sig = self._get_abstract_signature(event)
+                        global_key = ('GLOBAL', str(abst_sig)) 
+                        self._analyze_result(global_key, [event], prev_context)
+                # --------------------------------------
 
-                # 3. Unified Learning Loop
-                # We process EVERY object from the previous frame.
-                for obj in self.last_object_summary:
-                    obj_id = obj['id']
-                    specific_events = obj_events_map[obj_id]
-                    
-                    # Key: (ActionName, TargetID)
-                    hypothesis_key = (learning_key, obj_id)
-                    
-                    # Learn (Success OR Failure is handled uniformly inside this function)
-                    self._analyze_result(hypothesis_key, specific_events, prev_context)
-                    
-        # --- 3. Update Memory For Next Turn ---
-        self.last_object_summary = current_summary
-        self.last_adjacencies = current_adjacencies
-        self.last_diag_adjacencies = current_diag_adjacencies
-        self.last_relationships = current_relationships
-        self.last_alignments = current_alignments
-        self.last_diag_alignments = current_diag_alignments
-        self.last_match_groups = current_match_groups
+                self._reset_level_state()
+                self.forcing_wait = False
+                self.run_counter += 1 # New Run
+                self.global_action_counter += 1
+                self.last_action_id = self.global_action_counter
+                return GameAction.RESET
 
-        # --- 4. Choose an Action (Discovery Profiler Logic) ---
-        
-        # [FIX] Define current_full_context before using it
-        current_full_context = {
-            'summary': current_summary,
-            'rels': current_relationships,
-            'adj': current_adjacencies,
-            'diag_adj': current_diag_adjacencies,
-            'align': current_alignments,
-            'diag_align': current_diag_alignments,
-            'match': current_match_groups
-        }
+            # --- 2. Animation Guard: If server says busy, we wait ---
+            if not latest_frame.available_actions:
+                return None
 
-        # --- Update Relational Archive ---
-        self.relational_archive.update(self._extract_relational_archive_strings(current_full_context))
+            # --- FIX: Store for the Gatekeeper ---
+            self._last_available_actions = latest_frame.available_actions
 
-        # --- NEW: Debug Relational Archive ---
-        if self.debug_channels.get('CONTEXT_DETAILS', False):
-            archive_size = len(self.relational_archive)
-            self._print_and_log(f"\n--- [Debug] Relational Archive Size: {archive_size} ---")
-            if archive_size > 0:
-                sample = list(self.relational_archive)[:min(5, archive_size)]
-                self._print_and_log(f"  Sample entries: {sample}")
-
-        # --- CAUSAL MEMORY: Track what the last action did ---
-        if self.last_action_context and self.last_object_summary:
-            prev_context = {
-                'summary': self.last_object_summary, 'rels': self.last_relationships,
-                'adj': self.last_adjacencies, 'diag_adj': self.last_diag_adjacencies,
-                'align': self.last_alignments, 'diag_align': self.last_diag_alignments,
-                'match': self.last_match_groups
-            }
-            old_feats = self._extract_all_features(prev_context)
-            new_feats = self._extract_all_features(current_full_context)
-            changed_features = old_feats.symmetric_difference(new_feats)
+            # --- 3. Stability Check (DISABLED) ---
+            # Immediate pass-through: We act on every frame available.
+            current_pixels = latest_frame.frame[0] if latest_frame.frame else []
+            self.last_stable_pixels = current_pixels
+            self.forcing_wait = False 
+            # -------------------------------------
             
-            # --- FIX: Store Base Variables instead of hyper-specific values ---
-            changed_base_vars = {self._get_base_variable(f) for f in changed_features}
+            # C. Authorized to ACT. Next time we must wait again.
+            self.forcing_wait = True 
+            self.last_stable_pixels = current_pixels
+            # -----------------------------------------------------
             
-            if self.last_action_context not in self.action_effects_memory:
-                self.action_effects_memory[self.last_action_context] = set()
-            self.action_effects_memory[self.last_action_context].update(changed_base_vars)
+            # --- 1. Perceive Raw Objects ---
+            # --- Print available actions once ---
+            if latest_frame.available_actions and not self.actions_printed:
+                action_names = [action.name for action in latest_frame.available_actions]
+                if self.debug_channels['PERCEPTION']:
+                    print(f"\n--- Discovered game-specific actions: {action_names} ---")
+                self.actions_printed = True
+            
+            # This just finds the blobs of pixels, without persistent IDs
+            current_summary = self._perceive_objects(latest_frame)
+            changes = []
 
-        # [Build all_possible_moves list...]
-        all_possible_moves = []
-        click_action_template = None
-        available = latest_frame.available_actions if latest_frame.available_actions else []
+            # --- 2. Compare Current State to Previous State ---
+            if not self.last_object_summary or self.is_new_level:
+                # --- FIRST FRAME LOGIC ---
+                # This block runs on the first frame of a new level, OR a retry.
+                current_score = latest_frame.score
+                
+                if self.is_new_level:
+                    # --- This is a NEW LEVEL (from score increase) ---
+                    # --- FIX: Preserve the Brain across wins! ---
+                    self._reset_level_state()
+                    self.relational_archive = set() # NEW: Wipe novelty only on brand new maps
+                    if self.debug_channels['PERCEPTION']:
+                        print(f"\n--- Level Cleared (Score: {current_score}): Preserving brain, resetting local history. ---")
 
-        for action in available:
-            if action.name == 'ACTION6':
-                click_action_template = action
+                else:
+                    # --- This is a RETRY (from GAME_OVER) ---
+                    # We are just re-perceiving the level. DO NOT wipe the brain.
+                    # The brain was preserved by the GAME_OVER check.
+                    if self.debug_channels['PERCEPTION']:
+                        print(f"\n--- Retrying Level (Score: {current_score}): Re-perceiving level. ---")
+
+                # Now, set the state for this "first frame" (applies to both cases)
+                self.is_new_level = False # We have now handled the "new level" state
+                self.last_score = current_score
+
+                id_map = {}
+                new_obj_to_old_id_map = {}
+                
+                # (Skipping cross-level correlation for now, as it requires
+                # self.final_summary_before_level_change, which is not yet set)
+
+                # --- Final Re-Numbering (simple version for first frame) ---
+                if self.debug_channels['PERCEPTION']: print("--- Finalizing Frame with Sequential IDs ---")
+                self.object_id_counter = 0
+                sorted_summary = sorted(current_summary, key=lambda o: (o['position'][0], o['position'][1]))
+                for obj in sorted_summary:
+                    self.object_id_counter += 1
+                    new_id = f'obj_{self.object_id_counter}'
+                    obj['id'] = new_id
+                current_summary = sorted_summary
+
+                # --- Analyze the fully ID'd summary ---
+                (current_relationships, current_adjacencies, current_diag_adjacencies, 
+                current_match_groups, current_alignments, current_diag_alignments, 
+                current_conjunctions) = self._analyze_relationships(current_summary)
+
+                # --- Print Initial Summary (if debug is on) ---
+                if self.debug_channels['PERCEPTION']:
+                    print("--- Initial Frame Summary ---")
+                    self._print_full_summary(current_summary)
+                    
+                    print("\n--- Initial Relationship Analysis ---")
+                    def format_id_list_str(id_set):
+                        id_list = sorted(list(id_set))
+                        if len(id_list) < 2: return f"Object {id_list[0]}"
+                        if len(id_list) == 2: return f"Objects {id_list[0]} and {id_list[1]}"
+                        return "Objects " + ", ".join(map(str, id_list[:-1])) + f", and {id_list[-1]}"
+
+                    for rel_type, groups in sorted(current_relationships.items()):
+                        for value, ids in sorted(groups.items()):
+                            value_str = f"{value[0]}x{value[1]}" if rel_type == 'Size' else value
+                            print(f"- {rel_type} Group ({value_str}): {format_id_list_str(ids)}")
+                    
+                    if current_adjacencies:
+                        print("\n--- Initial Adjacency Analysis (T,R,B,L) ---")
+                        for obj_id, contacts in sorted(current_adjacencies.items(), key=lambda item: int(item[0].split('_')[1])):
+                            contact_ids = [c.replace('obj_', '') if 'obj_' in c else c for c in contacts]
+                            print(f"- Object {obj_id.replace('obj_', 'id_')} ({', '.join(contact_ids)})")
+
+                    if current_diag_adjacencies:
+                        print("\n--- Initial Diagonal Adjacency (TR,BR,BL,TL) ---")
+                        for obj_id, contacts in sorted(current_diag_adjacencies.items(), key=lambda item: int(item[0].split('_')[1])):
+                            contact_ids = [c.replace('obj_', '') if 'obj_' in c else c for c in contacts]
+                            print(f"- Object {obj_id.replace('obj_', 'id_')} ({', '.join(contact_ids)})")
+
+                    if current_alignments:
+                        print("\n--- Initial Alignment Analysis ---")   
+                        for align_type, groups in sorted(current_alignments.items()):
+                            for coord, ids in sorted(groups.items()):
+                                print(f"- '{align_type}' Alignment at {coord}: {format_id_list_str(ids)}")
+
+                    if current_diag_alignments:
+                        print("\n--- Initial Diagonal Alignment Analysis ---")
+                        for align_type, groups in sorted(current_diag_alignments.items()):
+                            for line_idx, ids in enumerate(groups):
+                                print(f"- '{align_type}' Alignment (Line {line_idx + 1}): {format_id_list_str(ids)}")
+
+                    if current_match_groups:
+                        print("\n--- Object Match Type Analysis ---")
+                        for match_type, groups_dict in current_match_groups.items():
+                            label = f"Exact Matches" if match_type == "Exact" else f"Matches (Except {match_type})"
+                            print(f"- {label}:")
+                            for props, group in groups_dict.items():
+                                id_list_str = ", ".join([i.replace('obj_', 'id_') for i in sorted(group, key=lambda x: int(x.split('_')[1]))])
+                                print(f"  - Group {props}: {id_list_str}")
+
             else:
-                all_possible_moves.append({'template': action, 'object': None})
-        
-        if click_action_template and current_summary:
-            for obj in current_summary:
-                all_possible_moves.append({'template': click_action_template, 'object': obj})
-
-        # --- FIX: Extract Base Variables for the Agenda ---
-        active_suspects = set()
-        for obj in current_summary:
-            if obj['id'] in self.active_experiments:
-                suspect_vars = self.state_refinements.get(obj['id'], {}).keys()
-                active_suspects.update(suspect_vars)
-
-        # --- PRIORITY 1: THE SCIENTIST ---
-        science_moves = []
-        mandated_move = None
-        
-        for move in all_possible_moves:
-            action_template = move['template']
-            target_obj = move['object']
-            target_id = target_obj['id'] if target_obj else None
-            
-            scientific_score = 0
-            this_action_key = self._get_learning_key(action_template.name, target_id)
-            
-            # --- TIER 1A: ACTIVE MANDATES (Absolute Override) ---
-            # Check if this move can satisfy ANY active mandate on the board
-            for exp_obj_id, mandate in self.active_experiments.items():
-                has_data = (exp_obj_id in self.truth_table and this_action_key in self.truth_table[exp_obj_id])
+                # --- SUBSEQUENT FRAME LOGIC ---
+                prev_summary = self.last_object_summary
                 
-                if mandate['req'] == 'POSITIVE_CONTROL' and this_action_key == mandate['ref']:
-                    mandated_move = move
-                    break
-                elif mandate['req'] == 'NEGATIVE_CONTROL' and this_action_key != mandate['ref'] and not has_data:
-                    mandated_move = move
-                    break
-                elif mandate['req'] in ['VERIFY_VAR', 'STABILIZE_CONTEXT'] and this_action_key == mandate['ref']:
-                    # --- LOCAL SCIENTIFIC STATE CHECK ---
-                    suspects = set()
-                    if mandate['req'] == 'VERIFY_VAR':
-                        suspects = set(self.state_refinements.get(exp_obj_id, {}).keys())
-                    else:
-                        suspects = set(self.pending_refinements.get(exp_obj_id, {}).get('suspects', set()))
+                # --- Absolute API Signal Detection ---
+                if not hasattr(self, 'last_levels'): self.last_levels = 0
+                
+                current_levels = getattr(latest_frame, 'levels_completed', 0)
+                current_score = getattr(latest_frame, 'score', 0.0)
+                level_increased = current_levels > self.last_levels
+
+                is_win_state = (latest_frame.state == GameState.WIN)
+                is_full_reset = getattr(latest_frame, 'full_reset', False)
+
+                if level_increased or is_win_state or is_full_reset:
+                    self._print_and_log(f"\n--- LEVEL CLEARED ---")
+                    if level_increased:
+                        self._print_and_log(f"    API reported Level {current_levels} completed!")
+                    
+                    # We intentionally keep self.hud_state_map intact across levels!
+                    
+                    # --- NEW: Phase 1 & 2 Win Logic ---
+                    if self.level_state_history and current_summary:
+                        # Quickly build the final context
+                        (rels, adj, diag_adj, match, align, diag_align, conj) = self._analyze_relationships(current_summary)
+                        final_context = {'rels': rels, 'adj': adj, 'diag_adj': diag_adj, 'align': align, 'diag_align': diag_align, 'match': match}
                         
-                    if not suspects:
+                        candidate_signature = self._isolate_win_signature(final_context)
+                        self._refine_global_win_laws(candidate_signature)
+                    # -----------------------------------
+                    
+                    self.last_levels = current_levels
+                    self.is_new_level = True
+                    
+                    # Force the pass action so we don't corrupt the physics engine
+                    return self.get_pass_action()
+                
+                # This function compares old and new summaries, assigns persistent IDs,
+                # and returns a list of change strings.
+                changes, current_summary = self._log_changes(prev_summary, current_summary)
+
+                # Now, analyze the new summary *after* persistent IDs are assigned
+                (current_relationships, current_adjacencies, current_diag_adjacencies, 
+                current_match_groups, current_alignments, current_diag_alignments, 
+                current_conjunctions) = self._analyze_relationships(current_summary)
+
+                self.last_score = current_score
+
+                # --- Log all changes found ---
+                if changes and self.debug_channels['CHANGES']:
+                    self._print_and_log("--- Change Log ---")
+                    for change in changes:
+                        self._print_and_log(change)
+
+                self._log_relationship_changes(self.last_relationships, current_relationships)
+                self._log_adjacency_changes(self.last_adjacencies, current_adjacencies)
+                self._log_diag_adjacency_changes(self.last_diag_adjacencies, current_diag_adjacencies)
+                self._log_match_type_changes(self.last_match_groups, current_match_groups)
+                self._log_alignment_changes(self.last_alignments, current_alignments, is_diagonal=False)
+                self._log_alignment_changes(self.last_diag_alignments, current_diag_alignments, is_diagonal=True)
+
+                # --- Analyze the outcome of the previous action ---
+                if self.last_action_context and self.last_object_summary:
+                    learning_key = self.last_action_context 
+            
+                    # This is the full context of the *previous* state
+                    prev_context = {
+                        'summary': prev_summary,
+                        'rels': self.last_relationships,
+                        'adj': self.last_adjacencies,
+                        'diag_adj': self.last_diag_adjacencies,
+                        'align': self.last_alignments,
+                        'diag_align': self.last_diag_alignments,
+                        'match': self.last_match_groups
+                    }
+
+                    # 1. Parse text changes back to structured event dicts
+                    events = self._parse_change_logs_to_events(changes)
+
+                    # --- NEW: BEHAVIORAL HUD IDENTIFICATION & SCRUBBING ---
+                    if not hasattr(self, 'hud_pair'): self.hud_pair = None
+                    if not hasattr(self, 'hud_colors'): self.hud_colors = None
+
+                    # --- NEW: Continuity Guard ---
+                    # If a locked ID disappears, unlock to re-identify (handles rare ID reassignments)
+                    if self.hud_pair and not all(any(o['id'] == hid for o in current_summary) for hid in self.hud_pair):
+                        self.hud_pair = None
+                        self.hud_colors = None
+
+                    # 1. Identification Phase (Only runs until a HUD is locked)
+                    if not self.hud_pair:
+                        shrink_events = [e for e in events if e['type'] == 'SHRINK']
+                        growth_events = [e for e in events if e['type'] == 'GROWTH']
+                        
+                        candidates = []
+                        for s_ev in shrink_events:
+                            s_id = s_ev['id']
+                            s_obj = next((o for o in prev_summary if o['id'] == s_id), None)
+                            
+                            # Prerequisite: Must be a perfect rectangle
+                            if not s_obj or not s_obj.get('is_perfect_rectangle'): continue
+                            
+                            for g_ev in growth_events:
+                                g_id = g_ev['id']
+                                g_obj = next((o for o in current_summary if o['id'] == g_id), None)
+                                
+                                # Prerequisite: Grower must also be a perfect rectangle
+                                if not g_obj or not g_obj.get('is_perfect_rectangle'): continue
+                                
+                                # Conservation of Mass: Exact pixel exchange
+                                if abs(s_ev['pixel_delta']) == g_ev['pixel_delta']:
+                                    candidates.append((s_id, g_id))
+                        
+                        # The Highlander Rule: Once exactly 1 candidate is found, it's finalized
+                        if len(candidates) == 1:
+                            self.hud_pair = candidates[0]
+                            s_id, g_id = self.hud_pair
+                            
+                            # --- NEW: Anchor roles by color ---
+                            s_obj = next(o for o in prev_summary if o['id'] == s_id)
+                            g_obj = next(o for o in current_summary if o['id'] == g_id)
+                            self.hud_colors = {'bar_color': s_obj['color'], 'track_color': g_obj['color']}
+                            
+                            if self.debug_channels.get('CHANGES', True):
+                                self._print_and_log(f"\n--- [HUD FINALIZED] Locked: Bar(Color {s_obj['color']}) & Track(Color {g_obj['color']}) ---")
+                            
+                            # --- 2. RECURSIVE MEMORY SCRUB ---
+                            # Permanently erase these IDs from the physics engine's memory
+                            hud_ids = {s_id, g_id}
+                            for hid in hud_ids:
+                                self.truth_table.pop(hid, None)
+                                self.certified_laws.pop(hid, None)
+                                self.active_experiments.pop(hid, None)
+                                self.state_refinements.pop(hid, None)
+                                self.pending_refinements.pop(hid, None)
+                            
+                            for a_key, effects in self.action_effects_memory.items():
+                                to_remove = [f for f in effects if any(hid in f for hid in hud_ids)]
+                                for f in to_remove: effects.remove(f)
+                                
+                            # Retroactively mark history so the scientist ignores past frames
+                            for past_ctx in self.level_state_history:
+                                for obj in past_ctx.get('summary', []):
+                                    if obj['id'] in hud_ids: obj['is_hud'] = True
+                            
+                    # 3. Refill-Tolerant Oracle (Runs once HUD is locked)
+                    if self.hud_pair:
+                        # --- NEW: Identify roles by persistent color, not ID order ---
+                        objs = [o for o in current_summary if o['id'] in self.hud_pair]
+                        if len(objs) == 2 and self.hud_colors:
+                            bar_obj = next((o for o in objs if o['color'] == self.hud_colors['bar_color']), None)
+                            if bar_obj:
+                                bar_id = bar_obj['id']
+                                track_id = next(oid for oid in self.hud_pair if oid != bar_id)
+                            else:
+                                bar_id, track_id = self.hud_pair # Fallback
+                        else:
+                            bar_id, track_id = self.hud_pair
+                                            
+                        # Forward Muting: Ensure both frames ignore the locked IDs
+                        for obj in prev_summary:
+                            if obj['id'] in self.hud_pair: obj['is_hud'] = True
+                        for obj in current_summary:
+                            if obj['id'] in self.hud_pair: obj['is_hud'] = True
+                            
+                        curr_bar = next((o for o in current_summary if o['id'] == bar_id), None)
+                        prev_bar = next((o for o in prev_summary if o['id'] == bar_id), None)
+                        
+                        if curr_bar and prev_bar:
+                            curr_pixels = curr_bar['pixels']
+                            prev_pixels = prev_bar['pixels']
+                            
+                            if not hasattr(self, 'hud_state_map'): self.hud_state_map = {}
+                            
+                            # Record Positional Transition
+                            if prev_pixels > curr_pixels: # Standard Drop
+                                self.hud_state_map[prev_pixels] = curr_pixels
+                            elif prev_pixels < curr_pixels: # Refill
+                                if self.debug_channels.get('CHANGES', True):
+                                    self._print_and_log(f"  [ORACLE] HUD Refill detected ({prev_pixels} -> {curr_pixels}). Maintaining lock.")
+
+                            # Project Death Clock
+                            steps = 0
+                            sim_pixels = curr_pixels
+                            while sim_pixels in self.hud_state_map and self.hud_state_map[sim_pixels] < sim_pixels:
+                                sim_pixels = self.hud_state_map[sim_pixels]
+                                steps += 1
+                                if sim_pixels <= 0: break
+                                
+                            if sim_pixels <= 0:
+                                self.death_clock = steps
+                                rule_name = "Finalized Positional Map (Proven)"
+                            elif steps > 0:
+                                self.death_clock = f"{steps} + ???"
+                                rule_name = f"Partial Positional Map (Depth {steps})"
+                            else:
+                                self.death_clock = "???"
+                                rule_name = "Mapping Positional HUD"
+                                
+                            if self.debug_channels.get('CHANGES', True) and prev_pixels != curr_pixels:
+                                self._print_and_log(f"  [ORACLE] HUD Rule: {rule_name} | Death Clock: {self.death_clock} moves remaining.")
+
+                    # --- NEW: EVENT MUTING (HUD IGNORANCE) ---
+                    # Strip all events related to the finalized HUD IDs
+                    filtered_events = []
+                    for e in events:
+                        obj_id = e.get('id')
+                        is_hud = False
+                        if self.hud_pair and obj_id in self.hud_pair: is_hud = True
+                        if not is_hud: filtered_events.append(e)
+                    events = filtered_events
+                    # -----------------------------------------
+
+                    # --- NEW: Identify Static Objects (Null Results) ---
+                    # The change log only tells us what moved. We must explicitly record
+                    # "NO_CHANGE" for objects that stood still, so the agent knows 
+                    # it has "tested" them.
+                    changed_ids = {e.get('id') for e in events if e.get('id')}
+                    
+                    for obj in prev_summary:
+                        if obj['id'] not in changed_ids:
+                            # Create synthetic NO_CHANGE event
+                            no_change_event = {'type': 'NO_CHANGE', 'id': obj['id']}
+                            events.append(no_change_event)
+
+                    # --- FIX: The "Guest List" Check (Object Permanence) ---
+                    # Check if the Gatekeeper is waiting for data on an object that no longer exists.
+                    for mandate_obj_id in list(self.active_experiments.keys()):
+                        if mandate_obj_id not in changed_ids and not any(o['id'] == mandate_obj_id for o in prev_summary):
+                            # The object is completely gone from the room. 
+                            # Submit a synthetic failure so the Splitter learns its presence is required.
+                            events.append({'type': 'NO_CHANGE', 'id': mandate_obj_id})
+                    # ---------------------------------------------------
+                    # ---------------------------------------------------
+                    # --- NEW: Pre-calculate Physics for Classification ---
+                    # We run this BEFORE classification so the notes are available 
+                    # for the classifier and debug logs.
+                    for e in events:
+                        # UPDATED: Allow Mass Changes (Growth/Shrink) to enter Physics
+                        if e['type'] in ['SHAPE_CHANGED', 'TRANSFORM', 'GROWTH', 'SHRINK']:
+                            # Unpack Tuple
+                            result = self._check_interaction_physics(e['id'], events, prev_context, current_summary)
+                            if result:
+                                note, agitators = result
+                                e['_physics_note'] = note
+                                e['_physics_agitators'] = agitators
+                    # -----------------------------------------------------
+
+                    # [INSERTION POINT] 1.5. Record Raw Data into Scientific Memory
+                    # We must record the events BEFORE we classify them, so the classifier
+                    # can see the "N=1" count immediately for new phenomena.
+                    for event in events:
+                        obj_id = event.get('id')
+                        if obj_id:
+                            # We need the state from the PREVIOUS context (Cause)
+                            # to associate with this Result.
+                            prev_obj = next((o for o in prev_summary if o['id'] == obj_id), None)
+                            
+                            if prev_obj:
+                                # 1. Get Scientific State (Color/Shape/Size + Context)
+                                state_sig = self._get_scientific_state(prev_obj, prev_context)
+                            else:
+                                # --- FIX: Ghost Object Signature ---
+                                # The object no longer exists, but we still use its ID as its state
+                                # to record the NO_CHANGE data and clear the active mandate.
+                                state_sig = obj_id
+                                
+                            # 2. Get Concrete Result (The "What happened")
+                            result_sig = self._get_concrete_signature(event)
+                            
+                            # 3. Log to Truth Table
+                            # learning_key is the Action (e.g., 'ACTION6_obj_5')
+                            self._update_truth_table(state_sig, learning_key, result_sig, obj_id=obj_id)
+
+                    # --- NEW: Run The Scientific Judge HERE ---
+                    # Now that data is recorded, let the Judge certify any rules immediately 
+                    # BEFORE the Gatekeeper runs and prints the logs.
+                    self._verify_and_certify()
+
+                    # 2. Classify Events (Now reads from the populated Truth Table AND updated Certified Laws)
+                    direct_events, global_events, ambiguous_events = self._classify_event_stream(events, learning_key, prev_context)
+                    
+                    # 3. Resolve Ambiguity (The Pipeline)
+                    promoted_events = self._resolve_ambiguous_events(
+                        ambiguous_events, events, current_summary, prev_summary, 
+                        current_adjacencies, self.last_adjacencies, learning_key
+                    )
+                    
+                    # Merge promoted events into Direct for learning
+                    direct_events.extend(promoted_events)
+                    ambiguous_events = [e for e in ambiguous_events if e not in promoted_events]
+
+                    # 4. Map events to specific objects for DIRECT learning
+                    obj_events_map = {obj['id']: [] for obj in self.last_object_summary}
+                    for event in direct_events:
+                        if 'id' in event and event['id'] in obj_events_map:
+                            obj_events_map[event['id']].append(event)
+                    
+                    # A. Learn Direct Rules (Action -> Result)
+                    for obj in self.last_object_summary:
+                        obj_id = obj['id']
+                        specific_events = obj_events_map[obj_id]
+                        hypothesis_key = (learning_key, obj_id)
+                    
+
+                        self._analyze_result(hypothesis_key, specific_events, prev_context)
+                    
+                    # B. Learn Global Rules (Environment -> Result)
+                    for event in global_events:
+                        abst_sig = self._get_abstract_signature(event)
+                        
+                        # --- NEW: Update Global History ---
+                        if abst_sig not in self.global_event_history:
+                            self.global_event_history[abst_sig] = []
+                        
+                        # Avoid duplicates for the same turn
+                        if self.last_action_id not in self.global_event_history[abst_sig]:
+                            self.global_event_history[abst_sig].append(self.last_action_id)
+                        # ----------------------------------
+
+                        global_key = ('GLOBAL', str(abst_sig)) 
+                        self._analyze_result(global_key, [event], prev_context)
+
+                    # --- NEW: Run Global Forecasting Analysis ---
+                    self._analyze_global_patterns()
+
+                    # --- NEW: Rescue Ambiguous Events via Relational Logic ---
+                    # UPDATED: Disabled. We do not rescue ambiguous events with hypotheses.
+                    # We strictly wait for the Truth Table to certify them.
+                    # ---------------------------------------------------------
+
+                    # --- DETAILED PRINTING (Now uses updated brain) ---
+                    if self.debug_channels['CHANGES']:
+                        
+                        # Define map for logging lookups
+                        prev_obj_map = {o['id']: o for o in prev_context['summary']}
+                        
+                        def _fmt_val(e):
+                            if e.get('is_until'):
+                                val = e.get('vector') if 'vector' in e else f"+{e.get('pixel_delta')}"
+                                action_verb = "Move" if 'vector' in e else "Grow"
+                                return f"{action_verb} {val} (Until {e['until_cond']})"
+                            
+                            if e.get('is_absolute'):
+                                if 'vector' in e: return f"Move to {e['abs_coords']}"
+                                if 'to_size' in e: return f"Grow to Size {e['abs_coords']}"
+                            
+                            suffix = ""
+                            if e.get('_is_variable'): suffix = " (Variable Magnitude/Shape)"
+                            
+                            if 'vector' in e: return f"Move {e['vector']}{suffix}"
+                            if 'to_color' in e: return f"Recolor to {e['to_color']}{suffix}"
+                            if 'pixel_delta' in e: return f"Size {'+' if e['pixel_delta']>0 else ''}{e['pixel_delta']}{suffix}"
+                            if 'to_fingerprint' in e: return f"Shape {e['to_fingerprint']}{suffix}"
+                            return e['type']
+
+                        if global_events: 
+                            self._print_and_log(f"  -> Filtered {len(global_events)} Global events:")
+                            for e in global_events:
+                                obj_id = e.get('id')
+                                if not obj_id or obj_id not in prev_obj_map: continue
+                                
+                                prev_obj = prev_obj_map[obj_id]
+                                state_sig = self._get_scientific_state(prev_obj, prev_context)
+                                
+                                # Check for Global Sequence Law
+                                laws_for_obj = self.certified_laws.get(obj_id, {})
+                                laws = laws_for_obj.get(state_sig, {})
+                                law = laws.get('ANY')
+                                
+                                self._print_and_log(f"     * [GLOBAL] {e['type']} on {e.get('id', 'Unknown')}")
+
+                                if law and law.get('type') == 'GLOBAL_SEQUENCE':
+                                    seq_str = " -> ".join(map(str, law['sequence']))
+                                    self._print_and_log(f"       [Explanation] Global Cycle: Target ID Pattern {seq_str}")
+                                    self._print_and_log(f"       [Prediction]  Next Target ID: {law.get('next_prediction', 'Unknown')}")
+                                else:
+                                    result_sig = self._get_concrete_signature(e)
+                                    # FIX: Use 'learning_key' instead of 'action_key'
+                                    rule_str = self._format_rule_description('GLOBAL', learning_key, state_sig, result_sig)
+                                    self._print_and_log(f"       [Explanation] Global Rule: Inevitable '{_fmt_val(e)}'.")
+                                    self._print_and_log(f"       [Prediction]  IF {rule_str}")
+
+                        if direct_events: 
+                            self._print_and_log(f"  -> Processing {len(direct_events)} Direct events:")
+                            for e in direct_events:
+                                obj_id = e.get('id')
+                                if not obj_id or obj_id not in prev_obj_map: continue
+                                
+                                prev_obj = prev_obj_map[obj_id]
+                                state_sig = self._get_scientific_state(prev_obj, prev_context)
+
+                                # Check for Direct Sequence Law
+                                laws_for_obj = self.certified_laws.get(obj_id, {})
+                                laws = laws_for_obj.get(state_sig, {})
+                                law = laws.get(learning_key)
+                                
+                                self._print_and_log(f"     * [DIRECT] {e['type']} on {e.get('id', 'Unknown')}")
+                                if '_physics_note' in e:
+                                    self._print_and_log(f"       [Physics]     {e['_physics_note']}")
+                                
+                                if law and law.get('type') == 'DIRECT_SEQUENCE':
+                                    seq_str = " -> ".join(map(str, law['sequence']))
+                                    self._print_and_log(f"       [Explanation] Direct Cycle: Value Pattern {seq_str}")
+                                    
+                                    # Calculate next value for display (replicating prediction logic)
+                                    current_val = None
+                                    r_type = law['result_type']
+                                    if r_type == 'RECOLORED': current_val = prev_obj['color']
+                                    elif r_type in ['SHAPE_CHANGED', 'TRANSFORM']: current_val = prev_obj['fingerprint']
+                                    elif r_type in ['GROWTH', 'SHRINK']: current_val = prev_obj['pixels']
+                                    
+                                    next_val = "Unknown"
+                                    if current_val in law['sequence']:
+                                        idx = law['sequence'].index(current_val)
+                                        next_val = law['sequence'][(idx + 1) % len(law['sequence'])]
+                                    
+                                    self._print_and_log(f"       [Prediction]  Next Value: {next_val}")
+                                else:
+                                    result_sig = self._get_concrete_signature(e)
+                                    rule_str = self._format_rule_description('DIRECT', learning_key, state_sig, result_sig)
+                                    self._print_and_log(f"       [Explanation] Direct Causality: Action consistently causes '{_fmt_val(e)}'")
+                                    self._print_and_log(f"       [Prediction]  IF {rule_str}")
+
+                        if ambiguous_events:
+                            # Split the events for clean printing
+                            semi_global_list = [w for w in ambiguous_events if w.get('type') == 'SEMI_GLOBAL']
+                            true_ambiguous_list = [w for w in ambiguous_events if w.get('type') != 'SEMI_GLOBAL']
+                            
+                            if semi_global_list:
+                                self._print_and_log(f"  -> Tracking {len(semi_global_list)} Semi-Global events:")
+                                for wrapper in semi_global_list:
+                                    e = wrapper['event']
+                                    reason = wrapper['reason']
+                                    fix = wrapper['fix']
+                                    detail = wrapper.get('detail', '')
+                                    val_str = _fmt_val(e)
+                                    
+                                    self._print_and_log(f"     * [SEMI_GLOBAL] {e['type']} on {e.get('id', 'Unknown')}")
+                                    self._print_and_log(f"       [Observed] {val_str}")
+                                    self._print_and_log(f"       [Status]   {reason}")
+                                    if detail:
+                                        self._print_and_log(f"       [Detail]   {detail}")
+                                    self._print_and_log(f"       [Needs]    {fix}")
+                                    
+                            if true_ambiguous_list:
+                                self._print_and_log(f"  -> Ignored {len(true_ambiguous_list)} Ambiguous events:")
+                                for wrapper in true_ambiguous_list:
+                                    e = wrapper['event']
+                                    reason = wrapper['reason']
+                                    fix = wrapper['fix']
+                                    detail = wrapper.get('detail', '')
+                                    val_str = _fmt_val(e)
+                                    e_category = wrapper.get('type', 'AMBIGUOUS')
+
+                                    self._print_and_log(f"     * [{e_category}] {e['type']} on {e.get('id', 'Unknown')}")
+                                    self._print_and_log(f"       [Observed] {val_str}")
+                                    self._print_and_log(f"       [Status]   {reason}")
+                                    if detail:
+                                        self._print_and_log(f"       [Detail]   {detail}")
+                                    self._print_and_log(f"       [Needs]    {fix}")
+                    
+                    # --- Failsafe: Track banned actions ---
+                    # UPDATED: Success = Any REAL change detected OR level increase.
+                    has_real_change = any(e.get('type') != 'NO_CHANGE' for e in events)
+                    action_succeeded = has_real_change or level_increased
+                    
+                    # --- NEW: Track Productive Actions (ACTION6 Only) ---
+                    if action_succeeded and self.last_action_context and self.last_action_context.startswith('ACTION6'):
+                        self.productive_action_types.add(self.last_action_context)
+                    # -------------------------------------
+
+                    if not action_succeeded and self.last_action_context: # Last action was a total failure
+                        self.banned_action_keys.add(self.last_action_context)
+                        if self.debug_channels['FAILURE']:
+                            print(f"--- Failsafe: Banning action '{self.last_action_context}' due to failure. Total banned: {len(self.banned_action_keys)} ---")
+                        
+                        # --- MODIFIED: Permanent Ban Logic ---
+                        if (self.last_action_context.startswith('ACTION6_') and
+                            self.last_action_context not in self.successful_click_actions):
+                            self.permanent_banned_actions.add(self.last_action_context)
+                            if self.debug_channels['FAILURE']:
+                                print(f"--- Failsafe: Permanently banning '{self.last_action_context}' (never succeeded). Total permanent: {len(self.permanent_banned_actions)} ---")
+                        # --- End MODIFIED ---
+                    
+                    elif action_succeeded: # Last action had *some* success
+                        if self.banned_action_keys:
+                            if self.debug_channels['FAILURE']:
+                                print(f"--- Failsafe: Success detected. Clearing {len(self.banned_action_keys)} banned actions. ---")
+                            self.banned_action_keys.clear() # Clear ban
+                        
+                        # --- NEW: Track Successful Clicks ---
+                        if self.last_action_context and self.last_action_context.startswith('ACTION6_'):
+                            self.successful_click_actions.add(self.last_action_context)
+                        # --- End NEW ---
+                    # --- End Failsafe ---
+
+                    # 2. Map events to specific objects
+                    # Only map DIRECT events to the learner.
+                    obj_events_map = {obj['id']: [] for obj in self.last_object_summary}
+                    
+                    for event in direct_events:
+                        if 'id' in event and event['id'] in obj_events_map:
+                            obj_events_map[event['id']].append(event)
+
+                    # 3. Unified Learning Loop
+                    # We process EVERY object from the previous frame.
+                    for obj in self.last_object_summary:
+                        obj_id = obj['id']
+                        specific_events = obj_events_map[obj_id]
+                        
+                        # Key: (ActionName, TargetID)
+                        hypothesis_key = (learning_key, obj_id)
+                        
+                        # Learn (Success OR Failure is handled uniformly inside this function)
+                        self._analyze_result(hypothesis_key, specific_events, prev_context)
+                        
+            # --- 3. Update Memory For Next Turn ---
+            self.last_object_summary = current_summary
+            self.last_adjacencies = current_adjacencies
+            self.last_diag_adjacencies = current_diag_adjacencies
+            self.last_relationships = current_relationships
+            self.last_alignments = current_alignments
+            self.last_diag_alignments = current_diag_alignments
+            self.last_match_groups = current_match_groups
+
+            # --- 4. Choose an Action (Discovery Profiler Logic) ---
+            
+            # [FIX] Define current_full_context before using it
+            current_full_context = {
+                'summary': current_summary,
+                'rels': current_relationships,
+                'adj': current_adjacencies,
+                'diag_adj': current_diag_adjacencies,
+                'align': current_alignments,
+                'diag_align': current_diag_alignments,
+                'match': current_match_groups
+            }
+
+            # --- Update Relational Archive ---
+            self.relational_archive.update(self._extract_relational_archive_strings(current_full_context))
+
+            # --- NEW: Debug Relational Archive ---
+            if self.debug_channels.get('CONTEXT_DETAILS', False):
+                archive_size = len(self.relational_archive)
+                self._print_and_log(f"\n--- [Debug] Relational Archive Size: {archive_size} ---")
+                if archive_size > 0:
+                    sample = list(self.relational_archive)[:min(5, archive_size)]
+                    self._print_and_log(f"  Sample entries: {sample}")
+
+            # --- CAUSAL MEMORY: Track what the last action did ---
+            if self.last_action_context and self.last_object_summary:
+                prev_context = {
+                    'summary': self.last_object_summary, 'rels': self.last_relationships,
+                    'adj': self.last_adjacencies, 'diag_adj': self.last_diag_adjacencies,
+                    'align': self.last_alignments, 'diag_align': self.last_diag_alignments,
+                    'match': self.last_match_groups
+                }
+                old_feats = self._extract_all_features(prev_context)
+                new_feats = self._extract_all_features(current_full_context)
+                changed_features = old_feats.symmetric_difference(new_feats)
+                
+                # --- FIX: Store Base Variables instead of hyper-specific values ---
+                changed_base_vars = {self._get_base_variable(f) for f in changed_features}
+                
+                if self.last_action_context not in self.action_effects_memory:
+                    self.action_effects_memory[self.last_action_context] = set()
+                self.action_effects_memory[self.last_action_context].update(changed_base_vars)
+
+            # [Build all_possible_moves list...]
+            all_possible_moves = []
+            click_action_template = None
+            available = latest_frame.available_actions if latest_frame.available_actions else []
+
+            for action in available:
+                if action.name == 'ACTION6':
+                    click_action_template = action
+                else:
+                    all_possible_moves.append({'template': action, 'object': None})
+            
+            if click_action_template and current_summary:
+                for obj in current_summary:
+                    all_possible_moves.append({'template': click_action_template, 'object': obj})
+
+            # --- FIX: Extract Base Variables for the Agenda ---
+            active_suspects = set()
+            for obj in current_summary:
+                if obj['id'] in self.active_experiments:
+                    suspect_vars = self.state_refinements.get(obj['id'], {}).keys()
+                    active_suspects.update(suspect_vars)
+
+            # --- PRIORITY 1: THE SCIENTIST ---
+            science_moves = []
+            mandated_move = None
+            
+            for move in all_possible_moves:
+                action_template = move['template']
+                target_obj = move['object']
+                target_id = target_obj['id'] if target_obj else None
+                
+                scientific_score = 0
+                this_action_key = self._get_learning_key(action_template.name, target_id)
+                
+                # --- TIER 1A: ACTIVE MANDATES (Absolute Override) ---
+                # Check if this move can satisfy ANY active mandate on the board
+                for exp_obj_id, mandate in self.active_experiments.items():
+                    has_data = (exp_obj_id in self.truth_table and this_action_key in self.truth_table[exp_obj_id])
+                    
+                    if mandate['req'] == 'POSITIVE_CONTROL' and this_action_key == mandate['ref']:
                         mandated_move = move
                         break
-                        
-                    current_features = self._extract_all_features(current_full_context)
-                    current_suspect_vals = {f for f in current_features if self._get_base_variable(f) in suspects}
-                    
-                    already_tested_this_setup = False
-                    action_history = self.truth_table.get(exp_obj_id, {}).get(this_action_key, {})
-                    
-                    for r_sig, locs in action_history.items():
-                        for entry in locs:
-                            if len(entry) >= 3:
-                                turn = entry[1]
-                                ctx_idx = turn - 1
-                                if 0 <= ctx_idx < len(self.level_state_history):
-                                    hist_ctx = self.level_state_history[ctx_idx]
-                                    hist_features = self._extract_all_features(hist_ctx)
-                                    hist_suspect_vals = {f for f in hist_features if self._get_base_variable(f) in suspects}
-                                    
-                                    if hist_suspect_vals == current_suspect_vals:
-                                        already_tested_this_setup = True
-                                        break
-                        if already_tested_this_setup:
+                    elif mandate['req'] == 'NEGATIVE_CONTROL' and this_action_key != mandate['ref'] and not has_data:
+                        mandated_move = move
+                        break
+                    elif mandate['req'] in ['VERIFY_VAR', 'STABILIZE_CONTEXT'] and this_action_key == mandate['ref']:
+                        # --- LOCAL SCIENTIFIC STATE CHECK ---
+                        suspects = set()
+                        if mandate['req'] == 'VERIFY_VAR':
+                            suspects = set(self.state_refinements.get(exp_obj_id, {}).keys())
+                        else:
+                            suspects = set(self.pending_refinements.get(exp_obj_id, {}).get('suspects', set()))
+                            
+                        if not suspects:
+                            mandated_move = move
                             break
                             
-                    if not already_tested_this_setup:
-                        mandated_move = move
-                        break
-                    # If already tested, do nothing. Yield to Tier 1B to "Setup" a new state.
+                        current_features = self._extract_all_features(current_full_context)
+                        current_suspect_vals = {f for f in current_features if self._get_base_variable(f) in suspects}
+                        
+                        already_tested_this_setup = False
+                        action_history = self.truth_table.get(exp_obj_id, {}).get(this_action_key, {})
+                        
+                        for r_sig, locs in action_history.items():
+                            for entry in locs:
+                                if len(entry) >= 3:
+                                    turn = entry[1]
+                                    ctx_idx = turn - 1
+                                    if 0 <= ctx_idx < len(self.level_state_history):
+                                        hist_ctx = self.level_state_history[ctx_idx]
+                                        hist_features = self._extract_all_features(hist_ctx)
+                                        hist_suspect_vals = {f for f in hist_features if self._get_base_variable(f) in suspects}
+                                        
+                                        if hist_suspect_vals == current_suspect_vals:
+                                            already_tested_this_setup = True
+                                            break
+                            if already_tested_this_setup:
+                                break
+                                
+                        if not already_tested_this_setup:
+                            mandated_move = move
+                            break
+                        # If already tested, do nothing. Yield to Tier 1B to "Setup" a new state.
+                        
+                if mandated_move:
+                    break
+
+                # --- TIER 1B: CURIOSITY & IGNORANCE (Score Math) ---
+                # Interrogation Bonus
+                known_effects = self.action_effects_memory.get(this_action_key, set())
+                relevant_toggles = known_effects.intersection(active_suspects)
+                scientific_score += len(relevant_toggles)
+
+                for obj in current_summary:
+                    obj_id = obj['id']
                     
+                    # --- FIX: Splitter-Aware Curiosity ---
+                    # Predict what THIS move (this_action_key) will do to THIS object (obj_id)
+                    predicted_events, confidence = self._predict_outcome(this_action_key, obj_id, current_full_context)
+                    
+                    state_sig = self._get_scientific_state(obj, current_full_context)
+                    action_history = self.truth_table.get(obj_id, {}).get(this_action_key, {})
+                    
+                    # Calculate raw observation counts for this exact state
+                    results_in_this_state = sum(1 for r_sig, locs in action_history.items() if any(len(e) >= 3 and e[2] == state_sig for e in locs))
+                    total_n_for_this_state = sum(len([e for e in locs if len(e) >= 3 and e[2] == state_sig]) for r_sig, locs in action_history.items())
+                    
+                    # 1. Is the science completely settled? (Predictor is 100% confident)
+                    if confidence == 100:
+                        scientific_score -= 1
+                        
+                    # 2. Is there an active, unsolved contradiction? (Splitter needs data)
+                    elif results_in_this_state > 1:
+                        scientific_score += 1  # Adjusted to +1 as requested
+                        
+                    # 3. Have we never physically tried this?
+                    elif total_n_for_this_state == 0:
+                        scientific_score += 1
+                        
+                    # 4. Consistent so far, waiting on Controls (handled by Tier 1A)
+                    else:
+                        scientific_score -= 1
+                    # -------------------------------------
+
+                if scientific_score > 0:
+                    science_moves.append((move, scientific_score))
+
+            action_to_return = None
+            chosen_object = None
+
             if mandated_move:
-                break
-
-            # --- TIER 1B: CURIOSITY & IGNORANCE (Score Math) ---
-            # Interrogation Bonus
-            known_effects = self.action_effects_memory.get(this_action_key, set())
-            relevant_toggles = known_effects.intersection(active_suspects)
-            scientific_score += len(relevant_toggles)
-
-            for obj in current_summary:
-                obj_id = obj['id']
-                
-                # --- FIX: Splitter-Aware Curiosity ---
-                # Predict what THIS move (this_action_key) will do to THIS object (obj_id)
-                predicted_events, confidence = self._predict_outcome(this_action_key, obj_id, current_full_context)
-                
-                state_sig = self._get_scientific_state(obj, current_full_context)
-                action_history = self.truth_table.get(obj_id, {}).get(this_action_key, {})
-                
-                # Calculate raw observation counts for this exact state
-                results_in_this_state = sum(1 for r_sig, locs in action_history.items() if any(len(e) >= 3 and e[2] == state_sig for e in locs))
-                total_n_for_this_state = sum(len([e for e in locs if len(e) >= 3 and e[2] == state_sig]) for r_sig, locs in action_history.items())
-                
-                # 1. Is the science completely settled? (Predictor is 100% confident)
-                if confidence == 100:
-                    scientific_score -= 1
-                    
-                # 2. Is there an active, unsolved contradiction? (Splitter needs data)
-                elif results_in_this_state > 1:
-                    scientific_score += 1  # Adjusted to +1 as requested
-                    
-                # 3. Have we never physically tried this?
-                elif total_n_for_this_state == 0:
-                    scientific_score += 1
-                    
-                # 4. Consistent so far, waiting on Controls (handled by Tier 1A)
-                else:
-                    scientific_score -= 1
-                # -------------------------------------
-
-            if scientific_score > 0:
-                science_moves.append((move, scientific_score))
-
-        action_to_return = None
-        chosen_object = None
-
-        if mandated_move:
-            action_to_return = mandated_move['template']
-            chosen_object = mandated_move['object']
-            if self.debug_channels['ACTION_SCORE']:
-                self._print_and_log(f"\n--- [Priority 1A: Mandate] Chose: {action_to_return.name}{' on '+chosen_object['id'] if chosen_object else ''} (Bypassed Scoring) ---")
-        elif science_moves:
-            science_moves.sort(key=lambda x: x[1], reverse=True)
-            chosen_move, score = science_moves[0]
-            action_to_return = chosen_move['template']
-            chosen_object = chosen_move['object']
-            if self.debug_channels['ACTION_SCORE']:
-                self._print_and_log(f"\n--- [Priority 1B: Science] Chose: {action_to_return.name}{' on '+chosen_object['id'] if chosen_object else ''} (Score: {score}) ---")
-        else:
-            # --- PRIORITY 2: THE EXPLORER (Infinite Horizon BFS) ---
-            explorer_move, novelty_score = self._search_for_novelty(current_full_context, available)
-            
-            if explorer_move:
-                action_to_return = explorer_move['template']
-                chosen_object = explorer_move['object']
+                action_to_return = mandated_move['template']
+                chosen_object = mandated_move['object']
                 if self.debug_channels['ACTION_SCORE']:
-                    self._print_and_log(f"\n--- [Priority 2: Exploration] Chose: {action_to_return.name}{' on '+chosen_object['id'] if chosen_object else ''} (Novelty Score: {novelty_score}) ---")
+                    self._print_and_log(f"\n--- [Priority 1A: Mandate] Chose: {action_to_return.name}{' on '+chosen_object['id'] if chosen_object else ''} (Bypassed Scoring) ---")
+            elif science_moves:
+                science_moves.sort(key=lambda x: x[1], reverse=True)
+                chosen_move, score = science_moves[0]
+                action_to_return = chosen_move['template']
+                chosen_object = chosen_move['object']
+                if self.debug_channels['ACTION_SCORE']:
+                    self._print_and_log(f"\n--- [Priority 1B: Science] Chose: {action_to_return.name}{' on '+chosen_object['id'] if chosen_object else ''} (Score: {score}) ---")
             else:
-                # --- PRIORITY 3: THE AGITATOR ---
-                agitator_candidates = []
-                for move in all_possible_moves:
-                    move_target_id = move['object']['id'] if move['object'] else None
-                    full_action_name = self._get_learning_key(move['template'].name, move_target_id)
-                    
-                    # Check every object on the board to see if THIS action moves ANYTHING
-                    for eval_obj in current_full_context.get('summary', []):
-                        predicted_events, conf = self._predict_outcome(full_action_name, eval_obj['id'], current_full_context)
-                        if predicted_events:
-                            agitator_candidates.append(move)
-                            break # Found a change! We can stop checking objects.
+                # --- PRIORITY 2: THE EXPLORER (Infinite Horizon BFS) ---
+                explorer_move, novelty_score = self._search_for_novelty(current_full_context, available)
                 
-                agitator_move = None
-                if agitator_candidates:
-                    # FIX: Round-Robin. Pick the candidate we haven't used recently to prevent infinite fallback loops.
-                    agitator_candidates.sort(key=lambda m: self.performed_action_types.get(
-                        self._get_learning_key(m['template'].name, m['object']['id'] if m['object'] else None), 0
-                    ))
-                    agitator_move = agitator_candidates[0]
-                
-                if agitator_move:
-                    action_to_return = agitator_move['template']
-                    chosen_object = agitator_move['object']
+                if explorer_move:
+                    action_to_return = explorer_move['template']
+                    chosen_object = explorer_move['object']
                     if self.debug_channels['ACTION_SCORE']:
-                        self._print_and_log(f"\n--- [Priority 3: Agitation] Chose: {action_to_return.name}{' on '+chosen_object['id'] if chosen_object else ''} (Stirring the pot) ---")
+                        self._print_and_log(f"\n--- [Priority 2: Exploration] Chose: {action_to_return.name}{' on '+chosen_object['id'] if chosen_object else ''} (Novelty Score: {novelty_score}) ---")
                 else:
-                    action_to_return = self.get_pass_action()
-                    if self.debug_channels['ACTION_SCORE']:
-                        self._print_and_log(f"\n--- [Priority 3: Agitation] Chose: Pass (Completely trapped) ---")
+                    # --- PRIORITY 3: THE AGITATOR ---
+                    agitator_candidates = []
+                    for move in all_possible_moves:
+                        move_target_id = move['object']['id'] if move['object'] else None
+                        full_action_name = self._get_learning_key(move['template'].name, move_target_id)
+                        
+                        # Check every object on the board to see if THIS action moves ANYTHING
+                        for eval_obj in current_full_context.get('summary', []):
+                            predicted_events, conf = self._predict_outcome(full_action_name, eval_obj['id'], current_full_context)
+                            if predicted_events:
+                                agitator_candidates.append(move)
+                                break # Found a change! We can stop checking objects.
+                    
+                    agitator_move = None
+                    if agitator_candidates:
+                        # FIX: Round-Robin. Pick the candidate we haven't used recently to prevent infinite fallback loops.
+                        agitator_candidates.sort(key=lambda m: self.performed_action_types.get(
+                            self._get_learning_key(m['template'].name, m['object']['id'] if m['object'] else None), 0
+                        ))
+                        agitator_move = agitator_candidates[0]
+                    
+                    if agitator_move:
+                        action_to_return = agitator_move['template']
+                        chosen_object = agitator_move['object']
+                        if self.debug_channels['ACTION_SCORE']:
+                            self._print_and_log(f"\n--- [Priority 3: Agitation] Chose: {action_to_return.name}{' on '+chosen_object['id'] if chosen_object else ''} (Stirring the pot) ---")
+                    else:
+                        action_to_return = self.get_pass_action()
+                        if self.debug_channels['ACTION_SCORE']:
+                            self._print_and_log(f"\n--- [Priority 3: Agitation] Chose: Pass (Completely trapped) ---")
 
-        # Inject coordinates for Click Actions using the OFFICIAL API method
-        if action_to_return and action_to_return.name == 'ACTION6':
-            if chosen_object:
-                guaranteed_pixels = sorted(list(chosen_object['pixel_coords']))
-                # Cast to standard int to prevent Numpy serialization errors
-                r, c = int(guaranteed_pixels[0][0]), int(guaranteed_pixels[0][1])
-                action_to_return.set_data({'x': c, 'y': r})
+            # Inject coordinates for Click Actions using the OFFICIAL API method
+            if action_to_return and action_to_return.name == 'ACTION6':
+                if chosen_object:
+                    guaranteed_pixels = sorted(list(chosen_object['pixel_coords']))
+                    # Cast to standard int to prevent Numpy serialization errors
+                    r, c = int(guaranteed_pixels[0][0]), int(guaranteed_pixels[0][1])
+                    action_to_return.set_data({'x': c, 'y': r})
+                else:
+                    raw_data = getattr(action_to_return, 'data', {})
+                    if raw_data is None: 
+                        raw_data = {}
+                    action_to_return.set_data({'x': int(raw_data.get('x', 0)), 'y': int(raw_data.get('y', 0))})
+
+            # --- Store action for next turn's analysis ---
+            if action_to_return:
+                target_id = chosen_object['id'] if chosen_object else None
+                learning_key_for_storage = self._get_learning_key(
+                    action_to_return.name, 
+                    target_id
+                )
+                self.performed_action_types[learning_key_for_storage] = self.global_action_counter
             else:
-                raw_data = getattr(action_to_return, 'data', {})
-                action_to_return.set_data({'x': int(raw_data.get('x', 0)), 'y': int(raw_data.get('y', 0))})
-
-        # --- Store action for next turn's analysis ---
-        if action_to_return:
-            target_id = chosen_object['id'] if chosen_object else None
-            learning_key_for_storage = self._get_learning_key(
-                action_to_return.name, 
-                target_id
-            )
-            self.performed_action_types[learning_key_for_storage] = self.global_action_counter
-        else:
-            learning_key_for_storage = None
+                learning_key_for_storage = None
+            
+            self.last_action_context = learning_key_for_storage
+            
+            # --- Timestamp the Action ---
+            self.global_action_counter += 1
+            self.last_action_id = self.global_action_counter
         
-        self.last_action_context = learning_key_for_storage
-        
-        # --- Timestamp the Action ---
-        self.global_action_counter += 1
-        self.last_action_id = self.global_action_counter
-      
-        # --- Store state for level history ---
-        current_context = {
-            'summary': current_summary,
-            'rels': current_relationships,
-            'adj': current_adjacencies,
-            'diag_adj': current_diag_adjacencies,
-            'align': current_alignments,
-            'diag_align': current_diag_alignments,
-            'match': current_match_groups,
-            'events': changes 
-        }
-        self.level_state_history.append(current_context)
+            # --- Store state for level history ---
+            current_context = {
+                'summary': current_summary,
+                'rels': current_relationships,
+                'adj': current_adjacencies,
+                'diag_adj': current_diag_adjacencies,
+                'align': current_alignments,
+                'diag_align': current_diag_alignments,
+                'match': current_match_groups,
+                'events': changes 
+            }
+            self.level_state_history.append(current_context)
 
-        # RETURN ONLY THE OBJECT (No Tuples!)
-        return action_to_return
+            # RETURN ONLY THE OBJECT (No Tuples!)
+            return action_to_return
+
+        except Exception as e:
+            # --- THE ULTIMATE KAGGLE FAILSAFE ---
+            error_trace = traceback.format_exc()
+            try:
+                self._print_and_log(f"\n[CRITICAL ERROR] Agent crashed during choose_action: {e}")
+                self._print_and_log(error_trace)
+            except AttributeError:
+                print(f"\n[CRITICAL ERROR] Agent crashed: {e}")
+                print(error_trace)
+            
+            # Safely pass the turn to keep the Kaggle server alive
+            return self.get_pass_action()
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         # 1. Natural Win: Safely disconnect and bank the points!
