@@ -4,6 +4,7 @@ from collections import deque
 import copy
 import ast
 from typing import Optional
+import traceback
 import statistics
 
 class ObmlAgi3Agent(Agent):
@@ -12,6 +13,8 @@ class ObmlAgi3Agent(Agent):
     """
     def __init__(self, params: dict = None, **kwargs):
         super().__init__(**kwargs)
+
+        ###Copy and Paste From this point onward####
 
         self.object_id_counter = 0
         self.removed_objects_memory = {}
@@ -243,6 +246,16 @@ class ObmlAgi3Agent(Agent):
         """
         Analyzes the current frame, checks for stability, and logs perceived changes.
         """
+        if hasattr(latest_frame, 'available_actions') and latest_frame.available_actions:
+            new_actions = []
+            for a in latest_frame.available_actions:
+                if isinstance(a, int):
+                    # Find the GameAction member that matches this number (e.g., ACTION1 for 1)
+                    match = next((member for member in GameAction if str(a) in member.name), None)
+                    new_actions.append(match if match else a)
+                else:
+                    new_actions.append(a)
+            latest_frame.available_actions = new_actions
         try:
             # --- 1. Game Start / Game Over Logic ---
             if latest_frame.state == GameState.NOT_PLAYED:
@@ -342,7 +355,7 @@ class ObmlAgi3Agent(Agent):
             if not self.last_object_summary or self.is_new_level:
                 # --- FIRST FRAME LOGIC ---
                 # This block runs on the first frame of a new level, OR a retry.
-                current_score = latest_frame.score
+                current_score = getattr(latest_frame, 'score', getattr(latest_frame, 'levels_completed', 0))
                 
                 if self.is_new_level:
                     # --- This is a NEW LEVEL (from score increase) ---
