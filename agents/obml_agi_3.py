@@ -116,12 +116,12 @@ class ObmlAgi3Agent(Agent):
         # Set these to True or False to control the debug output.
         self.debug_channels = {
             'PERCEPTION': False,      # Object finding, relationships, new level setup
-            'CHANGES': False,    #TRUE     # All "Change Log" prints
+            'CHANGES': True,    #TRUE     # All "Change Log" prints
             'STATE_GRAPH': False,     # State understanding
-            'HYPOTHESIS': False, #TRUE     # "Initial Hypotheses", "Refined Hypothesis"
+            'HYPOTHESIS': True, #TRUE     # "Initial Hypotheses", "Refined Hypothesis"
             'FAILURE': False,         # "Failure Analysis", "Failure Detected"
             'WIN_CONDITION': False,   # "LEVEL CHANGE DETECTED", "Win Condition Analysis"
-            'ACTION_SCORE': False,  #TRUE  # All scoring prints
+            'ACTION_SCORE': True,  #TRUE  # All scoring prints
             'CONTEXT_DETAILS': False # Keep or remove large prints
         }
 
@@ -668,8 +668,12 @@ class ObmlAgi3Agent(Agent):
                     
                     for obj in prev_summary:
                         if obj['id'] not in changed_ids:
-                            # Create synthetic NO_CHANGE event
-                            no_change_event = {'type': 'NO_CHANGE', 'id': obj['id']}
+                            # --- FIX: Prevent HUD/Resource elements from being logged as NO_CHANGE ---
+                            if obj.get('is_hud') or (self.hud_pair and obj['id'] in self.hud_pair):
+                                continue 
+                                
+                            # Create synthetic NO_CHANGE event explicitly tied to the intrinsic properties
+                            no_change_event = {'type': 'NO_CHANGE', 'id': obj['id'], 'color': obj['color'], 'fingerprint': obj['fingerprint'], 'position': obj['position']}
                             events.append(no_change_event)
 
                     # --- FIX: The "Guest List" Check (Object Permanence) ---
@@ -786,8 +790,8 @@ class ObmlAgi3Agent(Agent):
                         
                         def _fmt_val(e):
                             if e.get('is_until'):
-                                val = e.get('vector') if 'vector' in e else f"+{e.get('pixel_delta')}"
-                                action_verb = "Move" if 'vector' in e else "Grow"
+                                val = f"dx:{e.get('dx')}, dy:{e.get('dy')}" if 'dx' in e else f"+{e.get('pixel_delta')}"
+                                action_verb = "Move" if 'dx' in e else "Grow"
                                 return f"{action_verb} {val} (Until {e['until_cond']})"
                             
                             if e.get('is_absolute'):
@@ -797,7 +801,7 @@ class ObmlAgi3Agent(Agent):
                             suffix = ""
                             if e.get('_is_variable'): suffix = " (Variable Magnitude/Shape)"
                             
-                            if 'vector' in e: return f"Move {e['vector']}{suffix}"
+                            if 'dx' in e: return f"Move dx:{e.get('dx')}, dy:{e.get('dy')}{suffix}"
                             if 'to_color' in e: return f"Recolor to {e['to_color']}{suffix}"
                             if 'pixel_delta' in e: return f"Size {'+' if e['pixel_delta']>0 else ''}{e['pixel_delta']}{suffix}"
                             if 'to_fingerprint' in e: return f"Shape {e['to_fingerprint']}{suffix}"
@@ -826,7 +830,7 @@ class ObmlAgi3Agent(Agent):
                                 else:
                                     result_sig = self._get_concrete_signature(e)
                                     # FIX: Use 'learning_key' instead of 'action_key'
-                                    rule_str = self._format_rule_description('GLOBAL', learning_key, state_sig, result_sig)
+                                    rule_str = self._format_rule_description('GLOBAL', learning_key, state_sig, result_sig, obj_id=obj_id)
                                     self._print_and_log(f"       [Explanation] Global Rule: Inevitable '{_fmt_val(e)}'.")
                                     self._print_and_log(f"       [Prediction]  IF {rule_str}")
 
@@ -867,7 +871,7 @@ class ObmlAgi3Agent(Agent):
                                     self._print_and_log(f"       [Prediction]  Next Value: {next_val}")
                                 else:
                                     result_sig = self._get_concrete_signature(e)
-                                    rule_str = self._format_rule_description('DIRECT', learning_key, state_sig, result_sig)
+                                    rule_str = self._format_rule_description('DIRECT', learning_key, state_sig, result_sig, obj_id=obj_id)
                                     self._print_and_log(f"       [Explanation] Direct Causality: Action consistently causes '{_fmt_val(e)}'")
                                     self._print_and_log(f"       [Prediction]  IF {rule_str}")
 
@@ -1051,57 +1055,8 @@ class ObmlAgi3Agent(Agent):
                 this_action_key = self._get_learning_key(action_template.name, target_id)
                 
                 # --- TIER 1A: ACTIVE MANDATES (Absolute Override) ---
-                # Check if this move can satisfy ANY active mandate on the board
-                for exp_obj_id, mandate in self.active_experiments.items():
-                    has_data = (exp_obj_id in self.truth_table and this_action_key in self.truth_table[exp_obj_id])
-                    
-                    if mandate['req'] == 'POSITIVE_CONTROL' and this_action_key == mandate['ref']:
-                        mandated_move = move
-                        break
-                    elif mandate['req'] == 'NEGATIVE_CONTROL' and this_action_key != mandate['ref'] and not has_data:
-                        mandated_move = move
-                        break
-                    elif mandate['req'] in ['VERIFY_VAR', 'STABILIZE_CONTEXT'] and this_action_key == mandate['ref']:
-                        # --- LOCAL SCIENTIFIC STATE CHECK ---
-                        suspects = set()
-                        if mandate['req'] == 'VERIFY_VAR':
-                            suspects = set(self.state_refinements.get(exp_obj_id, {}).keys())
-                        else:
-                            suspects = set(self.pending_refinements.get(exp_obj_id, {}).get('suspects', set()))
-                            
-                        if not suspects:
-                            mandated_move = move
-                            break
-                            
-                        current_features = self._extract_all_features(current_full_context)
-                        current_suspect_vals = {f for f in current_features if self._get_base_variable(f) in suspects}
-                        
-                        already_tested_this_setup = False
-                        action_history = self.truth_table.get(exp_obj_id, {}).get(this_action_key, {})
-                        
-                        for r_sig, locs in action_history.items():
-                            for entry in locs:
-                                if len(entry) >= 3:
-                                    turn = entry[1]
-                                    ctx_idx = turn - 1
-                                    if 0 <= ctx_idx < len(self.level_state_history):
-                                        hist_ctx = self.level_state_history[ctx_idx]
-                                        hist_features = self._extract_all_features(hist_ctx)
-                                        hist_suspect_vals = {f for f in hist_features if self._get_base_variable(f) in suspects}
-                                        
-                                        if hist_suspect_vals == current_suspect_vals:
-                                            already_tested_this_setup = True
-                                            break
-                            if already_tested_this_setup:
-                                break
-                                
-                        if not already_tested_this_setup:
-                            mandated_move = move
-                            break
-                        # If already tested, do nothing. Yield to Tier 1B to "Setup" a new state.
-                        
-                if mandated_move:
-                    break
+                # REMOVED: No forced positive/negative controls. The engine strictly uses pure discovery.
+                mandated_move = None
 
                 # --- TIER 1B: CURIOSITY & IGNORANCE (Score Math) ---
                 # Interrogation Bonus
@@ -1478,7 +1433,7 @@ class ObmlAgi3Agent(Agent):
                     # ---------------------------------------------------------------
                     pos_parts = coord_part.replace('.', '').split(' to ')
                     start_pos, end_pos = ast.literal_eval(pos_parts[0]), ast.literal_eval(pos_parts[1])
-                    event.update({'vector': (end_pos[0] - start_pos[0], end_pos[1] - start_pos[1])})
+                    event.update({'dx': end_pos[1] - start_pos[1], 'dy': end_pos[0] - start_pos[0]})
                     events.append(event)
 
                 elif change_type == 'RECOLORED':
@@ -1585,7 +1540,7 @@ class ObmlAgi3Agent(Agent):
         
         # --- Standard Value Extraction (Fallback) ---
         elif e_type == 'MOVED':
-            val = event.get('vector')
+            val = (event.get('dx', 0), event.get('dy', 0))
         elif e_type == 'RECOLORED':
             val = event.get('to_color')
         elif e_type in ['GROWTH', 'SHRINK']:
@@ -1629,7 +1584,7 @@ class ObmlAgi3Agent(Agent):
         
         val = None
         if e_type == 'MOVED':
-            val = event.get('vector')
+            val = (event.get('dx', 0), event.get('dy', 0))
         elif e_type == 'RECOLORED':
             val = event.get('to_color')
         elif e_type in ['GROWTH', 'SHRINK']:
@@ -1710,7 +1665,8 @@ class ObmlAgi3Agent(Agent):
                  print(f"  [Failure Analysis] Intersection is generic. Keeping {len(outcome_data['contexts'])} specific landmines instead of a rule.")
         else:
              outcome_data['rule'] = candidate_rule
-             if self.debug_channels['HYPOTHESIS']:
+             # ONLY print if there are actual events (changes), to avoid NO_CHANGE log spam
+             if self.debug_channels['HYPOTHESIS'] and events:
                 lbl = "FAILURE" if not events else "SUCCESS"
                 print(f"  Learned {lbl} Consistency Rule for {action_key} (seen {len(outcome_data['contexts'])} times).")
         # --- LANDMINE LOGIC END ---
@@ -2081,100 +2037,60 @@ class ObmlAgi3Agent(Agent):
                     if self.debug_channels['HYPOTHESIS']:
                         print(f"  [Global Forecaster] Discovered Signal: Event {sig} is preceded by a specific state.")
 
+    def _get_generalized_signature(self, history_entries: list) -> tuple:
+        """Tier 1: Intersects a list of state signatures to find the common characteristics."""
+        sigs = [e[2] for e in history_entries if len(e) >= 3 and isinstance(e[2], tuple)]
+        if not sigs: return None
+        gen_sig = list(sigs[0])
+        for sig in sigs[1:]:
+            for i in range(len(gen_sig)):
+                if gen_sig[i] != 'ANY' and gen_sig[i] != sig[i]:
+                    gen_sig[i] = 'ANY'
+        return tuple(gen_sig)
+
+    def _sig_matches(self, current_sig, gen_sig) -> bool:
+        """Tier 1: Checks if a specific state signature matches a generalized one."""
+        if not gen_sig or not isinstance(current_sig, tuple) or len(current_sig) != len(gen_sig): return False
+        for c, g in zip(current_sig, gen_sig):
+            if g != 'ANY' and c != g:
+                return False
+        return True
+
     def _predict_outcome(self, action_key: str, eval_obj_id: str, current_context: dict) -> tuple[list|None, int]:
         """
-        Scientific Prediction. 
-        Priority 1: Certified Laws.
-        Priority 2: Greedy Assumption (Truth Table Lookup with Refined State).
+        Pure Greedy Prediction with Tier 1 Intersection. 
+        Trusts conditional splits first, then generalizes past characteristics.
         """
-        # --- FIX: Map the variable so the lower half of the function doesn't crash ---
-        target_id = eval_obj_id
-        
-        target_obj = next((o for o in current_context['summary'] if o['id'] == target_id), None)
+        target_obj = next((o for o in current_context['summary'] if o['id'] == eval_obj_id), None)
         if not target_obj: return None, 0
         
         state_sig = self._get_scientific_state(target_obj, current_context)
         
-        laws_for_obj = self.certified_laws.get(eval_obj_id, {})
-        univ_laws = laws_for_obj.get('UNIVERSAL_STATE', {})
-        
-        full_action_key = action_key
-        
-        law = univ_laws.get(full_action_key)
-        
-        # If we don't have a direct law, check for an ANY law, 
-        # but ONLY apply it if it's a truly proven GLOBAL law.
-        if not law and 'ANY' in univ_laws and univ_laws['ANY'].get('type') == 'GLOBAL':
-            law = univ_laws['ANY']
-        # -----------------------------------------
-        
-        if law:
-            if 'result' in law:
-                return self._expand_result(law['result'], target_obj), 100
-        
-        # TIER 2: Positive-First Conjunction (The Goldilocks Zone)
-        refined_vars = self.state_refinements.get(target_id, {})
-        current_features = self._extract_all_features(current_context)
-        
+        # 1. Check for Refined Conditional Rules (Tier 2/3 Splitter Overrides)
+        refined_vars = self.state_refinements.get(eval_obj_id, {})
         if refined_vars:
-            # Assume success unless proven otherwise
-            predict_failure = False
-            best_success_sig = None
-            
+            current_features = self._extract_all_features(current_context)
             for base_var, buckets in refined_vars.items():
                 active_val = next((f for f in current_features if self._get_base_variable(f) == base_var), None)
-                
-                # Find the SUCCESS bucket and FAILURE bucket for this variable
-                success_bucket = set()
-                failure_bucket = set()
-                for r_sig, b_vals in buckets.items():
-                    if r_sig[0] == 'NO_CHANGE': failure_bucket.update(b_vals)
-                    else: 
-                        success_bucket.update(b_vals)
-                        best_success_sig = r_sig 
-                
-                # Check for Violation A: Missing Prerequisite
-                if not active_val and success_bucket:
-                    predict_failure = True
-                    break
-                    
-                # Check for Violation B: Poisoned Value
-                if active_val and active_val in failure_bucket and active_val not in success_bucket:
-                    predict_failure = True
-                    break
-            
-            if predict_failure:
-                return [], 100 # NO_CHANGE
-            elif best_success_sig:
-                return self._expand_result(best_success_sig, target_obj), 100
+                if active_val:
+                    for r_sig, valid_vals in buckets.items():
+                        if active_val in valid_vals:
+                            return self._expand_result(r_sig, target_obj), 100
 
-        # 3. [NEW] Greedy Prediction from Truth Table
-        if target_id in self.truth_table:
-            # --- FIX: Use full_action_key so it actually finds the history ---
-            action_data = self.truth_table[target_id].get(full_action_key, {})
+        # 2. Tier 1 Intrinsic Intersection Prediction
+        best_match_result = None
+        for stored_id, stored_actions in self.truth_table.items():
+            if action_key in stored_actions:
+                for result_sig, history in stored_actions[action_key].items():
+                    if not history: continue
+                    gen_sig = self._get_generalized_signature(history)
+                    if self._sig_matches(state_sig, gen_sig):
+                        best_match_result = result_sig
+                        break
+            if best_match_result: break
             
-            best_match_result = None
-            for result_sig, history in action_data.items():
-                if not history: continue
-                # Look at the most recent entry
-                last_entry = history[-1]
-                if len(last_entry) >= 3:
-                    run, turn = last_entry[0], last_entry[1]
-                    # The state that caused the event was the turn BEFORE the event
-                    ctx_idx = turn - 1
-                    if 0 <= ctx_idx < len(self.level_state_history):
-                        past_ctx = self.level_state_history[ctx_idx]
-                        past_obj = next((o for o in past_ctx['summary'] if o['id'] == target_id), None)
-                        if past_obj:
-                            # Recalculate the historical state signature using the NEW rules
-                            past_state_sig = self._get_scientific_state(past_obj, past_ctx)
-                            # If it matches the current state signature, we have a Greedy Match!
-                            if past_state_sig == state_sig:
-                                best_match_result = result_sig
-                                break
-            
-            if best_match_result:
-                return self._expand_result(best_match_result, target_obj), 80
+        if best_match_result:
+            return self._expand_result(best_match_result, target_obj), 100
 
         return None, 0
 
@@ -2192,7 +2108,9 @@ class ObmlAgi3Agent(Agent):
         if r_type == 'NO_CHANGE': return []
         
         event = {'id': target_obj['id'], 'type': r_type}
-        if r_type == 'MOVED': event['vector'] = r_val
+        if r_type == 'MOVED': 
+            event['dx'] = r_val[0]
+            event['dy'] = r_val[1]
         elif r_type == 'RECOLORED': event['to_color'] = r_val
         elif r_type in ['GROWTH', 'SHRINK']: event['pixel_delta'] = r_val
         elif r_type in ['TRANSFORM', 'SHAPE_CHANGED']: event['to_fingerprint'] = r_val
@@ -2244,9 +2162,10 @@ class ObmlAgi3Agent(Agent):
             target_obj = obj_map[obj_id]
 
             if event_type == 'MOVED':
-                dr, dc = event['vector']
+                dy = event.get('dy', 0)
+                dx = event.get('dx', 0)
                 r, c = target_obj['position']
-                target_obj['position'] = (r + dr, c + dc)
+                target_obj['position'] = (r + dy, c + dx)
             elif event_type == 'RECOLORED':
                 target_obj['color'] = event['to_color']
             elif event_type == 'SHAPE_CHANGED':
@@ -3431,220 +3350,36 @@ class ObmlAgi3Agent(Agent):
 
     def _classify_event_stream(self, current_events: list[dict], action_key: str, prev_context: dict) -> tuple[list[dict], list[dict], list[dict]]:
         """
-        [THE GATEKEEPER]
-        Sorts raw events into DIRECT, GLOBAL, or AMBIGUOUS.
-        UPDATED: Now runs the Splitter IMMEDIATELY upon detecting conflict
-        so the logs reflect the active hypothesis instead of just 'Waiting'.
+        Absolute Assumption Classifier.
+        Everything is treated as a direct rule. Instantly triggers Splitter on contradiction.
         """
         direct_events = []
-        global_events = []
-        ambiguous_events = []
 
         for event in current_events:
             obj_id = event.get('id')
-            
-            # 1. Valid ID Check
-            if not obj_id:
-                ambiguous_events.append({
-                    'event': event, 'reason': "No Object ID", 'fix': "IGNORE",
-                    'requirements': [], 'detail': "Event has no target ID."
-                })
-                continue
+            if not obj_id: continue
 
-            # 2. Construct the Signature
             result_sig = self._get_concrete_signature(event)
-            
-            # --- GET CURRENT STATE SIG ---
             target_obj = next((o for o in prev_context['summary'] if o['id'] == obj_id), None)
-            if target_obj:
-                state_sig = self._get_scientific_state(target_obj, prev_context)
-            else:
-                # --- FIX: Handle Ghost Signatures during Classification ---
-                state_sig = obj_id
+            state_sig = self._get_scientific_state(target_obj, prev_context) if target_obj else obj_id
 
-            # 3. Check the Law Book (Certified Laws)
-            laws_for_obj = self.certified_laws.get(obj_id, {})
-            univ_laws = laws_for_obj.get('UNIVERSAL_STATE', {})
-            
-            # A. Check for UNIVERSAL GLOBAL / SEMI-GLOBAL Law
-            any_law = univ_laws.get('ANY')
-            if any_law and any_law['result'] == result_sig:
-                if any_law['type'] == 'GLOBAL':
-                    global_events.append(event)
-                    if obj_id in self.active_experiments: del self.active_experiments[obj_id]
-                    continue
-                elif any_law['type'] == 'SEMI_GLOBAL':
-                    ambiguous_events.append({
-                        'event': event, 'type': 'SEMI_GLOBAL', 'reason': "Semi-Global (Assumed Physics)",
-                        'requirements': ["NEGATIVE_CONTROL"], 'fix': "TRY_DIFFERENT_ACTION",
-                        'detail': "Pattern holds across tested actions. Need to test ALL actions to certify Global.",
-                        'target_action': action_key, 'target_object': obj_id
-                    })
-                    self.active_experiments[obj_id] = {'req': 'NEGATIVE_CONTROL', 'ref': action_key}
-                    continue
-            
-            # B. Check for UNIVERSAL DIRECT Law
-            direct_law = univ_laws.get(action_key)
-            if direct_law and direct_law['result'] == result_sig:
-                direct_events.append(event)
-                if obj_id in self.active_experiments and self.active_experiments[obj_id].get('ref') == action_key:
-                    del self.active_experiments[obj_id]
-                continue
-                
-            # C. Check for TIER 2 ISOLATED BUCKET Law (Parallel Hypotheses)
-            refined_vars = self.state_refinements.get(obj_id, {})
-            current_features = self._extract_all_features(prev_context)
-            is_certified_isolated_direct = False
-            is_certified_isolated_global = False
-            
-            for base_var, buckets in refined_vars.items():
-                active_val = next((f for f in current_features if self._get_base_variable(f) == base_var), None)
-                if active_val and active_val in buckets.get(result_sig, set()):
-                    # The hypothesis predicts this result! Does the bucket have N >= 2?
-                    if obj_id in self.truth_table and action_key in self.truth_table[obj_id]:
-                        count = sum(1 for e in self.truth_table[obj_id][action_key].get(result_sig, []) if len(e) >= 2)
-                        if count >= 2:
-                            # --- NEW: CONDITIONAL GLOBAL CHECK ---
-                            # It is consistent for THIS action. Do OTHER actions trigger it too?
-                            other_actions_with_result = 0
-                            for other_a, r_map in self.truth_table[obj_id].items():
-                                if other_a != action_key and result_sig in r_map:
-                                    other_actions_with_result += 1
-                                    
-                            if other_actions_with_result > 0:
-                                is_certified_isolated_global = True
-                                
-                                if self.debug_channels['HYPOTHESIS']:
-                                    self._print_and_log(f"\n--- [Science Debug] Caught by TIER 2 SPLITTER (Transcendence to GLOBAL) ---")
-                                    self._print_and_log(f"    Target: {obj_id} | Event: {result_sig}")
-                                    self._print_and_log(f"    Reason: Occurs under specific condition '{base_var}' across multiple actions.")
-                            else:
-                                is_certified_isolated_direct = True
-                                
-                                if self.debug_channels['HYPOTHESIS']:
-                                    self._print_and_log(f"\n--- [Science Debug] Caught by TIER 2 SPLITTER (Remains DIRECT) ---")
-                                    self._print_and_log(f"    Target: {obj_id} | Event: {result_sig}")
-                                    self._print_and_log(f"    Reason: Condition '{base_var}' is exclusive to this action.")
-                            break
-                            
-            if is_certified_isolated_global:
-                global_events.append(event)
-                if obj_id in self.active_experiments: del self.active_experiments[obj_id]
-                continue
-            elif is_certified_isolated_direct:
-                direct_events.append(event)
-                if obj_id in self.active_experiments and self.active_experiments[obj_id].get('ref') == action_key:
-                    del self.active_experiments[obj_id]
-                continue
-                
-            # 4. If we are here, it is AMBIGUOUS. 
-            diagnosis = "Unknown"
-            requirements = []
-            fix = "EXPLORE"
-            detail = ""
-            
+            # Detect Contradiction against the Tier 1 Generalized Assumption
             if obj_id in self.truth_table and action_key in self.truth_table[obj_id]:
-                # --- FIX: State-Specific Filtering ---
-                # Only look at history that matches the CURRENT refined state!
-                state_specific_results = {}
+                expected_results = {}
                 for r_sig, locs in self.truth_table[obj_id][action_key].items():
-                    matching_locs = [e for e in locs if len(e) >= 3 and e[2] == state_sig]
-                    if matching_locs:
-                        state_specific_results[r_sig] = matching_locs
-                        
-                n_count = len(state_specific_results.get(result_sig, []))
-                all_results = list(state_specific_results.keys())
+                    gen_sig = self._get_generalized_signature(locs)
+                    if self._sig_matches(state_sig, gen_sig):
+                        expected_results[r_sig] = locs
                 
-                if len(all_results) > 1:
-                    # [CRITICAL UPDATE]: Immediate Splitter Execution
-                    diagnosis = "Unstable/Inconsistent"
-                    
-                    # 1. Run the Splitter NOW using the filtered data
-                    self._trigger_splitter(obj_id, action_key, state_specific_results)
-                    
-                    # 2. Retrieve the fresh hypothesis
-                    current_refinements = self.state_refinements.get(obj_id, {}) # Now a dict!
-                    pending_data = self.pending_refinements.get(obj_id)
+                # If we expected a specific outcome based on characteristics, but got something else: CONTRADICTION!
+                if expected_results and result_sig not in expected_results:
+                    # Temporarily inject the current event for the Splitter to compare
+                    expected_results[result_sig] = [(self.run_counter, len(self.level_state_history), state_sig)]
+                    self._trigger_splitter(obj_id, action_key, expected_results)
 
-                    if current_refinements:
-                        unique_vars = sorted(list(current_refinements.keys()))
-                        prefix = f"{obj_id}_"
-                        clean_vars = [v.replace(prefix, "") if v.startswith(prefix) else v for v in unique_vars]
+            direct_events.append(event)
 
-                        if len(clean_vars) > 10:
-                            vars_str = ", ".join(clean_vars[:10]) + f"... (+{len(clean_vars)-10} more)"
-                        else:
-                            vars_str = ", ".join(clean_vars)
-                            
-                        diagnosis = "Parallel Hypotheses Active"
-                        fix = "TEST_CANDIDATES"
-                        detail = f"Tracking {len(unique_vars)} isolated variables: {{{vars_str}}}"
-                        requirements = ["VERIFY_VAR"]
-                        
-                    elif pending_data:
-                        unique_vars = sorted(list(pending_data['suspects']))
-                        prefix = f"{obj_id}_"
-                        clean_vars = [v.replace(prefix, "") if v.startswith(prefix) else v for v in unique_vars]
-                        
-                        if len(clean_vars) > 10:
-                            vars_str = ", ".join(clean_vars[:10]) + f"... (+{len(clean_vars)-10} more)"
-                        else:
-                            vars_str = ", ".join(clean_vars)
-                            
-                        diagnosis = f"Whittling Suspects (Stable: {pending_data['stable_count']}/2)"
-                        fix = "FORCE_COLLISIONS"
-                        detail = f"Contenders: {{{vars_str}}}"
-                        requirements = ["STABILIZE_CONTEXT"]
-                        
-                    else:
-                        # Failure. Splitter ran but found no intersection.
-                        fix = "WAIT_FOR_MORE_DATA"
-                        detail = "Splitter ran but found no consistent differentiator yet."
-                        requirements = ["STABILIZE_CONTEXT"]
-
-                else:
-                    # No contradictions, standard checks
-                    # With the Asymmetrical Judge, if it is not certified by now, 
-                    # it mathematically guarantees either N=1, OR no other actions have been tried.
-                    if n_count < 2:
-                        requirements.append("POSITIVE_CONTROL")
-                        diagnosis = "Unverified (N=1)"
-                        fix = "REPEAT_ACTION"
-                        detail = "Result seen once. Need confirmation."
-                    else:
-                        requirements.append("NEGATIVE_CONTROL")
-                        diagnosis = "Undistinguished"
-                        fix = "TRY_DIFFERENT_ACTION"
-                        detail = "Consistent (N>=2), but need Negative Control."
-
-            else:
-                diagnosis = "New Phenomenon"
-                requirements = ["POSITIVE_CONTROL", "NEGATIVE_CONTROL"]
-                fix = "REPEAT_ACTION"
-                
-            # --- Update Active Experiments ---
-            if "POSITIVE_CONTROL" in requirements:
-                self.active_experiments[obj_id] = {'req': 'POSITIVE_CONTROL', 'ref': action_key}
-            elif "NEGATIVE_CONTROL" in requirements:
-                self.active_experiments[obj_id] = {'req': 'NEGATIVE_CONTROL', 'ref': action_key}
-            elif "VERIFY_VAR" in requirements:
-                self.active_experiments[obj_id] = {'req': 'VERIFY_VAR', 'ref': action_key}
-            elif "STABILIZE_CONTEXT" in requirements:
-                self.active_experiments[obj_id] = {'req': 'STABILIZE_CONTEXT', 'ref': action_key}
-            # ---------------------------------
-
-            ambiguous_events.append({
-                'event': event,
-                'type': 'AMBIGUOUS',
-                'reason': diagnosis,
-                'requirements': requirements,
-                'fix': fix,
-                'detail': detail,
-                'target_action': action_key,
-                'target_object': obj_id
-            })
-
-        return direct_events, global_events, ambiguous_events
+        return direct_events, [], []
 
     def _update_truth_table(self, state_sig, action_key, result_sig, obj_id=None):
         """
@@ -3848,76 +3583,42 @@ class ObmlAgi3Agent(Agent):
 
         return conditions
     
-    def _format_rule_description(self, rule_type, action_key, state_sig, result_sig):
+    def _format_rule_description(self, rule_type, action_key, state_sig, result_sig, obj_id=None):
         """
-        Returns a scientific description of the rule.
-        Refined Logic:
-        1. Always shows Color (Primary ID).
-        2. Hides Size/Shape unless they VARY across known laws for this action (Salience).
-        3. Hides Context (Neighbors) unless marked critical by the Splitter.
+        Translates the scientific state and splitter refinements into a readable log.
+        Outputs the exact Tier 1 (Characteristics) and Tier 2/3 (Relationships) context.
         """
-        # 1. Get raw invariants (Color, Size, Shape, Neighbors, etc.)
-        raw_conditions = self._get_invariant_properties(state_sig, action_key, result_sig)
+        rule_parts = []
         
-        # 2. Analyze Salience (Do Size/Shape matter?)
-        # We check all certified laws for this Action to see if Size/Shape ever change.
-        # If every object we click has the same Size, we assume Size is irrelevant (Occam's Razor).
-        # If we have rules for Size A and Size B, then Size is a discriminator -> Show it.
-        
-        variations = {'Size': set(), 'Shape': set()}
-        
-        # Scan Truth Table to check for salience (Do Size/Shape vary for this action?)
-        for o_id, actions_data in self.truth_table.items():
-            if action_key in actions_data:
-                for r_sig, locs in actions_data[action_key].items():
-                    for entry in locs:
-                        if len(entry) >= 3: run, turn = entry[0], entry[1]
-                        else: run, turn = 0, entry[0]
-                        if 0 <= turn - 1 < len(self.level_state_history):
-                            ctx = self.level_state_history[turn - 1]
-                            t_obj = next((o for o in ctx['summary'] if o['id'] == o_id), None)
-                            if t_obj:
-                                variations['Shape'].add(t_obj['fingerprint'])
-                                variations['Size'].add(t_obj['size'])
+        # 1. Unpack Tier 1: Intrinsic Characteristics
+        gen_sig = state_sig
+        if obj_id and obj_id in self.truth_table and action_key in self.truth_table[obj_id]:
+            history = self.truth_table[obj_id][action_key].get(result_sig, [])
+            computed_gen = self._get_generalized_signature(history)
+            if computed_gen: gen_sig = computed_gen
 
-        show_size = len(variations['Size']) > 1
-        show_shape = len(variations['Shape']) > 1
-        
-        # 3. Filter Conditions
-        refined_conditions = []
-        
-        if isinstance(state_sig, tuple) and len(state_sig) == 2 and isinstance(state_sig[1], tuple):
-            obj_id = state_sig[0]
+        if isinstance(gen_sig, tuple) and len(gen_sig) == 5:
+            color, shape, size, pixels, pos = gen_sig
+            shape_str = str(shape)[:5] + ".." if len(str(shape)) > 5 and shape != 'ANY' else str(shape)
+            size_str = f"{size[0]}x{size[1]}" if size != 'ANY' else "ANY"
+            rule_parts.append(f"Tier 1 (Intrinsic): [Color: {color}, Size: {size_str}, Pos: {pos}, Shape: {shape_str}]")
         else:
-            obj_id = state_sig
-            
-        critical_keys = self.state_refinements.get(obj_id, [])
-        critical_base_vars = {self._get_base_variable(k) for k in critical_keys}
-        
-        for cond in raw_conditions:
-            if cond.startswith("Target="): refined_conditions.append(cond)
-            elif cond.startswith("Size=") and (show_size or any('pixels' in k for k in critical_base_vars)): 
-                refined_conditions.append(cond)
-            elif cond.startswith("Shape=") and (show_shape or any('shape' in k for k in critical_base_vars)): 
-                refined_conditions.append(cond)
-            else:
-                # Context keys logic
-                clean_cond = cond.replace('*', '')
-                keep = False
-                if "Adj(" in clean_cond:
-                    for k in critical_keys:
-                        if k.startswith('adj_') and k.replace('adj_', '') in clean_cond: keep = True
-                elif "Align" in clean_cond:
-                    for k in critical_keys:
-                        if k.startswith('align_') and k.replace('align_', '') in clean_cond: keep = True
-                elif "Match" in clean_cond:
-                     for k in critical_keys:
-                        if k.startswith('match_') and k.replace('match_', '') in clean_cond: keep = True
-                
-                if keep: refined_conditions.append(cond)
+            rule_parts.append(f"Tier 1 (Intrinsic): [{gen_sig}]")
 
-        if not refined_conditions: return "Universal Rule"
-        return " AND ".join(refined_conditions)
+        # 2. Unpack Tier 2/3: Splitter Refinements
+        if obj_id and obj_id in self.state_refinements:
+            refinements = self.state_refinements[obj_id]
+            active_conds = []
+            for base_var, buckets in refinements.items():
+                if result_sig in buckets:
+                    active_conds.append(base_var)
+            
+            if active_conds:
+                rule_parts.append(f"Tier 2/3 (Conditional): [{', '.join(active_conds)}]")
+            else:
+                rule_parts.append(f"Tier 2/3 (Conditional): [Testing Alternatives...]")
+                
+        return " AND ".join(rule_parts)
             
     def _solve_conditional_rule(self, start_state, action_family, current_end_sig, current_context) -> str | None:
         """
@@ -4343,65 +4044,11 @@ class ObmlAgi3Agent(Agent):
 
     def _verify_and_certify(self, state_sig=None):
         """
-        [THE DUAL-TIERED JUDGE]
-        Tier 1: Certifies Universal Laws if an action ALWAYS does the same thing.
-        Tier 2: (Bucket-Level Isolated Variables) is evaluated on-the-fly in Predictor/Gatekeeper.
+        [DISABLED]
+        Universal checking and Positive/Negative controls are abolished.
+        The engine trusts pure greedy prediction and conditional splits.
         """
-        self.certified_laws = {} 
-        
-        # Calculate total known tools for Global checks
-        total_known_tools = 7
-        if hasattr(self, '_last_available_actions') and self._last_available_actions:
-            available = self._last_available_actions
-            num_globals = sum(1 for a in available if a.name != 'ACTION6')
-            has_click = any(a.name == 'ACTION6' for a in available)
-            total_known_tools = num_globals + (len(self.last_object_summary) if has_click and hasattr(self, 'last_object_summary') else 0)
-
-        for obj_id, actions_data in self.truth_table.items():
-            self.certified_laws[obj_id] = {}
-            
-            # --- TIER 1: THE UNIVERSAL CHECK ---
-            action_to_results = {}
-            for a_key, r_map in actions_data.items():
-                action_to_results[a_key] = {}
-                for r_sig, locs in r_map.items():
-                    if locs: action_to_results[a_key][r_sig] = len(locs)
-                    
-            for a_key, r_counts in action_to_results.items():
-                if len(r_counts) == 1:
-                    r_sig, n_count = list(r_counts.items())[0]
-                    if n_count >= 2:
-                        # Consistent! Check Controls
-                        has_neg_control = False
-                        same_result_actions = set([a_key])
-                        
-                        for other_a, other_r_counts in action_to_results.items():
-                            if other_a != a_key:
-                                # --- FIX: Strict Global Consistency ---
-                                # The other action must ONLY cause this result to be grouped in.
-                                # If it causes multiple results, it proves the result is NOT universal.
-                                if len(other_r_counts) == 1 and r_sig in other_r_counts:
-                                    same_result_actions.add(other_a)
-                                else:
-                                    has_neg_control = True
-                                # --------------------------------------
-                                    
-                        if len(same_result_actions) >= total_known_tools:
-                            self._certify_law(obj_id, 'GLOBAL', 'ANY', r_sig, 'UNIVERSAL_STATE')
-                        elif len(same_result_actions) > 1:
-                            self._certify_law(obj_id, 'SEMI_GLOBAL', 'ANY', r_sig, 'UNIVERSAL_STATE')
-                        elif has_neg_control:
-                            # --- NEW: Interrogate the False Negative ---
-                            if self.debug_channels['HYPOTHESIS']:
-                                self._print_and_log(f"\n--- [Science Debug] Classifying as DIRECT instead of GLOBAL ---")
-                                self._print_and_log(f"Target: {obj_id} | Event: {r_sig}")
-                                self._print_and_log(f"Why? Action '{a_key}' triggered it {n_count} times...")
-                                self._print_and_log(f"BUT, these other actions failed to trigger it:")
-                                for other_a, other_r_counts in action_to_results.items():
-                                    if other_a != a_key:
-                                        self._print_and_log(f"  - '{other_a}' resulted in: {list(other_r_counts.keys())}")
-                            # ------------------------------------------
-                            self._certify_law(obj_id, 'DIRECT', a_key, r_sig, 'UNIVERSAL_STATE')
+        pass
 
     def _certify_law(self, obj_id, law_type, action_key, result_sig, state_sig=None):
         """Helper to store the proven law in the registry."""
@@ -4475,18 +4122,17 @@ class ObmlAgi3Agent(Agent):
 
     def _trigger_splitter(self, obj_id, action, conflicting_results: dict):
         """
-        [THE GLOBAL SPLITTER]
-        Uses Set Intersection to find constant conditions for each result, 
-        and Set Subtraction to isolate the differences between results.
+        [THE CASCADING SPLITTER]
+        Tier 1: Intrinsic Intersection (Object characteristics)
+        Tier 2: Local Relational Intersection (Adjacencies)
+        Tier 3: Global Intersection (Macro-board state)
         """
         contexts_by_result = {}
         for r_sig, locs in conflicting_results.items():
             contexts_by_result[r_sig] = []
             for entry in locs:
-                if len(entry) >= 3: run, turn = entry[0], entry[1]
-                else: run, turn = entry[0], entry[1]
-                
-                # --- FIX: Allow the Splitter to use old data ---
+                if len(entry) >= 3: turn = entry[1]
+                else: turn = entry[0]
                 
                 ctx_idx = turn - 1
                 if 0 <= ctx_idx < len(self.level_state_history):
@@ -4495,143 +4141,142 @@ class ObmlAgi3Agent(Agent):
                         'target_id': obj_id
                     })
 
-        # --- FIX: Purge results that have no contexts in the current run ---
         contexts_by_result = {sig: ctx_list for sig, ctx_list in contexts_by_result.items() if len(ctx_list) > 0}
-
         if len(contexts_by_result) < 2: return
 
-        # --- 1. POSITIVE-FIRST AGGREGATION (The Goldilocks Zone) ---
-        success_contexts = []
-        failure_contexts = []
-        
+        # Separate Outcomes
+        success_ctxs = []
+        failure_ctxs = []
         for r_sig, ctx_list in contexts_by_result.items():
-            if r_sig[0] == 'NO_CHANGE':
-                failure_contexts.extend(ctx_list)
-            else:
-                success_contexts.extend(ctx_list)
+            if r_sig[0] == 'NO_CHANGE': failure_ctxs.extend(ctx_list)
+            else: success_ctxs.extend(ctx_list)
                 
-        if not success_contexts or not failure_contexts:
-            return # We need both to find a differentiator
+        if not success_ctxs or not failure_ctxs: return
 
-        # Build the Success Profile
-        success_base_var_counts = {}
-        success_base_var_values = {}
-        
-        for ctx_entry in success_contexts:
-            raw_features = self._extract_all_features(ctx_entry['snapshot'])
-            seen_in_this_ctx = set()
+        # Helper for Tiered Extraction
+        def _get_tiered_features(ctx_entry, current_tier):
+            features = set()
+            snap = ctx_entry['snapshot']
+            oid = ctx_entry['target_id']
+            obj = next((o for o in snap['summary'] if o['id'] == oid), None)
+            if not obj or obj.get('is_hud'): return features
             
-            for f_str in raw_features:
-                base_var = self._get_base_variable(f_str)
-                seen_in_this_ctx.add(base_var)
-                
-                if base_var not in success_base_var_values:
-                    success_base_var_values[base_var] = set()
-                success_base_var_values[base_var].add(f_str)
-                
-            for base_var in seen_in_this_ctx:
-                success_base_var_counts[base_var] = success_base_var_counts.get(base_var, 0) + 1
+            # TIER 1: Intrinsic Variables
+            if current_tier >= 1:
+                features.add(f"{oid}_color_{obj['color']}")
+                features.add(f"{oid}_pixels_{obj['pixels']}")
+                features.add(f"{oid}_shape_{obj['fingerprint']}")
+                features.add(f"{oid}_position_{obj['position']}")
+            
+            # TIER 2: Local Relationships
+            if current_tier >= 2:
+                for d_idx, direction in enumerate(['top', 'right', 'bottom', 'left']):
+                    nid = snap.get('adj', {}).get(oid, ['na']*4)[d_idx]
+                    if nid not in ['na', 'x']: features.add(f"{oid}_adj_{direction}_{nid}")
+                for d_idx, direction in enumerate(['tr', 'br', 'bl', 'tl']):
+                    nid = snap.get('diag_adj', {}).get(oid, ['na']*4)[d_idx]
+                    if nid not in ['na', 'x']: features.add(f"{oid}_diag_adj_{direction}_{nid}")
+            
+            # TIER 3: Global Relationships
+            if current_tier >= 3:
+                for a_type in ['top_y', 'bottom_y', 'center_y', 'left_x', 'right_x', 'center_x']:
+                    for coord, ids in snap.get('align', {}).get(a_type, {}).items():
+                        if oid in ids: features.add(f"{oid}_align_{a_type}_{coord}")
+                for m_type in ['Exact', 'Color', 'Fingerprint', 'Size', 'Pixels']:
+                    for props, ids in snap.get('match', {}).get(m_type, {}).items():
+                        if oid in ids: features.add(f"{oid}_match_{m_type}_{props}")
+            return features
 
-        # --- 2. DIFFERENTIATION (Finding the Violators) ---
         valid_refinements = set()
-        num_successes = len(success_contexts)
+        num_successes = len(success_ctxs)
         
-        for f_ctx_entry in failure_contexts:
-            raw_features = self._extract_all_features(f_ctx_entry['snapshot'])
-            f_base_vars_present = set()
-            f_base_var_values = {}
+        # Cascading Filter Loop
+        for tier in [1, 2, 3]:
+            success_base_var_counts = {}
+            success_base_var_values = {}
             
-            for f_str in raw_features:
-                base_var = self._get_base_variable(f_str)
-                f_base_vars_present.add(base_var)
-                f_base_var_values[base_var] = f_str
-                
-            violators_for_this_failure = set()
+            # 1. Build Success Baseline at this Tier
+            for ctx_entry in success_ctxs:
+                tier_features = _get_tiered_features(ctx_entry, tier)
+                seen_vars = set()
+                for f_str in tier_features:
+                    b_var = self._get_base_variable(f_str)
+                    seen_vars.add(b_var)
+                    success_base_var_values.setdefault(b_var, set()).add(f_str)
+                for b_var in seen_vars:
+                    success_base_var_counts[b_var] = success_base_var_counts.get(b_var, 0) + 1
+
+            tier_violators = set()
             
-            # Reason A: Poisoned Value (A value causing failure that was NEVER seen in success)
-            for base_var, val in f_base_var_values.items():
-                if base_var in success_base_var_values:
-                    if val not in success_base_var_values[base_var]:
-                        violators_for_this_failure.add(base_var)
+            # 2. Test Failures against the Baseline
+            for f_ctx in failure_ctxs:
+                f_features = _get_tiered_features(f_ctx, tier)
+                f_base_vars_present = set()
+                f_base_var_values = {}
+                for f_str in f_features:
+                    b_var = self._get_base_variable(f_str)
+                    f_base_vars_present.add(b_var)
+                    f_base_var_values[b_var] = f_str
+                    
+                # Reason A: Poisoned Value (Causing failure but never seen in success)
+                for b_var, val in f_base_var_values.items():
+                    if b_var in success_base_var_values and val not in success_base_var_values[b_var]:
+                        tier_violators.add(b_var)
                         
-            # Reason B: Missing Prerequisite (Strictly required in success, missing in failure)
-            for base_var, count in success_base_var_counts.items():
-                if count == num_successes: 
-                    if base_var not in f_base_vars_present:
-                        violators_for_this_failure.add(base_var)
+                # Reason B: Missing Prerequisite (Strictly required in success, missing in failure)
+                for b_var, count in success_base_var_counts.items():
+                    if count == num_successes and b_var not in f_base_vars_present:
+                        tier_violators.add(b_var)
                         
-            valid_refinements.update(violators_for_this_failure)
-            
-        # Build the result_variable_values dictionary for the bucket mapping below
+            if tier_violators:
+                valid_refinements = tier_violators
+                break # Differentiator found at this tier, stop expanding
+
+        # Build bucket mapping for the Predictor
         result_variable_values = {}
         for r_sig, ctx_list in contexts_by_result.items():
             result_variable_values[r_sig] = {}
             for ctx_entry in ctx_list:
-                raw_features = self._extract_all_features(ctx_entry['snapshot'])
+                raw_features = _get_tiered_features(ctx_entry, 3) 
                 for f_str in raw_features:
-                    base_var = self._get_base_variable(f_str)
-                    if base_var not in result_variable_values[r_sig]:
-                        result_variable_values[r_sig][base_var] = set()
-                    result_variable_values[r_sig][base_var].add(f_str)
+                    b_var = self._get_base_variable(f_str)
+                    if b_var not in result_variable_values[r_sig]:
+                        result_variable_values[r_sig][b_var] = set()
+                    result_variable_values[r_sig][b_var].add(f_str)
 
-        # --- 3. APPLY DISCOVERIES ---
+        # APPLY DISCOVERIES
         if valid_refinements:
-            first_ctx = list(contexts_by_result.values())[0][0]
-            t_obj = next((o for o in first_ctx['snapshot']['summary'] if o['id'] == obj_id), None)
-            
-            if t_obj:
-                # --- The Shadow Splitter (Purgatory) ---
-                if obj_id not in self.pending_refinements:
-                    self.pending_refinements[obj_id] = {'suspects': valid_refinements, 'stable_count': 0}
+            if obj_id not in self.pending_refinements:
+                self.pending_refinements[obj_id] = {'suspects': valid_refinements, 'stable_count': 0}
+            else:
+                if self.pending_refinements[obj_id]['suspects'] == valid_refinements:
+                    self.pending_refinements[obj_id]['stable_count'] += 1
                 else:
-                    current_suspects = self.pending_refinements[obj_id]['suspects']
-                    if current_suspects == valid_refinements:
-                        self.pending_refinements[obj_id]['stable_count'] += 1
-                    else:
-                        self.pending_refinements[obj_id]['suspects'] = valid_refinements
-                        self.pending_refinements[obj_id]['stable_count'] = 0
+                    self.pending_refinements[obj_id]['suspects'] = valid_refinements
+                    self.pending_refinements[obj_id]['stable_count'] = 0
+            
+            if self.pending_refinements[obj_id]['stable_count'] >= 2:
+                old_refinements = set(self.state_refinements.get(obj_id, {}).keys())
+                falsified = old_refinements - valid_refinements
+                for f in falsified:
+                    del self.state_refinements[obj_id][f]
+                    
+                if obj_id not in self.state_refinements:
+                    self.state_refinements[obj_id] = {}
                 
-                # Check for Promotion to Parallel Hypotheses
-                STABILITY_THRESHOLD = 2
-                if self.pending_refinements[obj_id]['stable_count'] >= STABILITY_THRESHOLD:
-                    
-                    # --- NEW: Purge old falsified hypotheses ---
-                    old_refinements = set(self.state_refinements.get(obj_id, {}).keys())
-                    falsified = old_refinements - valid_refinements
-                    for f in falsified:
-                        del self.state_refinements[obj_id][f]
-                        if self.debug_channels['HYPOTHESIS']:
-                            self._print_and_log(f"  [Splitter] FALSIFIED Variable: Removed '{f}' for {obj_id}.")
-                    # -------------------------------------------
-
-                    if obj_id not in self.state_refinements:
-                        self.state_refinements[obj_id] = {} # Dict instead of list!
-                    
-                    added_count = 0
-                    for refinement in valid_refinements:
-                        # Build the bucket map for this isolated variable
-                        bucket_map = {}
-                        # --- FIX: Use the keys from the dictionary we just built ---
-                        for r_sig in result_variable_values.keys():
-                            bucket_map[r_sig] = result_variable_values[r_sig].get(refinement, set())
-                            
-                        # Store the exact boundaries of the bucket
-                        if refinement not in self.state_refinements[obj_id] or self.state_refinements[obj_id][refinement] != bucket_map:
-                            self.state_refinements[obj_id][refinement] = bucket_map
-                            added_count += 1
-                    
-                    del self.pending_refinements[obj_id]
-                    
-                    if added_count > 0 and self.debug_channels['HYPOTHESIS']:
-                        self._print_and_log(f"  [Splitter] PROMOTION! Spawning {added_count} Parallel Hypotheses for {obj_id}.")
-        else:
-            # --- NEW: TOTAL FALSIFICATION ---
-            if obj_id in self.pending_refinements:
+                for refinement in valid_refinements:
+                    bucket_map = {}
+                    for r_sig in result_variable_values.keys():
+                        bucket_map[r_sig] = result_variable_values[r_sig].get(refinement, set())
+                    self.state_refinements[obj_id][refinement] = bucket_map
+                
                 del self.pending_refinements[obj_id]
-            if obj_id in self.state_refinements:
-                del self.state_refinements[obj_id]
-                if self.debug_channels['HYPOTHESIS']:
-                    self._print_and_log(f"  [Splitter] TOTAL FALSIFICATION! Destroyed all Parallel Hypotheses for {obj_id}.")
+                
+                if self.debug_channels.get('HYPOTHESIS', False):
+                    self._print_and_log(f"  [Splitter] Discovered specific conditional rules for {obj_id}.")
+        else:
+            if obj_id in self.pending_refinements: del self.pending_refinements[obj_id]
+            if obj_id in self.state_refinements: del self.state_refinements[obj_id]
 
     def _get_context_prop(self, ctx_entry: dict, key: str, mode: str):
         """
@@ -4700,10 +4345,9 @@ class ObmlAgi3Agent(Agent):
 
     def _get_scientific_state(self, obj: dict, context: dict) -> tuple:
         """
-        State Signature is now purely the Object ID. 
-        All refinements (Size, Adjacency) are handled dynamically via Parallel Hypothesis Testing.
+        State Signature uses intrinsic properties including position to establish a hyper-specific baseline.
         """
-        return obj['id']
+        return (obj['color'], obj['fingerprint'], obj['size'], obj['pixels'], obj['position'])
 
     def _check_feature_presence(self, contexts, base_sig, feature_type, sub_key):
         """
@@ -4891,6 +4535,7 @@ class ObmlAgi3Agent(Agent):
             features.add(f"{oid}_color_{obj['color']}")
             features.add(f"{oid}_pixels_{obj['pixels']}")
             features.add(f"{oid}_shape_{obj['fingerprint']}")
+            features.add(f"{oid}_position_{obj['position']}")
             
             # Adjacencies
             for d_idx, direction in enumerate(['top', 'right', 'bottom', 'left']):
@@ -4955,6 +4600,8 @@ class ObmlAgi3Agent(Agent):
             return f_str.split('_pixels_')[0] + '_pixels'
         if '_shape_' in f_str:
             return f_str.split('_shape_')[0] + '_shape'
+        if '_position_' in f_str:
+            return f_str.split('_position_')[0] + '_position'
             
         if '_diag_adj_' in f_str:
             # Keeps the object ID and the direction (e.g. 'obj_11_diag_adj_tl')
