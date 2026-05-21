@@ -2058,15 +2058,19 @@ class ObmlAgi3Agent(Agent):
 
     def _predict_outcome(self, action_key: str, eval_obj_id: str, current_context: dict) -> tuple[list|None, int]:
         """
-        Pure Greedy Prediction with Tier 1 Intersection. 
-        Trusts conditional splits first, then generalizes past characteristics.
+        Predicts outcomes strictly using Exclusion Logic.
+        Priority: Tier 2 (Relational) -> Tier 1 (Hard Exception) -> Tier 1 (Generalized).
         """
         target_obj = next((o for o in current_context['summary'] if o['id'] == eval_obj_id), None)
         if not target_obj: return None, 0
         
+        # --- 1. The HUD Blindfold ---
+        # Treat the UI as completely static to kill Explorer curiosity.
+        if target_obj.get('is_hud'): return [], 100 
+        
         state_sig = self._get_scientific_state(target_obj, current_context)
         
-        # 1. Check for Refined Conditional Rules (Tier 2/3 Splitter Overrides)
+        # --- 2. Check for Refined Conditional Rules (Tier 2/3 Splitter Overrides) ---
         refined_vars = self.state_refinements.get(eval_obj_id, {})
         if refined_vars:
             current_features = self._extract_all_features(current_context)
@@ -2077,20 +2081,26 @@ class ObmlAgi3Agent(Agent):
                         if active_val in valid_vals:
                             return self._expand_result(r_sig, target_obj), 100
 
-        # 2. Tier 1 Intrinsic Intersection Prediction
-        best_match_result = None
+        # --- Pool Cross-Object History ---
+        pooled_history = {}
         for stored_id, stored_actions in self.truth_table.items():
             if action_key in stored_actions:
-                for result_sig, history in stored_actions[action_key].items():
-                    if not history: continue
-                    gen_sig = self._get_generalized_signature(history)
-                    if self._sig_matches(state_sig, gen_sig):
-                        best_match_result = result_sig
-                        break
-            if best_match_result: break
-            
-        if best_match_result:
-            return self._expand_result(best_match_result, target_obj), 100
+                for r_sig, locs in stored_actions[action_key].items():
+                    pooled_history.setdefault(r_sig, []).extend(locs)
+                    
+        if not pooled_history: return None, 0
+
+        # --- 3. Check for Hard Exceptions (Exact Historical Match) ---
+        for r_sig, history in pooled_history.items():
+            for entry in history:
+                if len(entry) >= 3 and entry[2] == state_sig:
+                    return self._expand_result(r_sig, target_obj), 100
+                    
+        # --- 4. Fallback to Generalized Tier 1 Rule ---
+        for r_sig, history in pooled_history.items():
+            gen_sig = self._get_generalized_signature(history)
+            if self._sig_matches(state_sig, gen_sig):
+                return self._expand_result(r_sig, target_obj), 100
 
         return None, 0
 
@@ -3351,7 +3361,7 @@ class ObmlAgi3Agent(Agent):
     def _classify_event_stream(self, current_events: list[dict], action_key: str, prev_context: dict) -> tuple[list[dict], list[dict], list[dict]]:
         """
         Absolute Assumption Classifier.
-        Everything is treated as a direct rule. Instantly triggers Splitter on contradiction.
+        Immediately triggers Splitter upon discovering multiple distinct exceptions.
         """
         direct_events = []
 
@@ -3363,19 +3373,34 @@ class ObmlAgi3Agent(Agent):
             target_obj = next((o for o in prev_context['summary'] if o['id'] == obj_id), None)
             state_sig = self._get_scientific_state(target_obj, prev_context) if target_obj else obj_id
 
-            # Detect Contradiction against the Tier 1 Generalized Assumption
-            if obj_id in self.truth_table and action_key in self.truth_table[obj_id]:
-                expected_results = {}
-                for r_sig, locs in self.truth_table[obj_id][action_key].items():
-                    gen_sig = self._get_generalized_signature(locs)
-                    if self._sig_matches(state_sig, gen_sig):
-                        expected_results[r_sig] = locs
+            # Pool cross-object history
+            pooled_history = {}
+            for stored_id, stored_actions in self.truth_table.items():
+                if action_key in stored_actions:
+                    for r_sig, locs in stored_actions[action_key].items():
+                        pooled_history.setdefault(r_sig, []).extend(locs)
+
+            if pooled_history:
+                same_result_states = set(e[2] for e in pooled_history.get(result_sig, []) if len(e) >= 3)
                 
-                # If we expected a specific outcome based on characteristics, but got something else: CONTRADICTION!
-                if expected_results and result_sig not in expected_results:
-                    # Temporarily inject the current event for the Splitter to compare
-                    expected_results[result_sig] = [(self.run_counter, len(self.level_state_history), state_sig)]
-                    self._trigger_splitter(obj_id, action_key, expected_results)
+                # --- Immediate Relational Trigger ---
+                # If we hit an exception (e.g. NO_CHANGE) at a NEW position, and there's another outcome (MOVED),
+                # trigger the Splitter immediately to find the relational commonality.
+                if same_result_states and state_sig not in same_result_states and len(pooled_history) > 1:
+                    split_data = copy.deepcopy(pooled_history)
+                    split_data[result_sig].append((self.run_counter, len(self.level_state_history), state_sig))
+                    self._trigger_splitter(obj_id, action_key, split_data)
+                else:
+                    # Standard Contradiction Check (Generalized Expectation failed)
+                    expected_results = {}
+                    for r_sig, locs in pooled_history.items():
+                        gen_sig = self._get_generalized_signature(locs)
+                        if self._sig_matches(state_sig, gen_sig):
+                            expected_results[r_sig] = locs
+                            
+                    if expected_results and result_sig not in expected_results:
+                        expected_results[result_sig] = [(self.run_counter, len(self.level_state_history), state_sig)]
+                        self._trigger_splitter(obj_id, action_key, expected_results)
 
             direct_events.append(event)
 
@@ -3585,23 +3610,42 @@ class ObmlAgi3Agent(Agent):
     
     def _format_rule_description(self, rule_type, action_key, state_sig, result_sig, obj_id=None):
         """
-        Translates the scientific state and splitter refinements into a readable log.
-        Outputs the exact Tier 1 (Characteristics) and Tier 2/3 (Relationships) context.
+        Translates the scientific state and exceptions into a readable log.
         """
         rule_parts = []
+        gen_sig = state_sig
+        exceptions = []
+        
+        # Pool history to calculate generalized signature and isolate exceptions
+        pooled_history = {}
+        for stored_id, stored_actions in self.truth_table.items():
+            if action_key in stored_actions:
+                for r_sig, locs in stored_actions[action_key].items():
+                    pooled_history.setdefault(r_sig, []).extend(locs)
+                    
+        if result_sig in pooled_history:
+            computed_gen = self._get_generalized_signature(pooled_history[result_sig])
+            if computed_gen: gen_sig = computed_gen
+            
+            # Find Exceptions (States that match the General Rule but yielded a different result)
+            for other_r_sig, locs in pooled_history.items():
+                if other_r_sig != result_sig:
+                    for entry in locs:
+                        if len(entry) >= 3 and self._sig_matches(entry[2], gen_sig):
+                            exc_state = entry[2]
+                            if isinstance(exc_state, tuple) and len(exc_state) == 5:
+                                exceptions.append(f"Pos {exc_state[4]}")
         
         # 1. Unpack Tier 1: Intrinsic Characteristics
-        gen_sig = state_sig
-        if obj_id and obj_id in self.truth_table and action_key in self.truth_table[obj_id]:
-            history = self.truth_table[obj_id][action_key].get(result_sig, [])
-            computed_gen = self._get_generalized_signature(history)
-            if computed_gen: gen_sig = computed_gen
-
         if isinstance(gen_sig, tuple) and len(gen_sig) == 5:
             color, shape, size, pixels, pos = gen_sig
             shape_str = str(shape)[:5] + ".." if len(str(shape)) > 5 and shape != 'ANY' else str(shape)
-            size_str = f"{size[0]}x{size[1]}" if size != 'ANY' else "ANY"
-            rule_parts.append(f"Tier 1 (Intrinsic): [Color: {color}, Size: {size_str}, Pos: {pos}, Shape: {shape_str}]")
+            size_str = f"{size[0]}x{size[1]}" if size != 'ANY' and isinstance(size, tuple) else "ANY"
+            
+            base_str = f"Tier 1 (Intrinsic): [Color: {color}, Size: {size_str}, Pos: {pos}, Shape: {shape_str}]"
+            if exceptions:
+                base_str += f" EXCEPT WHEN [{', '.join(set(exceptions))}]"
+            rule_parts.append(base_str)
         else:
             rule_parts.append(f"Tier 1 (Intrinsic): [{gen_sig}]")
 
