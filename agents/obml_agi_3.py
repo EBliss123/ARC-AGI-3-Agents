@@ -530,135 +530,175 @@ class ObmlAgi3Agent(Agent):
                     if not hasattr(self, 'hud_pair'): self.hud_pair = None
                     if not hasattr(self, 'hud_colors'): self.hud_colors = None
 
-                    # --- NEW: Continuity Guard ---
-                    # If a locked ID disappears, unlock to re-identify (handles rare ID reassignments)
-                    if self.hud_pair and not all(any(o['id'] == hid for o in current_summary) for hid in self.hud_pair):
+                    # --- THE ORACLE VETO (Terminal State Check) ---
+                    is_terminal = False
+                    if self.hud_pair:
+                        # 1. STRICT ROLE: hud_pair[0] is ALWAYS the Shrinker (Active Bar)
+                        bar_id = self.hud_pair[0]
+                        
+                        curr_bar = next((o for o in current_summary if o['id'] == bar_id), None)
+                        
+                        # Fallback: If ID scrambled, try to re-identify via the known Bar Color
+                        if not curr_bar and self.hud_colors and 'bar_color' in self.hud_colors:
+                            possible_bars = [o for o in current_summary if o.get('is_perfect_rectangle') and o['color'] == self.hud_colors['bar_color']]
+                            # Exclude the known Track ID if present to prevent mixing them up
+                            if len(self.hud_pair) > 1:
+                                possible_bars = [o for o in possible_bars if o['id'] != self.hud_pair[1]]
+                            if possible_bars: 
+                                curr_bar = possible_bars[0]
+                                bar_id = curr_bar['id']
+                        
+                        # If the Active Bar vanished or hit <= 0 pixels, we died.
+                        if not curr_bar or curr_bar.get('pixels', 0) <= 0:
+                            is_terminal = True
+
+                    if is_terminal:
+                        if self.debug_channels.get('CHANGES', True):
+                            self._print_and_log(f"\n  [ORACLE EXCEPTION] HUD Bar depleted/vanished! Intercepting as TERMINAL state and forcing RESET.")
+                        
+                        events = [{'type': 'TERMINAL', 'outcome': 'LOSS', 'id': obj['id']} for obj in prev_summary if not obj.get('is_hud')]
+                        
                         self.hud_pair = None
                         self.hud_colors = None
+                        self.needs_soft_reset = True
+                    else:
+                        # --- Continuity Guard ---
+                        if self.hud_pair and not all(any(o['id'] == hid for o in current_summary) for hid in self.hud_pair):
+                            self.hud_pair = None
+                            self.hud_colors = None
 
-                    # 1. Identification Phase (Only runs until a HUD is locked)
-                    if not self.hud_pair:
-                        shrink_events = [e for e in events if e['type'] == 'SHRINK']
-                        growth_events = [e for e in events if e['type'] == 'GROWTH']
-                        
-                        candidates = []
-                        for s_ev in shrink_events:
-                            s_id = s_ev['id']
-                            s_obj = next((o for o in prev_summary if o['id'] == s_id), None)
+                        # 1. Identification Phase
+                        if not self.hud_pair:
+                            shrink_events = [e for e in events if e['type'] == 'SHRINK']
+                            growth_events = [e for e in events if e['type'] == 'GROWTH']
                             
-                            # Prerequisite: Must be a perfect rectangle
-                            if not s_obj or not s_obj.get('is_perfect_rectangle'): continue
-                            
-                            for g_ev in growth_events:
-                                g_id = g_ev['id']
-                                g_obj = next((o for o in current_summary if o['id'] == g_id), None)
+                            candidates = []
+                            for s_ev in shrink_events:
+                                s_id = s_ev['id']
+                                s_obj = next((o for o in prev_summary if o['id'] == s_id), None)
+                                if not s_obj or not s_obj.get('is_perfect_rectangle'): continue
                                 
-                                # Prerequisite: Grower must also be a perfect rectangle
-                                if not g_obj or not g_obj.get('is_perfect_rectangle'): continue
+                                found_track = False
+                                for g_ev in growth_events:
+                                    g_id = g_ev['id']
+                                    g_obj = next((o for o in current_summary if o['id'] == g_id), None)
+                                    if not g_obj or not g_obj.get('is_perfect_rectangle'): continue
+                                    
+                                    if abs(s_ev['pixel_delta']) == g_ev['pixel_delta']:
+                                        candidates.append((s_id, g_id))
+                                        found_track = True
+                                        break
+                                        
+                                if not found_track:
+                                    # Accept solitary bars if no matching track exists
+                                    candidates.append((s_id,))
+                            
+                            if len(candidates) == 1:
+                                self.hud_pair = candidates[0]
+                                s_id = self.hud_pair[0]
+                                s_obj = next(o for o in prev_summary if o['id'] == s_id)
                                 
-                                # Conservation of Mass: Exact pixel exchange
-                                if abs(s_ev['pixel_delta']) == g_ev['pixel_delta']:
-                                    candidates.append((s_id, g_id))
-                        
-                        # The Highlander Rule: Once exactly 1 candidate is found, it's finalized
-                        if len(candidates) == 1:
-                            self.hud_pair = candidates[0]
-                            s_id, g_id = self.hud_pair
-                            
-                            # --- NEW: Anchor roles by color ---
-                            s_obj = next(o for o in prev_summary if o['id'] == s_id)
-                            g_obj = next(o for o in current_summary if o['id'] == g_id)
-                            self.hud_colors = {'bar_color': s_obj['color'], 'track_color': g_obj['color']}
-                            
-                            if self.debug_channels.get('CHANGES', True):
-                                self._print_and_log(f"\n--- [HUD FINALIZED] Locked: Bar(Color {s_obj['color']}) & Track(Color {g_obj['color']}) ---")
-                            
-                            # --- 2. RECURSIVE MEMORY SCRUB ---
-                            # Permanently erase these IDs from the physics engine's memory
-                            hud_ids = {s_id, g_id}
-                            for hid in hud_ids:
-                                self.truth_table.pop(hid, None)
-                                self.certified_laws.pop(hid, None)
-                                self.active_experiments.pop(hid, None)
-                                self.state_refinements.pop(hid, None)
-                                self.pending_refinements.pop(hid, None)
-                            
-                            for a_key, effects in self.action_effects_memory.items():
-                                to_remove = [f for f in effects if any(hid in f for hid in hud_ids)]
-                                for f in to_remove: effects.remove(f)
+                                self.hud_colors = {'bar_color': s_obj['color']}
                                 
-                            # Retroactively mark history so the scientist ignores past frames
-                            for past_ctx in self.level_state_history:
-                                for obj in past_ctx.get('summary', []):
-                                    if obj['id'] in hud_ids: obj['is_hud'] = True
-                            
-                    # 3. Refill-Tolerant Oracle (Runs once HUD is locked)
-                    if self.hud_pair:
-                        # --- NEW: Identify roles by persistent color, not ID order ---
-                        objs = [o for o in current_summary if o['id'] in self.hud_pair]
-                        if len(objs) == 2 and self.hud_colors:
-                            bar_obj = next((o for o in objs if o['color'] == self.hud_colors['bar_color']), None)
-                            if bar_obj:
-                                bar_id = bar_obj['id']
-                                track_id = next(oid for oid in self.hud_pair if oid != bar_id)
-                            else:
-                                bar_id, track_id = self.hud_pair # Fallback
-                        else:
-                            bar_id, track_id = self.hud_pair
-                                            
-                        # Forward Muting: Ensure both frames ignore the locked IDs
-                        for obj in prev_summary:
-                            if obj['id'] in self.hud_pair: obj['is_hud'] = True
-                        for obj in current_summary:
-                            if obj['id'] in self.hud_pair: obj['is_hud'] = True
-                            
-                        curr_bar = next((o for o in current_summary if o['id'] == bar_id), None)
-                        prev_bar = next((o for o in prev_summary if o['id'] == bar_id), None)
-                        
-                        if curr_bar and prev_bar:
-                            curr_pixels = curr_bar['pixels']
-                            prev_pixels = prev_bar['pixels']
-                            
-                            if not hasattr(self, 'hud_state_map'): self.hud_state_map = {}
-                            
-                            # Record Positional Transition
-                            if prev_pixels > curr_pixels: # Standard Drop
-                                self.hud_state_map[prev_pixels] = curr_pixels
-                            elif prev_pixels < curr_pixels: # Refill
+                                if len(self.hud_pair) == 2:
+                                    g_id = self.hud_pair[1]
+                                    g_obj = next(o for o in current_summary if o['id'] == g_id)
+                                    self.hud_colors['track_color'] = g_obj['color']
+                                    msg = f"Locked: Bar(Color {s_obj['color']}) & Track(Color {g_obj['color']})"
+                                else:
+                                    msg = f"Locked: Solitary Bar(Color {s_obj['color']})"
+                                
                                 if self.debug_channels.get('CHANGES', True):
-                                    self._print_and_log(f"  [ORACLE] HUD Refill detected ({prev_pixels} -> {curr_pixels}). Maintaining lock.")
-
-                            # Project Death Clock
-                            steps = 0
-                            sim_pixels = curr_pixels
-                            while sim_pixels in self.hud_state_map and self.hud_state_map[sim_pixels] < sim_pixels:
-                                sim_pixels = self.hud_state_map[sim_pixels]
-                                steps += 1
-                                if sim_pixels <= 0: break
+                                    self._print_and_log(f"\n--- [HUD FINALIZED] {msg} ---")
+                                    
+                                hud_ids = set(self.hud_pair)
+                                for hid in hud_ids:
+                                    self.truth_table.pop(hid, None)
+                                    self.certified_laws.pop(hid, None)
+                                    self.active_experiments.pop(hid, None)
+                                    self.state_refinements.pop(hid, None)
+                                    self.pending_refinements.pop(hid, None)
                                 
-                            if sim_pixels <= 0:
-                                self.death_clock = steps
-                                rule_name = "Finalized Positional Map (Proven)"
-                            elif steps > 0:
-                                self.death_clock = f"{steps} + ???"
-                                rule_name = f"Partial Positional Map (Depth {steps})"
-                            else:
-                                self.death_clock = "???"
-                                rule_name = "Mapping Positional HUD"
+                                for a_key, effects in self.action_effects_memory.items():
+                                    to_remove = [f for f in effects if any(hid in f for hid in hud_ids)]
+                                    for f in to_remove: effects.remove(f)
+                                    
+                                for past_ctx in self.level_state_history:
+                                    for obj in past_ctx.get('summary', []):
+                                        if obj['id'] in hud_ids: obj['is_hud'] = True
                                 
-                            if self.debug_channels.get('CHANGES', True) and prev_pixels != curr_pixels:
-                                self._print_and_log(f"  [ORACLE] HUD Rule: {rule_name} | Death Clock: {self.death_clock} moves remaining.")
+                        # 3. Refill-Tolerant Oracle
+                        if self.hud_pair:
+                            # 1. STRICT ROLE: hud_pair[0] is ALWAYS the Shrinker (Active Bar)
+                            bar_id = self.hud_pair[0]
+                            curr_bar = next((o for o in current_summary if o['id'] == bar_id), None)
+                            
+                            if not curr_bar and self.hud_colors and 'bar_color' in self.hud_colors:
+                                possible_bars = [o for o in current_summary if o.get('is_perfect_rectangle') and o['color'] == self.hud_colors['bar_color']]
+                                if len(self.hud_pair) > 1:
+                                    possible_bars = [o for o in possible_bars if o['id'] != self.hud_pair[1]]
+                                if possible_bars: 
+                                    curr_bar = possible_bars[0]
+                                    bar_id = curr_bar['id']
+                                    
+                            prev_bar = next((o for o in prev_summary if o['id'] == bar_id), None)
+                            if not prev_bar and self.hud_colors and 'bar_color' in self.hud_colors:
+                                possible_prev_bars = [o for o in prev_summary if o.get('is_perfect_rectangle') and o['color'] == self.hud_colors['bar_color']]
+                                if len(self.hud_pair) > 1:
+                                    possible_prev_bars = [o for o in possible_prev_bars if o['id'] != self.hud_pair[1]]
+                                if possible_prev_bars:
+                                    prev_bar = possible_prev_bars[0]
+                                                
+                            for obj in prev_summary:
+                                if obj['id'] in self.hud_pair: obj['is_hud'] = True
+                            for obj in current_summary:
+                                if obj['id'] in self.hud_pair: obj['is_hud'] = True
+                                
+                            if curr_bar and prev_bar:
+                                curr_pixels = curr_bar['pixels']
+                                prev_pixels = prev_bar['pixels']
+                                delta = curr_pixels - prev_pixels
+                                
+                                if not hasattr(self, 'hud_state_map'): self.hud_state_map = {}
+                                
+                                # STRICT SHRINKER LOGIC
+                                if delta < 0: 
+                                    self.hud_state_map[prev_pixels] = curr_pixels
+                                elif delta > 0: 
+                                    if self.debug_channels.get('CHANGES', True):
+                                        self._print_and_log(f"  [ORACLE WARNING] Active Bar grew ({prev_pixels} -> {curr_pixels}). Anomalous behavior.")
 
-                    # --- NEW: EVENT MUTING (HUD IGNORANCE) ---
-                    # Strip all events related to the finalized HUD IDs
-                    filtered_events = []
-                    for e in events:
-                        obj_id = e.get('id')
-                        is_hud = False
-                        if self.hud_pair and obj_id in self.hud_pair: is_hud = True
-                        if not is_hud: filtered_events.append(e)
-                    events = filtered_events
-                    # -----------------------------------------
+                                steps = 0
+                                sim_pixels = curr_pixels
+                                while sim_pixels in self.hud_state_map and self.hud_state_map[sim_pixels] < sim_pixels:
+                                    sim_pixels = self.hud_state_map[sim_pixels]
+                                    steps += 1
+                                    if sim_pixels <= 0: break
+                                    
+                                if sim_pixels <= 0:
+                                    self.death_clock = steps
+                                    rule_name = "Finalized Positional Map (Proven)"
+                                elif steps > 0:
+                                    self.death_clock = f"{steps} + ???"
+                                    rule_name = f"Partial Positional Map (Depth {steps})"
+                                else:
+                                    self.death_clock = "???"
+                                    if delta == 0:
+                                        rule_name = "HUD Paused (No Delta)"
+                                    else:
+                                        rule_name = "Mapping Positional HUD"
+                                    
+                                if self.debug_channels.get('CHANGES', True) and delta != 0:
+                                    self._print_and_log(f"  [ORACLE] HUD Rule: {rule_name} | Death Clock: {self.death_clock} moves remaining.")
+
+                            # --- NORMAL EVENT MUTING (HUD IGNORANCE) ---
+                            filtered_events = []
+                            for e in events:
+                                obj_id = e.get('id')
+                                is_hud = False
+                                if self.hud_pair and obj_id in self.hud_pair: is_hud = True
+                                if not is_hud: filtered_events.append(e)
+                            events = filtered_events
 
                     # --- NEW: Identify Static Objects (Null Results) ---
                     # The change log only tells us what moved. We must explicitly record
@@ -1084,7 +1124,13 @@ class ObmlAgi3Agent(Agent):
                         
                     # 2. Is there an active, unsolved contradiction? (Splitter needs data)
                     elif results_in_this_state > 1:
-                        scientific_score += 1  # Adjusted to +1 as requested
+                        # --- FIX: Terminal Contradiction Ignorance ---
+                        # If the contradiction is just "Sometimes I die", it's the death clock, 
+                        # not a physics mystery. Do not reward studying it.
+                        if any(r_sig[0] == 'TERMINAL' for r_sig in action_history.keys()):
+                            scientific_score -= 1
+                        else:
+                            scientific_score += 1
                         
                     # 3. Have we never physically tried this?
                     elif total_n_for_this_state == 0:
@@ -1196,6 +1242,15 @@ class ObmlAgi3Agent(Agent):
                 'events': changes 
             }
             self.level_state_history.append(current_context)
+
+            # --- FORCE MANUAL RESET ---
+            if getattr(self, 'needs_soft_reset', False):
+                self.needs_soft_reset = False
+                self._reset_level_state()
+                self.run_counter += 1
+                self.global_action_counter += 1
+                self.last_action_id = self.global_action_counter
+                return GameAction.RESET
 
             # RETURN ONLY THE OBJECT (No Tuples!)
             return action_to_return
@@ -2074,34 +2129,80 @@ class ObmlAgi3Agent(Agent):
         refined_vars = self.state_refinements.get(eval_obj_id, {})
         if refined_vars:
             current_features = self._extract_all_features(current_context)
-            for base_var, buckets in refined_vars.items():
-                active_val = next((f for f in current_features if self._get_base_variable(f) == base_var), None)
-                if active_val:
-                    for r_sig, valid_vals in buckets.items():
-                        if active_val in valid_vals:
-                            return self._expand_result(r_sig, target_obj), 100
-
-        # --- Pool Cross-Object History ---
-        pooled_history = {}
-        for stored_id, stored_actions in self.truth_table.items():
-            if action_key in stored_actions:
-                for r_sig, locs in stored_actions[action_key].items():
-                    pooled_history.setdefault(r_sig, []).extend(locs)
+            
+            all_r_sigs = set()
+            for buckets in refined_vars.values():
+                all_r_sigs.update(buckets.keys())
+                
+            valid_r_sigs = []
+            
+            # Evaluate every outcome to see which one perfectly satisfies the AND gate
+            for r_sig in all_r_sigs:
+                is_match = True
+                for base_var, buckets in refined_vars.items():
+                    valid_vals = buckets.get(r_sig, set())
+                    active_val = next((f for f in current_features if self._get_base_variable(f) == base_var), None)
                     
-        if not pooled_history: return None, 0
+                    # If bucket has requirements, active_val must match. 
+                    # If bucket is empty, it means ANY value is fine (no restriction).
+                    if valid_vals and active_val not in valid_vals:
+                        is_match = False
+                        break
+                
+                if is_match:
+                    valid_r_sigs.append(r_sig)
+            
+            # Resolve Matches
+            if valid_r_sigs:
+                best_r_sigs = []
+                max_strictness = -1
+                
+                for r_sig in valid_r_sigs:
+                    # Strictness = how many variables have specific requirements
+                    strictness = sum(1 for buckets in refined_vars.values() if buckets.get(r_sig, set()))
+                    if strictness > max_strictness:
+                        max_strictness = strictness
+                        best_r_sigs = [r_sig]
+                    elif strictness == max_strictness:
+                        best_r_sigs.append(r_sig)
+                        
+                if len(best_r_sigs) == 1:
+                    return self._expand_result(best_r_sigs[0], target_obj), 100
+                else:
+                    return None, 0 # True ambiguity (tied strictness), force Explorer to test it
 
-        # --- 3. Check for Hard Exceptions (Exact Historical Match) ---
-        for r_sig, history in pooled_history.items():
+        # --- 3. Object-Isolated History ---
+        object_history = self.truth_table.get(eval_obj_id, {}).get(action_key, {})
+        if not object_history: return None, 0
+
+        # --- 3.5. Absolute Precision (Exact Historical Match) ---
+        # If we have observed this exact object in this exact intrinsic state before, we know the outcome.
+        matching_exact_sigs = []
+        for r_sig, history in object_history.items():
             for entry in history:
                 if len(entry) >= 3 and entry[2] == state_sig:
-                    return self._expand_result(r_sig, target_obj), 100
+                    matching_exact_sigs.append(r_sig)
+                    break
                     
-        # --- 4. Fallback to Generalized Tier 1 Rule ---
-        for r_sig, history in pooled_history.items():
+        if len(matching_exact_sigs) == 1:
+            return self._expand_result(matching_exact_sigs[0], target_obj), 100
+        elif len(matching_exact_sigs) > 1:
+            return None, 0 # Unresolved contradiction (Requires Tier 2/3 to solve, force UNKNOWN)
+
+        # --- 4. Check for Proven Law (Tier 1 Generalized Match) ---
+        valid_gen_sigs = []
+        for r_sig, history in object_history.items():
             gen_sig = self._get_generalized_signature(history)
             if self._sig_matches(state_sig, gen_sig):
-                return self._expand_result(r_sig, target_obj), 100
+                valid_gen_sigs.append(r_sig)
+                
+        # Only use the generalized rule if it unambiguously points to a single outcome
+        if len(valid_gen_sigs) == 1:
+            return self._expand_result(valid_gen_sigs[0], target_obj), 100
+        elif len(valid_gen_sigs) > 1:
+            return None, 0 # Ambiguous generalization (force UNKNOWN)
 
+        # --- 5. Enforce UNKNOWN State ---
         return None, 0
 
     def _expand_result(self, result_sig, target_obj):
@@ -3373,33 +3474,28 @@ class ObmlAgi3Agent(Agent):
             target_obj = next((o for o in prev_context['summary'] if o['id'] == obj_id), None)
             state_sig = self._get_scientific_state(target_obj, prev_context) if target_obj else obj_id
 
-            # Pool cross-object history
-            pooled_history = {}
-            for stored_id, stored_actions in self.truth_table.items():
-                if action_key in stored_actions:
-                    for r_sig, locs in stored_actions[action_key].items():
-                        pooled_history.setdefault(r_sig, []).extend(locs)
+            # Object-isolated history
+            object_history = self.truth_table.get(obj_id, {}).get(action_key, {})
 
-            if pooled_history:
-                same_result_states = set(e[2] for e in pooled_history.get(result_sig, []) if len(e) >= 3)
+            if object_history:
+                expected_results = {}
+                for r_sig, locs in object_history.items():
+                    gen_sig = self._get_generalized_signature(locs)
+                    if self._sig_matches(state_sig, gen_sig):
+                        expected_results[r_sig] = locs
                 
-                # --- Immediate Relational Trigger ---
-                # If we hit an exception (e.g. NO_CHANGE) at a NEW position, and there's another outcome (MOVED),
-                # trigger the Splitter immediately to find the relational commonality.
-                if same_result_states and state_sig not in same_result_states and len(pooled_history) > 1:
-                    split_data = copy.deepcopy(pooled_history)
-                    split_data[result_sig].append((self.run_counter, len(self.level_state_history), state_sig))
-                    self._trigger_splitter(obj_id, action_key, split_data)
-                else:
-                    # Standard Contradiction Check (Generalized Expectation failed)
-                    expected_results = {}
-                    for r_sig, locs in pooled_history.items():
-                        gen_sig = self._get_generalized_signature(locs)
-                        if self._sig_matches(state_sig, gen_sig):
-                            expected_results[r_sig] = locs
-                            
-                    if expected_results and result_sig not in expected_results:
-                        expected_results[result_sig] = [(self.run_counter, len(self.level_state_history), state_sig)]
+                if expected_results:
+                    # 1. Standard Contradiction (Got an outcome we didn't expect at all)
+                    if result_sig not in expected_results:
+                        full_history = object_history.get(result_sig, [])
+                        expected_results[result_sig] = full_history + [(self.run_counter, len(self.level_state_history), state_sig)]
+                        self._trigger_splitter(obj_id, action_key, expected_results)
+                        
+                    # 2. AMBIGUITY COLLISION (Multiple exceptions formed a tied rule)
+                    elif len(expected_results) > 1:
+                        for r_sig in expected_results.keys():
+                            expected_results[r_sig] = object_history.get(r_sig, [])
+                        expected_results[result_sig].append((self.run_counter, len(self.level_state_history), state_sig))
                         self._trigger_splitter(obj_id, action_key, expected_results)
 
             direct_events.append(event)
@@ -3636,31 +3732,75 @@ class ObmlAgi3Agent(Agent):
                             if isinstance(exc_state, tuple) and len(exc_state) == 5:
                                 exceptions.append(f"Pos {exc_state[4]}")
         
-        # 1. Unpack Tier 1: Intrinsic Characteristics
+        # 1. Unpack Tier 2 & Tier 3: Splitter Refinements
+        has_tier_2_or_3 = False
+        tier_2_conds = []
+        tier_3_conds = []
+        
+        if obj_id and obj_id in self.state_refinements:
+            refinements = self.state_refinements[obj_id]
+            for base_var, buckets in refinements.items():
+                if result_sig in buckets:
+                    has_tier_2_or_3 = True
+                    valid_raw_features = buckets[result_sig]
+                    clean_base = base_var.replace(f"{obj_id}_", "")
+                    
+                    if not valid_raw_features:
+                        # FIX 2: Handle Generalized Relational Requirements (The empty bucket)
+                        # If the bucket is empty, the math engine successfully subtracted all varying
+                        # properties, meaning this relation can be ANYTHING.
+                        combined_cond = f"({clean_base} -> ANY)"
+                    else:
+                        formatted_features = []
+                        for feature in valid_raw_features:
+                            if feature.startswith(base_var):
+                                req_val = feature[len(base_var):].strip('_').replace('_', ': ')
+                                
+                                # FIX 1: Hide the noisy micro-traits to keep the log clean
+                                if any(noise in req_val for noise in ["Pixels", "Position", "Size"]):
+                                    continue
+                                    
+                                formatted_features.append(f"{clean_base} -> {req_val}")
+                            else:
+                                formatted_features.append(feature.replace(f"{obj_id}_", ""))
+                        
+                        # Failsafe: if we filtered out everything, put the raw data back
+                        if not formatted_features:
+                            for feature in valid_raw_features:
+                                if feature.startswith(base_var):
+                                    req_val = feature[len(base_var):].strip('_').replace('_', ': ')
+                                    formatted_features.append(f"{clean_base} -> {req_val}")
+                        
+                        # Intersection Logic: Everything in this list must be TRUE
+                        combined_cond = "(" + " AND ".join(formatted_features) + ")"
+                    
+                    # Split into Tier 2 (Affected object relationships) and Tier 3 (Global)
+                    if '_adj_' in base_var:
+                        tier_2_conds.append(combined_cond)
+                    else:
+                        tier_3_conds.append(combined_cond)
+
+        # 2. Unpack Tier 1: Intrinsic Characteristics
         if isinstance(gen_sig, tuple) and len(gen_sig) == 5:
             color, shape, size, pixels, pos = gen_sig
             shape_str = str(shape)[:5] + ".." if len(str(shape)) > 5 and shape != 'ANY' else str(shape)
             size_str = f"{size[0]}x{size[1]}" if size != 'ANY' and isinstance(size, tuple) else "ANY"
             
             base_str = f"Tier 1 (Intrinsic): [Color: {color}, Size: {size_str}, Pos: {pos}, Shape: {shape_str}]"
-            if exceptions:
-                base_str += f" EXCEPT WHEN [{', '.join(set(exceptions))}]"
-            rule_parts.append(base_str)
-        else:
-            rule_parts.append(f"Tier 1 (Intrinsic): [{gen_sig}]")
-
-        # 2. Unpack Tier 2/3: Splitter Refinements
-        if obj_id and obj_id in self.state_refinements:
-            refinements = self.state_refinements[obj_id]
-            active_conds = []
-            for base_var, buckets in refinements.items():
-                if result_sig in buckets:
-                    active_conds.append(base_var)
             
-            if active_conds:
-                rule_parts.append(f"Tier 2/3 (Conditional): [{', '.join(active_conds)}]")
-            else:
-                rule_parts.append(f"Tier 2/3 (Conditional): [Testing Alternatives...]")
+            # Hide Tier 1 exceptions if Tier 2/3 has already explained them
+            if exceptions and not has_tier_2_or_3:
+                base_str += f" EXCEPT WHEN [{', '.join(set(exceptions))}]"
+                
+            rule_parts.insert(0, base_str)
+        else:
+            rule_parts.insert(0, f"Tier 1 (Intrinsic): [{gen_sig}]")
+            
+        # 3. Append the Split Tiers
+        if tier_2_conds:
+            rule_parts.append(f"Tier 2 (Relational): [{', '.join(tier_2_conds)}]")
+        if tier_3_conds:
+            rule_parts.append(f"Tier 3 (Global): [{', '.join(tier_3_conds)}]")
                 
         return " AND ".join(rule_parts)
             
@@ -4188,15 +4328,6 @@ class ObmlAgi3Agent(Agent):
         contexts_by_result = {sig: ctx_list for sig, ctx_list in contexts_by_result.items() if len(ctx_list) > 0}
         if len(contexts_by_result) < 2: return
 
-        # Separate Outcomes
-        success_ctxs = []
-        failure_ctxs = []
-        for r_sig, ctx_list in contexts_by_result.items():
-            if r_sig[0] == 'NO_CHANGE': failure_ctxs.extend(ctx_list)
-            else: success_ctxs.extend(ctx_list)
-                
-        if not success_ctxs or not failure_ctxs: return
-
         # Helper for Tiered Extraction
         def _get_tiered_features(ctx_entry, current_tier):
             features = set()
@@ -4212,14 +4343,29 @@ class ObmlAgi3Agent(Agent):
                 features.add(f"{oid}_shape_{obj['fingerprint']}")
                 features.add(f"{oid}_position_{obj['position']}")
             
-            # TIER 2: Local Relationships
+            # TIER 2: Local Relationships (Extracts ALL intrinsic properties of neighbors)
             if current_tier >= 2:
                 for d_idx, direction in enumerate(['top', 'right', 'bottom', 'left']):
                     nid = snap.get('adj', {}).get(oid, ['na']*4)[d_idx]
-                    if nid not in ['na', 'x']: features.add(f"{oid}_adj_{direction}_{nid}")
+                    if nid not in ['na', 'x']: 
+                        n_obj = next((o for o in snap['summary'] if o['id'] == nid), None)
+                        if n_obj and not n_obj.get('is_hud'):
+                            features.add(f"{oid}_adj_{direction}_Color_{n_obj['color']}")
+                            features.add(f"{oid}_adj_{direction}_Shape_{n_obj['fingerprint']}")
+                            features.add(f"{oid}_adj_{direction}_Size_{n_obj['size']}")
+                            features.add(f"{oid}_adj_{direction}_Pixels_{n_obj['pixels']}")
+                            features.add(f"{oid}_adj_{direction}_Position_{n_obj['position']}")
+                            
                 for d_idx, direction in enumerate(['tr', 'br', 'bl', 'tl']):
                     nid = snap.get('diag_adj', {}).get(oid, ['na']*4)[d_idx]
-                    if nid not in ['na', 'x']: features.add(f"{oid}_diag_adj_{direction}_{nid}")
+                    if nid not in ['na', 'x']: 
+                        n_obj = next((o for o in snap['summary'] if o['id'] == nid), None)
+                        if n_obj and not n_obj.get('is_hud'):
+                            features.add(f"{oid}_diag_adj_{direction}_Color_{n_obj['color']}")
+                            features.add(f"{oid}_diag_adj_{direction}_Shape_{n_obj['fingerprint']}")
+                            features.add(f"{oid}_diag_adj_{direction}_Size_{n_obj['size']}")
+                            features.add(f"{oid}_diag_adj_{direction}_Pixels_{n_obj['pixels']}")
+                            features.add(f"{oid}_diag_adj_{direction}_Position_{n_obj['position']}")
             
             # TIER 3: Global Relationships
             if current_tier >= 3:
@@ -4232,92 +4378,89 @@ class ObmlAgi3Agent(Agent):
             return features
 
         valid_refinements = set()
-        num_successes = len(success_ctxs)
         
-        # Cascading Filter Loop
-        for tier in [1, 2, 3]:
-            success_base_var_counts = {}
-            success_base_var_values = {}
-            
-            # 1. Build Success Baseline at this Tier
-            for ctx_entry in success_ctxs:
-                tier_features = _get_tiered_features(ctx_entry, tier)
-                seen_vars = set()
-                for f_str in tier_features:
-                    b_var = self._get_base_variable(f_str)
-                    seen_vars.add(b_var)
-                    success_base_var_values.setdefault(b_var, set()).add(f_str)
-                for b_var in seen_vars:
-                    success_base_var_counts[b_var] = success_base_var_counts.get(b_var, 0) + 1
-
-            tier_violators = set()
-            
-            # 2. Test Failures against the Baseline
-            for f_ctx in failure_ctxs:
-                f_features = _get_tiered_features(f_ctx, tier)
-                f_base_vars_present = set()
-                f_base_var_values = {}
-                for f_str in f_features:
-                    b_var = self._get_base_variable(f_str)
-                    f_base_vars_present.add(b_var)
-                    f_base_var_values[b_var] = f_str
+        # Multi-Class Evaluation
+        for target_r_sig, focus_ctxs in contexts_by_result.items():
+            contrast_ctxs = []
+            for other_r_sig, other_ctxs in contexts_by_result.items():
+                if other_r_sig != target_r_sig:
+                    contrast_ctxs.extend(other_ctxs)
                     
-                # Reason A: Poisoned Value (Causing failure but never seen in success)
-                for b_var, val in f_base_var_values.items():
-                    if b_var in success_base_var_values and val not in success_base_var_values[b_var]:
-                        tier_violators.add(b_var)
-                        
-                # Reason B: Missing Prerequisite (Strictly required in success, missing in failure)
-                for b_var, count in success_base_var_counts.items():
-                    if count == num_successes and b_var not in f_base_vars_present:
-                        tier_violators.add(b_var)
-                        
-            if tier_violators:
-                valid_refinements = tier_violators
-                break # Differentiator found at this tier, stop expanding
+            if not contrast_ctxs: continue
 
-        # Build bucket mapping for the Predictor
+            for tier in [1, 2, 3]:
+                # 1. Focus Intersection (What is always true when this specific outcome happens?)
+                focus_intersection = set()
+                if focus_ctxs:
+                    focus_intersection = _get_tiered_features(focus_ctxs[0], tier)
+                    for ctx_entry in focus_ctxs[1:]:
+                        focus_intersection.intersection_update(_get_tiered_features(ctx_entry, tier))
+                
+                # 2. Contrast Intersection (What is always true when ANY OTHER outcome happens?)
+                contrast_intersection = set()
+                if contrast_ctxs:
+                    contrast_intersection = _get_tiered_features(contrast_ctxs[0], tier)
+                    for ctx_entry in contrast_ctxs[1:]:
+                        contrast_intersection.intersection_update(_get_tiered_features(ctx_entry, tier))
+
+                tier_violators = set()
+                
+                # 3. Analyze: What traits are ONLY in the focus outcome?
+                for f_feature in focus_intersection:
+                    f_base_var = self._get_base_variable(f_feature)
+                    
+                    if not any(self._get_base_variable(c_feat) == f_base_var for c_feat in contrast_intersection):
+                        tier_violators.add(f_base_var)
+                    elif f_feature not in contrast_intersection:
+                        tier_violators.add(f_base_var)
+                        
+                for c_feature in contrast_intersection:
+                    c_base_var = self._get_base_variable(c_feature)
+                    if not any(self._get_base_variable(f_feat) == c_base_var for f_feat in focus_intersection):
+                        tier_violators.add(c_base_var)
+
+                if tier_violators:
+                    valid_refinements.update(tier_violators)
+                    break
+
+        # Build bucket mapping for the Predictor (Strict Intersection)
         result_variable_values = {}
         for r_sig, ctx_list in contexts_by_result.items():
             result_variable_values[r_sig] = {}
-            for ctx_entry in ctx_list:
-                raw_features = _get_tiered_features(ctx_entry, 3) 
-                for f_str in raw_features:
-                    b_var = self._get_base_variable(f_str)
-                    if b_var not in result_variable_values[r_sig]:
-                        result_variable_values[r_sig][b_var] = set()
-                    result_variable_values[r_sig][b_var].add(f_str)
-
-        # APPLY DISCOVERIES
-        if valid_refinements:
-            if obj_id not in self.pending_refinements:
-                self.pending_refinements[obj_id] = {'suspects': valid_refinements, 'stable_count': 0}
-            else:
-                if self.pending_refinements[obj_id]['suspects'] == valid_refinements:
-                    self.pending_refinements[obj_id]['stable_count'] += 1
-                else:
-                    self.pending_refinements[obj_id]['suspects'] = valid_refinements
-                    self.pending_refinements[obj_id]['stable_count'] = 0
+            if not ctx_list: continue
             
-            if self.pending_refinements[obj_id]['stable_count'] >= 2:
-                old_refinements = set(self.state_refinements.get(obj_id, {}).keys())
-                falsified = old_refinements - valid_refinements
-                for f in falsified:
-                    del self.state_refinements[obj_id][f]
-                    
-                if obj_id not in self.state_refinements:
-                    self.state_refinements[obj_id] = {}
+            # 1. Find the universal common ground for this specific outcome
+            common_features = _get_tiered_features(ctx_list[0], 3)
+            for ctx_entry in ctx_list[1:]:
+                common_features.intersection_update(_get_tiered_features(ctx_entry, 3))
                 
-                for refinement in valid_refinements:
-                    bucket_map = {}
-                    for r_sig in result_variable_values.keys():
-                        bucket_map[r_sig] = result_variable_values[r_sig].get(refinement, set())
-                    self.state_refinements[obj_id][refinement] = bucket_map
+            # 2. Map ONLY the strictly common features to the Predictor
+            for f_str in common_features:
+                b_var = self._get_base_variable(f_str)
+                if b_var not in result_variable_values[r_sig]:
+                    result_variable_values[r_sig][b_var] = set()
+                result_variable_values[r_sig][b_var].add(f_str)
+
+        # APPLY DISCOVERIES (Immediate Promotion)
+        if valid_refinements:
+            old_refinements = set(self.state_refinements.get(obj_id, {}).keys())
+            falsified = old_refinements - valid_refinements
+            for f in falsified:
+                del self.state_refinements[obj_id][f]
                 
-                del self.pending_refinements[obj_id]
-                
-                if self.debug_channels.get('HYPOTHESIS', False):
-                    self._print_and_log(f"  [Splitter] Discovered specific conditional rules for {obj_id}.")
+            if obj_id not in self.state_refinements:
+                self.state_refinements[obj_id] = {}
+            
+            for refinement in valid_refinements:
+                bucket_map = {}
+                for r_sig in result_variable_values.keys():
+                    bucket_map[r_sig] = result_variable_values[r_sig].get(refinement, set())
+                self.state_refinements[obj_id][refinement] = bucket_map
+            
+            if obj_id in self.pending_refinements: del self.pending_refinements[obj_id]
+            
+            if self.debug_channels.get('HYPOTHESIS', False):
+                self._print_and_log(f"  [Splitter] Discovered specific conditional rules for {obj_id}: {valid_refinements}")
         else:
             if obj_id in self.pending_refinements: del self.pending_refinements[obj_id]
             if obj_id in self.state_refinements: del self.state_refinements[obj_id]
