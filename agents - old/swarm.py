@@ -8,8 +8,9 @@ from typing import TYPE_CHECKING, Optional, Type
 import time
 import random
 
-from arc_agi import Arcade, OperationMode
-from arc_agi.scorecard import EnvironmentScorecard
+import requests
+
+from .structs import Scorecard
 
 if TYPE_CHECKING:
     from .agent import Agent
@@ -31,7 +32,7 @@ class Swarm:
     cleanup_threads: list[Thread]
     headers: dict[str, str]
     card_id: Optional[str]
-    _arc: Arcade
+    _session: requests.Session
 
     def __init__(
         self,
@@ -54,16 +55,11 @@ class Swarm:
             "X-API-Key": os.getenv("ARC_API_KEY", ""),
             "Accept": "application/json",
         }
-<<<<<<< HEAD
-        self.tags = tags.copy() if tags is not None else []
-        self._arc = Arcade()
-=======
         self._session = requests.Session()
         self._session.headers.update(self.headers)
         self.tags = tags.copy() if tags else []
         self.agent_params = params
         self.api_lock = Lock()
->>>>>>> bb87cc866110c1b1c067f72864d95ec77baba68f
 
         # Set up base tags for tracing
         if self.agent_name.endswith(".recording.jsonl"):
@@ -75,22 +71,16 @@ class Swarm:
         else:
             self.tags.extend(["agent", self.agent_name])
 
-    def main(self) -> EnvironmentScorecard | None:
+    def main(self) -> Scorecard | None:
         """The main orchestration loop, continues until all agents are done."""
 
         # Stagger startup to avoid overwhelming the API server when running in parallel.
         time.sleep(random.uniform(0.5, 5.0))
 
         # submit start of scorecard
-        print("***** MAKING SCORECARD")
         self.card_id = self.open_scorecard()
 
-<<<<<<< HEAD
-        print(f"***** MAKING ALL AGENTS with card id: {self.card_id}")
-        # create all the agents
-=======
         # create and run all the agents, ONE AT A TIME
->>>>>>> bb87cc866110c1b1c067f72864d95ec77baba68f
         for i in range(len(self.GAMES)):
             g = self.GAMES[i % len(self.GAMES)]
             a = self.agent_class(
@@ -99,7 +89,7 @@ class Swarm:
                 agent_name=self.agent_name,
                 ROOT_URL=self.ROOT_URL,
                 record=True,
-                arc_env=self._arc.make(g, scorecard_id=self.card_id),
+                cookies=self._session.cookies,
                 tags=self.tags,
                 params=self.agent_params,
                 api_lock=self.api_lock, # This lock will no longer be contended
@@ -155,25 +145,14 @@ class Swarm:
 
         # Provide web link to scorecard
         if card_id:
-            if self._arc.operation_mode == OperationMode.ONLINE:
-                scorecard_url = f"{self.ROOT_URL}/scorecards/{card_id}"
-                logger.info(f"View your scorecard online: {scorecard_url}")
-            else:
-                logger.info(
-                    "Online scorecard is not available, to use the online API set the ONLINE_ONLY envvar to True"
-                )
+            scorecard_url = f"{self.ROOT_URL}/scorecards/{card_id}"
+            logger.info(f"View your scorecard online: {scorecard_url}")
 
         self.cleanup(scorecard)
 
         return scorecard
 
     def open_scorecard(self) -> str:
-<<<<<<< HEAD
-        return self._arc.open_scorecard(tags=self.tags)  # type: ignore[no-any-return]
-
-    def close_scorecard(self, card_id: str) -> Optional[EnvironmentScorecard]:
-        self.card_id = None
-=======
         with self.api_lock:
             json_str = json.dumps({"tags": self.tags})
 
@@ -204,11 +183,22 @@ class Swarm:
             json=json.loads(json_str),
             headers=self.headers,
         )
->>>>>>> bb87cc866110c1b1c067f72864d95ec77baba68f
 
-        return self._arc.close_scorecard(card_id)
+        try:
+            response_data = r.json()
+        except ValueError:
+            logger.warning(f"Failed to close scorecard: {r.status_code} - {r.text}")
+            return None
 
-    def cleanup(self, scorecard: Optional[EnvironmentScorecard] = None) -> None:
+        if not r.ok:
+            logger.warning(
+                f"API error during close scorecard: {r.status_code} - {response_data}"
+            )
+            return None
+
+        return Scorecard.model_validate(response_data)
+
+    def cleanup(self, scorecard: Optional[Scorecard] = None) -> None:
         """Cleanup all agents."""
         for a in self.agents:
             a.cleanup(scorecard)

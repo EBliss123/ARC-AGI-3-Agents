@@ -16,6 +16,12 @@ dependencies = [
     "pydantic>=2.11.7",
     "requests>=2.32.4",
     "smolagents>=1.20.0",
+<<<<<<< HEAD
+=======
+    "optuna>=3.0.0",
+    "arc-agi>=0.9.1",
+    "gymnasium>=1.2.3",
+>>>>>>> bb87cc866110c1b1c067f72864d95ec77baba68f
 ]
 
 [dependency-groups]

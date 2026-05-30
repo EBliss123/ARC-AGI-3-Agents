@@ -4,19 +4,18 @@ import os
 import random
 import time
 from abc import ABC, abstractmethod
-<<<<<<< HEAD
-=======
 from copy import deepcopy
 from threading import Lock
->>>>>>> bb87cc866110c1b1c067f72864d95ec77baba68f
 from typing import Any, Optional
 
-from arc_agi import EnvironmentWrapper
-from arc_agi.scorecard import EnvironmentScorecard
-from arcengine import FrameData, FrameDataRaw, GameAction, GameState
+import requests
+import requests.cookies
 from pydantic import ValidationError
+from requests import Response
+from requests.cookies import RequestsCookieJar
 
 from .recorder import Recorder
+from .structs import FrameData, GameAction, GameState, Scorecard
 from .tracing import trace_agent_session
 
 logger = logging.getLogger()
@@ -39,7 +38,7 @@ class Agent(ABC):
 
     recorder: Recorder
     headers: dict[str, str]
-    arc_env: EnvironmentWrapper
+    _session: requests.Session
 
     # AgentOps tracing attributes
     trace: Any = None
@@ -52,13 +51,9 @@ class Agent(ABC):
         agent_name: str,
         ROOT_URL: str,
         record: bool,
-        arc_env: EnvironmentWrapper,
         tags: Optional[list[str]] = None,
-<<<<<<< HEAD
-=======
         cookies: requests.cookies.RequestsCookieJar = RequestsCookieJar(),
         api_lock: Optional[Lock] = None,
->>>>>>> bb87cc866110c1b1c067f72864d95ec77baba68f
     ) -> None:
         self.ROOT_URL = ROOT_URL
         self.card_id = card_id
@@ -66,7 +61,7 @@ class Agent(ABC):
         self.guid = ""
         self.agent_name = agent_name
         self.tags = tags or []
-        self.frames = [FrameData(levels_completed=0)]
+        self.frames = [FrameData(score=0)]
         self._cleanup = True
         if record:
             self.start_recording()
@@ -74,15 +69,11 @@ class Agent(ABC):
             "X-API-Key": os.getenv("ARC_API_KEY", "no-key-required"), # Add default fallback
             "Accept": "application/json",
         }
-<<<<<<< HEAD
-        self.arc_env = arc_env
-=======
         self.api_lock = api_lock
         # Reuse session
         self._session = requests.Session()
         self._session.cookies = deepcopy(cookies)
         self._session.headers.update(self.headers)
->>>>>>> bb87cc866110c1b1c067f72864d95ec77baba68f
 
     @trace_agent_session
     def main(self) -> None:
@@ -92,15 +83,6 @@ class Agent(ABC):
             not self.is_done(self.frames, self.frames[-1])
             and self.action_counter < self.MAX_ACTIONS
         ):
-<<<<<<< HEAD
-            action = self.choose_action(
-                self.frames,
-                self._convert_raw_frame_data(
-                    self.arc_env.observation_space if self.arc_env else None
-                ),
-            )
-            if frame := self.take_action(action):
-=======
             action = self.choose_action(self.frames, self.frames[-1])
             
             # --- NEW: Handle "Wait/Pass" ---
@@ -117,18 +99,13 @@ class Agent(ABC):
                 # Store the levels from before the latest action
                 previous_levels = getattr(self.frames[-2], 'levels_completed', 0) if len(self.frames) > 1 else 0
 
->>>>>>> bb87cc866110c1b1c067f72864d95ec77baba68f
                 self.append_frame(frame)
 
                 if action != GameAction.RESET:
                     self.action_counter += 1
 
                 logger.info(
-<<<<<<< HEAD
-                    f"{self.game_id} - {action.name}: count {self.action_counter}, levels completed {frame.levels_completed}, avg fps {self.fps})"
-=======
                     f"{self.game_id} - {action.name}: count {self.action_counter}, levels {frame.levels_completed}/{frame.win_levels}, avg fps {self.fps})"
->>>>>>> bb87cc866110c1b1c067f72864d95ec77baba68f
                 )
 
                 # If the levels increased, reset the action counter
@@ -145,8 +122,8 @@ class Agent(ABC):
         return self.frames[-1].state
 
     @property
-    def levels_completed(self) -> int:
-        return self.frames[-1].levels_completed  # type: ignore[no-any-return]
+    def score(self) -> int:
+        return self.frames[-1].score
 
     @property
     def seconds(self) -> float:
@@ -182,37 +159,6 @@ class Agent(ABC):
         if hasattr(self, "recorder") and not self.is_playback:
             self.recorder.record(json.loads(frame.model_dump_json()))
 
-<<<<<<< HEAD
-    def do_action_request(self, action: GameAction) -> FrameData:
-        data = action.action_data.model_dump()
-        # Agents attach reasoning to the GameAction enum instance, not to
-        # action_data — read it from the enum so it actually reaches step().
-        # Some agents emit a bare string; wrap so the wrapper always sees a dict.
-        reasoning = getattr(action, "reasoning", None)
-        if reasoning is not None and not isinstance(reasoning, dict):
-            reasoning = {"text": str(reasoning)}
-        raw = self.arc_env.step(action, data=data, reasoning=reasoning)
-        return self._convert_raw_frame_data(raw)
-
-    def _convert_raw_frame_data(self, raw: FrameDataRaw | None) -> FrameData:
-        if raw is None:
-            raise ValueError("Received None frame data from environment")
-        out = FrameData(
-            game_id=raw.game_id,
-            frame=[arr.tolist() for arr in raw.frame],
-            state=raw.state,
-            levels_completed=raw.levels_completed,
-            win_levels=raw.win_levels,
-            guid=raw.guid,
-            full_reset=raw.full_reset,
-            available_actions=raw.available_actions,
-        )
-        return out
-
-    def take_action(self, action: GameAction) -> Optional[FrameData]:
-        """Submits the specific action and gets the next frame."""
-        frame_data = self.do_action_request(action)
-=======
     def refresh_frame(self) -> bool:
         """Forces a server update by sending a calculated 'Pass' action."""
         try:
@@ -307,7 +253,6 @@ class Agent(ABC):
             )
             return None # Gracefully skip this frame without crashing
 
->>>>>>> bb87cc866110c1b1c067f72864d95ec77baba68f
         try:
             frame_data = response.json()
             frame = FrameData.model_validate(frame_data)
@@ -316,7 +261,19 @@ class Agent(ABC):
             return None
         return frame
 
-    def cleanup(self, scorecard: Optional[EnvironmentScorecard] = None) -> None:
+    def get_scorecard(self) -> Scorecard:
+        """Get the scorecard for this agent's game as a Scorecard pydantic object."""
+        r = self._session.get(
+            f"{self.ROOT_URL}/api/scorecard/{self.card_id}/{self.game_id}",
+            timeout=1,
+            headers=self.headers,
+        )
+        response_data = r.json()
+        if "error" in response_data:
+            logger.warning(f"Exception during scorecard request: {response_data}")
+        return Scorecard.model_validate(response_data)
+
+    def cleanup(self, scorecard: Optional[Scorecard] = None) -> None:
         """Called after main loop is finished."""
         time.sleep(random.uniform(0, 4.0))
         if self._cleanup:
@@ -324,6 +281,9 @@ class Agent(ABC):
             if hasattr(self, "recorder") and not self.is_playback:
                 if scorecard:
                     self.recorder.record(scorecard.get(self.game_id))
+                else:
+                    scorecard_obj = self.get_scorecard()
+                    self.recorder.record(scorecard_obj.get(self.game_id))
                 logger.info(
                     f"recording for {self.name} is available in {self.recorder.filename}"
                 )
@@ -335,6 +295,8 @@ class Agent(ABC):
                 logger.info(
                     f"Finishing: agent took {self.action_counter} actions, took {self.seconds} seconds ({self.fps} average fps)"
                 )
+            if hasattr(self, "_session"):
+                self._session.close()
 
     @abstractmethod
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:

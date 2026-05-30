@@ -4,6 +4,7 @@ from typing import Any, cast
 from arcengine import FrameData, GameAction, GameState
 from langgraph.graph import END, START, StateGraph
 from langgraph.pregel import Pregel
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.store.sqlite import SqliteStore
 
 from ...agent import Agent
@@ -14,7 +15,7 @@ from .schema import LLM, AgentState
 class LangGraphThinking(Agent):
     """A LangGraph agent, using a variety of tools to make decisions."""
 
-    MAX_ACTIONS = 20
+    MAX_ACTIONS = 2
 
     agent_state: AgentState
     workflow: Pregel[AgentState, Any, AgentState, AgentState]
@@ -76,6 +77,7 @@ class LangGraphThinking(Agent):
                 )
             )
         )
+
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
         """Decide if the agent is done playing or not."""
