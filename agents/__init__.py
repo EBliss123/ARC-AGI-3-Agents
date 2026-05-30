@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 from typing import Type, cast
 
 from dotenv import load_dotenv
@@ -16,38 +17,26 @@ from .templates.reasoning_agent import ReasoningAgent
 from .templates.smolagents import SmolCodingAgent, SmolVisionAgent
 
 load_dotenv()
+=======
+from typing import Type
+from .agent import Agent
+from .swarm import Swarm # <--- ADD THIS LINE
+from .obml_agi_3 import ObmlAgi3Agent
+>>>>>>> bb87cc866110c1b1c067f72864d95ec77baba68f
 
+# Registry for the fast_runner.py to find your agent
 AVAILABLE_AGENTS: dict[str, Type[Agent]] = {
-    cls.__name__.lower(): cast(Type[Agent], cls)
-    for cls in Agent.__subclasses__()
-    if cls.__name__ != "Playback"
+    "obmlagi3agent": ObmlAgi3Agent
 }
 
-# add all the recording files as valid agent names
-for rec in Recorder.list():
-    AVAILABLE_AGENTS[rec] = Playback
-
-# update the agent dictionary to include subclasses of LLM class
-AVAILABLE_AGENTS["reasoningagent"] = ReasoningAgent
-
 __all__ = [
-    "Swarm",
-    "Random",
-    "LangGraphFunc",
-    "LangGraphTextOnly",
-    "LangGraphThinking",
-    "LangGraphRandom",
-    "LLM",
-    "FastLLM",
-    "ReasoningLLM",
-    "GuidedLLM",
-    "ReasoningAgent",
-    "SmolCodingAgent",
-    "SmolVisionAgent",
     "Agent",
-    "Recorder",
-    "Playback",
+    "Swarm", # <--- ADD THIS LINE
     "AVAILABLE_AGENTS",
+<<<<<<< HEAD
     "MultiModalLLM",
     "OpenClaw",
 ]
+=======
+]
+>>>>>>> bb87cc866110c1b1c067f72864d95ec77baba68f

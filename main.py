@@ -15,6 +15,12 @@ from functools import partial
 from types import FrameType
 from typing import Optional
 
+# --- Force Python to use the code in this project directory first ---
+import sys
+import os
+project_root = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, project_root)
+
 import requests
 
 from agents import AVAILABLE_AGENTS, Swarm
@@ -41,8 +47,6 @@ HEADERS = {
 
 def run_agent(swarm: Swarm) -> None:
     swarm.main()
-    os.kill(os.getpid(), signal.SIGINT)
-
 
 def cleanup(
     swarm: Swarm,
@@ -50,8 +54,10 @@ def cleanup(
     frame: Optional[FrameType],
 ) -> None:
     logger.info("Received SIGINT, exiting...")
-    card_id = swarm.card_id
-    if card_id:
+    # Check if the swarm object has a card_id before trying to access it.
+    # This prevents a crash if the agent failed before the scorecard was opened.
+    if hasattr(swarm, 'card_id') and swarm.card_id:
+        card_id = swarm.card_id
         scorecard = swarm.close_scorecard(card_id)
         if scorecard:
             logger.info("--- EXISTING SCORECARD REPORT ---")
@@ -72,7 +78,7 @@ def main() -> None:
         log_level = logging.DEBUG
 
     logger.setLevel(log_level)
-    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    formatter = logging.Formatter("***%(asctime)s | %(levelname)s | %(message)s***")
 
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setLevel(log_level)
@@ -107,6 +113,28 @@ def main() -> None:
         help="Comma-separated list of tags for the scorecard (e.g., 'experiment,v1.0')",
         default=None,
     )
+
+    # --- Hyperparameters for the Optimizer ---
+    parser.add_argument('--learning_rate', type=float)
+    parser.add_argument('--discount_factor', type=float)
+    parser.add_argument('--reward_win', type=float)
+    parser.add_argument('--reward_novelty_multiplier', type=float)
+    parser.add_argument('--reward_new_effect_pattern', type=float)
+    parser.add_argument('--penalty_unexpected_failure', type=float)
+    parser.add_argument('--penalty_repeated_effect', type=float)
+    parser.add_argument('--penalty_boring_move', type=float)
+    parser.add_argument('--penalty_predicted_failure', type=float)
+    parser.add_argument('--penalty_blacklist_base', type=float)
+    parser.add_argument('--penalty_blacklist_scaler', type=float)
+    parser.add_argument('--drought_increment', type=float)
+    parser.add_argument('--bonus_action_exp', type=float)
+    parser.add_argument('--bonus_state_exp_unknown', type=float)
+    parser.add_argument('--bonus_state_exp_known_scaler', type=float)
+    parser.add_argument('--bonus_goal_seeking', type=float)
+    parser.add_argument('--reward_goal_proximity', type=float)
+    parser.add_argument('--weight_novelty_ratio', type=float)
+    parser.add_argument('--planning_confidence_threshold', type=float)
+    parser.add_argument('--recent_effect_patterns_maxlen', type=int)
 
     args = parser.parse_args()
 
@@ -179,11 +207,38 @@ def main() -> None:
     # Initialize AgentOps client
     init_agentops(api_key=os.getenv("AGENTOPS_API_KEY"), log_level=log_level)
 
+    # --- Collect Hyperparameters for the Agent ---
+    # Create a dictionary of only the hyperparameters that were passed via command line
+    hyperparams_to_pass = {
+        'learning_rate': args.learning_rate,
+        'discount_factor': args.discount_factor,
+        'reward_win': args.reward_win,
+        'reward_novelty_multiplier': args.reward_novelty_multiplier,
+        'reward_new_effect_pattern': args.reward_new_effect_pattern,
+        'penalty_unexpected_failure': args.penalty_unexpected_failure,
+        'penalty_repeated_effect': args.penalty_repeated_effect,
+        'penalty_boring_move': args.penalty_boring_move,
+        'penalty_predicted_failure': args.penalty_predicted_failure,
+        'penalty_blacklist_base': args.penalty_blacklist_base,
+        'penalty_blacklist_scaler': args.penalty_blacklist_scaler,
+        'drought_increment': args.drought_increment,
+        'bonus_action_exp': args.bonus_action_exp,
+        'bonus_state_exp_unknown': args.bonus_state_exp_unknown,
+        'bonus_state_exp_known_scaler': args.bonus_state_exp_known_scaler,
+        'bonus_goal_seeking': args.bonus_goal_seeking,
+        'weight_novelty_ratio': args.weight_novelty_ratio,
+        'planning_confidence_threshold': args.planning_confidence_threshold,
+        'recent_effect_patterns_maxlen': args.recent_effect_patterns_maxlen,
+    }
+    # Filter out any that were not set, so we don't pass `None`
+    cli_params = {key: value for key, value in hyperparams_to_pass.items() if value is not None}
+
     swarm = Swarm(
         args.agent,
         ROOT_URL,
         games,
-        tags=tags,  # Pass tags as keyword argument
+        tags=tags,
+        params=cli_params,  # Pass the collected hyperparameters
     )
     agent_thread = threading.Thread(target=partial(run_agent, swarm))
     agent_thread.daemon = True  # die when the main thread dies
@@ -192,17 +247,14 @@ def main() -> None:
     signal.signal(signal.SIGINT, partial(cleanup, swarm))  # handler for Ctrl+C
 
     try:
-        # Wait for the agent thread to complete
-        while agent_thread.is_alive():
-            agent_thread.join(timeout=5)  # Check every 5 second
+        # Wait indefinitely for the agent thread to complete on its own.
+        agent_thread.join()
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt received in main thread")
-        cleanup(swarm, signal.SIGINT, None)
-    except Exception as e:
-        logger.error(f"Unexpected error in main thread: {e}")
+    finally:
+        # This block will run whether the agent finished normally or was interrupted.
+        logger.info("Agent thread finished. Cleaning up.")
         cleanup(swarm, None, None)
-
-
 if __name__ == "__main__":
     os.environ["TESTING"] = "False"
     main()

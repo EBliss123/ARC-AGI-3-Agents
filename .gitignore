@@ -19,5 +19,10 @@ tests/recordings/not-a-recording.txt
 
 # Long-term memory
 memory.db
+<<<<<<< HEAD
 
 environment_files/
+=======
+tuning_study.db
+tuning_study.db
+>>>>>>> bb87cc866110c1b1c067f72864d95ec77baba68f
