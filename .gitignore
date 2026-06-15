@@ -3,6 +3,7 @@
 
 # except this file
 !data_utils.py
+!networks.py
 
 # still allow .gitignore itself
 !.gitignore
