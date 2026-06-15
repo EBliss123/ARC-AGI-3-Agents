@@ -1,0 +1,8 @@
+# ignore everything
+*
+
+# except this file
+!data_utils.py
+
+# still allow .gitignore itself
+!.gitignore
