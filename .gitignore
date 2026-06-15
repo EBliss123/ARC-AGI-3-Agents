@@ -1,9 +1,9 @@
 # ignore everything
 *
 
-# except this file
-!data_utils.py
-!networks.py
-
-# still allow .gitignore itself
+# re-allow gitignore itself
 !.gitignore
+
+# re-allow the directory (IMPORTANT)
+!neural_network/
+!neural_network/**
