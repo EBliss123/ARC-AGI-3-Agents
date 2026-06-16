@@ -7,3 +7,7 @@
 # re-allow the directory (IMPORTANT)
 !neural_network/
 !neural_network/**
+
+# but ignore these directories
+neural_network/**/__pycache__/
+neural_network/**/environment_files/

@@ -72,8 +72,8 @@ def run_outer_update(global_model, outer_optimizer, meta_test_data):
         
         # 2. Calculate the Meta-Loss (Surprise on the unseen frame)
         loss = F.cross_entropy(
-            predicted_frame.view(16, -1).unsqueeze(0), 
-            true_test_frame.view(-1).unsqueeze(0)
+            predicted_frame.reshape(16, -1).unsqueeze(0), 
+            true_test_frame.reshape(-1).unsqueeze(0)
         )
         total_meta_loss += loss
         

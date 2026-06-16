@@ -14,7 +14,7 @@ class PlannerNetwork(nn.Module):
 
     def forward(self, grid_tensor, action_mask):
         # Flatten the (Batch, 16, 64, 64) grid into a 65,536-node vector
-        x = grid_tensor.view(grid_tensor.size(0), -1) 
+        x = grid_tensor.reshape(grid_tensor.size(0), -1)
         
         x = torch.relu(self.layer1(x))
         x = torch.relu(self.layer2(x))
@@ -60,7 +60,7 @@ class PredictorNetwork(nn.Module):
 
     def forward(self, grid_tensor, film_params):
         # Flatten the grid
-        x = grid_tensor.view(grid_tensor.size(0), -1)
+        x = grid_tensor.reshape(grid_tensor.size(0), -1)
         
         # Split the 2,048-node film_params into 4 chunks of 512
         # Each chunk contains 256 gamma (multipliers) and 256 beta (shifts)
