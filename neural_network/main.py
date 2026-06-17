@@ -6,6 +6,8 @@ from arcengine import GameAction, GameState
 import random
 import os
 import csv
+import numpy as np
+from scipy.ndimage import label
 
 # Import our custom modules
 from networks import PlannerNetwork, ActionNetwork, PredictorNetwork
@@ -20,58 +22,70 @@ class AGI_Architecture(nn.Module):
         self.action_network = ActionNetwork()
         self.predictor = PredictorNetwork()
 
-def play_game_turn(raw_grid, model_clone):
-    # 1. Prepare the data
-    grid_tensor = encode_grid(raw_grid).unsqueeze(0)
-    action_mask = get_action_mask(raw_grid)
-
-    valid_action_ids = [a.value for a in GameAction]
-    
-    for i in range(8):
-        if i not in valid_action_ids:
-            action_mask[i] = False
-            
-    if 6 not in valid_action_ids:
-        action_mask[8:] = False
-
-    # Hard-disable the RESET button so the agent never intentionally restarts
-    for a in GameAction:
-        if a.name == 'RESET':
-            action_mask[a.value] = False
-    
-    # --- DYNAMIC GUARDRAIL: Restrict to valid actions for the current game ---
-    valid_action_ids = [a.value for a in GameAction]
-    
-    # Disable any discrete buttons (0-7) that don't exist in this game
-    for i in range(8):
-        if i not in valid_action_ids:
-            action_mask[i] = False
-            
-    # If ACTION6 (Spatial click) is not allowed, disable all 4,096 spatial nodes
-    if 6 not in valid_action_ids:
-        action_mask[8:] = False
+def get_cluster_representatives(raw_grid):
+    grid = np.array(raw_grid)
+    if grid.ndim != 2:
+        return []
         
-    # 2. The Planner makes a decision (Forward Pass)
-    # Add a batch dimension to the grid_tensor for the network (1, 16, 64, 64)
+    representatives = []
+    # Structure defines the 4-way connectivity (up, down, left, right)
+    structure = np.array([[0, 1, 0], 
+                          [1, 1, 1], 
+                          [0, 1, 0]])
+                          
+    for c in np.unique(grid):
+        # Create a binary mask for just this color
+        binary_mask = (grid == c).astype(int)
+        labeled_array, num_features = label(binary_mask, structure=structure)
+        
+        for i in range(1, num_features + 1):
+            coords = np.argwhere(labeled_array == i)
+            if len(coords) > 0:
+                y, x = coords[0]  # Grab the first coordinate of this specific blob
+                representatives.append((x, y))
+                
+    return representatives
+
+def play_game_turn(obs, model_clone):
+    # 1. Prepare the data
+    raw_grid = obs.frame[-1] if isinstance(obs.frame, list) else obs.frame
+    grid_tensor = encode_grid(raw_grid).unsqueeze(0)
+    
+    # Start with a clean mask
+    action_mask = torch.zeros(4104, dtype=torch.bool)
+    
+    # --- DYNAMIC GUARDRAIL: Official Emulator Actions ---
+    for action in obs.available_actions:
+        # If it's an Enum, use .value; if it's an int, use it directly
+        action_val = action.value if hasattr(action, 'value') else action
+        if action_val < 8:
+            action_mask[action_val] = True
+            
+    # --- DYNAMIC SPATIAL CLUSTER MASKING ---
+    # Only enable spatial clicking if index 6 (ACTION6) is in available_actions
+    if any((a.value if hasattr(a, 'value') else a) == 6 for a in obs.available_actions):
+        valid_coords = get_cluster_representatives(raw_grid)
+        for x, y in valid_coords:
+            spatial_index = 8 + (y * 64) + x
+            if spatial_index < 4104:
+                action_mask[spatial_index] = True
+        
+    # 2. The Planner makes a decision
     action_probs = model_clone.planner(grid_tensor, action_mask)
     
-    # 3. Select the action (Using multinomial to sample based on probabilities)
+    # 3. Select action
     chosen_index = torch.multinomial(action_probs, 1).item()
     
-    # 4. Translate the flat index back into an action type and coordinates
     if chosen_index < 8:
         action_id = chosen_index
         x, y = 0, 0
     else:
-        action_id = 6
+        action_id = 6 # Map all spatial indices to the generic ACTION6 enum
         spatial_index = chosen_index - 8
         y = spatial_index // 64
         x = spatial_index % 64
         
-    # 5. Build the exact unified vector for the Action Network
     action_vector = unify_action(action_id, x, y)
-    
-    # 6. Format for the Kaggle Emulator
     emulator_action = next(a for a in GameAction if a.value == action_id)
     emulator_coords = {"x": x, "y": y} if action_id == 6 else None
     
@@ -127,7 +141,7 @@ if __name__ == "__main__":
                 raw_grid = extract_grid(obs)
                 
                 # Ask the Planner for a move
-                grid_tensor, action_vector, em_action, em_coords = play_game_turn(raw_grid, clone_model)
+                grid_tensor, action_vector, em_action, em_coords = play_game_turn(obs, clone_model)
                 
                 # Record the human-readable action name, plus coordinates if it's a spatial click
                 if em_coords:
@@ -161,8 +175,7 @@ if __name__ == "__main__":
             
             # C. Save the adapted clone and an unseen frame for the final exam
             if not done:
-                test_grid_raw = extract_grid(obs)
-                test_grid, test_action_vector, test_em_action, test_coords = play_game_turn(test_grid_raw, adapted_clone)
+                test_grid, test_action_vector, test_em_action, test_coords = play_game_turn(obs, adapted_clone)
                 next_obs = env.step(test_em_action, data=test_coords)
                 
                 true_test_frame = torch.tensor(extract_grid(next_obs), dtype=torch.long)
@@ -181,8 +194,9 @@ if __name__ == "__main__":
             # Checkpoint the model if it hits a new record
             if epoch_loss < best_loss:
                 best_loss = epoch_loss
-                torch.save(global_model.state_dict(), 'arc_agi_checkpoint.pt')
-                print(f"   -> New best loss! Checkpoint saved to disk.")
+                os.makedirs('__pycache__', exist_ok=True)
+                torch.save(global_model.state_dict(), os.path.join('__pycache__', 'arc_agi_checkpoint.pt'))
+                print(f"   -> New best loss! Checkpoint saved to __pycache__.")
                 
         else:
             print(f"Epoch {epoch+1} | Skipped Update (All games ended early)")
