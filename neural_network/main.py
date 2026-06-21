@@ -12,7 +12,7 @@ from scipy.ndimage import label
 # Import our custom modules
 from networks import PlannerNetwork, ActionNetwork, PredictorNetwork
 from data_utils import encode_grid, get_action_mask, unify_action
-from meta_loop import setup_game_clone, run_fast_adaptation, transition_to_next_level, run_outer_update
+from meta_loop import setup_game_clone, run_single_turn_adaptation, transition_to_next_level, run_outer_update
 
 class AGI_Architecture(nn.Module):
     def __init__(self):
@@ -76,6 +76,9 @@ def play_game_turn(obs, model_clone):
     # 3. Select action
     chosen_index = torch.multinomial(action_probs, 1).item()
     
+    # Capture the mathematical log probability of the chosen action for REINFORCE
+    log_prob = torch.log(action_probs[0, chosen_index] + 1e-10)
+    
     if chosen_index < 8:
         action_id = chosen_index
         x, y = 0, 0
@@ -89,7 +92,7 @@ def play_game_turn(obs, model_clone):
     emulator_action = next(a for a in GameAction if a.value == action_id)
     emulator_coords = {"x": x, "y": y} if action_id == 6 else None
     
-    return grid_tensor, action_vector, emulator_action, emulator_coords
+    return grid_tensor, action_vector, emulator_action, emulator_coords, log_prob
     
 if __name__ == "__main__":
     # 1. Initialize the Global Master Model
@@ -98,7 +101,7 @@ if __name__ == "__main__":
     # 2. Setup the Global Outer Optimizer (Adam for slow, stable learning)
     outer_optimizer = optim.Adam(global_model.parameters(), lr=0.0005)
 
-    epochs = 30
+    epochs = 10
     best_loss = float('inf')
 
     # Initialize the CSV log file locally
@@ -119,8 +122,8 @@ if __name__ == "__main__":
         batch_of_games = random.sample(public_games, 5)
         
         for game in batch_of_games:
-            # A. Spawn the temporary clone and its fast optimizer
-            clone_model, inner_optimizer = setup_game_clone(global_model, inner_lr=0.05)
+            # A. Spawn the temporary clone and its optimizers
+            clone_model, physics_optimizer, policy_optimizer = setup_game_clone(global_model, inner_lr=0.05)
             
             # Boot up the live emulator for this specific game
             env = arc.make(game.game_id)
@@ -136,14 +139,22 @@ if __name__ == "__main__":
                 # Handle animations: if it returns a list of frames, grab the final one
                 return grid_data[-1] if isinstance(grid_data, list) else grid_data
 
-            # B. Run the 30-step Test-Time Training (Inner Loop)
-            for step in range(30):
+            game_over_count = 0
+            step = 0
+            max_steps = 150  
+            state_memory = set()  # Tracks every grid state we've seen this game
+            
+            # B. Run the Test-Time Training (Inner Loop) until 2 Game Overs
+            while game_over_count < 2 and step < max_steps:
                 raw_grid = extract_grid(obs)
                 
-                # Ask the Planner for a move
-                grid_tensor, action_vector, em_action, em_coords = play_game_turn(obs, clone_model)
+                # Hash the current grid and save it to memory
+                grid_hash = hash(np.array(raw_grid).tobytes())
+                state_memory.add(grid_hash)
                 
-                # Record the human-readable action name, plus coordinates if it's a spatial click
+                # Ask the Planner for a move
+                grid_tensor, action_vector, em_action, em_coords, log_prob = play_game_turn(obs, clone_model)
+                
                 if em_coords:
                     action_history.append(f"{em_action.name}({em_coords['x']},{em_coords['y']})")
                 else:
@@ -152,22 +163,42 @@ if __name__ == "__main__":
                 # Submit the move to the live emulator
                 next_obs = env.step(em_action, data=em_coords)
                 
-                # --- VERIFICATION: Did the action actually change the board? ---
+                # --- VERIFICATION & CURIOSITY REWARDS ---
                 next_raw_grid = extract_grid(next_obs)
-                if np.array_equal(raw_grid, next_raw_grid):
-                    # Append a warning to the last recorded action in our log
-                    action_history[-1] += " (NO_CHANGE)"
+                next_grid_hash = hash(np.array(next_raw_grid).tobytes())
                 
-                # Store the true outcome for the backprop
+                if np.array_equal(raw_grid, next_raw_grid):
+                    action_history[-1] += " (NO_CHANGE)"
+                    reward = -1.0  # Heavy penalty for wasting a turn
+                elif next_grid_hash in state_memory:
+                    action_history[-1] += " (LOOP)"
+                    reward = -0.5  # Penalty for toggling something back and forth
+                else:
+                    reward = 1.0   # Positive reward for finding a novel state!
+                
+                # Store the true outcome for the final exam backprop
                 target_next_frame = torch.tensor(next_raw_grid, dtype=torch.long)
-                train_states.append((grid_tensor, action_vector, target_next_frame))
+                turn_data = (grid_tensor, action_vector, target_next_frame, log_prob, reward)
+                train_states.append(turn_data)
+                
+                # --- REAL-TIME LEARNING: Update the brain instantly after this single move ---
+                clone_model = run_single_turn_adaptation(clone_model, physics_optimizer, policy_optimizer, turn_data)
                 
                 obs = next_obs
                 
-                # FIX 3: Check if the game is over using the explicit GameState enum
-                if obs and obs.state in [GameState.WIN, GameState.GAME_OVER]:
-                    done = True
-                    break
+                # --- CHECK GAME STATE ---
+                if hasattr(obs, 'state'):
+                    if obs.state == GameState.GAME_OVER:
+                        game_over_count += 1
+                        if game_over_count < 2:
+                            obs = env.reset()
+                            action_history.append("---DIED_AND_RESET---")
+                    elif obs.state == GameState.WIN:
+                        break  
+                        
+                step += 1
+                
+            done = (obs.state == GameState.WIN or game_over_count == 2) if hasattr(obs, 'state') else True
                     
             # --- VERIFICATION LOG ---
             final_status = obs.state.name if hasattr(obs, 'state') else "ALIVE_BUT_CAPPED"
@@ -176,12 +207,12 @@ if __name__ == "__main__":
             print(f"      Actions: {action_str}")
             # ------------------------
                     
-            # Run the actual fast adaptation on those captured turns
-            adapted_clone = run_fast_adaptation(clone_model, inner_optimizer, train_states, steps=len(train_states))
+            # The clone is already fully adapted because it learned move-by-move!
+            adapted_clone = clone_model
             
             # C. Save the adapted clone and an unseen frame for the final exam
             if not done:
-                test_grid, test_action_vector, test_em_action, test_coords = play_game_turn(obs, adapted_clone)
+                test_grid, test_action_vector, test_em_action, test_coords, _ = play_game_turn(obs, adapted_clone)
                 next_obs = env.step(test_em_action, data=test_coords)
                 
                 true_test_frame = torch.tensor(extract_grid(next_obs), dtype=torch.long)

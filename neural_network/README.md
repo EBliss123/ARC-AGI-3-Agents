@@ -30,6 +30,15 @@ The architecture is split into three interconnected modules:
 * **Mechanism:** It processes the current grid and dynamically injects the FiLM parameters from the Action Network at each hidden layer, effectively altering its own internal logic based on the action taken.
 * **Residual Connection Bias:** Because the vast majority of pixels in ARC games do not change per turn, the Predictor takes the original input grid, multiplies it by a heavy bias (`* 10.0`), and adds it to the final output. This mathematically forces the network to default to "No Change" and focus exclusively on predicting the deltas.
 
+## Intrinsic Motivation (Curiosity & Novelty)
+Because random action sampling normally breaks the PyTorch computation graph, the `PlannerNetwork` utilizes a **REINFORCE Policy Gradient** algorithm to learn actively.
+
+During the Inner Loop, the agent hashes and memorizes every unique grid state it encounters. 
+* **The Penalty:** If an action results in `NO_CHANGE`, it receives a reward of `-1.0`. If it results in a state it has already seen (a `LOOP`), it receives `-0.5`.
+* **The Reward:** If the action triggers a visual change leading to an entirely unseen state, it receives a `+1.0`.
+
+The `log_probability` of every chosen action is captured, multiplied by the resulting reward, and backpropagated into the Planner. This directly alters the Planner's weights, making it mathematically "allergic" to clicking useless buttons and driving it to seek novel interactions.
+
 ## Data & Logic Heuristics (`data_utils.py` & `main.py`)
 
 ### Dynamic Guardrails
