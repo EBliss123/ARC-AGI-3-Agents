@@ -98,7 +98,7 @@ if __name__ == "__main__":
     # 2. Setup the Global Outer Optimizer (Adam for slow, stable learning)
     outer_optimizer = optim.Adam(global_model.parameters(), lr=0.0005)
 
-    epochs = 100
+    epochs = 30
     best_loss = float('inf')
 
     # Initialize the CSV log file locally
@@ -152,8 +152,14 @@ if __name__ == "__main__":
                 # Submit the move to the live emulator
                 next_obs = env.step(em_action, data=em_coords)
                 
+                # --- VERIFICATION: Did the action actually change the board? ---
+                next_raw_grid = extract_grid(next_obs)
+                if np.array_equal(raw_grid, next_raw_grid):
+                    # Append a warning to the last recorded action in our log
+                    action_history[-1] += " (NO_CHANGE)"
+                
                 # Store the true outcome for the backprop
-                target_next_frame = torch.tensor(extract_grid(next_obs), dtype=torch.long)
+                target_next_frame = torch.tensor(next_raw_grid, dtype=torch.long)
                 train_states.append((grid_tensor, action_vector, target_next_frame))
                 
                 obs = next_obs

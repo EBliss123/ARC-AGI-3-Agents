@@ -86,5 +86,13 @@ class PredictorNetwork(nn.Module):
         x = torch.relu(self.layer4(x))
         x = (x * gamma4) + beta4
         
-        # Output raw logits (CrossEntropyLoss will handle the probabilities)
-        return self.output_layer(x)
+        # Get the network's raw prediction for what it thinks will change
+        logits = self.output_layer(x)
+        
+        # --- RESIDUAL CONNECTION (NO CHANGE BIAS) ---
+        # We take the original input grid, flatten it to match the output size,
+        # and heavily boost the probabilities of the colors that are already there.
+        # This explicitly forces the network to default to "No Change".
+        flattened_input = grid_tensor.reshape(grid_tensor.size(0), -1)
+        
+        return logits + (flattened_input * 10.0)
