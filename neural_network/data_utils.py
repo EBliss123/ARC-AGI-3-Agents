@@ -4,14 +4,14 @@ import numpy as np
 from scipy.ndimage import label
 
 def encode_grid(raw_grid):
-    # Convert input array to a PyTorch long tensor
     grid_tensor = torch.tensor(raw_grid, dtype=torch.long)
+    one_hot = F.one_hot(grid_tensor, num_classes=16).float()
     
-    # Perform one-hot encoding across 16 color dimensions (0-15)
-    one_hot = F.one_hot(grid_tensor, num_classes=16)
+    y_coords = torch.linspace(-1.0, 1.0, 64).view(64, 1).expand(64, 64).unsqueeze(-1)
+    x_coords = torch.linspace(-1.0, 1.0, 64).view(1, 64).expand(64, 64).unsqueeze(-1)
     
-    # Permute from (64, 64, 16) to (16, 64, 64) for spatial network layers
-    return one_hot.permute(2, 0, 1).float()
+    combined = torch.cat([one_hot, x_coords, y_coords], dim=-1)
+    return combined.view(-1, 18)
 
 def get_action_mask(raw_grid, background_color=0):
     # Create a base mask of 4104 zeros (8 discrete + 4096 spatial)
@@ -36,18 +36,11 @@ def get_action_mask(raw_grid, background_color=0):
     return mask
 
 def unify_action(action_id, x=0, y=0):
-    # Create the empty 136-node vector (8 discrete + 64 X + 64 Y)
-    vector = torch.zeros(136, dtype=torch.float32)
-    
-    # 1. One-hot encode the chosen discrete action (Indices 0-7)
-    vector[action_id] = 1.0
-    
-    # 2. One-hot encode spatial coordinates ONLY if Action 6 is chosen
-    if action_id == 6:
-        # X coordinate offset begins at index 8
-        vector[8 + x] = 1.0
+    vector = torch.zeros(10, dtype=torch.float32)
+    if action_id < 8:
+        vector[action_id] = 1.0
         
-        # Y coordinate offset begins at index 72 (8 + 64)
-        vector[72 + y] = 1.0
-        
+    # Normalize spatial clicks from 0-63 to -1.0 to 1.0
+    vector[8] = (x / 63.0) * 2.0 - 1.0 if action_id == 6 else 0.0
+    vector[9] = (y / 63.0) * 2.0 - 1.0 if action_id == 6 else 0.0
     return vector

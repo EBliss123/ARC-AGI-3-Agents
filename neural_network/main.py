@@ -10,16 +10,15 @@ import numpy as np
 from scipy.ndimage import label
 
 # Import our custom modules
-from networks import PlannerNetwork, ActionNetwork, PredictorNetwork
+from networks import PlannerNetwork, PredictorNetwork
 from data_utils import encode_grid, get_action_mask, unify_action
-from meta_loop import setup_game_clone, run_single_turn_adaptation, transition_to_next_level, run_outer_update
+from meta_loop import setup_game_clone, run_single_turn_adaptation, run_outer_update
 
 class AGI_Architecture(nn.Module):
     def __init__(self):
         super().__init__()
-        # Bring the three networks under one global umbrella
+        # The architecture is now beautifully reduced to just two decentralized brains
         self.planner = PlannerNetwork()
-        self.action_network = ActionNetwork()
         self.predictor = PredictorNetwork()
 
 def get_cluster_representatives(raw_grid):
@@ -46,10 +45,10 @@ def get_cluster_representatives(raw_grid):
                 
     return representatives
 
-def play_game_turn(obs, model_clone):
+def play_game_turn(obs, clone_model):
     # 1. Prepare the data
     raw_grid = obs.frame[-1] if isinstance(obs.frame, list) else obs.frame
-    grid_tensor = encode_grid(raw_grid).unsqueeze(0)
+    grid_tensor = encode_grid(raw_grid)
     
     # Start with a clean mask
     action_mask = torch.zeros(4104, dtype=torch.bool)
@@ -70,13 +69,15 @@ def play_game_turn(obs, model_clone):
             if spatial_index < 4104:
                 action_mask[spatial_index] = True
         
-    # 2. The Planner makes a decision
-    action_probs = model_clone.planner(grid_tensor, action_mask)
+    # 2. Query the Planner Network (Adding .unsqueeze(0) to create a Batch dimension for the Transformer)
+    grid_batch = grid_tensor.unsqueeze(0)
+    mask_batch = action_mask.unsqueeze(0)
+    action_probs = clone_model.planner(grid_batch, mask_batch)
     
     # 3. Select action
     chosen_index = torch.multinomial(action_probs, 1).item()
     
-    # Capture the mathematical log probability of the chosen action for REINFORCE
+    # Capture the mathematical log probability
     log_prob = torch.log(action_probs[0, chosen_index] + 1e-10)
     
     if chosen_index < 8:

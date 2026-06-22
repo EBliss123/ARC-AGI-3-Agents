@@ -2,97 +2,73 @@ import torch
 import torch.nn as nn
 
 class PlannerNetwork(nn.Module):
-    def __init__(self):
+    def __init__(self, d_model=64, nhead=4, num_layers=2):
         super().__init__()
-        # Flattened Input (16 colors * 64 * 64) -> 256 hidden nodes
-        self.layer1 = nn.Linear(65536, 256)
-        self.layer2 = nn.Linear(256, 256)
-        self.layer3 = nn.Linear(256, 256)
+        # Project the 18-channel pixel nodes into the mathematical transformer space
+        self.pixel_embedding = nn.Linear(18, d_model)
+        
+        # The Self-Attention Brain (The Tactician)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
         # 4,104 output nodes (8 discrete actions + 4096 spatial coordinates)
-        self.output_layer = nn.Linear(256, 4104)
+        self.output_layer = nn.Linear(d_model, 4104)
 
-    def forward(self, grid_tensor, action_mask):
-        # Flatten the (Batch, 16, 64, 64) grid into a 65,536-node vector
-        x = grid_tensor.reshape(grid_tensor.size(0), -1)
+    def forward(self, grid_nodes, action_mask):
+        # grid_nodes shape: (Batch, 4096, 18)
+        x = self.pixel_embedding(grid_nodes)
         
-        x = torch.relu(self.layer1(x))
-        x = torch.relu(self.layer2(x))
-        x = torch.relu(self.layer3(x))
+        # Self-Attention allows every pixel to analyze every other pixel instantly
+        x = self.transformer(x)
         
-        # Get raw action probabilities
-        raw_logits = self.output_layer(x)
+        # Pool the 4096 grid nodes into a single global state vector by averaging them
+        global_state = x.mean(dim=1) 
         
-        # Apply the dynamic guardrail mask (sets invalid moves to negative infinity)
+        # Predict the best action
+        raw_logits = self.output_layer(global_state)
         masked_logits = raw_logits.masked_fill(~action_mask, float('-inf'))
-        
-        # Return proper probabilities where invalid moves are now exactly 0%
         return torch.softmax(masked_logits, dim=-1)
-    
-class ActionNetwork(nn.Module):
-    def __init__(self):
-        super().__init__()
-        # 136 input nodes (8 discrete + 64 X + 64 Y)
-        self.layer1 = nn.Linear(136, 256)
-        self.layer2 = nn.Linear(256, 256)
-        
-        # 2,048 output nodes (4 target layers * 256 gamma + 4 target layers * 256 beta)
-        self.output_layer = nn.Linear(256, 2048)
 
-    def forward(self, action_vector):
-        x = torch.relu(self.layer1(action_vector))
-        x = torch.relu(self.layer2(x))
-        
-        # Raw linear output for the modulators (no activation function at the end)
-        return self.output_layer(x)
-    
 class PredictorNetwork(nn.Module):
-    def __init__(self):
+    def __init__(self, d_model=64, nhead=4, num_layers=2):
         super().__init__()
-        # Flattened Input (16 colors * 64 * 64) -> 256 hidden nodes
-        self.layer1 = nn.Linear(65536, 256)
-        self.layer2 = nn.Linear(256, 256)
-        self.layer3 = nn.Linear(256, 256)
-        self.layer4 = nn.Linear(256, 256)
+        # Project both node types into the exact same mathematical dimension
+        self.pixel_embedding = nn.Linear(18, d_model)
+        self.action_embedding = nn.Linear(10, d_model)
         
-        # Final output predicting the 64x64x16 grid (65,536 nodes)
-        self.output_layer = nn.Linear(256, 65536)
+        # The Self-Attention Brain (The Physics Observer)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # --- THE DUAL-HEAD PHYSICS ENGINE ---
+        # Head 1: Predicts if the pixel's condition was met to trigger a change (0 = No, 1 = Yes)
+        self.change_mask_head = nn.Linear(d_model, 2)  
+        
+        # Head 2: Predicts what the new color will be (the 16 color channels)
+        self.color_target_head = nn.Linear(d_model, 16) 
 
-    def forward(self, grid_tensor, film_params):
-        # Flatten the grid
-        x = grid_tensor.reshape(grid_tensor.size(0), -1)
+    def forward(self, grid_nodes, action_vector):
+        # grid_nodes shape: (Batch, 4096, 18)
+        # action_vector shape: (Batch, 10) -> unsqueeze to (Batch, 1, 10) so it acts as a sequence node
+        action_node = action_vector.unsqueeze(1)
         
-        # Split the 2,048-node film_params into 4 chunks of 512
-        # Each chunk contains 256 gamma (multipliers) and 256 beta (shifts)
-        params = torch.split(film_params, 512, dim=-1)
+        # Embed both into the d_model dimension (64)
+        p_emb = self.pixel_embedding(grid_nodes)
+        a_emb = self.action_embedding(action_node)
         
-        # Layer 1 Processing & FiLM Injection
-        gamma1, beta1 = torch.split(params[0], 256, dim=-1)
-        x = torch.relu(self.layer1(x))
-        x = (x * gamma1) + beta1  
+        # Concatenate the Global Action Node (Node 0) with the 4096 Pixel Nodes
+        # Total Sequence length becomes 4097 nodes
+        sequence = torch.cat([a_emb, p_emb], dim=1)
         
-        # Layer 2 Processing & FiLM Injection
-        gamma2, beta2 = torch.split(params[1], 256, dim=-1)
-        x = torch.relu(self.layer2(x))
-        x = (x * gamma2) + beta2
+        # Let all 4097 nodes mathematically query each other
+        transformed = self.transformer(sequence)
         
-        # Layer 3 Processing & FiLM Injection
-        gamma3, beta3 = torch.split(params[2], 256, dim=-1)
-        x = torch.relu(self.layer3(x))
-        x = (x * gamma3) + beta3
+        # Slice out just the 4096 pixel nodes to get their physical reactions 
+        # (We drop Index 0 because that was the Action Node)
+        pixel_outputs = transformed[:, 1:, :]
         
-        # Layer 4 Processing & FiLM Injection
-        gamma4, beta4 = torch.split(params[3], 256, dim=-1)
-        x = torch.relu(self.layer4(x))
-        x = (x * gamma4) + beta4
+        # Calculate the direct conditional events
+        change_logits = self.change_mask_head(pixel_outputs)
+        color_logits = self.color_target_head(pixel_outputs)
         
-        # Get the network's raw prediction for what it thinks will change
-        logits = self.output_layer(x)
-        
-        # --- RESIDUAL CONNECTION (NO CHANGE BIAS) ---
-        # We take the original input grid, flatten it to match the output size,
-        # and heavily boost the probabilities of the colors that are already there.
-        # This explicitly forces the network to default to "No Change".
-        flattened_input = grid_tensor.reshape(grid_tensor.size(0), -1)
-        
-        return logits + (flattened_input * 10.0)
+        return change_logits, color_logits
