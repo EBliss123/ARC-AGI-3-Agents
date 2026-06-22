@@ -1,54 +1,57 @@
-# ARC-AGI-3 Meta-Learning Engine
+# ARC-AGI-3 Hierarchical Meta-Learning Engine
 
-## Architecture Overview
-This project implements a test-time training (meta-learning) architecture to solve spatial reasoning puzzles in the ARC-AGI-3 Kaggle environment. 
+## Project Context
+This repository contains a machine learning architecture designed for the **ARC-AGI-3 (Abstraction and Reasoning Corpus) Kaggle Competition**. The goal of ARC is to measure general fluid intelligence by forcing AI agents to solve novel spatial reasoning puzzles using only a few demonstration examples. 
 
-Instead of training a monolithic reinforcement learning agent, this engine separates "planning" from "physics prediction." It relies on a global baseline model that spawns temporary clones to rapidly adapt to the physics of individual ARC games within a 30-step limit.
+Standard reinforcement learning and computer vision techniques fail at ARC because they attempt to memorize specific puzzle layouts. To solve this, this project implements a **Hierarchical Meta-Learning Architecture** that completely separates the discovery of universal laws (Long-Term Planner) from the localized execution of pure physics logic (Short-Term Planner).
 
-## Core Loop
-The system uses a **Gradient-Through-A-Gradient** approach:
-1. **The Inner Loop (Fast Adaptation):** For a specific game, a temporary clone of the network is spawned. As it interacts with the emulator, it records (Input Grid, Action Taken, Actual Next Grid). The clone uses an aggressive SGD optimizer (`lr=0.05`) to update its Action Network (fast weights) to minimize the surprise between its predicted frame and the actual frame.
-2. **The Outer Loop (Generalization):** After adaptation, the clone makes a final move on an unseen state. The loss from this final prediction is passed backward all the way through the adaptation steps to update the Global Model using Adam (`lr=0.0005`). This teaches the global model how to initialize better starting weights for future clones.
+---
 
-## Neural Networks (`networks.py`)
-The architecture is split into three interconnected modules:
+## Project Structure & File Manifest
+The engine is highly modularized to separate the Kaggle emulator interactions from the PyTorch mathematics.
 
-### 1. Planner Network
-* **Role:** Decides *what* button to press and *where* to click.
-* **Input:** The 64x64 grid (one-hot encoded across 16 color channels).
-* **Output:** 4,104 probabilities (8 discrete buttons + 4,096 spatial coordinates).
-* **Guardrails:** Uses a dynamic `action_mask` based on the emulator's `available_actions` to strictly force the probabilities of invalid moves to 0%.
+* **`main.py` (The Execution Hub):** The entry point. It initializes the ARC emulator, manages the live game loop, captures state-action-reward trajectories, and triggers the real-time learning updates after every move.
+* **`networks.py` (The Brains):** Contains the PyTorch neural network classes. This houses the 4097-Node Self-Attention Transformer used by the Short-Term Planner, including the exact logic for the Change Mask, Color Target, and Reactive Policy heads.
+* **`meta_loop.py` (The Learning Calculus):** Houses the PyTorch optimization algorithms. It contains the decoupled physics and policy optimizers, the fast-adaptation formulas for real-time learning, and the Gradient-Through-A-Gradient logic used to update the universal basecamp.
+* **`data_utils.py` (The Translators):** Handles the objective translation of the game state. It converts the raw Kaggle grid into the normalized `64x64x18` mathematical tensors and structures the 10-channel Global Action Node.
 
-### 2. Action Network (Fast Weights)
-* **Role:** Translates the chosen action into physical modifiers. 
-* **Input:** A unified 136-node action vector (Discrete ID + X + Y).
-* **Output:** 2,048 FiLM (Feature-wise Linear Modulation) parameters (gamma multipliers and beta shifts).
-* **Note:** This is the *only* network that is updated during the Inner Loop. It learns the specific physical rules of the current game on the fly.
+---
 
-### 3. Predictor Network (Slow Weights)
-* **Role:** Predicts the exact next 64x64 frame.
-* **Mechanism:** It processes the current grid and dynamically injects the FiLM parameters from the Action Network at each hidden layer, effectively altering its own internal logic based on the action taken.
-* **Residual Connection Bias:** Because the vast majority of pixels in ARC games do not change per turn, the Predictor takes the original input grid, multiplies it by a heavy bias (`* 10.0`), and adds it to the final output. This mathematically forces the network to default to "No Change" and focus exclusively on predicting the deltas.
+## 1. The Long-Term Planner (The Scientist / Basecamp Meta-Learning)
+The Long-Term Planner (LTP) acts as an accelerator, not a physics engine. 
+* **Curriculum Focus:** It trains exclusively on solving Level 1 across the 25 games, preventing noisy gradients from complex, multi-step levels.
+* **The Basecamp:** Once the Short-Term Planners successfully solve their respective Level 1s, the LTP averages those successful weights together. This calculates an "Universal Basecamp"—a highly optimized, static starting point. 
+* **The Goal:** The LTP does not know the specific physics of any game. Instead, its weights naturally encode foundational ARC laws (boundaries, movement, color-matching). When dropped into a new, unseen Level 2+, the agent spawns at this basecamp, allowing it to adapt to complex mechanics in a fraction of the time.
 
-## Intrinsic Motivation (Curiosity & Novelty)
-Because random action sampling normally breaks the PyTorch computation graph, the `PlannerNetwork` utilizes a **REINFORCE Policy Gradient** algorithm to learn actively.
+## 2. The Short-Term Planner (The Tactician / Objective Physics Engine)
+The Short-Term Planner (STP) lives exclusively inside a single game to discover its unique physics. To maintain universal applicability, the STP operates entirely on pure, decentralized logic without high-level "actor" or "object" labels.
 
-During the Inner Loop, the agent hashes and memorizes every unique grid state it encounters. 
-* **The Penalty:** If an action results in `NO_CHANGE`, it receives a reward of `-1.0`. If it results in a state it has already seen (a `LOOP`), it receives `-0.5`.
-* **The Reward:** If the action triggers a visual change leading to an entirely unseen state, it receives a `+1.0`.
+### Objective Vision (The 4097-Node Transformer)
+Standard Convolutional Neural Networks (CNNs) rely on sliding windows that destroy absolute coordinate logic. To preserve exact spatial reality, the STP completely bypasses CNNs in favor of a **Self-Attention** architecture. 
 
-The `log_probability` of every chosen action is captured, multiplied by the resulting reward, and backpropagated into the Planner. This directly alters the Planner's weights, making it mathematically "allergic" to clicking useless buttons and driving it to seek novel interactions.
+The input is flattened into exactly 4,097 independent nodes:
+* **Nodes 0 to 4095 (The Grid):** Every pixel is an independent node with 18 channels (16 one-hot colors, Normalized X, Normalized Y). Every pixel mathematically knows exactly what it is and where it is in space.
+* **Node 4096 (The Global Action Node):** A single super-node containing a 10-channel vector (8 one-hot discrete buttons, Normalized X, Normalized Y).
 
-## Data & Logic Heuristics (`data_utils.py` & `main.py`)
+Through Self-Attention, the 4,096 pixel nodes send mathematical queries to each other and to the Action Node. This natively allows the network to calculate direct conditional events across the entire board instantly, recognizing exact coordinate triggers without relying on brittle localized windows.
 
-### Dynamic Guardrails
-The Kaggle Arcade emulator is strictly enforced as the ground truth. At the start of every turn, `obs.available_actions` is parsed to disable any invalid discrete buttons. The `RESET` button is hard-disabled to prevent the agent from throwing away its 30-step learning trajectory.
+### The Pure Logic Calculus
+Every single turn, the STP evaluates the 4097 nodes. It processes physics in two stages:
+1. **The Change Mask:** A binary prediction layer. Every pixel independently evaluates if its conditions have been met based on its coordinates and the Action Node. It outputs `1` if it predicts it will change on the next frame, and `0` if it will stay the same.
+2. **The Color Target:** For pixels that flagged a `1`, a secondary layer evaluates the conditions again to predict the new color channel.
 
-### Contiguous Spatial Clustering
-If the model decides to click the grid (`ACTION6`), it cannot choose completely at random. `scipy.ndimage.label` scans the raw grid for 4-way contiguous color blobs. The `action_mask` disables all 4,096 spatial nodes *except* for one representative coordinate per valid cluster. This drastically reduces the action space and forces the agent to interact with actual objects.
+Because the math is applied pixel-by-pixel, the Categorical Cross-Entropy Loss function surgically corrects the network if it mispredicts a specific pixel's behavior, creating a highly accurate, objective physics simulator.
 
-### Verification Tracking
-The inner loop checks if `np.array_equal(raw_grid, next_raw_grid)` after every move. Actions that result in no visual change (e.g., tool selections) are flagged in the logs with `(NO_CHANGE)`.
+## 3. Action Planning & Decision Engine (Gut Instinct)
+The Decision Engine dictates *what* button to press, acting completely independently of the Physics Engine's predictions.
+
+It uses a **Reactive Policy Layer** that processes the board state and outputs a probability distribution for all valid moves. It trains via **REINFORCE (Curiosity Rewards)**:
+* **Reward (`+1.0`):** If the chosen action results in a novel physical change to the board, it receives a positive reward, boosting the mathematical confidence of that specific decision path.
+* **Penalty (`-1.0`):** If the chosen action results in `NO_CHANGE` (a wasted click), it receives a heavy penalty, mathematically forcing the network to become "allergic" to useless interactions.
+
+This decoupling ensures the agent learns optimal exploratory behavior without being paralyzed by temporary inaccuracies in its own physics predictions.
+
+---
 
 ## Execution
 Run the engine from the `neural_network` directory using the virtual environment:
