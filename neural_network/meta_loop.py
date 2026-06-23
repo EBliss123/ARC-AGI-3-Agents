@@ -40,14 +40,20 @@ def run_single_turn_adaptation(clone_model, physics_optimizer, policy_optimizer,
     
     original_colors = grid_nodes[:, :16].argmax(dim=1)
     actual_change_mask = (original_colors != target_colors).long()
+    predicted_change_mask = change_logits.argmax(dim=1)
+    
+    # Dynamic active mask: what actually changed OR what the network thought would change
+    active_mask = (actual_change_mask > 0) | (predicted_change_mask > 0)
+    active_area = active_mask.sum().float().clamp(min=1.0) # clamp prevents division by zero
     
     change_loss = F.cross_entropy(change_logits, actual_change_mask)
     pixel_color_losses = F.cross_entropy(color_logits, target_colors, reduction='none')
-    weight_map = torch.where(actual_change_mask > 0, 50.0, 1.0)
-    weighted_color_loss = (pixel_color_losses * weight_map).mean()
+    
+    # Isolate color loss to the active area and apply square root scaling
+    active_color_loss = pixel_color_losses[active_mask].sum() / torch.sqrt(active_area)
     
     # The Physics Error is the raw measure of "Surprise"
-    physics_loss = change_loss + weighted_color_loss
+    physics_loss = change_loss + active_color_loss
     
     # --- 2. ADVERSARIAL REWARD CALCULUS ---
     if valid_change_flag < 0:
@@ -67,6 +73,7 @@ def run_single_turn_adaptation(clone_model, physics_optimizer, policy_optimizer,
     # Update the Physics Engine (Reduce Surprise)
     physics_optimizer.zero_grad()
     physics_loss.backward()
+    torch.nn.utils.clip_grad_norm_(clone_model.predictor.parameters(), max_norm=1.0)
     physics_optimizer.step()
     
     # Update the Decision Engine (Maximize Reward / Seek Surprise)
@@ -74,6 +81,7 @@ def run_single_turn_adaptation(clone_model, physics_optimizer, policy_optimizer,
     
     policy_optimizer.zero_grad()
     policy_loss.backward()
+    torch.nn.utils.clip_grad_norm_(clone_model.planner.parameters(), max_norm=1.0)
     policy_optimizer.step()
         
     return clone_model, final_reward
