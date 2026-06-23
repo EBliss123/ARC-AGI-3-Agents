@@ -41,15 +41,15 @@ Every single turn, the STP evaluates the grid and action inputs. It processes ph
 
 Because the math is applied pixel-by-pixel, the Categorical Cross-Entropy Loss function surgically corrects the network if it mispredicts a specific pixel's behavior, creating a highly accurate, objective physics simulator.
 
-## 3. Action Planning & Decision Engine (Gut Instinct)
+## 3. Action Planning & Decision Engine (Adversarial Curiosity)
 The Decision Engine dictates *what* button to press, acting completely independently of the Physics Engine's predictions.
 
-It uses a **Reactive Policy Layer** that processes the board state and outputs a probability distribution for all valid moves. It trains via pure **REINFORCE (Curiosity Rewards)** without artificial loop penalties, allowing it to natively solve mechanical toggles or repetitive pumps:
-* **Reward (`+1.0`):** If the chosen action results in any physical change to the board, it receives a positive reward, boosting the mathematical confidence of that specific decision path.
-* **Penalty (`-1.0`):** If the chosen action results in `NO_CHANGE` (a wasted click), it receives a heavy penalty, mathematically forcing the network to become "allergic" to useless interactions.
+It uses a **Reactive Policy Layer** trained via **Adversarial Intrinsic Motivation**. Because ARC is a perfectly deterministic, noiseless environment, prediction error equates strictly to ignorance. The network pits the two brains against each other:
+* **The Surprise Reward (Adversarial Curiosity):** If an action alters the board, the policy receives a positive reward exactly equal to the Physics Engine's loss (prediction error). The policy actively hunts for uncomfortable, complex situations it cannot predict, while the Physics Engine desperately learns to minimize that error. 
+* **The Time Decay Penalty:** Each move applies a slight negative penalty (e.g., `-0.01`) that grows linearly with the step count and resets on death. This naturally teaches urgency and efficiency without artificially assigning blame to the final move before a `GAME_OVER`.
+* **The Static Penalty (`-1.0`):** If the chosen action results in `NO_CHANGE` (a wasted click), it receives a static heavy penalty, forcing the network to become "allergic" to useless interactions.
 
-This decoupling ensures the agent learns optimal exploratory behavior without being paralyzed by temporary inaccuracies in its own physics predictions.
-
+This adversarial decoupling ensures the agent rapidly explores the boundaries of the puzzle's mechanics until it has mastered the underlying physics.
 ---
 
 ## Execution

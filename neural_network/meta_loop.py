@@ -24,50 +24,59 @@ def setup_game_clone(global_model, inner_lr=0.05):
 def run_single_turn_adaptation(clone_model, physics_optimizer, policy_optimizer, turn_data):
     clone_model.train()
     
-    # Unpack the 4096-node grid and the 10-channel Action Node
-    grid_nodes, action_vector, target_next_frame, log_prob, reward = turn_data
+    # Unpack the exact data, including the change flag and the current step count
+    grid_nodes, action_vector, target_next_frame, log_prob, valid_change_flag, step = turn_data
     
-    # Add batch dimensions for the Transformer
     grid_batch = grid_nodes.unsqueeze(0)
     action_batch = action_vector.unsqueeze(0)
     
     # --- 1. PHYSICS UPDATE (Observer) ---
     change_logits, color_logits = clone_model.predictor(grid_batch, action_batch)
     
-    # Remove batch dims for the loss calculation
-    change_logits = change_logits.squeeze(0)  # (4096, 2)
-    color_logits = color_logits.squeeze(0)    # (4096, 16)
+    change_logits = change_logits.squeeze(0)  
+    color_logits = color_logits.squeeze(0)    
     
-    # Flatten the target frame into 4096 integers
     target_colors = target_next_frame.view(-1)
     
-    # Determine the absolute truth: Did the pixels actually change?
-    # Index :16 grabs the color channels, argmax converts the one-hot back to an integer 0-15
     original_colors = grid_nodes[:, :16].argmax(dim=1)
     actual_change_mask = (original_colors != target_colors).long()
     
-    # Loss A: Did it correctly predict IF the pixel would change?
     change_loss = F.cross_entropy(change_logits, actual_change_mask)
-    
-    # Loss B: Did it correctly predict the NEW color? (50x penalty on pixels that actually moved)
     pixel_color_losses = F.cross_entropy(color_logits, target_colors, reduction='none')
     weight_map = torch.where(actual_change_mask > 0, 50.0, 1.0)
     weighted_color_loss = (pixel_color_losses * weight_map).mean()
     
+    # The Physics Error is the raw measure of "Surprise"
     physics_loss = change_loss + weighted_color_loss
     
+    # --- 2. ADVERSARIAL REWARD CALCULUS ---
+    if valid_change_flag < 0:
+        # Heavily punish wasted clicks
+        final_reward = -1.0
+    else:
+        # Surprise Metric: Scale the physics loss down so it's a manageable reward
+        surprise_bonus = min(physics_loss.item() * 0.1, 2.0)
+        
+        # Growing Time Penalty: Starts at -0.01 and gets slightly worse every move
+        time_penalty = 0.01 + (0.0001 * step)
+        
+        # The agent gets dopamine for being confused, but suffers a tax for taking too long
+        final_reward = surprise_bonus - time_penalty
+    
+    # --- 3. EXECUTE GRADIENTS ---
+    # Update the Physics Engine (Reduce Surprise)
     physics_optimizer.zero_grad()
     physics_loss.backward()
     physics_optimizer.step()
     
-    # --- 2. POLICY UPDATE (Tactician) ---
-    policy_loss = -(log_prob * reward)
+    # Update the Decision Engine (Maximize Reward / Seek Surprise)
+    policy_loss = -(log_prob * final_reward)
     
     policy_optimizer.zero_grad()
     policy_loss.backward()
     policy_optimizer.step()
         
-    return clone_model
+    return clone_model, final_reward
 
 def run_outer_update(global_model, outer_optimizer, meta_test_data):
     global_model.train()

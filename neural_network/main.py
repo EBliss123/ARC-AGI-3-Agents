@@ -158,22 +158,28 @@ if __name__ == "__main__":
                 # Submit the move to the live emulator
                 next_obs = env.step(em_action, data=em_coords)
                 
-                # --- VERIFICATION & CURIOSITY REWARDS ---
+                # --- VERIFICATION & ADVERSARIAL CURIOSITY FLAG ---
                 next_raw_grid = extract_grid(next_obs)
                 
+                # We flag whether the board changed or not
                 if np.array_equal(raw_grid, next_raw_grid):
                     action_history[-1] += " (NO_CHANGE)"
-                    reward = -1.0  # Heavy penalty for wasting a turn
+                    valid_change_flag = -1.0  # Wasted click
                 else:
-                    reward = 1.0   # Positive reward for causing any physical change
+                    valid_change_flag = 1.0   # Trigger the adversarial surprise calculation
                 
                 # Store the true outcome for the final exam backprop
                 target_next_frame = torch.tensor(next_raw_grid, dtype=torch.long)
-                turn_data = (grid_tensor, action_vector, target_next_frame, log_prob, reward)
+                
+                # Bundle the step count so the meta_loop can calculate the growing time penalty
+                turn_data = (grid_tensor, action_vector, target_next_frame, log_prob, valid_change_flag, step)
                 train_states.append(turn_data)
                 
                 # --- REAL-TIME LEARNING: Update the brain instantly after this single move ---
-                clone_model = run_single_turn_adaptation(clone_model, physics_optimizer, policy_optimizer, turn_data)
+                clone_model, final_reward = run_single_turn_adaptation(clone_model, physics_optimizer, policy_optimizer, turn_data)
+                
+                # --- REAL-TIME TERMINAL LOGGING ---
+                print(f"\r   ... Step {step+1} | Reward: {final_reward:.4f} | Action: {action_history[-1]}", end="", flush=True)
                 
                 obs = next_obs
                 
