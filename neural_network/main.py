@@ -102,7 +102,7 @@ if __name__ == "__main__":
     # 2. Setup the Global Outer Optimizer (Adam for slow, stable learning)
     outer_optimizer = optim.Adam(global_model.parameters(), lr=0.0005)
 
-    epochs = 10
+    epochs = 1
     best_loss = float('inf')
 
     # Initialize the CSV log file locally
@@ -140,13 +140,11 @@ if __name__ == "__main__":
                 # Handle animations: if it returns a list of frames, grab the final one
                 return grid_data[-1] if isinstance(grid_data, list) else grid_data
 
-            game_over_count = 0
             step = 0
-            max_steps = 150  
-            state_memory = set()  # Tracks every grid state we've seen this game
+            max_steps = 1500  
             
-            # B. Run the Test-Time Training (Inner Loop) until 2 Game Overs
-            while game_over_count < 2 and step < max_steps:
+            # B. Run the Test-Time Training (Inner Loop) until solved or capped
+            while step < max_steps:
                 raw_grid = extract_grid(obs)
                  
                 # Ask the Planner for a move
@@ -182,16 +180,14 @@ if __name__ == "__main__":
                 # --- CHECK GAME STATE ---
                 if hasattr(obs, 'state'):
                     if obs.state == GameState.GAME_OVER:
-                        game_over_count += 1
-                        if game_over_count < 2:
-                            obs = env.reset()
-                            action_history.append("---DIED_AND_RESET---")
+                        obs = env.reset()
+                        action_history.append("---DIED_AND_RESET---")
                     elif obs.state == GameState.WIN:
                         break  
                         
                 step += 1
                 
-            done = (obs.state == GameState.WIN or game_over_count == 2) if hasattr(obs, 'state') else True
+            done = (obs.state == GameState.WIN) if hasattr(obs, 'state') else True
                     
             # --- VERIFICATION LOG ---
             final_status = obs.state.name if hasattr(obs, 'state') else "ALIVE_BUT_CAPPED"
