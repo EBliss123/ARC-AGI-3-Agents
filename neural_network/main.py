@@ -139,7 +139,8 @@ if __name__ == "__main__":
                 return grid_data[-1] if isinstance(grid_data, list) else grid_data
 
             step = 0
-            max_steps = 1500  
+            life_step = 0
+            max_steps = 1500
             
             # B. Run the Test-Time Training (Inner Loop) until solved or capped
             while step < max_steps:
@@ -170,7 +171,7 @@ if __name__ == "__main__":
                 target_next_frame = torch.tensor(next_raw_grid, dtype=torch.long)
                 
                 # Bundle the step count so the meta_loop can calculate the growing time penalty
-                turn_data = (grid_tensor, action_vector, target_next_frame, log_prob, valid_change_flag, step)
+                turn_data = (grid_tensor, action_vector, target_next_frame, log_prob, valid_change_flag, life_step)
                 train_states.append(turn_data)
                 
                 # --- REAL-TIME LEARNING: Update the brain instantly after this single move ---
@@ -186,10 +187,12 @@ if __name__ == "__main__":
                     if obs.state == GameState.GAME_OVER:
                         obs = env.reset()
                         action_history.append("---DIED_AND_RESET---")
+                        life_step = 0
                     elif obs.state == GameState.WIN:
                         break  
                         
                 step += 1
+                life_step += 1
                 
             done = (obs.state == GameState.WIN) if hasattr(obs, 'state') else True
                     
