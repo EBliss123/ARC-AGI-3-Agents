@@ -10,8 +10,25 @@ def encode_grid(raw_grid):
     y_coords = torch.linspace(-1.0, 1.0, 64).view(64, 1).expand(64, 64).unsqueeze(-1)
     x_coords = torch.linspace(-1.0, 1.0, 64).view(1, 64).expand(64, 64).unsqueeze(-1)
     
-    combined = torch.cat([one_hot, x_coords, y_coords], dim=-1)
-    return combined.view(-1, 18)
+    # --- DYNAMIC CLUSTER MAPPING ---
+    # Group contiguous pixels of the same color into strictly logical sets
+    grid_np = np.array(raw_grid)
+    cluster_ids = np.zeros_like(grid_np, dtype=np.int32)
+    current_id = 0
+    
+    structure = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]])
+    for c in np.unique(grid_np):
+        color_mask = (grid_np == c).astype(int)
+        labeled, num_features = label(color_mask, structure=structure)
+        for i in range(1, num_features + 1):
+            cluster_ids[labeled == i] = current_id
+            current_id += 1
+            
+    cluster_tensor = torch.tensor(cluster_ids, dtype=torch.float32).view(64, 64).unsqueeze(-1)
+    
+    # 18 channels (Physics) + 1 channel (Cluster ID) = 19 channels
+    combined = torch.cat([one_hot, x_coords, y_coords, cluster_tensor], dim=-1)
+    return combined.view(-1, 19)
 
 def get_action_mask(raw_grid, background_color=0):
     # Create a base mask of 4104 zeros (8 discrete + 4096 spatial)

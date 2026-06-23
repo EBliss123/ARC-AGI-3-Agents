@@ -2,73 +2,98 @@ import torch
 import torch.nn as nn
 
 class PlannerNetwork(nn.Module):
-    def __init__(self, d_model=64, nhead=4, num_layers=2):
+    def __init__(self, d_model=128, nhead=4, num_layers=2):
         super().__init__()
-        # Project the 18-channel pixel nodes into the mathematical transformer space
-        self.pixel_embedding = nn.Linear(18, d_model)
+        self.pixel_projection = nn.Linear(18, d_model)
         
-        # The Self-Attention Brain (The Tactician)
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # 4,104 output nodes (8 discrete actions + 4096 spatial coordinates)
         self.output_layer = nn.Linear(d_model, 4104)
 
     def forward(self, grid_nodes, action_mask):
-        # grid_nodes shape: (Batch, 4096, 18)
-        x = self.pixel_embedding(grid_nodes)
+        batch_size = grid_nodes.size(0)
         
-        # Self-Attention allows every pixel to analyze every other pixel instantly
-        x = self.transformer(x)
+        # Extract pure 18-channel physics data and 1-channel cluster IDs
+        pixel_data = grid_nodes[:, :, :18]
+        cluster_ids = grid_nodes[:, :, 18].long()
         
-        # Pool the 4096 grid nodes into a single global state vector by averaging them
+        # 1. High-Dimensional Fingerprinting
+        p_emb = self.pixel_projection(pixel_data)
+        
+        # 2. Summation (The Cryptographic Hash via Set Embedding)
+        max_clusters = int(cluster_ids.max().item()) + 1
+        embed_dim = p_emb.size(2)
+        
+        expanded_ids = cluster_ids.unsqueeze(-1).expand(-1, -1, embed_dim)
+        object_nodes = torch.zeros(batch_size, max_clusters, embed_dim, device=p_emb.device)
+        object_nodes.scatter_add_(1, expanded_ids, p_emb)
+        
+        # 3. The Brain (Self-Attention dynamically sized to exact object count)
+        x = self.transformer(object_nodes)
+        
+        # Pool the object nodes into a single global state vector
         global_state = x.mean(dim=1) 
         
-        # Predict the best action
         raw_logits = self.output_layer(global_state)
         masked_logits = raw_logits.masked_fill(~action_mask, float('-inf'))
         return torch.softmax(masked_logits, dim=-1)
 
 class PredictorNetwork(nn.Module):
-    def __init__(self, d_model=64, nhead=4, num_layers=2):
+    def __init__(self, d_model=128, nhead=4, num_layers=2):
         super().__init__()
-        # Project both node types into the exact same mathematical dimension
-        self.pixel_embedding = nn.Linear(18, d_model)
+        # High-dimensional spatial fingerprinting (18 -> 128)
+        self.pixel_projection = nn.Linear(18, d_model)
         self.action_embedding = nn.Linear(10, d_model)
         
-        # The Self-Attention Brain (The Physics Observer)
+        # The narrow "neck" of the hourglass
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # --- THE DUAL-HEAD PHYSICS ENGINE ---
-        # Head 1: Predicts if the pixel's condition was met to trigger a change (0 = No, 1 = Yes)
-        self.change_mask_head = nn.Linear(d_model, 2)  
+        # Output layer that maps the combined broadcast back to pixels
+        self.broadcast_fusion = nn.Linear(d_model * 2, d_model)
         
-        # Head 2: Predicts what the new color will be (the 16 color channels)
+        self.change_mask_head = nn.Linear(d_model, 2)  
         self.color_target_head = nn.Linear(d_model, 16) 
 
     def forward(self, grid_nodes, action_vector):
-        # grid_nodes shape: (Batch, 4096, 18)
-        # action_vector shape: (Batch, 10) -> unsqueeze to (Batch, 1, 10) so it acts as a sequence node
-        action_node = action_vector.unsqueeze(1)
+        batch_size = grid_nodes.size(0)
         
-        # Embed both into the d_model dimension (64)
-        p_emb = self.pixel_embedding(grid_nodes)
-        a_emb = self.action_embedding(action_node)
+        # Extract pure 18-channel physics data and 1-channel cluster IDs
+        pixel_data = grid_nodes[:, :, :18]
+        cluster_ids = grid_nodes[:, :, 18].long()
         
-        # Concatenate the Global Action Node (Node 0) with the 4096 Pixel Nodes
-        # Total Sequence length becomes 4097 nodes
-        sequence = torch.cat([a_emb, p_emb], dim=1)
+        # 1. High-Dimensional Fingerprinting (Batch, 4096, 128)
+        p_emb = self.pixel_projection(pixel_data) 
         
-        # Let all 4097 nodes mathematically query each other
-        transformed = self.transformer(sequence)
+        # 2. Summation (The Cryptographic Hash via Set Embedding)
+        max_clusters = int(cluster_ids.max().item()) + 1
+        embed_dim = p_emb.size(2)
         
-        # Slice out just the 4096 pixel nodes to get their physical reactions 
-        # (We drop Index 0 because that was the Action Node)
-        pixel_outputs = transformed[:, 1:, :]
+        expanded_ids = cluster_ids.unsqueeze(-1).expand(-1, -1, embed_dim)
+        object_nodes = torch.zeros(batch_size, max_clusters, embed_dim, device=p_emb.device)
         
-        # Calculate the direct conditional events
-        change_logits = self.change_mask_head(pixel_outputs)
-        color_logits = self.color_target_head(pixel_outputs)
+        # Flawlessly sums the 128-D exact coordinate strings into dynamic object nodes
+        object_nodes.scatter_add_(1, expanded_ids, p_emb)
+        
+        # Embed the Action Node
+        action_node = self.action_embedding(action_vector.unsqueeze(1))
+        
+        # 3. The Brain (Self-Attention dynamically sized to exact object count)
+        sequence = torch.cat([action_node, object_nodes], dim=1)
+        transformed_seq = self.transformer(sequence)
+        
+        # Extract the updated Object Nodes
+        updated_objects = transformed_seq[:, 1:, :]
+        
+        # 4. The Broadcast (Expanding back down to 4096 using advanced indexing)
+        broadcasted_data = torch.gather(updated_objects, 1, expanded_ids)
+            
+        # 5. Fusion: Each pixel combines its exact original fingerprint with the object's physics conclusion
+        fused_pixels = torch.relu(self.broadcast_fusion(torch.cat([p_emb, broadcasted_data], dim=-1)))
+        
+        # 6. Final Pixel-Level Predictions based strictly on exact maintained coordinates
+        change_logits = self.change_mask_head(fused_pixels)
+        color_logits = self.color_target_head(fused_pixels)
         
         return change_logits, color_logits

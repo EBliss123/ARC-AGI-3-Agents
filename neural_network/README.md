@@ -11,9 +11,9 @@ Standard reinforcement learning and computer vision techniques fail at ARC becau
 The engine is highly modularized to separate the Kaggle emulator interactions from the PyTorch mathematics.
 
 * **`main.py` (The Execution Hub):** The entry point. It initializes the ARC emulator, manages the live game loop, captures state-action-reward trajectories, and triggers the real-time learning updates after every move.
-* **`networks.py` (The Brains):** Contains the PyTorch neural network classes. This houses the 4097-Node Self-Attention Transformer used by the Short-Term Planner, including the exact logic for the Change Mask, Color Target, and Reactive Policy heads.
+* **`networks.py` (The Brains):** Contains the PyTorch neural network classes. This houses the deterministic Hourglass Transformer used by the Short-Term Planner, including the exact logic for the Change Mask, Color Target, and Reactive Policy heads.
 * **`meta_loop.py` (The Learning Calculus):** Houses the PyTorch optimization algorithms. It contains the decoupled physics and policy optimizers, the fast-adaptation formulas for real-time learning, and the Gradient-Through-A-Gradient logic used to update the universal basecamp.
-* **`data_utils.py` (The Translators):** Handles the objective translation of the game state. It converts the raw Kaggle grid into the normalized `64x64x18` mathematical tensors and structures the 10-channel Global Action Node.
+* **`data_utils.py` (The Translators):** Handles the objective translation of the game state. It converts the raw Kaggle grid into the normalized `64x64` mathematical tensors, identifies dynamic clusters, and structures the 10-channel Global Action Node.
 
 ---
 
@@ -24,20 +24,19 @@ The Long-Term Planner (LTP) acts as an accelerator, not a physics engine.
 * **The Goal:** The LTP does not know the specific physics of any game. Instead, its weights naturally encode foundational ARC laws (boundaries, movement, color-matching). When dropped into a new, unseen Level 2+, the agent spawns at this basecamp, allowing it to adapt to complex mechanics in a fraction of the time.
 
 ## 2. The Short-Term Planner (The Tactician / Objective Physics Engine)
-The Short-Term Planner (STP) lives exclusively inside a single game to discover its unique physics. To maintain universal applicability, the STP operates entirely on pure, decentralized logic without high-level "actor" or "object" labels.
+The Short-Term Planner (STP) lives exclusively inside a single game to discover its unique physics. To maintain universal applicability, the STP operates entirely on pure, decentralized logic without high-level "actor" labels or assumptions of object overlap.
 
-### Objective Vision (The 4097-Node Transformer)
-Standard Convolutional Neural Networks (CNNs) rely on sliding windows that destroy absolute coordinate logic. To preserve exact spatial reality, the STP completely bypasses CNNs in favor of a **Self-Attention** architecture. 
+### Objective Vision (The Deterministic Hourglass Transformer)
+Standard CNNs rely on sliding windows that destroy absolute coordinate logic, while standard Transformers collapse under the weight of 4097x4097 Self-Attention matrices. To preserve exact spatial reality while ensuring massive computational speed (allowing rapid execution on local hardware), the STP uses a mathematically pure **Hourglass Architecture**:
 
-The input is flattened into exactly 4,097 independent nodes:
-* **Nodes 0 to 4095 (The Grid):** Every pixel is an independent node with 18 channels (16 one-hot colors, Normalized X, Normalized Y). Every pixel mathematically knows exactly what it is and where it is in space.
-* **Node 4096 (The Global Action Node):** A single super-node containing a 10-channel vector (8 one-hot discrete buttons, Normalized X, Normalized Y).
-
-Through Self-Attention, the 4,096 pixel nodes send mathematical queries to each other and to the Action Node. This natively allows the network to calculate direct conditional events across the entire board instantly, recognizing exact coordinate triggers without relying on brittle localized windows.
+1. **High-Dimensional Fingerprinting:** The input is flattened into 4,096 independent nodes containing 18 channels (16 one-hot colors, Normalized X, Normalized Y). These are projected into a 128-dimensional space, giving every exact coordinate a unique mathematical fingerprint.
+2. **Set Embedding (The Cryptographic Hash):** Contiguous pixels are mapped via 4-way connections. The exact coordinate fingerprints of all pixels within an object are summed together into a single 128-dimensional Object Node. This acts as a flawless cryptographic hash, encoding the exact shape, density, and coordinate bounds of the object without using predefined bounding boxes or destructive averaging.
+3. **The Brain (Self-Attention):** The dynamically sized Object Nodes (often <30 per board) and the single Global Action Node evaluate their direct conditional triggers using Self-Attention. 
+4. **The Broadcast Layer:** The updated Object Nodes broadcast their physics conclusions back down to the 4,096 raw pixels. Each individual pixel compares the object's conclusion against its own perfectly preserved exact coordinates to execute localized partial changes.
 
 ### The Pure Logic Calculus
-Every single turn, the STP evaluates the 4097 nodes. It processes physics in two stages:
-1. **The Change Mask:** A binary prediction layer. Every pixel independently evaluates if its conditions have been met based on its coordinates and the Action Node. It outputs `1` if it predicts it will change on the next frame, and `0` if it will stay the same.
+Every single turn, the STP evaluates the grid and action inputs. It processes physics in two stages at the pixel level:
+1. **The Change Mask:** A binary prediction layer. Every pixel independently evaluates if its conditions have been met based on its coordinates and the broadcasted Action Node physics. It outputs `1` if it predicts it will change on the next frame, and `0` if it will stay the same.
 2. **The Color Target:** For pixels that flagged a `1`, a secondary layer evaluates the conditions again to predict the new color channel.
 
 Because the math is applied pixel-by-pixel, the Categorical Cross-Entropy Loss function surgically corrects the network if it mispredicts a specific pixel's behavior, creating a highly accurate, objective physics simulator.
@@ -45,8 +44,8 @@ Because the math is applied pixel-by-pixel, the Categorical Cross-Entropy Loss f
 ## 3. Action Planning & Decision Engine (Gut Instinct)
 The Decision Engine dictates *what* button to press, acting completely independently of the Physics Engine's predictions.
 
-It uses a **Reactive Policy Layer** that processes the board state and outputs a probability distribution for all valid moves. It trains via **REINFORCE (Curiosity Rewards)**:
-* **Reward (`+1.0`):** If the chosen action results in a novel physical change to the board, it receives a positive reward, boosting the mathematical confidence of that specific decision path.
+It uses a **Reactive Policy Layer** that processes the board state and outputs a probability distribution for all valid moves. It trains via pure **REINFORCE (Curiosity Rewards)** without artificial loop penalties, allowing it to natively solve mechanical toggles or repetitive pumps:
+* **Reward (`+1.0`):** If the chosen action results in any physical change to the board, it receives a positive reward, boosting the mathematical confidence of that specific decision path.
 * **Penalty (`-1.0`):** If the chosen action results in `NO_CHANGE` (a wasted click), it receives a heavy penalty, mathematically forcing the network to become "allergic" to useless interactions.
 
 This decoupling ensures the agent learns optimal exploratory behavior without being paralyzed by temporary inaccuracies in its own physics predictions.

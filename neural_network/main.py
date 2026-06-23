@@ -148,11 +148,7 @@ if __name__ == "__main__":
             # B. Run the Test-Time Training (Inner Loop) until 2 Game Overs
             while game_over_count < 2 and step < max_steps:
                 raw_grid = extract_grid(obs)
-                
-                # Hash the current grid and save it to memory
-                grid_hash = hash(np.array(raw_grid).tobytes())
-                state_memory.add(grid_hash)
-                
+                 
                 # Ask the Planner for a move
                 grid_tensor, action_vector, em_action, em_coords, log_prob = play_game_turn(obs, clone_model)
                 
@@ -166,16 +162,12 @@ if __name__ == "__main__":
                 
                 # --- VERIFICATION & CURIOSITY REWARDS ---
                 next_raw_grid = extract_grid(next_obs)
-                next_grid_hash = hash(np.array(next_raw_grid).tobytes())
                 
                 if np.array_equal(raw_grid, next_raw_grid):
                     action_history[-1] += " (NO_CHANGE)"
                     reward = -1.0  # Heavy penalty for wasting a turn
-                elif next_grid_hash in state_memory:
-                    action_history[-1] += " (LOOP)"
-                    reward = -0.5  # Penalty for toggling something back and forth
                 else:
-                    reward = 1.0   # Positive reward for finding a novel state!
+                    reward = 1.0   # Positive reward for causing any physical change
                 
                 # Store the true outcome for the final exam backprop
                 target_next_frame = torch.tensor(next_raw_grid, dtype=torch.long)
