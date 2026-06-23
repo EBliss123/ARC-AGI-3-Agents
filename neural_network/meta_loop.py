@@ -78,35 +78,10 @@ def run_single_turn_adaptation(clone_model, physics_optimizer, policy_optimizer,
         
     return clone_model, final_reward
 
-def run_outer_update(global_model, outer_optimizer, meta_test_data):
-    global_model.train()
-    outer_optimizer.zero_grad()
-    
-    total_meta_loss = 0.0
-    
-    for adapted_clone, test_grid, test_action, true_test_frame in meta_test_data:
-        
-        grid_batch = test_grid.unsqueeze(0)
-        action_batch = test_action.unsqueeze(0)
-        
-        change_logits, color_logits = adapted_clone.predictor(grid_batch, action_batch)
-        
-        change_logits = change_logits.squeeze(0)
-        color_logits = color_logits.squeeze(0)
-        target_colors = true_test_frame.view(-1)
-        
-        original_colors = test_grid[:, :16].argmax(dim=1)
-        actual_change_mask = (original_colors != target_colors).long()
-        
-        change_loss = F.cross_entropy(change_logits, actual_change_mask)
-        pixel_color_losses = F.cross_entropy(color_logits, target_colors, reduction='none')
-        weight_map = torch.where(actual_change_mask > 0, 50.0, 1.0)
-        weighted_color_loss = (pixel_color_losses * weight_map).mean()
-        
-        total_meta_loss += (change_loss + weighted_color_loss)
-        
-    avg_meta_loss = total_meta_loss / len(meta_test_data)
-    avg_meta_loss.backward()
-    outer_optimizer.step()
-    
-    return avg_meta_loss.item()
+def average_successful_weights(global_model, successful_weights_list):
+    avg_state_dict = global_model.state_dict()
+    for key in avg_state_dict.keys():
+        stacked = torch.stack([w[key] for w in successful_weights_list])
+        # .float() ensures we don't get mathematical errors if averaging integer tracking layers
+        avg_state_dict[key] = torch.mean(stacked.float(), dim=0).to(stacked.dtype)
+    global_model.load_state_dict(avg_state_dict)

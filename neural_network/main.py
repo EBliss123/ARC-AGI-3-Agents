@@ -12,7 +12,8 @@ from scipy.ndimage import label
 # Import our custom modules
 from networks import PlannerNetwork, PredictorNetwork
 from data_utils import encode_grid, get_action_mask, unify_action
-from meta_loop import setup_game_clone, run_single_turn_adaptation, run_outer_update
+import copy
+from meta_loop import setup_game_clone, run_single_turn_adaptation, average_successful_weights
 
 class AGI_Architecture(nn.Module):
     def __init__(self):
@@ -99,9 +100,6 @@ if __name__ == "__main__":
     # 1. Initialize the Global Master Model
     global_model = AGI_Architecture()
 
-    # 2. Setup the Global Outer Optimizer (Adam for slow, stable learning)
-    outer_optimizer = optim.Adam(global_model.parameters(), lr=0.0005)
-
     epochs = 1
     best_loss = float('inf')
 
@@ -117,7 +115,7 @@ if __name__ == "__main__":
     public_games = arc.get_environments()
 
     for epoch in range(epochs):
-        meta_test_data = []
+        successful_weights = []
         
         # Grab a random batch of 5 games
         batch_of_games = random.sample(public_games, 5)
@@ -205,30 +203,19 @@ if __name__ == "__main__":
             # The clone is already fully adapted because it learned move-by-move!
             adapted_clone = clone_model
             
-            # C. Save the adapted clone and an unseen frame for the final exam
-            if not done:
-                test_grid, test_action_vector, test_em_action, test_coords, _ = play_game_turn(obs, adapted_clone)
-                next_obs = env.step(test_em_action, data=test_coords)
-                
-                true_test_frame = torch.tensor(extract_grid(next_obs), dtype=torch.long)
-                meta_test_data.append((adapted_clone, test_grid, test_action_vector, true_test_frame))
+            # C. Save the adapted clone's weights if it won
+            if done:
+                successful_weights.append(copy.deepcopy(adapted_clone.state_dict()))
             
-        # 3. The Outer Loop (Gradient-through-a-gradient)
-        if meta_test_data:
-            epoch_loss = run_outer_update(global_model, outer_optimizer, meta_test_data)
-            print(f"Epoch {epoch+1} | Average Meta-Loss: {epoch_loss:.4f}")
+        # 3. The Outer Loop (Universal Basecamp Update)
+        if successful_weights:
+            average_successful_weights(global_model, successful_weights)
+            print(f"Epoch {epoch+1} | Basecamp updated from {len(successful_weights)} wins!")
             
-            # Log the metric to the CSV
-            with open('training_log.csv', mode='a', newline='') as file:
-                writer = csv.writer(file)
-                writer.writerow([epoch + 1, epoch_loss])
-                
-            # Checkpoint the model if it hits a new record
-            if epoch_loss < best_loss:
-                best_loss = epoch_loss
-                os.makedirs('__pycache__', exist_ok=True)
-                torch.save(global_model.state_dict(), os.path.join('__pycache__', 'arc_agi_checkpoint.pt'))
-                print(f"   -> New best loss! Checkpoint saved to __pycache__.")
+            # Checkpoint the model
+            os.makedirs('__pycache__', exist_ok=True)
+            torch.save(global_model.state_dict(), os.path.join('__pycache__', 'arc_agi_checkpoint.pt'))
+            print(f"   -> New Basecamp checkpoint saved to __pycache__.")
                 
         else:
-            print(f"Epoch {epoch+1} | Skipped Update (All games ended early)")
+            print(f"Epoch {epoch+1} | Skipped Update (No games were won)")
