@@ -1,7 +1,7 @@
 # ARC-AGI-3 Hierarchical Meta-Learning Engine
 
 ## Project Context
-This repository contains a machine learning architecture designed for the **ARC-AGI-3 (Abstraction and Reasoning Corpus) Kaggle Competition**. The goal of ARC is to measure general fluid intelligence by forcing AI agents to solve novel spatial reasoning puzzles using only a few demonstration examples. 
+This repository contains a machine learning architecture designed for the **ARC-AGI-3 (Abstraction and Reasoning Corpus) Kaggle Competition**. The goal of ARC is to measure general fluid intelligence by forcing AI agents to solve novel spatial reasoning video games using only pixel and color information on a 64x64 pixel grid with 16 color options. 
 
 Standard reinforcement learning and computer vision techniques fail at ARC because they attempt to memorize specific puzzle layouts. To solve this, this project implements a **Hierarchical Meta-Learning Architecture** that completely separates the discovery of universal laws (Long-Term Planner) from the localized execution of pure physics logic (Short-Term Planner).
 
@@ -20,7 +20,7 @@ The engine is highly modularized to separate the Kaggle emulator interactions fr
 ## 1. The Long-Term Planner (The Scientist / Basecamp Meta-Learning)
 The Long-Term Planner (LTP) acts as an accelerator, not a physics engine. 
 * **Curriculum Focus:** It trains exclusively on solving Level 1 across the 25 games, preventing noisy gradients from complex, multi-step levels.
-* **The Basecamp:** Once the Short-Term Planners successfully solve their respective Level 1s, the LTP averages those successful weights together. This calculates an "Universal Basecamp"—a highly optimized, static starting point. 
+* **The Basecamp:** Once the Short-Term Planners successfully solve their respective Level 1s, the LTP averages those successful weights together. This calculates a "Universal Basecamp"—a highly optimized, static starting point. 
 * **The Goal:** The LTP does not know the specific physics of any game. Instead, its weights naturally encode foundational ARC laws (boundaries, movement, color-matching). When dropped into a new, unseen Level 2+, the agent spawns at this basecamp, allowing it to adapt to complex mechanics in a fraction of the time.
 
 ## 2. The Short-Term Planner (The Tactician / Objective Physics Engine)
@@ -30,8 +30,8 @@ The Short-Term Planner (STP) lives exclusively inside a single game to discover 
 Standard CNNs rely on sliding windows that destroy absolute coordinate logic, while standard Transformers collapse under the weight of 4097x4097 Self-Attention matrices. To preserve exact spatial reality while ensuring massive computational speed (allowing rapid execution on local hardware), the STP uses a mathematically pure **Hourglass Architecture**:
 
 1. **High-Dimensional Fingerprinting:** The input is flattened into 4,096 independent nodes containing 18 channels (16 one-hot colors, Normalized X, Normalized Y). These are projected into a 128-dimensional space, giving every exact coordinate a unique mathematical fingerprint.
-2. **Set Embedding (The Cryptographic Hash):** Contiguous pixels are mapped via 4-way connections. The exact coordinate fingerprints of all pixels within an object are summed together into a single 128-dimensional Object Node. This acts as a flawless cryptographic hash, encoding the exact shape, density, and coordinate bounds of the object without using predefined bounding boxes or destructive averaging.
-3. **The Brain (Self-Attention):** The dynamically sized Object Nodes (often <30 per board) and the single Global Action Node evaluate their direct conditional triggers using Self-Attention. 
+2. **Set Embedding (The Cryptographic Hash):** Contiguous pixels are mapped via 4-way connections. The exact coordinate fingerprints of all pixels within an object are summed together into a single 128-dimensional Object Node. This acts as a flawless cryptographic hash, encoding the exact shape, density, and coordinate bounds of the object without using predefined bounding boxes or destructive averaging. This should allow the agent's neural network to still understand exact coordinates and colors of every pixel within an object.
+3. **The Brain (Self-Attention):** The dynamically sized Object Nodes and the single Global Action Node evaluate their direct conditional triggers using Self-Attention. 
 4. **The Broadcast Layer:** The updated Object Nodes broadcast their physics conclusions back down to the 4,096 raw pixels. Each individual pixel compares the object's conclusion against its own perfectly preserved exact coordinates to execute localized partial changes.
 
 ### The Pure Logic Calculus
