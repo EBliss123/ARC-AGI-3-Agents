@@ -166,12 +166,20 @@ if __name__ == "__main__":
                     valid_change_flag = -1.0  # Wasted click
                 else:
                     valid_change_flag = 1.0   # Trigger the adversarial surprise calculation
+                    
+                # --- EXTRINSIC TERMINAL REWARDS ---
+                terminal_reward = 0.0
+                if hasattr(next_obs, 'state'):
+                    if next_obs.state == GameState.WIN:
+                        terminal_reward = 100.0  # The Ultimate Jackpot
+                    elif next_obs.state == GameState.GAME_OVER:
+                        terminal_reward = -10.0  # The Death Penalty
                 
                 # Store the true outcome for the final exam backprop
                 target_next_frame = torch.tensor(next_raw_grid, dtype=torch.long)
                 
-                # Bundle the step count so the meta_loop can calculate the growing time penalty
-                turn_data = (grid_tensor, action_vector, target_next_frame, log_prob, valid_change_flag, life_step)
+                # Bundle the step count and terminal reward so the meta_loop can apply them
+                turn_data = (grid_tensor, action_vector, target_next_frame, log_prob, valid_change_flag, life_step, terminal_reward)
                 train_states.append(turn_data)
                 
                 # --- REAL-TIME LEARNING: Update the brain instantly after this single move ---

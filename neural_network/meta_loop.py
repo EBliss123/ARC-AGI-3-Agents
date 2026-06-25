@@ -24,8 +24,8 @@ def setup_game_clone(global_model, inner_lr=0.05):
 def run_single_turn_adaptation(clone_model, physics_optimizer, policy_optimizer, turn_data):
     clone_model.train()
     
-    # Unpack the exact data, including the change flag and the current step count
-    grid_nodes, action_vector, target_next_frame, log_prob, valid_change_flag, step = turn_data
+    # Unpack the exact data, including the change flag, step count, and terminal status
+    grid_nodes, action_vector, target_next_frame, log_prob, valid_change_flag, life_step, terminal_reward = turn_data
     
     grid_batch = grid_nodes.unsqueeze(0)
     action_batch = action_vector.unsqueeze(0)
@@ -64,10 +64,10 @@ def run_single_turn_adaptation(clone_model, physics_optimizer, policy_optimizer,
         surprise_bonus = min(physics_loss.item() * 0.1, 2.0)
         
         # Growing Time Penalty: Starts at -0.01 and gets slightly worse every move
-        time_penalty = 0.01 + (0.0001 * step)
+        time_penalty = 0.01 + (0.0001 * life_step)
         
-        # The agent gets dopamine for being confused, but suffers a tax for taking too long
-        final_reward = surprise_bonus - time_penalty
+        # The final mathematical objective: Seek surprise, act fast, avoid death, and win the game
+        final_reward = surprise_bonus - time_penalty + terminal_reward
     
     # --- 3. EXECUTE GRADIENTS ---
     # Update the Physics Engine (Reduce Surprise)
