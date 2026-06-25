@@ -68,12 +68,19 @@ def play_and_record(game_id):
         action_str = f"{em_action.name}({coords['x']},{coords['y']})" if coords else em_action.name
         print(f"\n[RECORDED] Executed: {action_str}")
         
-        # Check game state
+        # Check game state and offer the reset option
         if hasattr(obs, 'state'):
             print(f"Current Status: {obs.state.name}")
+            if obs.state.name in ["GAME_OVER", "WIN"]:
+                print("\n" + "!"*45)
+                print(f"--- LEVEL ENDED: {obs.state.name} ---")
+                print("-> Type 'r' and press Enter to RESET the board.")
+                print("-> OR close the image window to SAVE and exit.")
+                print("!"*45)
             
-        # Reprint menu for the next turn
-        print_available_actions(obs)
+        # Reprint menu for the next turn if still alive
+        if not hasattr(obs, 'state') or obs.state.name not in ["GAME_OVER", "WIN"]:
+            print_available_actions(obs)
 
     def on_click(event):
         """Handles grid click interactions (ACTION6)."""
@@ -97,10 +104,30 @@ def play_and_record(game_id):
     while plt.fignum_exists(fig.number):
         plt.pause(0.1) # Keep window reactive
         
-        # Check terminal for keyboard input via standard non-blocking poll or prompt
         try:
-            # We open an interactive prompt that keeps the UI alive
-            user_input = input("\nEnter Action ID to submit (or press Enter to keep using mouse): ").strip()
+            user_input = input("\nEnter Action ID (or 'r' to reset, press Enter for mouse): ").strip().lower()
+            
+            if user_input == 'r':
+                print("\n[SYSTEM] Resetting the environment...")
+                obs = env.reset()
+                
+                # Update visual board
+                current_grid = extract_grid(obs)
+                img_display.set_data(current_grid)
+                fig.canvas.draw_idle()
+                
+                # Log the reset as a special trajectory step (-1)
+                human_data.append({
+                    "state": current_grid.copy(),
+                    "action_id": -1, 
+                    "click_x": 0,
+                    "click_y": 0,
+                    "next_state": current_grid.copy()
+                })
+                
+                print_available_actions(obs)
+                continue
+
             if user_input:
                 action_choice = int(user_input)
                 valid_vals = [(a.value if hasattr(a, 'value') else a) for a in obs.available_actions]
