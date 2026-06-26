@@ -55,19 +55,24 @@ def run_single_turn_adaptation(clone_model, physics_optimizer, policy_optimizer,
     # The Physics Error is the raw measure of "Surprise"
     physics_loss = change_loss + active_color_loss
     
-    # --- 2. ADVERSARIAL REWARD CALCULUS ---
+    # --- 2. ADVERSARIAL REWARD CALCULUS & COMPETENCE THRESHOLD ---
     if valid_change_flag < 0:
         # Heavily punish wasted clicks
         final_reward = -1.0
     else:
-        # Surprise Metric: Scale the physics loss down so it's a manageable reward
-        surprise_bonus = min(physics_loss.item() * 0.1, 2.0)
-        
         # Growing Time Penalty: Starts at -0.01 and gets slightly worse every move
         time_penalty = 0.01 + (0.0001 * life_step)
         
-        # The final mathematical objective: Seek surprise, act fast, avoid death, and win the game
-        final_reward = surprise_bonus - time_penalty + terminal_reward
+        # THE THRESHOLD: Check if the Physics Engine understands the environment
+        if physics_loss.item() > 0.5:
+            # PHASE 1: EXPLORATION (High Error)
+            surprise_bonus = min(physics_loss.item() * 0.1, 2.0)
+            final_reward = surprise_bonus - time_penalty + terminal_reward
+        else:
+            # PHASE 2: EXPLOITATION (Low Error -> Extract Commonalities)
+            # A static positive reward maximizes the log_prob of the recorded human action
+            imitation_bonus = 1.0
+            final_reward = imitation_bonus - time_penalty + terminal_reward
     
     # --- 3. EXECUTE GRADIENTS ---
     # Update the Physics Engine (Reduce Surprise)
