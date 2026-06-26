@@ -41,13 +41,25 @@ def play_and_record(game_id):
     # Show the initial action menu
     print_available_actions(obs)
 
+    levels_cleared = getattr(obs, 'levels_completed', 0)
+
     def process_and_log_action(action_id, coords=None):
         """Helper to process an action, step the emulator, and log tensors."""
-        nonlocal current_grid, obs
+        nonlocal current_grid, obs, levels_cleared
         
         em_action = next(a for a in GameAction if a.value == action_id)
         next_obs = env.step(em_action, data=coords)
         next_grid = extract_grid(next_obs)
+        
+        # Determine the terminal status from next_obs
+        new_levels_cleared = getattr(next_obs, 'levels_completed', 0)
+        
+        status = "ALIVE"
+        if hasattr(next_obs, 'state'):
+            if next_obs.state.name == "GAME_OVER":
+                status = "GAME_OVER"
+            elif next_obs.state.name == "WIN" or new_levels_cleared > levels_cleared:
+                status = "WIN"
         
         # --- THE SNAPSHOT ---
         # Capture exactly what the network will train on later
@@ -56,7 +68,8 @@ def play_and_record(game_id):
             "action_id": action_id,
             "click_x": coords["x"] if coords else 0,
             "click_y": coords["y"] if coords else 0,
-            "next_state": next_grid.copy()
+            "next_state": next_grid.copy(),
+            "terminal_status": status
         })
         
         # Update state and display
@@ -68,19 +81,24 @@ def play_and_record(game_id):
         action_str = f"{em_action.name}({coords['x']},{coords['y']})" if coords else em_action.name
         print(f"\n[RECORDED] Executed: {action_str}")
         
-        # Check game state and offer the reset option
-        if hasattr(obs, 'state'):
-            print(f"Current Status: {obs.state.name}")
-            if obs.state.name in ["GAME_OVER", "WIN"]:
-                print("\n" + "!"*45)
-                print(f"--- LEVEL ENDED: {obs.state.name} ---")
-                print("-> Type 'r' and press Enter to RESET the board.")
-                print("-> OR close the image window to SAVE and exit.")
-                print("!"*45)
-            
-        # Reprint menu for the next turn if still alive
-        if not hasattr(obs, 'state') or obs.state.name not in ["GAME_OVER", "WIN"]:
+        # --- TERMINAL LOGGING STRATEGY ---
+        if status in ["WIN", "GAME_OVER"]:
+            print("\n" + "★"*50)
+            if status == "WIN":
+                print("🏆 LEVEL CLEARED! (WIN)")
+            else:
+                print("💀 GAME OVER!")
+            print("★"*50)
+            print("-> Type 'r' and press Enter to RESET the board.")
+            print("-> OR close the image window to SAVE and exit.")
+            print("★"*50)
+        else:
+            move_count = len([d for d in human_data if d["action_id"] != -1])
+            print(f"   -> Move {move_count} | Status: ALIVE")
             print_available_actions(obs)
+            
+        # Update the tracker for the next turn
+        levels_cleared = new_levels_cleared
 
     def on_click(event):
         """Handles grid click interactions (ACTION6)."""
@@ -122,7 +140,8 @@ def play_and_record(game_id):
                     "action_id": -1, 
                     "click_x": 0,
                     "click_y": 0,
-                    "next_state": current_grid.copy()
+                    "next_state": current_grid.copy(),
+                    "terminal_status": "RESET"
                 })
                 
                 print_available_actions(obs)
