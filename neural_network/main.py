@@ -99,6 +99,12 @@ def play_game_turn(obs, clone_model):
 if __name__ == "__main__":
     # 1. Initialize the Global Master Model
     global_model = AGI_Architecture()
+    
+    # Load the Expert Planner Basecamp (The Predictor intentionally remains random)
+    checkpoint_path = os.path.join('__pycache__', 'arc_agi_checkpoint.pt')
+    if os.path.exists(checkpoint_path):
+        global_model.planner.load_state_dict(torch.load(checkpoint_path, weights_only=True))
+        print("-> Loaded Expert Planner Basecamp weights.")
 
     epochs = 1
     best_loss = float('inf')
@@ -183,10 +189,11 @@ if __name__ == "__main__":
                 train_states.append(turn_data)
                 
                 # --- REAL-TIME LEARNING: Update the brain instantly after this single move ---
-                clone_model, final_reward = run_single_turn_adaptation(clone_model, physics_optimizer, policy_optimizer, turn_data)
+                clone_model, final_reward, phys_loss = run_single_turn_adaptation(clone_model, physics_optimizer, policy_optimizer, turn_data)
                 
                 # --- REAL-TIME TERMINAL LOGGING ---
-                print(f"\r   ... Step {step+1} | Reward: {final_reward:.4f} | Action: {action_history[-1]}", end="", flush=True)
+                mode = "EXPLORE" if phys_loss > 0.5 else "EXPLOIT"
+                print(f"\r   ... Step {step+1} | Mode: {mode} (Loss: {phys_loss:.2f}) | Action: {action_history[-1]}    ", end="", flush=True)
                 
                 obs = next_obs
                 

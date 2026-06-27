@@ -24,8 +24,9 @@ def train_basecamp_offline():
     # Try to load existing basecamp if you have one
     checkpoint_path = os.path.join('__pycache__', 'arc_agi_checkpoint.pt')
     if os.path.exists(checkpoint_path):
-        global_model.load_state_dict(torch.load(checkpoint_path))
-        print("-> Loaded existing Basecamp weights.")
+        # STRICLY load into the Planner. The Predictor stays blank.
+        global_model.planner.load_state_dict(torch.load(checkpoint_path, weights_only=True))
+        print("-> Loaded Expert Planner Basecamp weights.")
     else:
         print("-> No existing checkpoint found. Starting fresh Basecamp.")
 
@@ -103,17 +104,18 @@ def train_basecamp_offline():
             # 4. Execute the Simulated Turn
             turn_data = (grid_tensor, action_vector, target_next_frame, log_prob, valid_change_flag, life_step, terminal_reward)
             
-            clone_model, final_reward = run_single_turn_adaptation(clone_model, physics_optimizer, policy_optimizer, turn_data)
+            clone_model, final_reward, _ = run_single_turn_adaptation(clone_model, physics_optimizer, policy_optimizer, turn_data)
             
             # Handle step logic
             life_step += 1
             if status == "GAME_OVER":
                 life_step = 0
                 
-        # If the human trajectory ended in a win, save the clone's adapted brain
+        # If the human trajectory ended in a win, commit the knowledge immediately
         if game_won:
-            successful_weights.append(copy.deepcopy(clone_model.state_dict()))
-            print(f"   -> Successfully learned patterns from {file_name}")
+            # ONLY the Planner continually inherits the newly adapted heuristics
+            global_model.planner.load_state_dict(clone_model.planner.state_dict())
+            print(f"   -> Heuristics extracted from {file_name}. Basecamp updated.")
         else:
             print(f"   -> Skipped {file_name} (Trajectory did not contain a WIN state)")
 
@@ -123,7 +125,7 @@ def train_basecamp_offline():
         average_successful_weights(global_model, successful_weights)
         
         os.makedirs('__pycache__', exist_ok=True)
-        torch.save(global_model.state_dict(), checkpoint_path)
+        torch.save(global_model.planner.state_dict(), checkpoint_path)
         print("★ Basecamp Successfully Updated and Saved! ★")
     else:
         print("\nNo wins were processed. Basecamp remains unchanged.")

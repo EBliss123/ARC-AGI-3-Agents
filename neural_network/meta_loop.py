@@ -89,7 +89,7 @@ def run_single_turn_adaptation(clone_model, physics_optimizer, policy_optimizer,
     torch.nn.utils.clip_grad_norm_(clone_model.planner.parameters(), max_norm=1.0)
     policy_optimizer.step()
         
-    return clone_model, final_reward
+    return clone_model, final_reward, physics_loss.item()
 
 def average_successful_weights(global_model, successful_weights_list):
     avg_state_dict = global_model.state_dict()
