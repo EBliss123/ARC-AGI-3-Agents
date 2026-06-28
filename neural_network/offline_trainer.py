@@ -119,16 +119,11 @@ def train_basecamp_offline():
         else:
             print(f"   -> Skipped {file_name} (Trajectory did not contain a WIN state)")
 
-    # Finally, average the global basecamp
-    if successful_weights:
-        print(f"\nAveraging {len(successful_weights)} successful minds into the Universal Basecamp...")
-        average_successful_weights(global_model, successful_weights)
-        
-        os.makedirs('__pycache__', exist_ok=True)
-        torch.save(global_model.planner.state_dict(), checkpoint_path)
-        print("★ Basecamp Successfully Updated and Saved! ★")
-    else:
-        print("\nNo wins were processed. Basecamp remains unchanged.")
+    # Finally, save the continually updated basecamp
+    print("\nCurriculum Complete! Saving the Continually Trained Basecamp...")
+    os.makedirs('__pycache__', exist_ok=True)
+    torch.save(global_model.planner.state_dict(), checkpoint_path)
+    print("★ Sequential Basecamp Successfully Saved! ★")
 
 if __name__ == "__main__":
     train_basecamp_offline()
