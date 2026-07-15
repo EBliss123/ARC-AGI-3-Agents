@@ -1,0 +1,17 @@
+# 1. Ignore everything in the repository root by default
+/*
+
+!/.gitignore
+
+# 2. Whitelist the unsupervised directory so Git tracks it
+!/unsupervised/
+
+# 3. Ignore Python and PyTorch junk that might generate inside the unsupervised folder
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.pt
+*.pth
