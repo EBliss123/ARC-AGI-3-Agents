@@ -5,6 +5,7 @@
 
 # 2. Whitelist the unsupervised directory so Git tracks it
 !/unsupervised/
+!/GOALS.md
 
 # 3. Ignore Python and PyTorch junk that might generate inside the unsupervised folder
 __pycache__/
