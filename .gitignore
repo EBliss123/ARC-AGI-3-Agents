@@ -19,3 +19,9 @@ tests/recordings/not-a-recording.txt
 
 # Long-term memory
 memory.db
+uv.lock
+pyproject.toml
+pyproject.toml
+uv.lock
+environment_files/ls20/9607627b/ls20.py
+uv.lock
