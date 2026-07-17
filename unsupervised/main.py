@@ -7,11 +7,19 @@ Responsibilities:
 """
 from environment.arc_interface import ARCInterface
 from engines.observer import DeltaObserver
+from engines.compressor import AlgebraicCompressor
+from memory.object_ledger import ObjectLedger
+from memory.physics_rulebook import PhysicsRulebook
+from memory.experience_buffer import ExperienceBuffer
 
 def main():
     print("Initializing ARC-AGI-3 Environment for 'ls20'...")
     interface = ARCInterface(task_id="ls20")
     observer = DeltaObserver()
+    ledger = ObjectLedger()
+    rulebook = PhysicsRulebook()
+    buffer = ExperienceBuffer()
+    compressor = AlgebraicCompressor()
     
     # 1. Start the game and get the initial board state (grid_before)
     initial_frames = interface.reset()
@@ -43,15 +51,18 @@ def main():
     print(f"\nObserver successfully generated {len(transitions)} transition tensor(s)!")
     
     for step_idx, transition_tensor in enumerate(transitions):
-        # Filter the tensor to only show rows where the old color doesn't match the new color
-        changed_pixels = transition_tensor[transition_tensor[:, 2] != transition_tensor[:, 3]]
-        
         print(f"\n--- Animation Step {step_idx + 1} ---")
-        if len(changed_pixels) == 0:
-            print("No pixels changed in this frame.")
-        else:
-            print(f"Found {len(changed_pixels)} changed pixels [x, y, old_color, new_color]:")
-            print(changed_pixels)
+        
+        # Pass the tensor into the compressor to log it and extract the baseline algebra
+        equation_count = compressor.process_transition(transition_tensor, buffer, rulebook, ledger)
+        
+        print(f"ExperienceBuffer logged raw tensor of shape: {transition_tensor.shape}")
+        print(f"Compressor generated {equation_count} bloated pixel-level algebraic rules.")
+        
+        # Let's peek at the first 3 rules to confirm the raw algebra
+        print("Sample of Baseline Equations in Rulebook:")
+        for rule in rulebook.get_rules()[:3]:
+            print(f"  {rule}")
 
 if __name__ == "__main__":
     main()

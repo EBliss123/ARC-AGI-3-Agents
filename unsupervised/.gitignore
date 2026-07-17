@@ -1,18 +1,20 @@
-# 1. Ignore everything in the repository root by default
+# 1. Ignore everything in the root, but allow subfolder traversal
 /*
+!/*/
 
+# 2. Allow the main gitignore file
 !/.gitignore
 
-# 2. Whitelist the unsupervised directory so Git tracks it
+# 3. Whitelist the folder and its specific contents
 !/unsupervised/
 !/GOALS.md
 
-# 3. Ignore Python and PyTorch junk that might generate inside the unsupervised folder
-__pycache__/
-*.py[cod]
-*$py.class
-.venv/
-venv/
-env/
-*.pt
-*.pth
+# 4. Ignore Python and PyTorch junk
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+**/.venv/
+**/venv/
+**/env/
+**/*.pt
+**/*.pth

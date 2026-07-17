@@ -1,7 +1,15 @@
-"""
-Purpose: The Law Book.
-Responsibilities:
-1. Stores the current active JSON physics rules.
-2. Allows the system to query rules for generating predictions.
-3. Can instantly wipe/overwrite rules when the Compressor shatters them via MDL.
-"""
+class PhysicsRulebook:
+    def __init__(self):
+        self.rules = []
+
+    def add_rule(self, rule_json):
+        """Saves a mathematical equation or JSON rule to the working theory."""
+        self.rules.append(rule_json)
+
+    def get_rules(self):
+        """Retrieves all rules in the current working theory."""
+        return self.rules
+
+    def wipe_rules(self):
+        """Instantly deletes all rules so the agent is forced to look back at the raw Immutable Log."""
+        self.rules = []
