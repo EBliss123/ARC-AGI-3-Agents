@@ -53,15 +53,15 @@ def main():
     for step_idx, transition_tensor in enumerate(transitions):
         print(f"\n--- Animation Step {step_idx + 1} ---")
         
-        # Pass the tensor into the compressor to log it and extract the baseline algebra
-        equation_count = compressor.process_transition(transition_tensor, buffer, rulebook, ledger)
+        bloat_count, compressed_count = compressor.process_transition(transition_tensor, buffer, rulebook, ledger)
         
         print(f"ExperienceBuffer logged raw tensor of shape: {transition_tensor.shape}")
-        print(f"Compressor generated {equation_count} bloated pixel-level algebraic rules.")
+        print(f"Baseline (Bloat) Memory: {bloat_count} raw equations.")
+        print(f"Compressed Working Memory: {compressed_count} abstract rule(s).")
         
         # Let's peek at the first 3 rules to confirm the raw algebra
         print("Sample of Baseline Equations in Rulebook:")
-        for rule in rulebook.get_rules()[:3]:
+        for rule in rulebook.get_active_rules()[:3]:
             print(f"  {rule}")
 
 if __name__ == "__main__":

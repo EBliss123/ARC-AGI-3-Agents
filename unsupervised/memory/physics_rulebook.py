@@ -1,15 +1,16 @@
 class PhysicsRulebook:
     def __init__(self):
-        self.rules = []
+        self.baseline_rules = []
+        self.compressed_rules = []
 
-    def add_rule(self, rule_json):
-        """Saves a mathematical equation or JSON rule to the working theory."""
-        self.rules.append(rule_json)
+    def set_baseline(self, rules):
+        """Sets the raw, bloated pixel-level truth."""
+        self.baseline_rules = rules
 
-    def get_rules(self):
-        """Retrieves all rules in the current working theory."""
-        return self.rules
+    def set_compressed(self, rules):
+        """Sets the smaller, abstracted rules chosen by the network."""
+        self.compressed_rules = rules
 
-    def wipe_rules(self):
-        """Instantly deletes all rules so the agent is forced to look back at the raw Immutable Log."""
-        self.rules = []
+    def get_active_rules(self):
+        """Returns compressed rules if they exist, otherwise falls back to baseline."""
+        return self.compressed_rules if self.compressed_rules else self.baseline_rules
