@@ -11,6 +11,7 @@ from engines.compressor import AlgebraicCompressor
 from memory.object_ledger import ObjectLedger
 from memory.physics_rulebook import PhysicsRulebook
 from memory.experience_buffer import ExperienceBuffer
+import json
 
 def main():
     print("Initializing ARC-AGI-3 Environment for 'ls20'...")
@@ -53,16 +54,21 @@ def main():
     for step_idx, transition_tensor in enumerate(transitions):
         print(f"\n--- Animation Step {step_idx + 1} ---")
         
-        bloat_count, compressed_count = compressor.process_transition(transition_tensor, buffer, rulebook, ledger)
+        bloat_count, compressed_count = compressor.process_transition(action_to_take, transition_tensor, buffer, rulebook, ledger)
         
         print(f"ExperienceBuffer logged raw tensor of shape: {transition_tensor.shape}")
         print(f"Baseline (Bloat) Memory: {bloat_count} raw equations.")
         print(f"Compressed Working Memory: {compressed_count} abstract rule(s).")
         
-        # Let's peek at the first 3 rules to confirm the raw algebra
-        print("Sample of Baseline Equations in Rulebook:")
-        for rule in rulebook.get_active_rules()[:3]:
-            print(f"  {rule}")
+        print("\n--- Active Theories & Sets ---")
+        print("Active Physics Rules:")
+        for rule in rulebook.get_active_rules():
+            print(json.dumps(rule, indent=4))
+            
+        print("\nObject Ledger Definitions:")
+        for set_id, pixels in ledger.sets.items():
+            changed = len([p for p in pixels if p['c_initial'] != p['c_final']])
+            print(f"  {set_id}: {len(pixels)} total pixels ({changed} changed).")
 
 if __name__ == "__main__":
     main()

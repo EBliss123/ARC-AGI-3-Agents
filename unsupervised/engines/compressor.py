@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 
 class CompressorNet(nn.Module):
     def __init__(self, num_sets=16):
@@ -18,55 +19,56 @@ class CompressorNet(nn.Module):
 
 class AlgebraicCompressor:
     def __init__(self):
-        # The neural engine that infers the pattern groupings
-        self.net = CompressorNet()
+        pass # The neural network is removed; grouping is now purely algorithmic
 
-    def process_transition(self, transition_tensor, experience_buffer, rulebook, ledger):
-        experience_buffer.add_transition(transition_tensor)
+    def process_transition(self, action, transition_tensor, experience_buffer, rulebook, ledger):
+        experience_buffer.add_transition(action, transition_tensor)
         
         # 1. Capture the Full Board Baseline
         pixel_equations = []
         for row in transition_tensor:
             x, y, old_c, new_c = row.tolist()
-            if old_c != new_c: # Only store actual changes in the baseline list
-                pixel_equations.append({"x": x, "y": y, "c_initial": old_c, "c_final": new_c})
+            if old_c != new_c:
+                pixel_equations.append({"trigger": action, "x": x, "y": y, "c_initial": old_c, "c_final": new_c})
         rulebook.set_baseline(pixel_equations)
         
-        # 2. Run the Neural Network to assign Set IDs across the raw history
-        # Convert tensor data to float for the linear layers
-        input_data = transition_tensor.float()
-        set_assignments = self.net(input_data) # Returns a Set ID for all 4096 pixels
-        
-        # 3. State-Mapping Translator (Group pixels by Set ID)
+        # 2. Algorithmic Grouping (Collapse by raw commonalities)
         ledger.wipe_ledger()
         grouped_sets = {}
-        for idx, set_id_tensor in enumerate(set_assignments):
-            set_id = int(set_id_tensor.item())
-            x, y, old_c, new_c = transition_tensor[idx].tolist()
+        
+        for row in transition_tensor:
+            x, y, old_c, new_c = row.tolist()
+            trans_key = (old_c, new_c)
             
-            if set_id not in grouped_sets:
-                grouped_sets[set_id] = []
-            grouped_sets[set_id].append({"x": x, "y": y, "c_initial": old_c, "c_final": new_c})
+            if trans_key not in grouped_sets:
+                grouped_sets[trans_key] = []
+            grouped_sets[trans_key].append({"x": x, "y": y, "c_initial": old_c, "c_final": new_c})
             
-        # 4. Generate Abstracted State Rules based on the network's sets
-        compressed_rules = []
-        for set_id, pixels in grouped_sets.items():
-            # Register full coordinate and color info inside the ledger
-            ledger_id = ledger.add_set(pixels)
-            
-            # Find which pixels in this set actually changed colors
-            changes_in_set = [p for p in pixels if p["c_initial"] != p["c_final"]]
-            
-            if not changes_in_set:
-                continue # If no pixels changed in this set, it's a pure static object (no rule needed)
+        # 3. Generate Abstracted State Rules 
+        state_changes = []
+        for trans_key, pixels in grouped_sets.items():
+            old_c, new_c = trans_key
+            if old_c == new_c:
+                continue # Skip ledger registration and rules for pure static background pixels
                 
-            # Create a compact state-mapping rule pointing to this ledger set
+            # Only add to ledger if it is actually going to be used in a rule
+            ledger_id = ledger.add_set(pixels)
+                
             abstract_rule = {
-                "target_set": ledger_id,
+                "affected_ledger_id": ledger_id,
                 "logic": "state_mapping",
-                "conditions": [{"c_initial": p["c_initial"], "c_final": p["c_final"]} for p in changes_in_set[:1]]
+                "conditions": [{"c_initial": old_c, "c_final": new_c}]
             }
-            compressed_rules.append(abstract_rule)
+            state_changes.append(abstract_rule)
             
-        rulebook.set_compressed(compressed_rules)
-        return len(pixel_equations), len(compressed_rules)
+        # 4. Wrap under a single universal trigger
+        if state_changes:
+            unified_action_rule = {
+                "trigger": action,
+                "state_changes": state_changes
+            }
+            rulebook.set_compressed([unified_action_rule])
+        else:
+            rulebook.set_compressed([])
+            
+        return len(pixel_equations), len(rulebook.get_active_rules())
