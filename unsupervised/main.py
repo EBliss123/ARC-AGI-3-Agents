@@ -68,7 +68,10 @@ def main():
         print("\nObject Ledger Definitions:")
         for set_id, pixels in ledger.sets.items():
             changed = len([p for p in pixels if p['c_initial'] != p['c_final']])
+            # Extract just the x, y tuples for a clean console print
+            coords = [(p['x'], p['y']) for p in pixels]
             print(f"  {set_id}: {len(pixels)} total pixels ({changed} changed).")
+            print(f"    Coords: {coords}")
 
 if __name__ == "__main__":
     main()
