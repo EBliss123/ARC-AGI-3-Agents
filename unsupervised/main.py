@@ -33,33 +33,32 @@ def main():
     grid_before = initial_frames[-1] 
     print(f"Game Started. Initial Board Shape: {grid_before.shape}")
 
-    # 2. Execute an action to trigger an animation
-    action_to_take = "ACTION1"
-    print(f"\nExecuting {action_to_take}...")
-    frames_after = interface.step(action_to_take)
+    # 2. Execute multiple actions to trigger animations
+    actions_to_take = ["ACTION1", "ACTION2"]
+    current_grid = initial_frames[-1]
     
-    if frames_after is None:
-        print("Action failed or game ended unexpectedly.")
-        return
+    for step_idx, action in enumerate(actions_to_take):
+        print(f"\n=============================================")
+        print(f"Executing {action} (Step {step_idx + 1})...")
+        frames_after = interface.step(action)
         
-    print(f"Action resulted in {frames_after.shape[0]} animation frame(s).")
-    
-    # 3. Pass the data to the math engine (The Observer)
-    print("\nRouting data to the DeltaObserver...")
-    transitions = observer.observe(grid_before, frames_after)
-    
-    # 4. Read the Ground Truth (Test Output)
-    print(f"\nObserver successfully generated {len(transitions)} transition tensor(s)!")
-    
-    for step_idx, transition_tensor in enumerate(transitions):
-        print(f"\n--- Animation Step {step_idx + 1} ---")
+        if frames_after is None:
+            print("Action failed or game ended unexpectedly.")
+            break
+            
+        print(f"Action resulted in {frames_after.shape[0]} animation frame(s).")
         
-        bloat_count, compressed_count = compressor.process_transition(action_to_take, transition_tensor, buffer, rulebook, ledger)
+        # 3. Pass the data to the math engine (The Observer)
+        transitions = observer.observe(current_grid, frames_after)
         
-        print(f"ExperienceBuffer logged raw tensor of shape: {transition_tensor.shape}")
-        print(f"Baseline (Bloat) Memory: {bloat_count} raw equations.")
-        print(f"Compressed Working Memory: {compressed_count} abstract rule(s).")
-        
+        for transition_tensor in transitions:
+            bloat_count, compressed_count = compressor.process_transition(action, transition_tensor, buffer, rulebook, ledger)
+            
+            print(f"ExperienceBuffer logged raw tensor of shape: {transition_tensor.shape}")
+            print(f"Universal Baseline (Bloat) Memory: {bloat_count} raw equations.")
+            print(f"Universal Compressed Memory: {compressed_count} abstract rule(s).")
+            
+        # Print state of theories after this action
         print("\n--- Active Theories & Sets ---")
         print("Active Physics Rules:")
         for rule in rulebook.get_active_rules():
@@ -68,10 +67,12 @@ def main():
         print("\nObject Ledger Definitions:")
         for set_id, pixels in ledger.sets.items():
             changed = len([p for p in pixels if p['c_initial'] != p['c_final']])
-            # Extract just the x, y tuples for a clean console print
             coords = [(p['x'], p['y']) for p in pixels]
             print(f"  {set_id}: {len(pixels)} total pixels ({changed} changed).")
             print(f"    Coords: {coords}")
+
+        # Update the current_grid for the next action in the loop
+        current_grid = frames_after[-1]
 
 if __name__ == "__main__":
     main()

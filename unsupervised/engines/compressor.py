@@ -22,53 +22,87 @@ class AlgebraicCompressor:
         pass # The neural network is removed; grouping is now purely algorithmic
 
     def process_transition(self, action, transition_tensor, experience_buffer, rulebook, ledger):
+        # 1. Log the new experience permanently into the timeline
         experience_buffer.add_transition(action, transition_tensor)
         
-        # 1. Capture the Full Board Baseline
+        # 2. Universal Re-evaluation: Rebuild Baseline from ALL history
         pixel_equations = []
-        for row in transition_tensor:
-            x, y, old_c, new_c = row.tolist()
-            if old_c != new_c:
-                pixel_equations.append({"trigger": action, "x": x, "y": y, "c_initial": old_c, "c_final": new_c})
+        for record in experience_buffer.history:
+            hist_action = record["action"]
+            hist_tensor = record["tensor"]
+            for row in hist_tensor:
+                x, y, old_c, new_c = row.tolist()
+                if old_c != new_c:
+                    pixel_equations.append({"trigger": hist_action, "x": x, "y": y, "c_initial": old_c, "c_final": new_c})
         rulebook.set_baseline(pixel_equations)
         
-        # 2. Algorithmic Grouping (Collapse by raw commonalities)
+        # 3. Algorithmic Grouping across ALL history
         ledger.wipe_ledger()
         grouped_sets = {}
         
-        for row in transition_tensor:
-            x, y, old_c, new_c = row.tolist()
-            trans_key = (old_c, new_c)
-            
-            if trans_key not in grouped_sets:
-                grouped_sets[trans_key] = []
-            grouped_sets[trans_key].append({"x": x, "y": y, "c_initial": old_c, "c_final": new_c})
-            
-        # 3. Generate Abstracted State Rules 
-        state_changes = []
+        for record in experience_buffer.history:
+            hist_action = record["action"]
+            hist_tensor = record["tensor"]
+            for row in hist_tensor:
+                x, y, old_c, new_c = row.tolist()
+                # Group by the action AND the color transition to map behaviors across turns
+                trans_key = (hist_action, old_c, new_c) 
+                
+                if trans_key not in grouped_sets:
+                    grouped_sets[trans_key] = []
+                grouped_sets[trans_key].append({"x": x, "y": y, "c_initial": old_c, "c_final": new_c})
+                
+        # 4. Generate Abstracted State Rules 
+        action_rules_map = {}
         for trans_key, pixels in grouped_sets.items():
-            old_c, new_c = trans_key
+            hist_action, old_c, new_c = trans_key
             if old_c == new_c:
                 continue # Skip ledger registration and rules for pure static background pixels
                 
-            # Only add to ledger if it is actually going to be used in a rule
-            ledger_id = ledger.add_set(pixels)
-                
+            # Deduplicate coordinates in case pixels are static in some turns and moving in others
+            unique_pixels = []
+            seen_coords = set()
+            for p in pixels:
+                coord = (p['x'], p['y'])
+                if coord not in seen_coords:
+                    seen_coords.add(coord)
+                    unique_pixels.append(p)
+
+            # Extract the physical footprint of the current group
+            current_coords = set((p['x'], p['y']) for p in unique_pixels)
+            existing_ledger_id = None
+            
+            # Scan the existing universe to see if this object already has a Set ID
+            for set_id, existing_pixels in ledger.sets.items():
+                existing_coords = set((p['x'], p['y']) for p in existing_pixels)
+                if current_coords == existing_coords:
+                    existing_ledger_id = set_id
+                    break
+                    
+            # Reuse the existing ID if found, otherwise register a new object
+            if existing_ledger_id:
+                ledger_id = existing_ledger_id
+            else:
+                ledger_id = ledger.add_set(unique_pixels)
+            
             abstract_rule = {
                 "affected_ledger_id": ledger_id,
                 "logic": "state_mapping",
                 "conditions": [{"c_initial": old_c, "c_final": new_c}]
             }
-            state_changes.append(abstract_rule)
             
-        # 4. Wrap under a single universal trigger
-        if state_changes:
-            unified_action_rule = {
-                "trigger": action,
+            if hist_action not in action_rules_map:
+                action_rules_map[hist_action] = []
+            action_rules_map[hist_action].append(abstract_rule)
+            
+        # 5. Wrap under universal triggers
+        compressed_rules = []
+        for hist_action, state_changes in action_rules_map.items():
+            compressed_rules.append({
+                "trigger": hist_action,
                 "state_changes": state_changes
-            }
-            rulebook.set_compressed([unified_action_rule])
-        else:
-            rulebook.set_compressed([])
+            })
+            
+        rulebook.set_compressed(compressed_rules)
             
         return len(pixel_equations), len(rulebook.get_active_rules())
