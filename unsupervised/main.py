@@ -68,8 +68,15 @@ def main():
         for set_id, pixels in ledger.sets.items():
             changed = len([p for p in pixels if p['c_initial'] != p['c_final']])
             coords = [(p['x'], p['y']) for p in pixels]
+            
+            # Calculate the signature for the console output
+            sorted_pixels = sorted(pixels, key=lambda p: (p['y'], p['x']))
+            anchor_x, anchor_y = sorted_pixels[0]['x'], sorted_pixels[0]['y']
+            signature = [(p['x'] - anchor_x, p['y'] - anchor_y, p['c_initial']) for p in sorted_pixels]
+            
             print(f"  {set_id}: {len(pixels)} total pixels ({changed} changed).")
             print(f"    Coords: {coords}")
+            print(f"    Signature: {signature}")
 
         # Update the current_grid for the next action in the loop
         current_grid = frames_after[-1]

@@ -70,6 +70,18 @@ class AlgebraicCompressor:
 
             # Extract the physical footprint of the current group
             current_coords = set((p['x'], p['y']) for p in unique_pixels)
+            
+            # Generate the Relational Signature (Shape & Color Orientation)
+            # Sort by Y then X to reliably find the top-left-most actual pixel in the shape
+            sorted_pixels = sorted(unique_pixels, key=lambda p: (p['y'], p['x']))
+            anchor_x, anchor_y = sorted_pixels[0]['x'], sorted_pixels[0]['y']
+            
+            # Map every single pixel's delta and color relative to the anchor
+            shape_signature = tuple(
+                (p['x'] - anchor_x, p['y'] - anchor_y, p['c_initial']) 
+                for p in sorted_pixels
+            )
+            
             existing_ledger_id = None
             
             # Scan the existing universe to see if this object already has a Set ID
