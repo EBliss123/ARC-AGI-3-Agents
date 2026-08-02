@@ -3,34 +3,42 @@ from pathlib import Path
 from typing import Dict, Any, List, Iterator
 
 def stream_jsonl(file_path: Path) -> Iterator[Dict[str, Any]]:
-    """Yields parsed JSON objects line-by-line to minimize memory footprint."""
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
             if line.strip():
                 yield json.loads(line)
 
 def extract_frame_transitions(file_path: Path) -> List[Dict[str, Any]]:
-    """
-    Reads human telemetry and pairs contiguous frames (S_t, S_next).
-    Captures both action-driven transitions and autonomous animations.
-    """
+    # Use the streaming generator we proved works for this file format
     frames = list(stream_jsonl(file_path))
+        
     transitions = []
     
     for i in range(len(frames) - 1):
-        current_frame = frames[i]
-        next_frame = frames[i + 1]
+        current_data = frames[i].get("data", {})
+        next_data = frames[i + 1].get("data", {})
         
-        # Extract the raw 2D grid arrays
-        s_t = current_frame.get("grid")
-        s_next = next_frame.get("grid")
+        # Safely extract the grid whether it is a dictionary containing "grid" or the 2D list itself
+        c_frame = current_data.get("frame")
+        s_t = c_frame.get("grid") if isinstance(c_frame, dict) else c_frame
         
+        n_frame = next_data.get("frame")
+        s_next = n_frame.get("grid") if isinstance(n_frame, dict) else n_frame
+        
+        # Fallback just in case the key was literally called "grid" all along
+        if not s_t: s_t = current_data.get("grid")
+        if not s_next: s_next = next_data.get("grid")
+        
+        # Skip intro/outro frames that do not contain a valid game board
+        if s_t is None or s_next is None:
+            continue
+            
         # Extract action ID if a human pressed a key on this frame; otherwise None
-        action_input = current_frame.get("action_input")
+        action_input = current_data.get("action_input")
         action_id = action_input.get("id") if action_input else None
         
-        # Extract environment status flags from the resulting frame
-        is_win = next_frame.get("level_cleared", False)
+        # Extract environment status flags (checking if the next frame reached a WIN state)
+        is_win = (next_data.get("state") == "WIN")
         
         # Store as an atomic state transition block
         transitions.append({
@@ -45,7 +53,7 @@ def extract_frame_transitions(file_path: Path) -> List[Dict[str, Any]]:
 
 if __name__ == "__main__":
     # Test block to verify the parser works locally
-    test_path = Path(r"C:\Users\Easton\ARC-AGI-3-Agents\wake_sleep_strategy\sample_replay.jsonl")
+    test_path = Path(r"C:\Users\Easton\ARC-AGI-3-Agents\wake_sleep_strategy\ar25-2a854897-cb79-48f4-92e1-0288df2cf6a9.json")
     
     if test_path.exists():
         data = extract_frame_transitions(test_path)

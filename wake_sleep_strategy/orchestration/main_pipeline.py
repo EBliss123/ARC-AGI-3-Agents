@@ -52,5 +52,5 @@ def verify_milestone_1(jsonl_path: Path):
 
 if __name__ == "__main__":
     # Point directly to the sample file you placed in the root directory
-    target_file = root_dir / "sample_replay.jsonl"
+    target_file = root_dir / "ar25-2a854897-cb79-48f4-92e1-0288df2cf6a9.json"
     verify_milestone_1(target_file)
