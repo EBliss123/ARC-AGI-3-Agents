@@ -1,5 +1,7 @@
 import sys
 from pathlib import Path
+from wake_phase.primitives import get_deltas
+from wake_phase.evolution_engine import evolve
 
 # Dynamically add the root directory to the system path so imports work cleanly from anywhere
 root_dir = Path(__file__).resolve().parent.parent
@@ -48,7 +50,24 @@ def verify_milestone_1(jsonl_path: Path):
     print(f"Dynamic Mask:  {changed_pixels} pixels changed.")
     print(f"Static Mask:   {static_pixels} pixels remained the same.")
     
-    print("\nMilestone 1 is complete and functioning perfectly.")
+    print("\n--- Starting Milestone 2 (Wake Phase) ---")
+        
+    # Explicitly grab the tensors for the first frame 
+    first_frame = tensor_data[0]
+    s_t = first_frame["s_t"]
+    s_next = first_frame["s_next"]
+    
+    # Extract the deltas. s_t and s_next contain the entire grid, 
+    # so all static pixels are included for the agent to probe later.
+    raw_deltas = get_deltas(s_t, s_next)
+    
+    print(f"Evolving rules based on {len(raw_deltas)} dynamic pixels...")
+    best_rule = evolve(s_t, s_next, raw_deltas, generations=3)
+    
+    print(f"Winning Rule Fitness Score: {best_rule.fitness_score:.2f}")
+    print(f"Winning Rule Complexity: {best_rule.complexity}")
+    print(f"Predictions preserved: {len(best_rule.proposed_deltas)}")
+    print("Milestone 2 is officially complete!")
 
 if __name__ == "__main__":
     # Point directly to the sample file you placed in the root directory
