@@ -122,3 +122,18 @@ BASE_OPERATORS = {
 }
 
 BASE_VARIABLES = ['z', 'y', 'x', 'color']
+
+class Parameter(ASTNode):
+    """An empty slot for auto-parameterized functions."""
+    def __init__(self, arg_index: int):
+        self.arg_index = arg_index
+        
+    def evaluate(self, context: Dict[str, Any]) -> Any:
+        # Pulls from an 'args' list that the generalized function will provide
+        return context['args'][self.arg_index]
+        
+    def get_complexity(self) -> int:
+        return 1
+        
+    def __repr__(self) -> str:
+        return f"arg_{self.arg_index}"
