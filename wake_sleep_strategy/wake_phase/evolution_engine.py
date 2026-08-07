@@ -1,7 +1,7 @@
 import random
 import torch
 from typing import List, Dict
-from wake_phase.primitives import ASTNode, Variable, Constant, Operator, BASE_OPERATORS, BASE_VARIABLES
+from wake_phase.primitives import ASTNode, Variable, Constant, Operator, Parameter, FunctionCall, BASE_OPERATORS, BASE_VARIABLES
 from wake_phase.fitness import apply_proposed_deltas, evaluate_fitness, evaluate_goal_fitness
 
 class EvolutionaryRule:
@@ -23,30 +23,35 @@ def generate_seed_population(raw_deltas: List[Dict[str, tuple]]) -> List[Evoluti
     seed_rule = EvolutionaryRule(proposed_deltas=proposed, complexity=len(proposed), ast_tree=None)
     return [seed_rule]
 
-def generate_random_tree(max_depth: int = 2) -> ASTNode:
-    """Generates a random AST mathematical tree without any human priors."""
+def generate_random_tree(max_depth: int = 2, cache=None) -> ASTNode:
+    """Generates a random AST mathematical tree, utilizing the memory cache if available."""
     if max_depth <= 0 or random.random() < 0.4:
-        # Leaf node: either a coordinate/color variable or a small constant
         if random.random() < 0.5:
             return Variable(random.choice(BASE_VARIABLES))
         else:
             return Constant(random.randint(-1, 2))
     else:
-        # Branch node: an operator combining two sub-trees
+        # If the Sleep Phase cache has active functions, 30% chance to reuse a concept
+        if cache is not None and len(cache.get_active_functions()) > 0 and random.random() < 0.3:
+            active_fns = [name for name, fn in cache.functions.items() if fn.is_active]
+            chosen_fn = random.choice(active_fns)
+            args = [Variable(random.choice(BASE_VARIABLES)), Constant(random.randint(-1, 2))]
+            return FunctionCall(chosen_fn, args)
+            
         op_name = random.choice(list(BASE_OPERATORS.keys()))
         func = BASE_OPERATORS[op_name]
-        left = generate_random_tree(max_depth - 1)
-        right = generate_random_tree(max_depth - 1)
+        left = generate_random_tree(max_depth - 1, cache)
+        right = generate_random_tree(max_depth - 1, cache)
         return Operator(op_name, func, left, right)
 
-def mutate(rule: EvolutionaryRule) -> EvolutionaryRule:
+def mutate(rule: EvolutionaryRule, cache=None) -> EvolutionaryRule:
     """Mutates the evolutionary rule by generating a new AST branch or simplifying."""
     new_deltas = list(rule.proposed_deltas)
     if len(new_deltas) > 1 and random.random() < 0.5:
         new_deltas.pop(random.randrange(len(new_deltas)))
     
-    # Generate a structural AST mutation component to test alongside deltas
-    mutated_tree = generate_random_tree(max_depth=2)
+    # Pass the memory cache down to the generator
+    mutated_tree = generate_random_tree(max_depth=2, cache=cache)
     new_complexity = rule.complexity + mutated_tree.get_complexity() - 1
     
     return EvolutionaryRule(proposed_deltas=new_deltas, complexity=max(1, new_complexity), ast_tree=mutated_tree)

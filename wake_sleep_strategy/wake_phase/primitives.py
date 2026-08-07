@@ -114,6 +114,32 @@ class Operator(ASTNode):
     def __repr__(self) -> str:
         return f"({self.left} {self.op_name} {self.right})"
 
+class FunctionCall(ASTNode):
+    """Executes a parameterized blueprint from the Sleep Phase Cache."""
+    def __init__(self, fn_name: str, args: list):
+        self.fn_name = fn_name
+        self.args = args
+        
+    def evaluate(self, context: Dict[str, Any]) -> Any:
+        # 1. Resolve arguments using the current coordinates
+        resolved_args = [arg.evaluate(context) for arg in self.args]
+        
+        # 2. Fetch the blueprint from the context's cache
+        blueprint = context['cache'].functions[self.fn_name].blueprint
+        
+        # 3. Create a sub-context and execute the cached function
+        sub_context = context.copy()
+        sub_context['args'] = resolved_args
+        return blueprint.evaluate(sub_context)
+        
+    def get_complexity(self) -> int:
+        # Reusing a function is mathematically cheaper than evolving new math!
+        return 1 + sum(arg.get_complexity() for arg in self.args)
+        
+    def __repr__(self) -> str:
+        args_str = ", ".join(map(str, self.args))
+        return f"{self.fn_name}({args_str})"
+
 BASE_OPERATORS = {
     '+': operator.add,
     '-': operator.sub,
