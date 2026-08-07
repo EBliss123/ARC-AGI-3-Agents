@@ -1,15 +1,36 @@
 import torch
 from typing import List, Dict
+from wake_phase.primitives import ASTNode
 
-def apply_proposed_deltas(s_t: torch.Tensor, proposed_deltas: List[Dict]) -> torch.Tensor:
+def apply_proposed_deltas(s_t: torch.Tensor, proposed_deltas: List[Dict], ast_tree: ASTNode = None) -> torch.Tensor:
     """
     The Simulator: Applies the agent's theoretical changes to a copy of the starting board.
-    Expects proposed_deltas format: [{"coord": (z, y, x), "new_color": int}]
+    Now supports evaluating algebraic AST math trees dynamically across the grid.
     """
     s_pred = s_t.clone()
+    
+    # 1. Execute the algebraic tree (if it exists) across every pixel
+    if ast_tree is not None:
+        max_z, max_y, max_x = s_t.shape
+        for z in range(max_z):
+            for y in range(max_y):
+                for x in range(max_x):
+                    current_color = int(s_t[z, y, x].item())
+                    context = {"z": z, "y": y, "x": x, "color": current_color}
+                    
+                    try:
+                        # If the tree evaluates to True for this pixel, apply a transition
+                        # (Hardcoded to color 4 temporarily for structural testing)
+                        if ast_tree.evaluate(context) == True:
+                            s_pred[z, y, x] = 4
+                    except Exception:
+                        pass # Ignore invalid math like division by zero
+                        
+    # 2. Apply literal coordinates (used primarily by the seed population)
     for delta in proposed_deltas:
         z, y, x = delta["coord"]
         s_pred[z, y, x] = delta["new_color"]
+        
     return s_pred
 
 def calculate_pixel_error(s_pred: torch.Tensor, s_next: torch.Tensor) -> int:
