@@ -1,8 +1,8 @@
 import random
 import torch
 from typing import List, Dict
-from wake_phase.fitness import apply_proposed_deltas, evaluate_fitness
 from wake_phase.primitives import ASTNode, Variable, Constant, Operator, BASE_OPERATORS, BASE_VARIABLES
+from wake_phase.fitness import apply_proposed_deltas, evaluate_fitness, evaluate_goal_fitness
 
 class EvolutionaryRule:
     def __init__(self, proposed_deltas: List[Dict], complexity: int, ast_tree: ASTNode = None):
@@ -75,6 +75,29 @@ def evolve(s_t: torch.Tensor, s_next: torch.Tensor, raw_deltas: List[Dict[str, t
         
         # 4. Keep the top 50% for the next generation
         population = offspring[:max(1, len(offspring) // 2)]
+        
+    return population[0]
+
+def evolve_win_condition(s_t: torch.Tensor, is_win: bool, generations: int = 5) -> EvolutionaryRule:
+    """The Arena for evolving boolean logic that isolates the win state."""
+    # Seed population with random ASTs instead of literal pixel deltas
+    population = [
+        EvolutionaryRule(proposed_deltas=[], complexity=1, ast_tree=generate_random_tree(max_depth=2)) 
+        for _ in range(10)
+    ]
+    
+    for gen in range(generations):
+        offspring = list(population)
+        # Create mutations
+        for _ in range(len(population)):
+            offspring.append(EvolutionaryRule([], 1, generate_random_tree(max_depth=2)))
+            
+        for rule in offspring:
+            if rule.fitness_score == float('inf'):
+                rule.fitness_score = evaluate_goal_fitness(s_t, is_win, rule.ast_tree)
+                
+        offspring.sort(key=lambda x: x.fitness_score)
+        population = offspring[:10]
         
     return population[0]
 

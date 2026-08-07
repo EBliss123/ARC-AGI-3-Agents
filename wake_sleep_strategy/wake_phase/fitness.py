@@ -50,6 +50,20 @@ def evaluate_fitness(s_next: torch.Tensor, s_pred: torch.Tensor, rule_complexity
     
     return total_score
 
+def evaluate_goal_fitness(s_t: torch.Tensor, is_win: bool, ast_tree: ASTNode) -> float:
+    """Scores how accurately an AST predicts the Win State flag."""
+    if ast_tree is None:
+        return float('inf')
+        
+    # Testing a single coordinate context for the structural skeleton
+    context = {"z": 0, "y": 0, "x": 0, "color": int(s_t[0, 0, 0].item())}
+    try:
+        prediction = bool(ast_tree.evaluate(context))
+        error = 0.0 if prediction == is_win else 1.0
+        return error + (ast_tree.get_complexity() * 0.1)
+    except Exception:
+        return float('inf')
+
 if __name__ == "__main__":
     # Test block to verify the Simulator and Occam's Razor penalty
     t1 = torch.zeros((1, 3, 3), dtype=torch.int8)

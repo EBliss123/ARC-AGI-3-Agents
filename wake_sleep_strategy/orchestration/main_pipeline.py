@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 from wake_phase.primitives import get_deltas
-from wake_phase.evolution_engine import evolve
+from wake_phase.evolution_engine import evolve, evolve_win_condition
 
 # Dynamically add the root directory to the system path so imports work cleanly from anywhere
 root_dir = Path(__file__).resolve().parent.parent
@@ -67,6 +67,15 @@ def verify_milestone_1(jsonl_path: Path):
     print(f"Winning Rule Fitness Score: {best_rule.fitness_score:.2f}")
     print(f"Winning Rule Complexity: {best_rule.complexity}")
     print(f"Predictions preserved: {len(best_rule.proposed_deltas)}")
+    print("Milestone 2 is officially complete!")
+
+    print("\n--- Micro-Step 2.5: Evolving the Win Condition ---")
+    is_win = first_frame["is_win"]
+    win_rule = evolve_win_condition(s_t, is_win, generations=5)
+
+    print(f"Goal Rule Fitness Score: {win_rule.fitness_score:.2f}")
+    print(f"Goal Rule Complexity: {win_rule.ast_tree.get_complexity()}")
+    print(f"Best Goal Equation: {win_rule.ast_tree}")
     print("Milestone 2 is officially complete!")
 
 if __name__ == "__main__":
