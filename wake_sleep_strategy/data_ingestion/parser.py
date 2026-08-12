@@ -10,46 +10,53 @@ def stream_jsonl(file_path: Path) -> Iterator[Dict[str, Any]]:
 
 def extract_frame_transitions(file_path: Path) -> List[Dict[str, Any]]:
     # Use the streaming generator we proved works for this file format
-    frames = list(stream_jsonl(file_path))
+    frames = [f for f in stream_jsonl(file_path) if f.get("data", {}).get("frame") is not None]
         
     transitions = []
     
-    for i in range(len(frames) - 1):
-        current_data = frames[i].get("data", {})
-        next_data = frames[i + 1].get("data", {})
-        
-        # Safely extract the grid whether it is a dictionary containing "grid" or the 2D list itself
-        c_frame = current_data.get("frame")
-        s_t = c_frame.get("grid") if isinstance(c_frame, dict) else c_frame
-        
-        n_frame = next_data.get("frame")
-        s_next = n_frame.get("grid") if isinstance(n_frame, dict) else n_frame
-        
-        # Fallback just in case the key was literally called "grid" all along
-        if not s_t: s_t = current_data.get("grid")
-        if not s_next: s_next = next_data.get("grid")
-        
-        # Skip intro/outro frames that do not contain a valid game board
-        if s_t is None or s_next is None:
-            continue
-            
-        # Extract action ID if a human pressed a key on this frame; otherwise None
-        action_input = current_data.get("action_input")
+    # Milestone 1.3: Flatten the 3D frame arrays into a continuous 2D timeline to capture animations
+    timeline = []
+    for step_idx, f in enumerate(frames):
+        data = f.get("data", {})
+        action_input = data.get("action_input")
         action_id = action_input.get("id") if action_input else None
+        is_win = (data.get("state") == "WIN")
         
-        # Extract environment status flags (checking if the next frame reached a WIN state)
-        is_win = (next_data.get("state") == "WIN")
+        c_frame = data.get("frame")
+        grids = c_frame.get("grid") if isinstance(c_frame, dict) else c_frame
         
-        # Store as an atomic state transition block
+        # Iterate through the animation sequence
+        for j, grid in enumerate(grids):
+            timeline.append({
+                "step": step_idx,
+                "grid": grid,
+                "action_id": action_id if j == 0 else None,
+                "is_win": is_win if j == len(grids) - 1 else False
+            })
+            
+    # Build the S_t -> S_next tuples
+    for i in range(len(timeline) - 1):
         transitions.append({
-            "step": i,
-            "s_t": s_t,
-            "action_id": action_id,
-            "s_next": s_next,
-            "is_win": is_win
+            "step": timeline[i]["step"],
+            "s_t": timeline[i]["grid"],
+            "action_id": timeline[i]["action_id"],
+            "s_next": timeline[i+1]["grid"],
+            "is_win": timeline[i+1]["is_win"]
         })
         
     return transitions
+
+def extract_level_1_transitions(file_path: Path) -> List[Dict[str, Any]]:
+    """Isolates only the frames belonging to the first level (up to the first WIN state)."""
+    all_transitions = extract_frame_transitions(file_path)
+    level_1_frames = []
+    
+    for turn in all_transitions:
+        level_1_frames.append(turn)
+        if turn.get("is_win"):
+            break  # Stop extracting once Level 1 is solved
+            
+    return level_1_frames
 
 if __name__ == "__main__":
     # Test block to verify the parser works locally

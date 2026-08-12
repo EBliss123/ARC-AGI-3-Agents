@@ -2,6 +2,13 @@ import sys
 from pathlib import Path
 from wake_phase.primitives import get_deltas
 from wake_phase.evolution_engine import evolve, evolve_win_condition
+from sleep_phase.memory_cache import HierarchicalCache
+from relational_engine.cross_game_matrix import RelationalMatrix
+from relational_engine.intra_game_tracker import TrajectoryTracker
+from relational_engine.seed_generator import generate_smart_population
+from wake_phase.primitives import Constant
+from data_ingestion.parser import extract_level_1_transitions
+from data_ingestion.tensor_math import process_transitions_to_tensors
 
 # Dynamically add the root directory to the system path so imports work cleanly from anywhere
 root_dir = Path(__file__).resolve().parent.parent
@@ -10,6 +17,58 @@ sys.path.append(str(root_dir))
 from data_ingestion.parser import extract_frame_transitions
 from data_ingestion.tensor_math import process_transitions_to_tensors
 
+# The Global Brain: Persists across all games
+global_cache = HierarchicalCache()
+global_matrix = RelationalMatrix()
+
+def process_level(game_id: str, file_path: Path, level_id: int, game_tracker: TrajectoryTracker):
+    """The Grand Loop for a single level."""
+    # 1. Pre-Check: Ask the Tracker and Matrix for hints
+    hypotheses = game_tracker.predict_next_level_goal(game_id)
+    if not hypotheses:
+        active_physics = [name for name, fn in global_cache.functions.items() if fn.is_active]
+        hypotheses = global_matrix.query_historical_goals(active_physics)
+        
+    # 2. Build the Seed Population
+    starting_population = generate_smart_population(hypotheses, population_size=10)
+    
+    # 3. Data Ingestion (Goal 1 Focus)
+    raw_level_1 = extract_level_1_transitions(file_path)
+    tensor_frames = process_transitions_to_tensors(raw_level_1)
+    
+    # 4. Find the first frame where physics actually happened
+    target_frame = None
+    for frame in tensor_frames:
+        if frame["dynamic_mask"].any():
+            target_frame = frame
+            break
+            
+    if not target_frame:
+        print(f"  No movement detected in {game_id} Level {level_id}.")
+        return Constant(1), []
+        
+    print(f"  Movement detected! Extracting {target_frame['dynamic_mask'].sum().item()} changing pixels...")
+    
+    # 5. Convert tensor delta into the raw_deltas format expected by evolve()
+    moving_coords = target_frame["dynamic_mask"].nonzero()
+    raw_deltas = []
+    for coord in moving_coords:
+        c = tuple(coord.tolist())
+        old_val = target_frame["s_t"][c].item()
+        new_val = target_frame["s_next"][c].item()
+        raw_deltas.append({"coord": c, "transition": (old_val, new_val)})
+        
+    # 6. Evolve the Physics Rule
+    print("  Entering the Wake Phase (Evolution Arena)...")
+    best_rule = evolve(target_frame["s_t"], target_frame["s_next"], raw_deltas, generations=3)
+    
+    print(f"  Evolution Complete! Winning AST: {best_rule.ast_tree} (Complexity: {best_rule.complexity})")
+    
+    # [Placeholder]: Sleep Phase caching and Win Condition evolution will hook in here next.
+    mock_winning_ast = Constant(1) 
+    mock_active_physics = ["fn_0"]
+    
+    return mock_winning_ast, mock_active_physics
 def verify_milestone_1(jsonl_path: Path):
     print("--- Starting Milestone 1 Verification ---")
     print(f"Target file: {jsonl_path.name}")
@@ -78,7 +137,26 @@ def verify_milestone_1(jsonl_path: Path):
     print(f"Best Goal Equation: {win_rule.ast_tree}")
     print("Milestone 2 is officially complete!")
 
+def play_game(game_id: str, file_path_str: str, num_levels: int):
+    print(f"--- Booting Game: {game_id} ---")
+    game_tracker = TrajectoryTracker()
+    target_file = Path(file_path_str)
+    
+    if not target_file.exists():
+        print(f"Error: Could not find file at {target_file}")
+        return
+    
+    for level in range(1, num_levels + 1):
+        print(f"  Simulating Level {level}...")
+        winning_goal, active_physics = process_level(game_id, target_file, level, game_tracker)
+        game_tracker.record_level_goal(game_id, winning_goal)
+        
+    global_matrix.record_game_solution(game_id, active_physics, winning_goal)
+    print(f"--- Game Mastered! Matrix Updated. ---\n")
+
 if __name__ == "__main__":
-    # Point directly to the sample file you placed in the root directory
-    target_file = root_dir / "ar25-2a854897-cb79-48f4-92e1-0288df2cf6a9.json"
-    verify_milestone_1(target_file)
+    # Goal 1: Process the first level of ls20
+    ls20_path = r"C:\Users\Easton\ARC-AGI-3-Agents\wake_sleep_strategy\ls20-34d098c6-df52-458c-b5ad-19cefeb75981.json"
+    
+    # We set num_levels=1 because extract_level_1_transitions strictly isolates Level 1
+    play_game("ls20", ls20_path, num_levels=1)

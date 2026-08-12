@@ -11,25 +11,24 @@ def apply_proposed_deltas(s_t: torch.Tensor, proposed_deltas: List[Dict], ast_tr
     
     # 1. Execute the algebraic tree (if it exists) across every pixel
     if ast_tree is not None:
-        max_z, max_y, max_x = s_t.shape
-        for z in range(max_z):
+            max_y, max_x = s_t.shape
             for y in range(max_y):
                 for x in range(max_x):
-                    current_color = int(s_t[z, y, x].item())
-                    context = {"z": z, "y": y, "x": x, "color": current_color}
+                    current_color = int(s_t[y, x].item())
+                    context = {"y": y, "x": x, "color": current_color}
                     
                     try:
                         # If the tree evaluates to True for this pixel, apply a transition
                         # (Hardcoded to color 4 temporarily for structural testing)
                         if ast_tree.evaluate(context) == True:
-                            s_pred[z, y, x] = 4
+                            s_pred[y, x] = 4
                     except Exception:
                         pass # Ignore invalid math like division by zero
                         
     # 2. Apply literal coordinates (used primarily by the seed population)
     for delta in proposed_deltas:
-        z, y, x = delta["coord"]
-        s_pred[z, y, x] = delta["new_color"]
+        y, x = delta["coord"]
+        s_pred[y, x] = delta["new_color"]
         
     return s_pred
 
@@ -56,7 +55,7 @@ def evaluate_goal_fitness(s_t: torch.Tensor, is_win: bool, ast_tree: ASTNode) ->
         return float('inf')
         
     # Testing a single coordinate context for the structural skeleton
-    context = {"z": 0, "y": 0, "x": 0, "color": int(s_t[0, 0, 0].item())}
+    context = {"y": 0, "x": 0, "color": int(s_t[0, 0].item())}
     try:
         prediction = bool(ast_tree.evaluate(context))
         error = 0.0 if prediction == is_win else 1.0
@@ -66,14 +65,14 @@ def evaluate_goal_fitness(s_t: torch.Tensor, is_win: bool, ast_tree: ASTNode) ->
 
 if __name__ == "__main__":
     # Test block to verify the Simulator and Occam's Razor penalty
-    t1 = torch.zeros((1, 3, 3), dtype=torch.int8)
-    t2 = torch.zeros((1, 3, 3), dtype=torch.int8)
+    t1 = torch.zeros((3, 3), dtype=torch.int8)
+    t2 = torch.zeros((3, 3), dtype=torch.int8)
     
     # Reality: A pixel moves from (0,0) to (0,1)
-    t2[0, 0, 1] = 4
+    t2[0, 1] = 4
     
     # Agent's Theory: Proposes that the pixel moved correctly
-    agent_theory = [{"coord": (0, 0, 1), "new_color": 4}]
+    agent_theory = [{"coord": (0, 1), "new_color": 4}]
     
     print("--- Testing Fitness Engine ---")
     
