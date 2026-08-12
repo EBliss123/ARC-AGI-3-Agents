@@ -36,33 +36,29 @@ def process_level(game_id: str, file_path: Path, level_id: int, game_tracker: Tr
     raw_level_1 = extract_level_1_transitions(file_path)
     tensor_frames = process_transitions_to_tensors(raw_level_1)
     
-    # 4. Find the first frame where physics actually happened
-    target_frame = None
+    # 4. Process all frames to capture the full trajectory (actions and animations)
+    level_rules = []
     for frame in tensor_frames:
-        if frame["dynamic_mask"].any():
-            target_frame = frame
-            break
+        action_desc = f"Action {frame['action_id']}" if frame['action_id'] is not None else "Animation"
+        print(f"  Step {frame['step']} [{action_desc}]: {frame['dynamic_mask'].sum().item()} changing pixels.")
+        
+        # 5. Convert tensor delta into the raw_deltas format expected by evolve()
+        moving_coords = frame["dynamic_mask"].nonzero()
+        raw_deltas = []
+        for coord in moving_coords:
+            c = tuple(coord.tolist())
+            old_val = frame["s_t"][c].item()
+            new_val = frame["s_next"][c].item()
+            raw_deltas.append({"coord": c, "transition": (old_val, new_val)})
             
-    if not target_frame:
+        # 6. Evolve the Physics Rule for this specific step
+        best_rule = evolve(frame["s_t"], frame["s_next"], raw_deltas, generations=3)
+        print(f"    Winning AST: {best_rule.ast_tree} (Complexity: {best_rule.complexity})")
+        level_rules.append(best_rule)
+        
+    if not level_rules:
         print(f"  No movement detected in {game_id} Level {level_id}.")
         return Constant(1), []
-        
-    print(f"  Movement detected! Extracting {target_frame['dynamic_mask'].sum().item()} changing pixels...")
-    
-    # 5. Convert tensor delta into the raw_deltas format expected by evolve()
-    moving_coords = target_frame["dynamic_mask"].nonzero()
-    raw_deltas = []
-    for coord in moving_coords:
-        c = tuple(coord.tolist())
-        old_val = target_frame["s_t"][c].item()
-        new_val = target_frame["s_next"][c].item()
-        raw_deltas.append({"coord": c, "transition": (old_val, new_val)})
-        
-    # 6. Evolve the Physics Rule
-    print("  Entering the Wake Phase (Evolution Arena)...")
-    best_rule = evolve(target_frame["s_t"], target_frame["s_next"], raw_deltas, generations=3)
-    
-    print(f"  Evolution Complete! Winning AST: {best_rule.ast_tree} (Complexity: {best_rule.complexity})")
     
     # [Placeholder]: Sleep Phase caching and Win Condition evolution will hook in here next.
     mock_winning_ast = Constant(1) 

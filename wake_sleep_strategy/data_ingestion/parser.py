@@ -20,7 +20,7 @@ def extract_frame_transitions(file_path: Path) -> List[Dict[str, Any]]:
         data = f.get("data", {})
         action_input = data.get("action_input")
         action_id = action_input.get("id") if action_input else None
-        is_win = (data.get("state") == "WIN")
+        is_win = (data.get("levels_completed", 0) > 0)
         
         c_frame = data.get("frame")
         grids = c_frame.get("grid") if isinstance(c_frame, dict) else c_frame
