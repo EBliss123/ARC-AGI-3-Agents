@@ -147,7 +147,7 @@ BASE_OPERATORS = {
     '!=': operator.ne
 }
 
-BASE_VARIABLES = ['z', 'y', 'x', 'color']
+BASE_VARIABLES = ['y', 'x', 'color']
 
 class Parameter(ASTNode):
     """An empty slot for auto-parameterized functions."""
@@ -163,3 +163,26 @@ class Parameter(ASTNode):
         
     def __repr__(self) -> str:
         return f"arg_{self.arg_index}"
+
+class ReadColor(ASTNode):
+    """Reads the color of a pixel at a relative offset (dy, dx)."""
+    def __init__(self, dy: ASTNode, dx: ASTNode):
+        self.dy = dy
+        self.dx = dx
+        
+    def evaluate(self, context: Dict[str, Any]) -> Any:
+        target_y = context["y"] + int(self.dy.evaluate(context))
+        target_x = context["x"] + int(self.dx.evaluate(context))
+        grid = context["grid"]
+        
+        # Return -1 if the agent tries to look out of bounds
+        max_y, max_x = grid.shape
+        if 0 <= target_y < max_y and 0 <= target_x < max_x:
+            return int(grid[target_y, target_x].item())
+        return -1
+        
+    def get_complexity(self) -> int:
+        return 1 + self.dy.get_complexity() + self.dx.get_complexity()
+        
+    def __repr__(self) -> str:
+        return f"ReadColor({self.dy}, {self.dx})"

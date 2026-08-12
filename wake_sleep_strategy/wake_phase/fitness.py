@@ -15,13 +15,13 @@ def apply_proposed_deltas(s_t: torch.Tensor, proposed_deltas: List[Dict], ast_tr
             for y in range(max_y):
                 for x in range(max_x):
                     current_color = int(s_t[y, x].item())
-                    context = {"y": y, "x": x, "color": current_color}
+                    context = {"y": 0, "x": 0, "color": int(s_t[0, 0].item()), "grid": s_t}
                     
                     try:
-                        # If the tree evaluates to True for this pixel, apply a transition
-                        # (Hardcoded to color 4 temporarily for structural testing)
-                        if ast_tree.evaluate(context) == True:
-                            s_pred[y, x] = 4
+                        # The AST must now output the actual target integer color, not just True/False
+                        result = ast_tree.evaluate(context)
+                        if isinstance(result, int) and 0 <= result <= 99:
+                            s_pred[y, x] = result
                     except Exception:
                         pass # Ignore invalid math like division by zero
                         

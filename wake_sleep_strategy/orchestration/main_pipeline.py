@@ -52,7 +52,7 @@ def process_level(game_id: str, file_path: Path, level_id: int, game_tracker: Tr
             raw_deltas.append({"coord": c, "transition": (old_val, new_val)})
             
         # 6. Evolve the Physics Rule for this specific step
-        best_rule = evolve(frame["s_t"], frame["s_next"], raw_deltas, generations=3)
+        best_rule = evolve(frame["s_t"], frame["s_next"], raw_deltas, generations=10)
         print(f"    Winning AST: {best_rule.ast_tree} (Complexity: {best_rule.complexity})")
         level_rules.append(best_rule)
         

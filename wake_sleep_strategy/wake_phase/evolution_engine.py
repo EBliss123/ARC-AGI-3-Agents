@@ -1,8 +1,8 @@
 import random
 import torch
 from typing import List, Dict
-from wake_phase.primitives import ASTNode, Variable, Constant, Operator, Parameter, FunctionCall, BASE_OPERATORS, BASE_VARIABLES
 from wake_phase.fitness import apply_proposed_deltas, evaluate_fitness, evaluate_goal_fitness
+from wake_phase.primitives import ASTNode, Variable, Constant, Operator, Parameter, FunctionCall, BASE_OPERATORS, BASE_VARIABLES, ReadColor
 
 class EvolutionaryRule:
     def __init__(self, proposed_deltas: List[Dict], complexity: int, ast_tree: ASTNode = None):
@@ -30,6 +30,10 @@ def generate_random_tree(max_depth: int = 2, cache=None) -> ASTNode:
             return Variable(random.choice(BASE_VARIABLES))
         else:
             return Constant(random.randint(-1, 2))
+    elif random.random() < 0.2:  # 20% chance to evolve a sensory node
+        dy = generate_random_tree(max_depth - 1, cache)
+        dx = generate_random_tree(max_depth - 1, cache)
+        return ReadColor(dy, dx)
     else:
         # If the Sleep Phase cache has active functions, 30% chance to reuse a concept
         if cache is not None and len(cache.get_active_functions()) > 0 and random.random() < 0.3:
@@ -47,12 +51,18 @@ def generate_random_tree(max_depth: int = 2, cache=None) -> ASTNode:
 def mutate(rule: EvolutionaryRule, cache=None) -> EvolutionaryRule:
     """Mutates the evolutionary rule by generating a new AST branch or simplifying."""
     new_deltas = list(rule.proposed_deltas)
-    if len(new_deltas) > 1 and random.random() < 0.5:
+    
+    # Take a leap of faith: 20% chance to completely wipe literal memory and trust the AST math
+    if random.random() < 0.2:
+        new_deltas = []
+    elif len(new_deltas) > 0 and random.random() < 0.5:
         new_deltas.pop(random.randrange(len(new_deltas)))
     
     # Pass the memory cache down to the generator
     mutated_tree = generate_random_tree(max_depth=2, cache=cache)
-    new_complexity = rule.complexity + mutated_tree.get_complexity() - 1
+    
+    # Complexity is the remaining literal pixels PLUS the size of the math tree
+    new_complexity = len(new_deltas) + mutated_tree.get_complexity()
     
     return EvolutionaryRule(proposed_deltas=new_deltas, complexity=max(1, new_complexity), ast_tree=mutated_tree)
 
