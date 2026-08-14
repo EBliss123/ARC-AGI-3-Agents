@@ -3,6 +3,7 @@ import collections
 class RelationalTracker:
     def __init__(self):
         self.history = {}
+        self.dormant_signatures = []
 
     def build_dense_footprints(self, grid_tensor):
         """1. Dense Initialization: Maps every coordinate to its relative distances to the same color."""
@@ -24,16 +25,18 @@ class RelationalTracker:
         return dense_footprints
 
     def match_and_prune(self, prev_signatures, current_dense):
-        """Matches identities across frames via maximum anchor overlap, prunes inconsistent anchors, and extracts movement."""
+        """Matches relational identities across frames, prunes inconsistent anchors, 
+        and flags PERSISTENT, DISAPPEARED, REAPPEARED, and SPAWNED pixels."""
         matched_results = {}
         available_current_coords = set(current_dense.keys())
+        unmatched_prev_coords = set(prev_signatures.keys())
 
+        # 1. Match active previous signatures to current frame
         for prev_coord, prev_data in prev_signatures.items():
             prev_color = prev_data["color"]
             prev_anchors = prev_data["anchors"]
             prev_id = prev_data.get("id")
 
-            # Filter current coordinates that match the same color and are not yet claimed
             candidates = [
                 coord for coord in available_current_coords
                 if current_dense[coord]["color"] == prev_color
@@ -42,7 +45,6 @@ class RelationalTracker:
             if not candidates:
                 continue
 
-            # Find candidate with maximum intersection of anchors
             best_coord = None
             best_overlap = -1
             best_consistent_anchors = set()
@@ -57,6 +59,7 @@ class RelationalTracker:
 
             if best_coord is not None and (best_overlap > 0 or len(prev_anchors) == 0):
                 available_current_coords.remove(best_coord)
+                unmatched_prev_coords.remove(prev_coord)
                 dy = best_coord[0] - prev_coord[0]
                 dx = best_coord[1] - prev_coord[1]
 
@@ -65,11 +68,63 @@ class RelationalTracker:
                     "anchors": best_consistent_anchors,
                     "id": prev_id,
                     "prev_coord": prev_coord,
-                    "translation": (dy, dx)
+                    "translation": (dy, dx),
+                    "presence": "PERSISTENT"
                 }
 
-        return matched_results
+        # 2. Track disappeared signatures and archive to dormant registry
+        disappeared = []
+        for prev_coord in unmatched_prev_coords:
+            lost_data = prev_signatures[prev_coord]
+            lost_data["last_coord"] = prev_coord
+            lost_data["presence"] = "DISAPPEARED"
+            disappeared.append(lost_data)
+            self.dormant_signatures.append(lost_data)
 
+        # 3. Check unclaimed current coordinates against dormant signatures (Reappearance) or flag as Spawned
+        spawned = {}
+        reappeared = {}
+        for cand_coord in list(available_current_coords):
+            cand_data = current_dense[cand_coord]
+            cand_color = cand_data["color"]
+            cand_anchors = cand_data["anchors"]
+
+            best_dormant_idx = None
+            best_dormant_overlap = -1
+            best_consistent_anchors = set()
+
+            for idx, dormant in enumerate(self.dormant_signatures):
+                if dormant["color"] == cand_color:
+                    overlap = dormant["anchors"].intersection(cand_anchors)
+                    if len(overlap) > best_dormant_overlap:
+                        best_dormant_overlap = len(overlap)
+                        best_dormant_idx = idx
+                        best_consistent_anchors = overlap
+
+            if best_dormant_idx is not None and best_dormant_overlap > 0:
+                dormant = self.dormant_signatures.pop(best_dormant_idx)
+                reappeared[cand_coord] = {
+                    "color": cand_color,
+                    "anchors": best_consistent_anchors,
+                    "id": dormant.get("id"),
+                    "last_known_coord": dormant["last_coord"],
+                    "presence": "REAPPEARED"
+                }
+            else:
+                spawned[cand_coord] = {
+                    "color": cand_color,
+                    "anchors": cand_anchors,
+                    "id": None,
+                    "presence": "SPAWNED"
+                }
+
+        return {
+            "persistent": matched_results,
+            "disappeared": disappeared,
+            "reappeared": reappeared,
+            "spawned": spawned
+        }
+    
     def apply_uniqueness_filter(self, footprints):
         """3. The Uniqueness Filter & Tie-Breaker."""
         color_groups = collections.defaultdict(dict)
