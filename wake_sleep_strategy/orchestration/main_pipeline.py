@@ -42,17 +42,13 @@ def process_level(game_id: str, file_path: Path, level_id: int, game_tracker: Tr
         action_desc = f"Action {frame['action_id']}" if frame['action_id'] is not None else "Animation"
         print(f"  Step {frame['step']} [{action_desc}]: {frame['dynamic_mask'].sum().item()} changing pixels.")
         
-        # 5. Convert tensor delta into the raw_deltas format expected by evolve()
-        moving_coords = frame["dynamic_mask"].nonzero()
-        raw_deltas = []
-        for coord in moving_coords:
-            c = tuple(coord.tolist())
-            old_val = frame["s_t"][c].item()
-            new_val = frame["s_next"][c].item()
-            raw_deltas.append({"coord": c, "transition": (old_val, new_val)})
-            
-        # 6. Evolve the Physics Rule for this specific step
-        best_rule = evolve(frame["s_t"], frame["s_next"], raw_deltas, generations=10)
+        # 5. Evolve relational invariant rules targeting the dynamic mask
+        best_rule = evolve(
+            frame["s_t"],
+            frame["s_next"],
+            dynamic_mask=frame["dynamic_mask"],
+            action_id=frame["action_id"]
+        )
         print(f"    Winning AST: {best_rule.ast_tree} (Complexity: {best_rule.complexity})")
         level_rules.append(best_rule)
         
@@ -114,10 +110,11 @@ def verify_milestone_1(jsonl_path: Path):
     
     # Extract the deltas. s_t and s_next contain the entire grid, 
     # so all static pixels are included for the agent to probe later.
-    raw_deltas = get_deltas(s_t, s_next)
+    dynamic_mask = first_frame["dynamic_mask"]
+    action_id = first_frame["action_id"]
     
-    print(f"Evolving rules based on {len(raw_deltas)} dynamic pixels...")
-    best_rule = evolve(s_t, s_next, raw_deltas, generations=3)
+    print(f"Evolving relational rules on {dynamic_mask.sum().item()} changing coordinates...")
+    best_rule = evolve(s_t, s_next, dynamic_mask=dynamic_mask, action_id=action_id)
     
     print(f"Winning Rule Fitness Score: {best_rule.fitness_score:.2f}")
     print(f"Winning Rule Complexity: {best_rule.complexity}")

@@ -18,30 +18,25 @@ def get_deltas(s_t: torch.Tensor, s_next: torch.Tensor) -> List[Dict[str, tuple]
     
     deltas = []
     for idx in changed_indices:
-        z, y, x = idx.tolist()
-        color_before = s_t[z, y, x].item()
-        color_after = s_next[z, y, x].item()
+        y, x = idx.tolist()
+        color_before = s_t[y, x].item()
+        color_after = s_next[y, x].item()
         
         deltas.append({
-            "coord": (z, y, x),
+            "coord": (y, x),
             "transition": (color_before, color_after)
         })
         
     return deltas
 
-def calculate_distance(coord_a: Tuple[int, int, int], coord_b: Tuple[int, int, int]) -> Tuple[int, int, int]:
-    """
-    Calculates the strict algebraic distance (dz, dy, dx) between two coordinates.
-    This provides the raw geometric scaffolding for future learning algorithms.
-    """
-    z_a, y_a, x_a = coord_a
-    z_b, y_b, x_b = coord_b
+def calculate_distance(coord_a: Tuple[int, int], coord_b: Tuple[int, int]) -> Tuple[int, int]:
+    y_a, x_a = coord_a
+    y_b, x_b = coord_b
     
-    dz = z_b - z_a
     dy = y_b - y_a
     dx = x_b - x_a
     
-    return (dz, dy, dx)
+    return (dy, dx)
 
 if __name__ == "__main__":
     # Quick mathematical verification of the primitives
@@ -186,3 +181,40 @@ class ReadColor(ASTNode):
         
     def __repr__(self) -> str:
         return f"ReadColor({self.dy}, {self.dx})"
+
+class And(ASTNode):
+    """Boolean AND logic node."""
+    def __init__(self, left: ASTNode, right: ASTNode):
+        self.left = left
+        self.right = right
+
+    def evaluate(self, context: Dict[str, Any]) -> Any:
+        return bool(self.left.evaluate(context)) and bool(self.right.evaluate(context))
+
+    def get_complexity(self) -> int:
+        return 1 + self.left.get_complexity() + self.right.get_complexity()
+
+    def __repr__(self) -> str:
+        return f"({self.left} and {self.right})"
+
+class RelationalCondition(ASTNode):
+    """Checks if a relative offset (dy, dx) equals a specific color."""
+    def __init__(self, dy: int, dx: int, target_color: int):
+        self.dy = dy
+        self.dx = dx
+        self.target_color = target_color
+
+    def evaluate(self, context: Dict[str, Any]) -> bool:
+        target_y = context["y"] + self.dy
+        target_x = context["x"] + self.dx
+        grid = context["grid"]
+        max_y, max_x = grid.shape
+        if 0 <= target_y < max_y and 0 <= target_x < max_x:
+            return int(grid[target_y, target_x].item()) == self.target_color
+        return False
+
+    def get_complexity(self) -> int:
+        return 2
+
+    def __repr__(self) -> str:
+        return f"(S[y+{self.dy}, x+{self.dx}] == {self.target_color})"

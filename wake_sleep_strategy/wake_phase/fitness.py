@@ -15,15 +15,15 @@ def apply_proposed_deltas(s_t: torch.Tensor, proposed_deltas: List[Dict], ast_tr
             for y in range(max_y):
                 for x in range(max_x):
                     current_color = int(s_t[y, x].item())
-                    context = {"y": 0, "x": 0, "color": int(s_t[0, 0].item()), "grid": s_t}
+                    context = {"y": y, "x": x, "color": current_color, "grid": s_t}
                     
                     try:
-                        # The AST must now output the actual target integer color, not just True/False
                         result = ast_tree.evaluate(context)
-                        if isinstance(result, int) and 0 <= result <= 99:
-                            s_pred[y, x] = result
+                        if isinstance(result, (int, bool)) and result is not False:
+                            # If result is True (from mask predicate), mark as 1, otherwise set color value
+                            s_pred[y, x] = int(result)
                     except Exception:
-                        pass # Ignore invalid math like division by zero
+                        pass
                         
     # 2. Apply literal coordinates (used primarily by the seed population)
     for delta in proposed_deltas:
