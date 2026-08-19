@@ -218,3 +218,37 @@ class RelationalCondition(ASTNode):
 
     def __repr__(self) -> str:
         return f"(S[y+{self.dy}, x+{self.dx}] == {self.target_color})"
+    
+class ActionCondition(ASTNode):
+    """Checks if the player performed a specific action."""
+    def __init__(self, target_action: int):
+        self.target_action = target_action
+
+    def evaluate(self, context: Dict[str, Any]) -> bool:
+        return context.get("action_id") == self.target_action
+
+    def get_complexity(self) -> int:
+        return 1
+
+    def __repr__(self) -> str:
+        return f"(Action == {self.target_action})"
+
+class GridCondition(ASTNode):
+    """Checks if an indicator coordinate (y, x) anywhere on the full 64x64 grid equals a color."""
+    def __init__(self, y: int, x: int, target_color: int):
+        self.y = y
+        self.x = x
+        self.target_color = target_color
+
+    def evaluate(self, context: Dict[str, Any]) -> bool:
+        grid = context["grid"]
+        max_y, max_x = grid.shape
+        if 0 <= self.y < max_y and 0 <= self.x < max_x:
+            return int(grid[self.y, self.x].item()) == self.target_color
+        return False
+
+    def get_complexity(self) -> int:
+        return 2
+
+    def __repr__(self) -> str:
+        return f"(S[{self.y}, {self.x}] == {self.target_color})"

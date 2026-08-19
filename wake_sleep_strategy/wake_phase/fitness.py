@@ -15,7 +15,7 @@ def apply_proposed_deltas(s_t: torch.Tensor, proposed_deltas: List[Dict], ast_tr
             for y in range(max_y):
                 for x in range(max_x):
                     current_color = int(s_t[y, x].item())
-                    context = {"y": y, "x": x, "color": current_color, "grid": s_t}
+                    context = {"y": y, "x": x, "color": current_color, "grid": s_t, "action_id": getattr(ast_tree, "_action_id", None)}
                     
                     try:
                         result = ast_tree.evaluate(context)
