@@ -116,16 +116,14 @@ class FunctionCall(ASTNode):
         self.args = args
         
     def evaluate(self, context: Dict[str, Any]) -> Any:
-        # 1. Resolve arguments using the current coordinates
         resolved_args = [arg.evaluate(context) for arg in self.args]
-        
-        # 2. Fetch the blueprint from the context's cache
-        blueprint = context['cache'].functions[self.fn_name].blueprint
-        
-        # 3. Create a sub-context and execute the cached function
-        sub_context = context.copy()
-        sub_context['args'] = resolved_args
-        return blueprint.evaluate(sub_context)
+        cache = context.get('cache')
+        if cache is not None and self.fn_name in cache.functions:
+            blueprint = cache.functions[self.fn_name].blueprint
+            sub_context = context.copy()
+            sub_context['args'] = resolved_args
+            return blueprint.evaluate(sub_context)
+        return None
         
     def get_complexity(self) -> int:
         # Reusing a function is mathematically cheaper than evolving new math!

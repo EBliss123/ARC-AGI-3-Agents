@@ -1,7 +1,8 @@
 import sys
+import numpy as np
 from pathlib import Path
-from wake_phase.primitives import get_deltas
-from wake_phase.evolution_engine import evolve, evolve_win_condition
+from wake_phase.primitives import get_deltas, RuleSet
+from wake_phase.evolution_engine import evolve, evolve_win_condition, synthesize_atomic_sub_rules
 from sleep_phase.memory_cache import HierarchicalCache
 from relational_engine.cross_game_matrix import RelationalMatrix
 from relational_engine.intra_game_tracker import TrajectoryTracker
@@ -37,9 +38,9 @@ def process_level(game_id: str, file_path: Path, level_id: int, game_tracker: Tr
     raw_level_1 = extract_level_1_transitions(file_path)
     tensor_frames = process_transitions_to_tensors(raw_level_1)
     
-    # 4. Process all frames with cross-frame contradiction verification
+    # 4. Atomic Sub-Rule Library & Sleep Cache Initialization
+    atomic_library = []
     level_rules = []
-    active_rule_library = []
 
     for frame in tensor_frames:
         action_desc = f"Action {frame['action_id']}" if frame['action_id'] is not None else "Animation"
@@ -47,41 +48,51 @@ def process_level(game_id: str, file_path: Path, level_id: int, game_tracker: Tr
         changed_count = frame['dynamic_mask'].sum().item()
         print(f"  Step {step_idx} [{action_desc}]: {changed_count} changing pixels.")
         
-        # 5. First: Check if an existing trajectory rule perfectly explains this frame
-        matched_rule = None
-        for candidate_rule in active_rule_library:
-            s_pred = apply_proposed_deltas(frame["s_t"], [], ast_tree=candidate_rule.ast_tree)
-            if (s_pred == frame["s_next"]).all():
-                matched_rule = candidate_rule
-                break
-                
-        if matched_rule is not None:
-            print(f"    [Reused Trajectory Law]: {matched_rule.ast_tree} (Complexity: {matched_rule.complexity})")
-            level_rules.append(matched_rule)
-            continue
-
-        # 6. Evolve minimal relational rule if not yet covered
-        best_rule = evolve(
-            frame["s_t"],
-            frame["s_next"],
-            dynamic_mask=frame["dynamic_mask"],
-            action_id=frame["action_id"]
-        )
+        s_t = frame["s_t"]
+        s_next = frame["s_next"]
+        action_id = frame["action_id"]
         
-        # 7. Cross-validate against all static / zero-delta frames to ensure zero contradictions
-        is_consistent = True
-        for check_frame in tensor_frames:
-            if check_frame['dynamic_mask'].sum().item() == 0 and check_frame['action_id'] == frame['action_id']:
-                check_pred = apply_proposed_deltas(check_frame["s_t"], [], ast_tree=best_rule.ast_tree)
-                if check_pred.any():
-                    is_consistent = False
-                    break
-                    
-        if is_consistent:
-            active_rule_library.append(best_rule)
+        # 5. Atomic Library Evaluation: apply matching atomic sub-rules to residual
+        s_pred = s_t.clone()
+        used_rules = []
+        reused_count = 0
+
+        for rule in atomic_library:
+            test_pred = apply_proposed_deltas(s_t, [], ast_tree=rule)
+            diff_coords = (test_pred != s_t)
             
-        print(f"    Winning AST: {best_rule.ast_tree} (Complexity: {best_rule.complexity})")
-        level_rules.append(best_rule)
+            # If the rule fires accurately without making any false predictions on s_next
+            if diff_coords.any() and (test_pred[diff_coords] == s_next[diff_coords]).all():
+                s_pred[diff_coords] = test_pred[diff_coords]
+                used_rules.append(rule)
+                reused_count += 1
+
+        # 6. Residual Synthesis: synthesize only for remaining unexplained pixels
+        residual_mask = (s_pred != s_next).detach().cpu().numpy()
+        new_sub_rules = []
+        if residual_mask.any():
+            new_sub_rules = synthesize_atomic_sub_rules(s_t, s_next, residual_mask, action_id=action_id)
+            for new_rule in new_sub_rules:
+                atomic_library.append(new_rule)
+                used_rules.append(new_rule)
+
+        frame_ast = RuleSet(used_rules)
+        frame_ast._action_id = action_id
+        
+        # Report atomic reuse vs synthesis
+        if reused_count > 0 and len(new_sub_rules) == 0:
+            print(f"    [Full Atomic Law Reuse]: {frame_ast} (Complexity: {frame_ast.get_complexity()})")
+        elif reused_count > 0:
+            print(f"    [Partial Reuse + {len(new_sub_rules)} New Rules]: {frame_ast} (Complexity: {frame_ast.get_complexity()})")
+        else:
+            print(f"    Winning AST: {frame_ast} (Complexity: {frame_ast.get_complexity()})")
+        level_rules.append(frame_ast)
+
+    # 7. Sleep Phase: Induce parameterized functions across all atomic rules
+    compressed_library, fn_count = global_cache.induce_function(atomic_library)
+    print(f"\n--- Sleep Phase Complete: Induced {fn_count} Parameterized Functions ---")
+    for name, fn_obj in global_cache.functions.items():
+        print(f"  {name}(args[{fn_obj.arity}]): Blueprint = {fn_obj.blueprint} (Used: {fn_obj.usage_count}x)")
         
     if not level_rules:
         print(f"  No movement detected in {game_id} Level {level_id}.")

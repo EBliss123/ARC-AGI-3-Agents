@@ -175,6 +175,30 @@ def synthesize_transition_group(s_t_np: np.ndarray, c_before: int, pos_mask: np.
         tree = And(ActionCondition(action_id), tree)
     return tree
 
+def synthesize_atomic_sub_rules(s_t: torch.Tensor, s_next: torch.Tensor, residual_mask: np.ndarray, action_id: int = None) -> List[ConditionalColor]:
+    """Synthesizes individual atomic ConditionalColor rules for remaining unexplained pixels."""
+    s_t_np = s_t.detach().cpu().numpy().astype(np.int16)
+    s_next_np = s_next.detach().cpu().numpy().astype(np.int16)
+
+    transitions: Dict[Tuple[int, int], np.ndarray] = {}
+    for y, x in np.argwhere(residual_mask):
+        c_b = int(s_t_np[y, x])
+        c_a = int(s_next_np[y, x])
+        key = (c_b, c_a)
+        if key not in transitions:
+            transitions[key] = np.zeros_like(residual_mask, dtype=bool)
+        transitions[key][y, x] = True
+
+    atomic_rules = []
+    for (c_b, c_a), group_mask in transitions.items():
+        predicate_ast = synthesize_transition_group(s_t_np, c_b, group_mask, action_id=action_id)
+        output_node = Constant(c_a)
+        rule = ConditionalColor(predicate_ast, output_node)
+        rule._action_id = action_id
+        atomic_rules.append(rule)
+
+    return atomic_rules
+
 def evolve(s_t: torch.Tensor, s_next: torch.Tensor, dynamic_mask: torch.Tensor = None, action_id: int = None) -> EvolutionaryRule:
     """Direct synthesis of exact color update rules partitioned by transition signatures."""
     if dynamic_mask is None:
@@ -185,24 +209,8 @@ def evolve(s_t: torch.Tensor, s_next: torch.Tensor, dynamic_mask: torch.Tensor =
         empty_ruleset._action_id = action_id
         return EvolutionaryRule(proposed_deltas=[], complexity=1, ast_tree=empty_ruleset)
 
-    s_t_np = s_t.detach().cpu().numpy().astype(np.int16)
-    s_next_np = s_next.detach().cpu().numpy().astype(np.int16)
     dyn_mask_np = dynamic_mask.detach().cpu().numpy().astype(bool)
-    
-    transitions: Dict[Tuple[int, int], np.ndarray] = {}
-    for y, x in np.argwhere(dyn_mask_np):
-        c_b = int(s_t_np[y, x])
-        c_a = int(s_next_np[y, x])
-        key = (c_b, c_a)
-        if key not in transitions:
-            transitions[key] = np.zeros_like(dyn_mask_np, dtype=bool)
-        transitions[key][y, x] = True
-
-    conditional_rules = []
-    for (c_b, c_a), group_mask in transitions.items():
-        predicate_ast = synthesize_transition_group(s_t_np, c_b, group_mask, action_id=action_id)
-        output_node = Constant(c_a)
-        conditional_rules.append(ConditionalColor(predicate_ast, output_node))
+    conditional_rules = synthesize_atomic_sub_rules(s_t, s_next, dyn_mask_np, action_id=action_id)
 
     final_ast = RuleSet(conditional_rules)
     final_ast._action_id = action_id
