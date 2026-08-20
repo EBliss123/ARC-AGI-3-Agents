@@ -87,8 +87,33 @@ def extract_shifted_view(grid_np: np.ndarray, dy: int, dx: int, oob_val: int = -
         shifted[y_start_dst:y_end_dst, x_start_dst:x_end_dst] = grid_np[y_start_src:y_end_src, x_start_src:x_end_src]
     return shifted
 
+def minimize_conditions(s_t_np: np.ndarray, selected_conds: List[RelationalCondition], pos_mask: np.ndarray) -> Tuple[List[RelationalCondition], List[RelationalCondition]]:
+    """Non-destructive backward minimization: retains minimal active set while archiving backup qualifiers."""
+    if len(selected_conds) <= 1:
+        return selected_conds, []
+
+    active_conds = list(selected_conds)
+    archived_backup = []
+
+    # Attempt to deactivate redundant conditions in reverse order (except the base self check at index 0)
+    for i in range(len(selected_conds) - 1, 0, -1):
+        candidate_active = [c for idx, c in enumerate(active_conds) if idx != i]
+        
+        # Test if remaining active conditions alone produce 0 false positives
+        combined_mask = np.ones_like(pos_mask, dtype=bool)
+        for cond in candidate_active:
+            shifted = extract_shifted_view(s_t_np, cond.dy, cond.dx)
+            combined_mask &= (shifted == cond.target_color)
+            
+        # If removing it introduces no false positives, move it to backup archive
+        if np.all(combined_mask == pos_mask):
+            archived_backup.append(active_conds[i])
+            active_conds = candidate_active
+
+    return active_conds, archived_backup
+
 def synthesize_transition_group(s_t_np: np.ndarray, c_before: int, pos_mask: np.ndarray, action_id: int = None) -> ASTNode:
-    """Synthesizes minimal relative offset conditions that isolate one transition group."""
+    """Synthesizes minimal relative offset conditions with non-destructive condition preservation."""
     h, w = s_t_np.shape
     pos_coords = np.argwhere(pos_mask)
     if len(pos_coords) == 0:
@@ -98,10 +123,9 @@ def synthesize_transition_group(s_t_np: np.ndarray, c_before: int, pos_mask: np.
     current_active_mask = (s_t_np == c_before)
     base_conds = [RelationalCondition(0, 0, c_before)]
     
-    # 2. Extract shared invariants across all positive coordinates in this transition
+    # 2. Extract shared invariants across positive coordinates
     p_first_y, p_first_x = pos_coords[0]
     candidate_offsets = []
-    # Broad multi-scale search: immediate neighbors, mid-range offsets, full span
     search_offsets = [(dy, dx) for dy in range(-8, 9) for dx in range(-8, 9) if not (dy == 0 and dx == 0)]
     
     for dy, dx in search_offsets:
@@ -109,7 +133,6 @@ def synthesize_transition_group(s_t_np: np.ndarray, c_before: int, pos_mask: np.
         target_x = p_first_x + dx
         if 0 <= target_y < h and 0 <= target_x < w:
             target_color = int(s_t_np[target_y, target_x])
-            # Check if all positive coordinates in this group share this exact offset color
             shifted = extract_shifted_view(s_t_np, dy, dx)
             if np.all(shifted[pos_mask] == target_color):
                 candidate_offsets.append((dy, dx, target_color))
@@ -140,19 +163,20 @@ def synthesize_transition_group(s_t_np: np.ndarray, c_before: int, pos_mask: np.
         shifted = extract_shifted_view(s_t_np, dy, dx)
         current_negatives = current_negatives & (shifted == c)
 
-    # 4. Chain selected conditions with AND
-    tree = selected_conds[0]
-    for cond in selected_conds[1:]:
+    # 4. Backward Minimization (Keep active minimal, archive the rest)
+    minimal_conds, archived_conds = minimize_conditions(s_t_np, selected_conds, pos_mask)
+
+    tree = minimal_conds[0]
+    for cond in minimal_conds[1:]:
         tree = And(tree, cond)
         
+    tree._archived_qualifiers = archived_conds
     if action_id is not None:
         tree = And(ActionCondition(action_id), tree)
     return tree
 
 def evolve(s_t: torch.Tensor, s_next: torch.Tensor, dynamic_mask: torch.Tensor = None, action_id: int = None) -> EvolutionaryRule:
-    """
-    Direct synthesis partitioned by transition signatures (c_before -> c_after).
-    """
+    """Direct synthesis with minimal qualifiers and non-destructive archive."""
     if dynamic_mask is None:
         dynamic_mask = (s_t != s_next)
         
@@ -165,7 +189,6 @@ def evolve(s_t: torch.Tensor, s_next: torch.Tensor, dynamic_mask: torch.Tensor =
     s_next_np = s_next.detach().cpu().numpy().astype(np.int16)
     dyn_mask_np = dynamic_mask.detach().cpu().numpy().astype(bool)
     
-    # 1. Partition changing pixels by transition signature (c_before, c_after)
     transitions: Dict[Tuple[int, int], np.ndarray] = {}
     for y, x in np.argwhere(dyn_mask_np):
         c_b = int(s_t_np[y, x])
@@ -175,13 +198,11 @@ def evolve(s_t: torch.Tensor, s_next: torch.Tensor, dynamic_mask: torch.Tensor =
             transitions[key] = np.zeros_like(dyn_mask_np, dtype=bool)
         transitions[key][y, x] = True
 
-    # 2. Synthesize translation-invariant rule for each distinct transition group
     group_rules = []
     for (c_b, c_a), group_mask in transitions.items():
         rule_ast = synthesize_transition_group(s_t_np, c_b, group_mask, action_id=action_id)
         group_rules.append(rule_ast)
 
-    # 3. Combine distinct transition groups with OR logic
     final_ast = group_rules[0]
     for next_rule in group_rules[1:]:
         final_ast = Operator("or", lambda a, b: bool(a) or bool(b), final_ast, next_rule)

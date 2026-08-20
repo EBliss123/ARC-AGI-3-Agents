@@ -9,6 +9,7 @@ from relational_engine.seed_generator import generate_smart_population
 from wake_phase.primitives import Constant
 from data_ingestion.parser import extract_level_1_transitions
 from data_ingestion.tensor_math import process_transitions_to_tensors
+from wake_phase.fitness import apply_proposed_deltas
 
 # Dynamically add the root directory to the system path so imports work cleanly from anywhere
 root_dir = Path(__file__).resolve().parent.parent
@@ -36,19 +37,49 @@ def process_level(game_id: str, file_path: Path, level_id: int, game_tracker: Tr
     raw_level_1 = extract_level_1_transitions(file_path)
     tensor_frames = process_transitions_to_tensors(raw_level_1)
     
-    # 4. Process all frames to capture the full trajectory (actions and animations)
+    # 4. Process all frames with cross-frame contradiction verification
     level_rules = []
+    active_rule_library = []
+
     for frame in tensor_frames:
         action_desc = f"Action {frame['action_id']}" if frame['action_id'] is not None else "Animation"
-        print(f"  Step {frame['step']} [{action_desc}]: {frame['dynamic_mask'].sum().item()} changing pixels.")
+        step_idx = frame['step']
+        changed_count = frame['dynamic_mask'].sum().item()
+        print(f"  Step {step_idx} [{action_desc}]: {changed_count} changing pixels.")
         
-        # 5. Evolve relational invariant rules targeting the dynamic mask
+        # 5. First: Check if an existing trajectory rule perfectly explains this frame
+        matched_rule = None
+        for candidate_rule in active_rule_library:
+            pred_mask = apply_proposed_deltas(frame["s_t"], [], ast_tree=candidate_rule.ast_tree)
+            if (pred_mask == frame["dynamic_mask"].int()).all():
+                matched_rule = candidate_rule
+                break
+                
+        if matched_rule is not None:
+            print(f"    [Reused Trajectory Law]: {matched_rule.ast_tree} (Complexity: {matched_rule.complexity})")
+            level_rules.append(matched_rule)
+            continue
+
+        # 6. Evolve minimal relational rule if not yet covered
         best_rule = evolve(
             frame["s_t"],
             frame["s_next"],
             dynamic_mask=frame["dynamic_mask"],
             action_id=frame["action_id"]
         )
+        
+        # 7. Cross-validate against all static / zero-delta frames to ensure zero contradictions
+        is_consistent = True
+        for check_frame in tensor_frames:
+            if check_frame['dynamic_mask'].sum().item() == 0 and check_frame['action_id'] == frame['action_id']:
+                check_pred = apply_proposed_deltas(check_frame["s_t"], [], ast_tree=best_rule.ast_tree)
+                if check_pred.any():
+                    is_consistent = False
+                    break
+                    
+        if is_consistent:
+            active_rule_library.append(best_rule)
+            
         print(f"    Winning AST: {best_rule.ast_tree} (Complexity: {best_rule.complexity})")
         level_rules.append(best_rule)
         
