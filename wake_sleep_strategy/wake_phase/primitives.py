@@ -252,3 +252,38 @@ class GridCondition(ASTNode):
 
     def __repr__(self) -> str:
         return f"(S[{self.y}, {self.x}] == {self.target_color})"
+
+class ConditionalColor(ASTNode):
+    """Pairs a boolean predicate with an output color expression."""
+    def __init__(self, condition: ASTNode, output_val: ASTNode):
+        self.condition = condition
+        self.output_val = output_val
+
+    def evaluate(self, context: Dict[str, Any]) -> Any:
+        if bool(self.condition.evaluate(context)):
+            return self.output_val.evaluate(context)
+        return None
+
+    def get_complexity(self) -> int:
+        return self.condition.get_complexity() + self.output_val.get_complexity()
+
+    def __repr__(self) -> str:
+        return f"If {self.condition} -> {self.output_val}"
+
+class RuleSet(ASTNode):
+    """A collection of conditional rules evaluated in order."""
+    def __init__(self, rules: List[ConditionalColor]):
+        self.rules = rules
+
+    def evaluate(self, context: Dict[str, Any]) -> Any:
+        for rule in self.rules:
+            res = rule.evaluate(context)
+            if res is not None:
+                return res
+        return None
+
+    def get_complexity(self) -> int:
+        return sum(r.get_complexity() for r in self.rules)
+
+    def __repr__(self) -> str:
+        return " | ".join(str(r) for r in self.rules)

@@ -2,7 +2,7 @@ import random
 import torch
 from typing import List, Dict
 from wake_phase.fitness import apply_proposed_deltas, evaluate_fitness, evaluate_goal_fitness
-from wake_phase.primitives import ASTNode, Variable, Constant, Operator, Parameter, FunctionCall, BASE_OPERATORS, BASE_VARIABLES, ReadColor, And, RelationalCondition, ActionCondition
+from wake_phase.primitives import ASTNode, Variable, Constant, Operator, Parameter, FunctionCall, BASE_OPERATORS, BASE_VARIABLES, ReadColor, And, RelationalCondition, ActionCondition, ConditionalColor, RuleSet
 from typing import Set, Tuple, Dict
 import numpy as np
 
@@ -176,14 +176,14 @@ def synthesize_transition_group(s_t_np: np.ndarray, c_before: int, pos_mask: np.
     return tree
 
 def evolve(s_t: torch.Tensor, s_next: torch.Tensor, dynamic_mask: torch.Tensor = None, action_id: int = None) -> EvolutionaryRule:
-    """Direct synthesis with minimal qualifiers and non-destructive archive."""
+    """Direct synthesis of exact color update rules partitioned by transition signatures."""
     if dynamic_mask is None:
         dynamic_mask = (s_t != s_next)
         
     if not dynamic_mask.any():
-        zero_node = Constant(0)
-        zero_node._action_id = action_id
-        return EvolutionaryRule(proposed_deltas=[], complexity=1, ast_tree=zero_node)
+        empty_ruleset = RuleSet([])
+        empty_ruleset._action_id = action_id
+        return EvolutionaryRule(proposed_deltas=[], complexity=1, ast_tree=empty_ruleset)
 
     s_t_np = s_t.detach().cpu().numpy().astype(np.int16)
     s_next_np = s_next.detach().cpu().numpy().astype(np.int16)
@@ -198,23 +198,22 @@ def evolve(s_t: torch.Tensor, s_next: torch.Tensor, dynamic_mask: torch.Tensor =
             transitions[key] = np.zeros_like(dyn_mask_np, dtype=bool)
         transitions[key][y, x] = True
 
-    group_rules = []
+    conditional_rules = []
     for (c_b, c_a), group_mask in transitions.items():
-        rule_ast = synthesize_transition_group(s_t_np, c_b, group_mask, action_id=action_id)
-        group_rules.append(rule_ast)
+        predicate_ast = synthesize_transition_group(s_t_np, c_b, group_mask, action_id=action_id)
+        output_node = Constant(c_a)
+        conditional_rules.append(ConditionalColor(predicate_ast, output_node))
 
-    final_ast = group_rules[0]
-    for next_rule in group_rules[1:]:
-        final_ast = Operator("or", lambda a, b: bool(a) or bool(b), final_ast, next_rule)
-
+    final_ast = RuleSet(conditional_rules)
     final_ast._action_id = action_id
+    
     rule = EvolutionaryRule(
         proposed_deltas=[],
         complexity=final_ast.get_complexity(),
         ast_tree=final_ast
     )
     s_pred = apply_proposed_deltas(s_t, [], ast_tree=rule.ast_tree)
-    rule.fitness_score = evaluate_fitness(dynamic_mask.int(), s_pred, rule.complexity)
+    rule.fitness_score = evaluate_fitness(s_next, s_pred, rule.complexity)
     return rule
 
 def evolve_win_condition(s_t: torch.Tensor, is_win: bool, generations: int = 5) -> EvolutionaryRule:

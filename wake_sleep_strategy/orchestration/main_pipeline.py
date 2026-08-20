@@ -50,8 +50,8 @@ def process_level(game_id: str, file_path: Path, level_id: int, game_tracker: Tr
         # 5. First: Check if an existing trajectory rule perfectly explains this frame
         matched_rule = None
         for candidate_rule in active_rule_library:
-            pred_mask = apply_proposed_deltas(frame["s_t"], [], ast_tree=candidate_rule.ast_tree)
-            if (pred_mask == frame["dynamic_mask"].int()).all():
+            s_pred = apply_proposed_deltas(frame["s_t"], [], ast_tree=candidate_rule.ast_tree)
+            if (s_pred == frame["s_next"]).all():
                 matched_rule = candidate_rule
                 break
                 

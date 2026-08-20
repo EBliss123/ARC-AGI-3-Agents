@@ -19,8 +19,7 @@ def apply_proposed_deltas(s_t: torch.Tensor, proposed_deltas: List[Dict], ast_tr
                     
                     try:
                         result = ast_tree.evaluate(context)
-                        if isinstance(result, (int, bool)) and result is not False:
-                            # If result is True (from mask predicate), mark as 1, otherwise set color value
+                        if isinstance(result, (int, bool)) and result is not False and result is not None:
                             s_pred[y, x] = int(result)
                     except Exception:
                         pass
