@@ -274,16 +274,61 @@ def audit_trajectory_coordinates(
     }
     return audit_ledger
 
+def extract_win_spatial_matrix(
+    s_win: torch.Tensor,
+    audit_ledger: Dict[str, Any],
+    background_color: int = 0
+) -> Dict[str, Any]:
+    """
+    Goal 2, Subgoal 2: Computes the unpruned, full-grid relative spatial matrix
+    between all modified coordinates and all active non-background coordinates in S_win.
+    No distance limits or spatial/color clustering applied.
+    """
+    s_win_np = s_win.detach().cpu().numpy().astype(np.int16)
+    h, w = s_win_np.shape
+
+    # Find all active (non-background) coordinates across the full grid in S_win
+    active_mask = (s_win_np != background_color)
+    active_points = [(int(y), int(x), int(s_win_np[y, x])) for y, x in np.argwhere(active_mask)]
+
+    spatial_matrix = []
+    for rec in audit_ledger["coordinate_records"]:
+        cy, cx = rec["coord"]
+        c_win = rec["c_win"]
+        
+        # Calculate full-grid relative offsets to all active points
+        offsets = []
+        for ay, ax, ac in active_points:
+            dy = ay - cy
+            dx = ax - cx
+            if dy == 0 and dx == 0:
+                continue
+            offsets.append((dy, dx, ac))
+
+        spatial_matrix.append({
+            "coord": (cy, cx),
+            "c_win": c_win,
+            "relative_offsets": offsets
+        })
+
+    return {
+        "active_points_count": len(active_points),
+        "spatial_records_count": len(spatial_matrix),
+        "matrix": spatial_matrix
+    }
+
 def evolve_win_condition(
     s_init: torch.Tensor,
     s_win: torch.Tensor,
     trajectory_frames: List[torch.Tensor]
-) -> Tuple[EvolutionaryRule, Dict[str, Any]]:
-    """Subgoal 1: Ingests raw state tensors and outputs the unclustered coordinate audit ledger."""
+) -> Tuple[EvolutionaryRule, Dict[str, Any], Dict[str, Any]]:
+    """Subgoals 1 & 2: Ingests raw state tensors and builds both coordinate audit and spatial matrix ledgers."""
     audit_ledger = audit_trajectory_coordinates(s_init, s_win, trajectory_frames)
+    spatial_matrix = extract_win_spatial_matrix(s_win, audit_ledger)
     
     print(f"    [Subgoal 1 Audit]: {audit_ledger['total_trajectory_modified_coords']} coordinates modified across trajectory.")
     print(f"    [Subgoal 1 Net Delta]: {audit_ledger['total_net_modified_coords']} coordinates with net color changes (S_0 != S_win).")
+    print(f"    [Subgoal 2 Spatial Matrix]: Mapped {spatial_matrix['spatial_records_count']} modified points across {spatial_matrix['active_points_count']} active grid features.")
     
     root = Constant(1)
     rule = EvolutionaryRule(
@@ -291,7 +336,7 @@ def evolve_win_condition(
         complexity=root.get_complexity(),
         ast_tree=root
     )
-    return rule, audit_ledger
+    return rule, audit_ledger, spatial_matrix
 
 if __name__ == "__main__":
     # Test block to verify the Evolution Engine

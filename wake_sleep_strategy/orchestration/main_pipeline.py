@@ -94,13 +94,13 @@ def process_level(game_id: str, file_path: Path, level_id: int, game_tracker: Tr
     for name, fn_obj in global_cache.functions.items():
         print(f"  {name}(args[{fn_obj.arity}]): Blueprint = {fn_obj.blueprint} (Used: {fn_obj.usage_count}x)")
         
-    # 8. Win Condition Synthesis: Subgoal 1 Coordinate Audit Ledger
+    # 8. Win Condition Synthesis: Subgoal 1 & 2 Ledgers
     all_states = [f["s_t"] for f in tensor_frames]
     final_win_state = tensor_frames[-1]["s_next"]
     s_init = tensor_frames[0]["s_t"]
     
     print(f"\n--- Synthesizing Goal 2 (Win Condition) for Level {level_id} ---")
-    win_rule, audit_ledger = evolve_win_condition(s_init, final_win_state, all_states)
+    win_rule, audit_ledger, spatial_matrix = evolve_win_condition(s_init, final_win_state, all_states)
     
     return win_rule.ast_tree, list(global_cache.functions.keys())
     
