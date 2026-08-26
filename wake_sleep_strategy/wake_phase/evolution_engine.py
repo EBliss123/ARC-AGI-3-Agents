@@ -1,9 +1,8 @@
 import random
 import torch
-from typing import List, Dict
+from typing import List, Dict, Any, Tuple, Set
 from wake_phase.fitness import apply_proposed_deltas, evaluate_fitness, evaluate_goal_fitness
 from wake_phase.primitives import ASTNode, Variable, Constant, Operator, Parameter, FunctionCall, BASE_OPERATORS, BASE_VARIABLES, ReadColor, And, RelationalCondition, ActionCondition, ConditionalColor, RuleSet
-from typing import Set, Tuple, Dict
 import numpy as np
 
 class EvolutionaryRule:
@@ -224,28 +223,75 @@ def evolve(s_t: torch.Tensor, s_next: torch.Tensor, dynamic_mask: torch.Tensor =
     rule.fitness_score = evaluate_fitness(s_next, s_pred, rule.complexity)
     return rule
 
-def evolve_win_condition(s_t: torch.Tensor, is_win: bool, generations: int = 5) -> EvolutionaryRule:
-    """The Arena for evolving boolean logic that isolates the win state."""
-    # Seed population with random ASTs instead of literal pixel deltas
-    population = [
-        EvolutionaryRule(proposed_deltas=[], complexity=1, ast_tree=generate_random_tree(max_depth=2)) 
-        for _ in range(10)
-    ]
-    
-    for gen in range(generations):
-        offspring = list(population)
-        # Create mutations
-        for _ in range(len(population)):
-            offspring.append(EvolutionaryRule([], 1, generate_random_tree(max_depth=2)))
-            
-        for rule in offspring:
-            if rule.fitness_score == float('inf'):
-                rule.fitness_score = evaluate_goal_fitness(s_t, is_win, rule.ast_tree)
-                
-        offspring.sort(key=lambda x: x.fitness_score)
-        population = offspring[:10]
+def audit_trajectory_coordinates(
+    s_init: torch.Tensor,
+    s_win: torch.Tensor,
+    trajectory_frames: List[torch.Tensor]
+) -> Dict[str, Any]:
+    """
+    Goal 2, Subgoal 1: Full unclustered coordinate audit across the level trajectory.
+    Records every coordinate that modified, initial/final colors, and exact transition history.
+    """
+    s_init_np = s_init.detach().cpu().numpy().astype(np.int16)
+    s_win_np = s_win.detach().cpu().numpy().astype(np.int16)
+    all_frames_np = [f.detach().cpu().numpy().astype(np.int16) for f in trajectory_frames] + [s_win_np]
+
+    # 1. Identify all coordinates that ever changed across any step in the level
+    footprint_mask = (s_init_np != s_win_np)
+    for i in range(len(all_frames_np) - 1):
+        footprint_mask |= (all_frames_np[i] != all_frames_np[i + 1])
+
+    modified_coords = np.argwhere(footprint_mask)
+
+    # 2. Build coordinate audit ledger
+    coordinate_records = []
+    for y, x in modified_coords:
+        y_int, x_int = int(y), int(x)
+        c_start = int(s_init_np[y_int, x_int])
+        c_end = int(s_win_np[y_int, x_int])
         
-    return population[0]
+        # Extract full transition sequence for this specific coordinate
+        history = [int(all_frames_np[0][y_int, x_int])]
+        for frame_np in all_frames_np[1:]:
+            c_curr = int(frame_np[y_int, x_int])
+            if c_curr != history[-1]:
+                history.append(c_curr)
+
+        coordinate_records.append({
+            "coord": (y_int, x_int),
+            "c_init": c_start,
+            "c_win": c_end,
+            "net_changed": (c_start != c_end),
+            "transition_history": history
+        })
+
+    net_changed_count = sum(1 for r in coordinate_records if r["net_changed"])
+
+    audit_ledger = {
+        "total_trajectory_modified_coords": len(coordinate_records),
+        "total_net_modified_coords": net_changed_count,
+        "coordinate_records": coordinate_records
+    }
+    return audit_ledger
+
+def evolve_win_condition(
+    s_init: torch.Tensor,
+    s_win: torch.Tensor,
+    trajectory_frames: List[torch.Tensor]
+) -> Tuple[EvolutionaryRule, Dict[str, Any]]:
+    """Subgoal 1: Ingests raw state tensors and outputs the unclustered coordinate audit ledger."""
+    audit_ledger = audit_trajectory_coordinates(s_init, s_win, trajectory_frames)
+    
+    print(f"    [Subgoal 1 Audit]: {audit_ledger['total_trajectory_modified_coords']} coordinates modified across trajectory.")
+    print(f"    [Subgoal 1 Net Delta]: {audit_ledger['total_net_modified_coords']} coordinates with net color changes (S_0 != S_win).")
+    
+    root = Constant(1)
+    rule = EvolutionaryRule(
+        proposed_deltas=[],
+        complexity=root.get_complexity(),
+        ast_tree=root
+    )
+    return rule, audit_ledger
 
 if __name__ == "__main__":
     # Test block to verify the Evolution Engine

@@ -94,15 +94,16 @@ def process_level(game_id: str, file_path: Path, level_id: int, game_tracker: Tr
     for name, fn_obj in global_cache.functions.items():
         print(f"  {name}(args[{fn_obj.arity}]): Blueprint = {fn_obj.blueprint} (Used: {fn_obj.usage_count}x)")
         
-    if not level_rules:
-        print(f"  No movement detected in {game_id} Level {level_id}.")
-        return Constant(1), []
+    # 8. Win Condition Synthesis: Subgoal 1 Coordinate Audit Ledger
+    all_states = [f["s_t"] for f in tensor_frames]
+    final_win_state = tensor_frames[-1]["s_next"]
+    s_init = tensor_frames[0]["s_t"]
     
-    # [Placeholder]: Sleep Phase caching and Win Condition evolution will hook in here next.
-    mock_winning_ast = Constant(1) 
-    mock_active_physics = ["fn_0"]
+    print(f"\n--- Synthesizing Goal 2 (Win Condition) for Level {level_id} ---")
+    win_rule, audit_ledger = evolve_win_condition(s_init, final_win_state, all_states)
     
-    return mock_winning_ast, mock_active_physics
+    return win_rule.ast_tree, list(global_cache.functions.keys())
+    
 def verify_milestone_1(jsonl_path: Path):
     print("--- Starting Milestone 1 Verification ---")
     print(f"Target file: {jsonl_path.name}")
